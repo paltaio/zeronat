@@ -76,14 +76,9 @@ async fn drive_conv(mut kcp: Kcp<ChannelWriter>, mut ch: ConvChannels) {
             return;
         }
         // Drain all complete messages KCP has reassembled.
-        loop {
-            match kcp.recv(&mut buf) {
-                Ok(n) => {
-                    if ch.read_tx.send(buf[..n].to_vec()).await.is_err() {
-                        return; // reader gone
-                    }
-                }
-                Err(_) => break, // RecvQueueEmpty / incomplete: nothing more right now
+        while let Ok(n) = kcp.recv(&mut buf) {
+            if ch.read_tx.send(buf[..n].to_vec()).await.is_err() {
+                return; // reader gone
             }
         }
         let delay = kcp.check(now_ms()).max(1);
@@ -305,7 +300,6 @@ mod tests {
         let srv_run = {
             let srv = srv.clone();
             let srv_sock = srv_sock.clone();
-            let psk = psk;
             tokio::spawn(async move {
                 let mut buf = [0u8; 65535];
                 loop {
