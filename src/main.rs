@@ -43,6 +43,9 @@ enum Cmd {
         /// Forward a UDP port: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable).
         #[arg(long = "udp")]
         udp: Vec<String>,
+        /// Transport selection: auto (UDP first, TCP fallback), udp, or tcp.
+        #[arg(long, default_value = "auto")]
+        transport: String,
     },
 }
 
@@ -88,6 +91,7 @@ async fn main() -> Result<()> {
             secret,
             tcp,
             udp,
+            transport,
         } => {
             if tcp.is_empty() && udp.is_empty() {
                 bail!("nothing to forward: pass at least one --tcp or --udp");
@@ -100,7 +104,13 @@ async fn main() -> Result<()> {
                 .iter()
                 .map(|s| parse_forward(s))
                 .collect::<Result<Vec<_>>>()?;
-            client::run(server, secret, tcp, udp, client::Transport::Auto).await
+            let transport = match transport.as_str() {
+                "auto" => client::Transport::Auto,
+                "udp" => client::Transport::Udp,
+                "tcp" => client::Transport::Tcp,
+                other => bail!("invalid --transport '{other}' (expected auto|udp|tcp)"),
+            };
+            client::run(server, secret, tcp, udp, transport).await
         }
     }
 }
