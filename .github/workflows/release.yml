@@ -42,6 +42,12 @@ jobs:
         with:
           tool: cross
 
+      - name: Guard getrandom on 0.2.x (MIPS build needs it)
+        run: |
+          v=$(cargo tree -i getrandom 2>/dev/null | head -1)
+          echo "$v"
+          echo "$v" | grep -q 'getrandom v0\.2\.' || { echo "getrandom drifted off 0.2.x; MIPS build will break"; exit 1; }
+
       - name: Build
         run: |
           flags=""
