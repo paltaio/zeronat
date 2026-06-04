@@ -7,6 +7,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use crate::dgram::{DgramRx, DgramTx};
 use crate::noise::{NoiseReader, NoiseWriter};
 
 const TCP_BUF: usize = 16 * 1024;
@@ -88,6 +89,62 @@ pub async fn udp_server(
                 },
                 m = nr.recv() => {
                     socket.send_to(&m?, src).await?;
+                    anyhow::Ok(true)
+                }
+            }
+        })
+        .await;
+        match step {
+            Ok(Ok(true)) => {}
+            _ => break,
+        }
+    }
+}
+
+/// Client side of a UDP-forward stream over the raw datagram channel.
+pub async fn udp_client_stateless(local: UdpSocket, mut rx: DgramRx, tx: DgramTx) {
+    let mut buf = [0u8; UDP_BUF];
+    loop {
+        let step = timeout(UDP_IDLE, async {
+            tokio::select! {
+                m = rx.recv() => {
+                    let m = m.ok_or_else(|| anyhow::anyhow!("transport closed"))?;
+                    local.send(&m).await?;
+                    anyhow::Ok(true)
+                }
+                r = local.recv(&mut buf) => {
+                    let n = r?;
+                    tx.send(&buf[..n]).await?;
+                    anyhow::Ok(true)
+                }
+            }
+        })
+        .await;
+        match step {
+            Ok(Ok(true)) => {}
+            _ => break,
+        }
+    }
+}
+
+/// Server side of a UDP-forward stream over the raw datagram channel.
+pub async fn udp_server_stateless(
+    socket: Arc<UdpSocket>,
+    src: SocketAddr,
+    mut dgram_rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: DgramRx,
+    tx: DgramTx,
+) {
+    loop {
+        let step = timeout(UDP_IDLE, async {
+            tokio::select! {
+                d = dgram_rx.recv() => match d {
+                    Some(d) => { tx.send(&d).await?; anyhow::Ok(true) }
+                    None => anyhow::Ok(false),
+                },
+                m = rx.recv() => {
+                    let m = m.ok_or_else(|| anyhow::anyhow!("transport closed"))?;
+                    socket.send_to(&m, src).await?;
                     anyhow::Ok(true)
                 }
             }
