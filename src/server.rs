@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,14 +16,17 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Server {
     psk: [u8; 32],
-    next_id: AtomicU64,
+    next_id: Mutex<u64>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Noise>>>,
     control_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
 }
 
 impl Server {
     fn next_id(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+        let mut id = self.next_id.lock().unwrap();
+        let next = *id;
+        *id += 1;
+        next
     }
 
     fn control(&self) -> Option<mpsc::Sender<Vec<u8>>> {
@@ -57,7 +59,7 @@ pub async fn run(
 ) -> Result<()> {
     let srv = Arc::new(Server {
         psk: crate::noise::derive_psk(&secret),
-        next_id: AtomicU64::new(1),
+        next_id: Mutex::new(1),
         pending: Mutex::new(HashMap::new()),
         control_tx: Mutex::new(None),
     });
