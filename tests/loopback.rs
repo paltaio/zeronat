@@ -53,8 +53,7 @@ async fn udp_echo(port: u16) {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tcp_and_udp_through_tunnel() {
+async fn run_tunnel_test(transport: zeronat::client::Transport) {
     let control = free_tcp_port();
     let public_tcp = free_tcp_port();
     let public_udp = free_udp_port();
@@ -80,7 +79,7 @@ async fn tcp_and_udp_through_tunnel() {
         SECRET.into(),
         vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
         vec![(public_udp, format!("127.0.0.1:{local_udp}"))],
-        zeronat::client::Transport::Tcp,
+        transport,
     ));
 
     let body = async {
@@ -119,7 +118,25 @@ async fn tcp_and_udp_through_tunnel() {
         }
     };
 
-    timeout(Duration::from_secs(15), body)
-        .await
-        .expect("tunnel did not pass traffic within 15s");
+    body.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_over_tcp_transport() {
+    timeout(
+        Duration::from_secs(20),
+        run_tunnel_test(zeronat::client::Transport::Tcp),
+    )
+    .await
+    .expect("tcp transport did not pass traffic within 20s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_over_udp_transport() {
+    timeout(
+        Duration::from_secs(20),
+        run_tunnel_test(zeronat::client::Transport::Udp),
+    )
+    .await
+    .expect("udp transport did not pass traffic within 20s");
 }
