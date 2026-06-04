@@ -4,6 +4,8 @@ Minimal encrypted reverse tunnel for services behind CG-NAT. Single static Rust 
 
 The server runs on a host with a public IP. The client runs behind NAT, dials out, and holds one control connection. Traffic hitting a public port on the server is forwarded to the matching local service on the client. Every connection is authenticated and encrypted with Noise (`NNpsk0`, X25519 + ChaCha20-Poly1305 + BLAKE2s) from a shared secret.
 
+The tunnel runs over UDP/KCP by default, falling back to TCP when the UDP handshake gets no reply. Both share port 2222.
+
 ## Install
 
 On the public host (interactive, or pass flags):
@@ -26,7 +28,7 @@ ZERONAT_SECRET=somelongsecret zeronat client \
   --server <public-ip>:2222 --tcp 443 --tcp 80 --udp 51820
 ```
 
-`--tcp 443` maps to `127.0.0.1:443`. Remap with `--tcp 443:127.0.0.1:8443` or point elsewhere with `--tcp 443:10.0.0.5:443`. `--udp` works the same way. The secret can be passed with `--secret` instead of the env var. Open the control port on the server's firewall.
+`--tcp 443` maps to `127.0.0.1:443`. Remap with `--tcp 443:127.0.0.1:8443` or point elsewhere with `--tcp 443:10.0.0.5:443`. `--udp` works the same way. The secret can be passed with `--secret` instead of the env var. The client picks the transport with `--transport auto|udp|tcp` (default `auto`). Open the control port (2222 UDP and TCP) on the server's firewall.
 
 ## Build
 
