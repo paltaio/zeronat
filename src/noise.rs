@@ -1,8 +1,9 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};
-use snow::{Builder, TransportState};
+use snow::{Builder, StatelessTransportState, TransportState};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
@@ -172,9 +173,116 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, b: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// A finished stateless Noise session. `seal`/`open` carry an explicit per-message
+/// nonce, so loss and reordering on the underlying datagram channel are tolerated.
+pub struct StatelessNoise {
+    t: StatelessTransportState,
+    send_nonce: AtomicU64,
+}
+
+impl StatelessNoise {
+    /// Encrypt `plaintext` into a `[nonce:8][ciphertext]` datagram body.
+    pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
+        let nonce = self.send_nonce.fetch_add(1, Ordering::Relaxed);
+        let mut out = vec![0u8; 8 + plaintext.len() + 16];
+        out[..8].copy_from_slice(&nonce.to_be_bytes());
+        let n = self
+            .t
+            .write_message(nonce, plaintext, &mut out[8..])
+            .expect("stateless encrypt");
+        out.truncate(8 + n);
+        out
+    }
+
+    /// Decrypt a `[nonce:8][ciphertext]` datagram body.
+    pub fn open(&self, datagram: &[u8]) -> Result<Vec<u8>> {
+        if datagram.len() < 8 {
+            anyhow::bail!("short datagram");
+        }
+        let nonce = u64::from_be_bytes(datagram[..8].try_into().unwrap());
+        let mut out = vec![0u8; datagram.len() - 8];
+        let n = self
+            .t
+            .read_message(nonce, &datagram[8..], &mut out)
+            .map_err(|e| anyhow!("stateless decrypt failed: {e}"))?;
+        out.truncate(n);
+        Ok(out)
+    }
+}
+
+/// Initiator handshake that converts straight to a stateless transport.
+/// The 8-byte `id` rides in the (PSK-encrypted) first handshake message payload.
+pub async fn client_handshake_stateless<S>(
+    mut stream: S,
+    psk: &[u8; 32],
+    id: u64,
+) -> Result<StatelessNoise>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut hs = Builder::new(PATTERN.parse()?).psk(0, psk).build_initiator()?;
+    let mut buf = [0u8; MAX_MSG];
+    let n = hs.write_message(&id.to_be_bytes(), &mut buf)?;
+    write_frame(&mut stream, &buf[..n]).await?;
+    let msg = read_frame(&mut stream).await?;
+    hs.read_message(&msg, &mut buf)?;
+    Ok(StatelessNoise {
+        t: hs.into_stateless_transport_mode()?,
+        send_nonce: AtomicU64::new(0),
+    })
+}
+
+/// Responder handshake; returns the peer's `id` and the stateless transport.
+pub async fn server_handshake_stateless<S>(
+    mut stream: S,
+    psk: &[u8; 32],
+) -> Result<(u64, StatelessNoise)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut hs = Builder::new(PATTERN.parse()?).psk(0, psk).build_responder()?;
+    let mut buf = [0u8; MAX_MSG];
+    let msg = read_frame(&mut stream).await?;
+    let n = hs.read_message(&msg, &mut buf)?;
+    if n < 8 {
+        anyhow::bail!("missing stream id in handshake payload");
+    }
+    let id = u64::from_be_bytes(buf[..8].try_into().unwrap());
+    let n = hs.write_message(&[], &mut buf)?;
+    write_frame(&mut stream, &buf[..n]).await?;
+    Ok((
+        id,
+        StatelessNoise {
+            t: hs.into_stateless_transport_mode()?,
+            send_nonce: AtomicU64::new(0),
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stateless_roundtrip_out_of_order() {
+        let psk = derive_psk("stateless secret");
+        let (a, b) = tokio::io::duplex(8192);
+
+        let srv = tokio::spawn(async move { server_handshake_stateless(b, &psk).await.unwrap() });
+        let cli = client_handshake_stateless(a, &psk, 0xABCD).await.unwrap();
+        let (id, srv) = srv.await.unwrap();
+        assert_eq!(id, 0xABCD);
+
+        // Client -> server: two datagrams, delivered out of order.
+        let d0 = cli.seal(b"first");
+        let d1 = cli.seal(b"second");
+        assert_eq!(srv.open(&d1).unwrap(), b"second");
+        assert_eq!(srv.open(&d0).unwrap(), b"first");
+
+        // Server -> client back.
+        let r = srv.seal(b"reply");
+        assert_eq!(cli.open(&r).unwrap(), b"reply");
+    }
 
     #[tokio::test]
     async fn handshake_and_roundtrip() {
