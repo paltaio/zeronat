@@ -11,7 +11,7 @@ use tokio::time::{interval, sleep};
 
 use crate::bridge;
 use crate::dgram::{DgramRx, DgramTx};
-use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP};
+use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT};
 use crate::noise::{client_handshake, client_handshake_stateless};
 use crate::proto::{Msg, Proto};
 
@@ -241,7 +241,7 @@ async fn handle_open(
             bridge::tcp(local, nr, nw).await;
         }
         (Link::Udp(sess), Proto::Udp) => {
-            let conv = id as u32;
+            let conv = (id as u32) | SETUP_CONV_BIT;
             let stream = sess.open_conv_with(CLASS_SETUP, conv);
             let noise = Arc::new(client_handshake_stateless(stream, &client.psk, id).await?);
             let local = UdpSocket::bind("0.0.0.0:0").await?;

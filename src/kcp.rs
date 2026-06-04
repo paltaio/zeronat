@@ -12,6 +12,12 @@ pub const CLASS_SETUP: u8 = 0x02;
 pub const CLASS_DGRAM: u8 = 0x03;
 pub const KCP_MTU: usize = 1350;
 
+/// High bit marking a UDP-forward setup/datagram conv. Auto-allocated stream
+/// convs (control + TCP-forward) come from a counter starting at 1 and stay in
+/// the low half, so setup convs derived from the control id never collide with
+/// an already-open stream conv.
+pub const SETUP_CONV_BIT: u32 = 0x8000_0000;
+
 const SOCKET_SEND_CAP: usize = 1024;
 const APP_CHAN_CAP: usize = 256;
 
