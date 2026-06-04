@@ -19,9 +19,10 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy, PartialEq)]
 pub enum ActiveTransport { Tcp, Udp }
 
-/// A parked public UDP source and the channel carrying its inbound datagrams,
-/// awaiting the matching UDP-forward setup conv.
-type UdpPending = (SocketAddr, mpsc::Receiver<Vec<u8>>);
+/// A parked public UDP source, the public socket its replies must go out on, and
+/// the channel carrying its inbound datagrams, awaiting the matching UDP-forward
+/// setup conv.
+type UdpPending = (Arc<UdpSocket>, SocketAddr, mpsc::Receiver<Vec<u8>>);
 
 pub(crate) struct Server {
     psk: [u8; 32],
@@ -233,7 +234,10 @@ async fn udp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
                     continue;
                 };
                 let id = srv.next_id();
-                srv.udp_pending.lock().unwrap().insert(id, (src, drx));
+                srv.udp_pending
+                    .lock()
+                    .unwrap()
+                    .insert(id, (socket.clone(), src, drx));
                 if ctl
                     .try_send(Msg::Open { proto: Proto::Udp, port, id }.encode())
                     .is_err()
@@ -276,11 +280,10 @@ async fn udp_control_listener(srv: Arc<Server>, bind: String, port: u16) -> Resu
             Some(Accepted::Setup { conv, stream }) => {
                 let srv = srv.clone();
                 let sess2 = sess.clone();
-                let socket2 = socket.clone();
                 let psk = srv.psk;
                 tokio::spawn(async move {
                     if let Ok((id, noise)) = server_handshake_stateless(stream, &psk).await {
-                        accept_udp_forward(srv, sess2, socket2, src, conv, id, noise).await;
+                        accept_udp_forward(srv, sess2, conv, id, noise).await;
                     }
                 });
             }
@@ -290,25 +293,25 @@ async fn udp_control_listener(srv: Arc<Server>, bind: String, port: u16) -> Resu
 }
 
 /// Bridge a UDP-forward setup conv to its parked public source. The matching public
-/// `Open` parked `(public src, inbound datagram channel)` under `id`; the setup
-/// conv carries the same id, with `conv` (== `id as u32`) used as the datagram tag.
+/// `Open` parked `(public socket, public src, inbound datagram channel)` under `id`;
+/// the setup conv carries the same id, with `conv` (== `(id as u32) | high bit`) used
+/// as the datagram tag. Replies must go out on the parked public socket so the public
+/// client sees them from the port it sent to.
 async fn accept_udp_forward(
     srv: Arc<Server>,
     sess: Arc<Session>,
-    socket: Arc<UdpSocket>,
-    _peer: SocketAddr,
     conv: u32,
     id: u64,
     noise: StatelessNoise,
 ) {
-    let Some((public_src, dgram_rx)) = take_udp_pending(&srv, id) else {
+    let Some((public_socket, public_src, dgram_rx)) = take_udp_pending(&srv, id) else {
         return;
     };
     let noise = Arc::new(noise);
     let inbound = sess.register_dgram(conv);
     let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
     let rx = DgramRx::new(inbound, noise);
-    crate::bridge::udp_server_stateless(socket, public_src, dgram_rx, rx, tx).await;
+    crate::bridge::udp_server_stateless(public_socket, public_src, dgram_rx, rx, tx).await;
 }
 
 fn take_udp_pending(srv: &Server, id: u64) -> Option<UdpPending> {
