@@ -4,6 +4,16 @@ Minimal encrypted reverse tunnel for services behind CG-NAT. Single static Rust 
 
 The server runs on a host with a public IP. The client runs behind NAT, dials out, and holds one control connection. Traffic hitting a public port on the server is forwarded to the matching local service on the client. Every connection is authenticated and encrypted with Noise (`NNpsk0`, X25519 + ChaCha20-Poly1305 + BLAKE2s) from a shared secret.
 
+## Install
+
+On the public host (interactive, or pass flags):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/paltaio/zeronat/main/install.sh | sh -s -- --server
+```
+
+It picks Docker or a systemd service, generates the secret, asks which ports to forward, and prints the matching command to run on the machine behind CG-NAT. Run `install.sh --help` for all options.
+
 ## Usage
 
 ```bash
