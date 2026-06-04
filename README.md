@@ -21,13 +21,20 @@ ZERONAT_SECRET=somelongsecret zeronat client \
 ## Build
 
 ```bash
-cargo build --release                 # dynamic binary
-./build.sh                            # static musl binary, smallest
-docker build -t zeronat .             # scratch image
+cargo build --release    # dynamic binary
+./build.sh               # static musl binary, smallest
 ```
 
-`build.sh` uses the nightly toolchain (`rust-src` component) for a size-optimized static build. For multi-arch images use `docker buildx build --platform linux/amd64,linux/arm64`.
+`build.sh` uses the nightly toolchain (`rust-src` component) for a size-optimized static build.
+
+```bash
+docker pull ghcr.io/paltaio/zeronat
+```
 
 ## Scope
 
 Built for a single operator with one shared secret. It is not hardened against a hostile public internet: no connection rate limiting, unbounded session tracking, and a naive single-client control channel.
+
+## License
+
+MIT, Copyright (c) 2026 Palta Studios. See [LICENSE](LICENSE).
