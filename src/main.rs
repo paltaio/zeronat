@@ -73,7 +73,32 @@ fn parse_forward(spec: &str) -> Result<(u16, String)> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    tokio::select! {
+        r = run(Cli::parse().cmd) => r,
+        _ = shutdown() => Ok(()),
+    }
+}
+
+/// Resolve on the first SIGTERM or SIGINT so the process exits promptly when a
+/// supervisor (Docker, systemd) stops it, including when it runs as PID 1 where
+/// the default signal disposition does not apply.
+async fn shutdown() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (mut term, mut int) = match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(term), Ok(int)) => (term, int),
+        _ => return std::future::pending().await,
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+}
+
+async fn run(cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::Server {
             bind,
             control,
