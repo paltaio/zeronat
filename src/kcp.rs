@@ -162,3 +162,173 @@ impl AsyncWrite for KcpStream {
         Poll::Ready(Ok(()))
     }
 }
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Mutex;
+
+/// Shared per-(socket,peer) multiplexing state.
+pub struct Session {
+    send_tx: mpsc::Sender<Vec<u8>>,
+    convs: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,   // conv id -> inbound packets
+    dgrams: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,  // tag -> [nonce][ct] bodies
+    next_conv: Mutex<u32>,
+}
+
+impl Session {
+    fn spawn_conv(&self, conv: u32, class: u8) -> KcpStream {
+        let (inbound_tx, inbound_rx) = mpsc::channel(SOCKET_SEND_CAP);
+        let (write_tx, write_rx) = mpsc::channel(APP_CHAN_CAP);
+        let (read_tx, read_rx) = mpsc::channel(APP_CHAN_CAP);
+        self.convs.lock().unwrap().insert(conv, inbound_tx);
+        let kcp = new_kcp(conv, self.send_tx.clone(), class);
+        tokio::spawn(drive_conv(kcp, ConvChannels { inbound_rx, write_rx, read_tx }));
+        KcpStream::new(write_tx, read_rx)
+    }
+
+    /// Initiator: allocate a fresh conv id and open a stream/setup conv.
+    pub fn open_conv(&self, class: u8) -> (u32, KcpStream) {
+        let conv = {
+            let mut n = self.next_conv.lock().unwrap();
+            let c = *n;
+            *n = n.wrapping_add(1);
+            c
+        };
+        (conv, self.spawn_conv(conv, class))
+    }
+
+    fn route_kcp(&self, conv: u32, class: u8, payload: Vec<u8>) -> Option<KcpStream> {
+        if let Some(tx) = self.convs.lock().unwrap().get(&conv) {
+            let _ = tx.try_send(payload);
+            return None;
+        }
+        // Unknown conv: a peer-initiated connection. Create it, deliver the packet.
+        let stream = self.spawn_conv(conv, class);
+        if let Some(tx) = self.convs.lock().unwrap().get(&conv) {
+            let _ = tx.try_send(payload);
+        }
+        Some(stream)
+    }
+
+    fn route_dgram(&self, tag: u32, body: Vec<u8>) {
+        if let Some(tx) = self.dgrams.lock().unwrap().get(&tag) {
+            let _ = tx.try_send(body);
+        }
+    }
+
+    pub fn register_dgram(&self, tag: u32) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel(APP_CHAN_CAP);
+        self.dgrams.lock().unwrap().insert(tag, tx);
+        rx
+    }
+
+    pub fn send_tx(&self) -> mpsc::Sender<Vec<u8>> {
+        self.send_tx.clone()
+    }
+}
+
+/// What the RX router yields when a peer opens a new conv.
+pub enum Accepted {
+    Stream { conv: u32, stream: KcpStream },
+    Setup { conv: u32, stream: KcpStream },
+}
+
+/// Build a session bound to `peer` and spawn its socket-sender task. Returns the
+/// session plus the receive loop driver inputs. The caller runs `recv_loop`.
+pub fn session(socket: Arc<UdpSocket>, peer: SocketAddr, first_conv: u32) -> Arc<Session> {
+    let (send_tx, send_rx) = mpsc::channel(SOCKET_SEND_CAP);
+    tokio::spawn(socket_writer(socket, peer, send_rx));
+    Arc::new(Session {
+        send_tx,
+        convs: Mutex::new(HashMap::new()),
+        dgrams: Mutex::new(HashMap::new()),
+        next_conv: Mutex::new(first_conv),
+    })
+}
+
+/// Feed one received datagram (already addressed to this session's peer) into the
+/// router. Returns `Some(Accepted)` when it opened a new peer-initiated conv.
+pub fn route(session: &Session, datagram: &[u8]) -> Option<Accepted> {
+    let (&class, rest) = datagram.split_first()?;
+    match class {
+        CLASS_KCP | CLASS_SETUP => {
+            if rest.len() < kcp::KCP_OVERHEAD {
+                return None;
+            }
+            let conv = kcp::get_conv(rest);
+            match session.route_kcp(conv, class, rest.to_vec()) {
+                Some(stream) if class == CLASS_KCP => Some(Accepted::Stream { conv, stream }),
+                Some(stream) => Some(Accepted::Setup { conv, stream }),
+                None => None,
+            }
+        }
+        CLASS_DGRAM => {
+            if rest.len() < 4 {
+                return None;
+            }
+            let tag = u32::from_be_bytes(rest[..4].try_into().unwrap());
+            session.route_dgram(tag, rest[4..].to_vec());
+            None
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::noise::{client_handshake, derive_psk, server_handshake};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kcpstream_carries_noise() {
+        let psk = derive_psk("kcp loopback");
+        let cli_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let srv_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let cli_addr = cli_sock.local_addr().unwrap();
+        let srv_addr = srv_sock.local_addr().unwrap();
+
+        let cli = session(cli_sock.clone(), srv_addr, 1);
+        let srv = session(srv_sock.clone(), cli_addr, 0);
+
+        // Server RX loop: accept the first stream conv, run a server handshake, echo one frame.
+        let srv_run = {
+            let srv = srv.clone();
+            let srv_sock = srv_sock.clone();
+            let psk = psk;
+            tokio::spawn(async move {
+                let mut buf = [0u8; 65535];
+                loop {
+                    let (n, _) = srv_sock.recv_from(&mut buf).await.unwrap();
+                    if let Some(Accepted::Stream { stream, .. }) = route(&srv, &buf[..n]) {
+                        tokio::spawn(async move {
+                            let (mut r, mut w) = server_handshake(stream, &psk).await.unwrap();
+                            let msg = r.recv().await.unwrap();
+                            w.send(&msg).await.unwrap();
+                        });
+                    }
+                }
+            })
+        };
+        // Client RX loop.
+        let cli_run = {
+            let cli = cli.clone();
+            let cli_sock = cli_sock.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 65535];
+                loop {
+                    let (n, _) = cli_sock.recv_from(&mut buf).await.unwrap();
+                    route(&cli, &buf[..n]);
+                }
+            })
+        };
+
+        let (_conv, stream) = cli.open_conv(CLASS_KCP);
+        let (mut r, mut w) = client_handshake(stream, &psk).await.unwrap();
+        w.send(b"over-kcp").await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), r.recv()).await.unwrap().unwrap();
+        assert_eq!(got, b"over-kcp");
+
+        srv_run.abort();
+        cli_run.abort();
+    }
+}
