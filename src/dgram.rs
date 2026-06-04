@@ -24,8 +24,11 @@ impl DgramTx {
         pkt.push(CLASS_DGRAM);
         pkt.extend_from_slice(&self.tag.to_be_bytes());
         pkt.extend_from_slice(&body);
-        self.send_tx.send(pkt).await.map_err(|_| anyhow::anyhow!("transport closed"))?;
-        Ok(())
+        match self.send_tx.try_send(pkt) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow::anyhow!("transport closed")),
+        }
     }
 }
 
