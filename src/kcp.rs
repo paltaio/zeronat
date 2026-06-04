@@ -94,3 +94,71 @@ async fn drive_conv(mut kcp: Kcp<ChannelWriter>, mut ch: ConvChannels) {
         }
     }
 }
+
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::mpsc::{OwnedPermit, Sender};
+
+type ReserveFut = Pin<Box<dyn Future<Output = Result<OwnedPermit<Vec<u8>>, tokio::sync::mpsc::error::SendError<()>>> + Send>>;
+
+pub struct KcpStream {
+    write_tx: Sender<Vec<u8>>,
+    read_rx: mpsc::Receiver<Vec<u8>>,
+    read_buf: Vec<u8>,
+    read_pos: usize,
+    reserve: Option<ReserveFut>,
+}
+
+impl KcpStream {
+    pub fn new(write_tx: Sender<Vec<u8>>, read_rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        KcpStream { write_tx, read_rx, read_buf: Vec::new(), read_pos: 0, reserve: None }
+    }
+}
+
+impl AsyncRead for KcpStream {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if self.read_pos >= self.read_buf.len() {
+            match self.read_rx.poll_recv(cx) {
+                Poll::Ready(Some(chunk)) => {
+                    self.read_buf = chunk;
+                    self.read_pos = 0;
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())), // EOF
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        let n = std::cmp::min(buf.remaining(), self.read_buf.len() - self.read_pos);
+        buf.put_slice(&self.read_buf[self.read_pos..self.read_pos + n]);
+        self.read_pos += n;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for KcpStream {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        loop {
+            if let Some(fut) = self.reserve.as_mut() {
+                return match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok(permit)) => {
+                        permit.send(buf.to_vec());
+                        self.reserve = None;
+                        Poll::Ready(Ok(buf.len()))
+                    }
+                    Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe))),
+                    Poll::Pending => Poll::Pending,
+                };
+            }
+            let tx = self.write_tx.clone();
+            self.reserve = Some(Box::pin(tx.reserve_owned()));
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
