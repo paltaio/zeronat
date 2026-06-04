@@ -15,7 +15,8 @@
 set -eu
 
 REPO="paltaio/zeronat"
-RAW_URL="https://raw.githubusercontent.com/${REPO}/main/install.sh"
+RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
+RAW_URL="${RAW_BASE}/install.sh"
 IMAGE="ghcr.io/${REPO}:latest"
 RELEASE_BASE="https://github.com/${REPO}/releases/latest/download"
 ETC_DIR="/etc/zeronat"
@@ -23,7 +24,7 @@ ENV_FILE="${ETC_DIR}/zeronat.env"
 BIN_PATH="/usr/local/bin/zeronat"
 UNIT="/etc/systemd/system/zeronat.service"
 
-MODE=""; METHOD=""; SECRET=""; CONTROL="2222"; PORTS=""; SERVER_ADDR=""; ASSUME_YES=""
+MODE=""; METHOD=""; DEPLOY=""; SECRET=""; CONTROL="2222"; PORTS=""; SERVER_ADDR=""; ASSUME_YES=""
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
@@ -38,6 +39,7 @@ zeronat installer
 
   --server | --client       side to install on this machine
   --method docker|systemd   install method (default: docker if present, else systemd)
+  --deploy compose|run      (docker only) compose file or plain docker run
   --ports "443/tcp 80/tcp 51820/udp"
   --control PORT            tunnel control port (default 2222)
   --secret SECRET           shared secret (default: generated)
@@ -97,6 +99,7 @@ while [ $# -gt 0 ]; do
     --server) MODE=server ;;
     --client) MODE=client ;;
     --method) METHOD="${2:-}"; shift ;;
+    --deploy) DEPLOY="${2:-}"; shift ;;
     --secret) SECRET="${2:-}"; shift ;;
     --control) CONTROL="${2:-}"; shift ;;
     --ports) PORTS="${2:-}"; shift ;;
@@ -130,6 +133,18 @@ if [ -z "$METHOD" ]; then
 fi
 case "$METHOD" in docker|systemd) ;; *) err "method must be docker or systemd" ;; esac
 [ "$METHOD" = docker ] && [ -z "$HAVE_DOCKER" ] && err "docker not installed; use --method systemd"
+
+# --- deploy style (docker only) ---------------------------------------------
+DC=""
+if [ "$METHOD" = docker ]; then
+  [ -z "$DEPLOY" ] && DEPLOY=$(prompt "Deploy with docker compose or plain docker run? (compose/run)" "compose")
+  case "$DEPLOY" in compose|run) ;; *) err "deploy must be compose or run" ;; esac
+  if [ "$DEPLOY" = compose ]; then
+    if docker compose version >/dev/null 2>&1; then DC="docker compose"
+    elif command -v docker-compose >/dev/null 2>&1; then DC="docker-compose"
+    else say "docker compose not found; using docker run."; DEPLOY=run; fi
+  fi
+fi
 
 # --- ports ------------------------------------------------------------------
 [ -z "$PORTS" ] && PORTS=$(prompt "Ports to forward, space separated as PORT/PROTO (e.g. 443/tcp 80/tcp 51820/udp)" "")
@@ -168,6 +183,7 @@ say ""
 say "Plan:"
 info "side:    $MODE"
 info "method:  $METHOD"
+[ "$METHOD" = docker ] && info "deploy:  $DEPLOY"
 info "ports:   $PORTS"
 [ "$MODE" = client ] && info "server:  $SERVER_ADDR"
 info "control: $CONTROL"
@@ -178,21 +194,43 @@ if [ -z "$ASSUME_YES" ] && has_tty; then
   case "$_ok" in y|Y|yes) ;; *) err "aborted" ;; esac
 fi
 
-# --- write secret -----------------------------------------------------------
+# --- write env --------------------------------------------------------------
 run mkdir -p "$ETC_DIR"
-printf 'ZERONAT_SECRET=%s\n' "$SECRET" | run tee "$ENV_FILE" >/dev/null
-run chmod 600 "$ENV_FILE"
+if [ "$METHOD" = docker ] && [ "$DEPLOY" = compose ]; then
+  # compose reads .env from the project dir for ${ZERONAT_*} and as the container env_file
+  { printf 'ZERONAT_SECRET=%s\n' "$SECRET"; printf 'ZERONAT_ARGS=%s\n' "$SUBCMD"; } \
+    | run tee "$ETC_DIR/.env" >/dev/null
+  run chmod 600 "$ETC_DIR/.env"
+else
+  printf 'ZERONAT_SECRET=%s\n' "$SECRET" | run tee "$ENV_FILE" >/dev/null
+  run chmod 600 "$ENV_FILE"
+fi
 
 # --- install ----------------------------------------------------------------
+RAN=""
 if [ "$METHOD" = docker ]; then
-  say "Pulling $IMAGE ..."
-  run docker pull "$IMAGE"
   run docker rm -f zeronat >/dev/null 2>&1 || true
-  # shellcheck disable=SC2086
-  run docker run -d --name zeronat --restart unless-stopped --network host \
-    --env-file "$ENV_FILE" "$IMAGE" $SUBCMD
-  say "Started container 'zeronat'."
-  MANAGE="docker logs -f zeronat    # status: docker ps"
+
+  if [ "$DEPLOY" = compose ]; then
+    COMPOSE_FILE="$ETC_DIR/compose.yml"
+    _c=$(curl -fsSL "$RAW_BASE/compose.yml") || err "could not fetch compose.yml"
+    printf '%s\n' "$_c" | run tee "$COMPOSE_FILE" >/dev/null
+    DCF="$DC -f $COMPOSE_FILE --project-directory $ETC_DIR"
+    RAN="$DCF up -d   # edit $ETC_DIR/.env to change ports/secret"
+    # shellcheck disable=SC2086
+    run $DCF pull
+    # shellcheck disable=SC2086
+    run $DCF up -d
+    say "Started via compose ($COMPOSE_FILE)."
+    MANAGE="$DCF logs -f    # status: $DCF ps"
+  else
+    RAN="docker run -d --name zeronat --restart unless-stopped --network host --env-file $ENV_FILE $IMAGE $SUBCMD"
+    run docker pull "$IMAGE"
+    # shellcheck disable=SC2086
+    run $RAN
+    say "Started container 'zeronat'."
+    MANAGE="docker logs -f zeronat    # status: docker ps"
+  fi
 else
   TARGET=$(arch_target)
   say "Downloading zeronat ($TARGET) ..."
@@ -225,6 +263,10 @@ fi
 
 # --- next step: command for the other machine -------------------------------
 say ""
+if [ -n "$RAN" ]; then
+  say "Ran:"
+  info "$RAN"
+fi
 say "Done. Manage it with:"
 info "$MANAGE"
 say ""
