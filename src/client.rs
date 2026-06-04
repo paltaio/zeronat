@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::Arc as StdArc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -141,7 +140,7 @@ async fn control_loop(
     mut r: crate::noise::NoiseReader,
     w: crate::noise::NoiseWriter,
 ) -> Result<()> {
-    let link = StdArc::new(link);
+    let link = Arc::new(link);
 
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
     tx.try_send(Msg::Hello.encode()).ok();
@@ -195,7 +194,7 @@ async fn control_loop(
 /// Open a data connection back to the server and bridge it to the local target.
 async fn handle_open(
     client: Arc<Client>,
-    link: StdArc<Link>,
+    link: Arc<Link>,
     proto: Proto,
     port: u16,
     id: u64,
@@ -244,7 +243,7 @@ async fn handle_open(
         (Link::Udp(sess), Proto::Udp) => {
             let conv = id as u32;
             let stream = sess.open_conv_with(CLASS_SETUP, conv);
-            let noise = StdArc::new(client_handshake_stateless(stream, &client.psk, id).await?);
+            let noise = Arc::new(client_handshake_stateless(stream, &client.psk, id).await?);
             let local = UdpSocket::bind("0.0.0.0:0").await?;
             local
                 .connect(&target)
