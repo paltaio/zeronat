@@ -10,6 +10,8 @@ clap = { version = "4", features = ["derive", "env"] }
 snow = "0.9"
 sha2 = "0.10"
 anyhow = "1"
+kcp = { version = "0.6", default-features = false }
+getrandom = "~0.2"
 
 [profile.release]
 opt-level = "z"
