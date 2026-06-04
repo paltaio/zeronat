@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
@@ -177,13 +176,18 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, b: &[u8]) -> Result<()> {
 /// nonce, so loss and reordering on the underlying datagram channel are tolerated.
 pub struct StatelessNoise {
     t: StatelessTransportState,
-    send_nonce: AtomicU64,
+    send_nonce: Mutex<u64>,
 }
 
 impl StatelessNoise {
     /// Encrypt `plaintext` into a `[nonce:8][ciphertext]` datagram body.
     pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
-        let nonce = self.send_nonce.fetch_add(1, Ordering::Relaxed);
+        let nonce = {
+            let mut n = self.send_nonce.lock().unwrap();
+            let v = *n;
+            *n = n.wrapping_add(1);
+            v
+        };
         let mut out = vec![0u8; 8 + plaintext.len() + 16];
         out[..8].copy_from_slice(&nonce.to_be_bytes());
         let n = self
@@ -228,7 +232,7 @@ where
     hs.read_message(&msg, &mut buf)?;
     Ok(StatelessNoise {
         t: hs.into_stateless_transport_mode()?,
-        send_nonce: AtomicU64::new(0),
+        send_nonce: Mutex::new(0),
     })
 }
 
@@ -254,7 +258,7 @@ where
         id,
         StatelessNoise {
             t: hs.into_stateless_transport_mode()?,
-            send_nonce: AtomicU64::new(0),
+            send_nonce: Mutex::new(0),
         },
     ))
 }
