@@ -2,6 +2,8 @@
 
 Minimal encrypted reverse tunnel for services behind CG-NAT. Single static Rust binary, TCP + UDP, Noise-encrypted.
 
+**Usecase**: You have a service behind CG-NAT (home/office) and a cheap cloud VM with a public IP. zeronat exposes your local ports through the VM without creating accounts, no third-party services, just a VPS.
+
 The server runs on a host with a public IP. The client runs behind NAT, dials out, and holds one control connection. Traffic hitting a public port on the server is forwarded to the matching local service on the client. Every connection is authenticated and encrypted with Noise (`NNpsk0`, X25519 + ChaCha20-Poly1305 + BLAKE2s) from a shared secret.
 
 The tunnel runs over UDP/KCP by default, falling back to TCP when the UDP handshake gets no reply. Both share port 2222.
