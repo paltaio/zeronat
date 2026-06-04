@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .map(|s| parse_forward(s))
                 .collect::<Result<Vec<_>>>()?;
-            client::run(server, secret, tcp, udp).await
+            client::run(server, secret, tcp, udp, client::Transport::Auto).await
         }
     }
 }

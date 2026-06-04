@@ -186,6 +186,11 @@ impl Session {
         KcpStream::new(write_tx, read_rx)
     }
 
+    /// Initiator: open a stream/setup conv with a caller-chosen conv id.
+    pub fn open_conv_with(&self, class: u8, conv: u32) -> KcpStream {
+        self.spawn_conv(conv, class)
+    }
+
     /// Initiator: allocate a fresh conv id and open a stream/setup conv.
     pub fn open_conv(&self, class: u8) -> (u32, KcpStream) {
         let conv = {

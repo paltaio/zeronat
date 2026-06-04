@@ -80,6 +80,7 @@ async fn tcp_and_udp_through_tunnel() {
         SECRET.into(),
         vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
         vec![(public_udp, format!("127.0.0.1:{local_udp}"))],
+        zeronat::client::Transport::Tcp,
     ));
 
     let body = async {
