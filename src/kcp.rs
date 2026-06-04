@@ -50,3 +50,46 @@ async fn socket_writer(socket: Arc<UdpSocket>, peer: std::net::SocketAddr, mut r
         let _ = socket.send_to(&pkt, peer).await;
     }
 }
+
+/// Channels connecting a `KcpStream` to its driver task.
+struct ConvChannels {
+    inbound_rx: mpsc::Receiver<Vec<u8>>,   // KCP packets (class byte stripped)
+    write_rx: mpsc::Receiver<Vec<u8>>,     // app bytes to send
+    read_tx: mpsc::Sender<Vec<u8>>,        // decoded app bytes out (empty Vec => EOF not used; closing the channel signals EOF)
+}
+
+async fn drive_conv(mut kcp: Kcp<ChannelWriter>, mut ch: ConvChannels) {
+    let base = Instant::now();
+    let now_ms = move || base.elapsed().as_millis() as u32;
+    let mut buf = vec![0u8; 65535];
+
+    loop {
+        let now = now_ms();
+        if kcp.update(now).is_err() {
+            return;
+        }
+        // Drain all complete messages KCP has reassembled.
+        loop {
+            match kcp.recv(&mut buf) {
+                Ok(n) => {
+                    if ch.read_tx.send(buf[..n].to_vec()).await.is_err() {
+                        return; // reader gone
+                    }
+                }
+                Err(_) => break, // RecvQueueEmpty / incomplete: nothing more right now
+            }
+        }
+        let delay = kcp.check(now_ms()).max(1);
+        tokio::select! {
+            pkt = ch.inbound_rx.recv() => match pkt {
+                Some(p) => { let _ = kcp.input(&p); }
+                None => return, // mux dropped this conv
+            },
+            data = ch.write_rx.recv() => match data {
+                Some(d) => { let _ = kcp.send(&d); }
+                None => { /* write half closed; keep draining inbound until it ends */ }
+            },
+            _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {}
+        }
+    }
+}
