@@ -62,6 +62,7 @@ async fn drive_conv(mut kcp: Kcp<ChannelWriter>, mut ch: ConvChannels) {
     let base = Instant::now();
     let now_ms = move || base.elapsed().as_millis() as u32;
     let mut buf = vec![0u8; 65535];
+    let mut write_open = true;
 
     loop {
         let now = now_ms();
@@ -85,9 +86,9 @@ async fn drive_conv(mut kcp: Kcp<ChannelWriter>, mut ch: ConvChannels) {
                 Some(p) => { let _ = kcp.input(&p); }
                 None => return, // mux dropped this conv
             },
-            data = ch.write_rx.recv() => match data {
+            data = ch.write_rx.recv(), if write_open => match data {
                 Some(d) => { let _ = kcp.send(&d); }
-                None => { /* write half closed; keep draining inbound until it ends */ }
+                None => { write_open = false; }
             },
             _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {}
         }
