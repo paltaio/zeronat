@@ -14,11 +14,15 @@ use crate::proto::{Msg, Proto};
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
-struct Server {
+#[derive(Clone, Copy, PartialEq)]
+pub enum ActiveTransport { Tcp, Udp }
+
+pub(crate) struct Server {
     psk: [u8; 32],
     next_id: Mutex<u64>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Noise>>>,
     control_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    active_transport: Mutex<ActiveTransport>,
 }
 
 impl Server {
@@ -62,6 +66,7 @@ pub async fn run(
         next_id: Mutex::new(1),
         pending: Mutex::new(HashMap::new()),
         control_tx: Mutex::new(None),
+        active_transport: Mutex::new(ActiveTransport::Tcp),
     });
 
     for port in tcp_ports {
@@ -96,18 +101,26 @@ pub async fn run(
     }
 }
 
-/// Handle a freshly accepted connection on the control port. After the Noise
-/// handshake, the first message decides whether it is the control channel
-/// (`Hello`) or a data connection (`Data`).
 async fn handle_incoming(srv: Arc<Server>, sock: TcpStream) -> Result<()> {
     sock.set_nodelay(true).ok();
-    let (mut r, w) = server_handshake(sock, &srv.psk).await?;
+    let (r, w) = server_handshake(sock, &srv.psk).await?;
+    serve_stream(srv, r, w, ActiveTransport::Tcp).await
+}
+
+/// Dispatch a freshly handshaked stream (control or TCP-forward data),
+/// transport-agnostic. The first message decides the role.
+pub(crate) async fn serve_stream(
+    srv: Arc<Server>,
+    mut r: crate::noise::NoiseReader,
+    w: crate::noise::NoiseWriter,
+    transport: ActiveTransport,
+) -> Result<()> {
     match Msg::decode(&r.recv().await?)? {
         Msg::Hello => {
             let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
             *srv.control_tx.lock().unwrap() = Some(tx);
+            *srv.active_transport.lock().unwrap() = transport;
             eprintln!("client connected");
-
             let mut w = w;
             let writer = tokio::spawn(async move {
                 while let Some(bytes) = rx.recv().await {
@@ -116,7 +129,6 @@ async fn handle_incoming(srv: Arc<Server>, sock: TcpStream) -> Result<()> {
                     }
                 }
             });
-            // Drain inbound control messages (pings) until the client drops.
             while r.recv().await.is_ok() {}
             *srv.control_tx.lock().unwrap() = None;
             writer.abort();
