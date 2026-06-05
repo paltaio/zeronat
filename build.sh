@@ -5,7 +5,7 @@ set -euo pipefail
 # Usage: ./build.sh [target-triple ...]   (defaults to a musl target for the host arch)
 # Cross targets need a matching linker installed; for multi-arch use Docker buildx.
 
-export RUSTFLAGS="-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort"
+export RUSTFLAGS="-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort -Cforce-unwind-tables=no --cfg curve25519_dalek_backend=\"serial\""
 
 targets=("$@")
 if [ ${#targets[@]} -eq 0 ]; then

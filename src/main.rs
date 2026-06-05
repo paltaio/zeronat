@@ -1,50 +1,43 @@
-use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
-use zeronat::{client, server};
+use zeronat::{client, server, Result};
 
-#[derive(Parser)]
-#[command(name = "zeronat", about = "Minimal encrypted reverse port tunnel")]
-struct Cli {
-    #[command(subcommand)]
-    cmd: Cmd,
-}
+static USAGE: &str = "\
+Usage: zeronat <SUBCOMMAND> [OPTIONS]
 
-#[derive(Subcommand)]
+Subcommands:
+  server   Run on the public host (VPS)
+  client   Run on the host behind CG-NAT
+
+server options:
+  --bind <ADDR>       Address to bind on (default: 0.0.0.0)
+  --control <PORT>    Control port (default: 2222)
+  --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
+  --tcp <PORT>        Public TCP port to expose (repeatable)
+  --udp <PORT>        Public UDP port to expose (repeatable)
+
+client options:
+  --server <ADDR>     Server control address, e.g. 203.0.113.10:2222
+  --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
+  --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
+  --udp <SPEC>        Forward UDP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
+  --transport <MODE>  auto|udp|tcp (default: auto)
+
+Options:
+  -h, --help          Print this help and exit
+";
+
 enum Cmd {
-    /// Run on the public host (VPS). Exposes ports and forwards them over the tunnel.
     Server {
-        /// Address to bind public and control listeners on.
-        #[arg(long, default_value = "0.0.0.0")]
         bind: String,
-        /// Control port the client connects to.
-        #[arg(long, default_value_t = 2222)]
         control: u16,
-        /// Shared secret. Must match the client.
-        #[arg(long, env = "ZERONAT_SECRET")]
         secret: String,
-        /// Public TCP port to expose (repeatable).
-        #[arg(long = "tcp")]
         tcp: Vec<u16>,
-        /// Public UDP port to expose (repeatable).
-        #[arg(long = "udp")]
         udp: Vec<u16>,
     },
-    /// Run on the host behind CG-NAT. Dials out to the server and serves local ports.
     Client {
-        /// Server control address, e.g. 203.0.113.10:2222.
-        #[arg(long)]
         server: String,
-        /// Shared secret. Must match the server.
-        #[arg(long, env = "ZERONAT_SECRET")]
         secret: String,
-        /// Forward a TCP port: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable).
-        #[arg(long = "tcp")]
         tcp: Vec<String>,
-        /// Forward a UDP port: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable).
-        #[arg(long = "udp")]
         udp: Vec<String>,
-        /// Transport selection: auto (UDP first, TCP fallback), udp, or tcp.
-        #[arg(long, default_value = "auto")]
         transport: String,
     },
 }
@@ -67,14 +60,150 @@ fn parse_forward(spec: &str) -> Result<(u16, String)> {
             let lport: u16 = lp.parse()?;
             Ok((port, format!("{host}:{lport}")))
         }
-        _ => bail!("invalid forward spec '{spec}'"),
+        _ => Err(format!("invalid forward spec '{spec}'").into()),
+    }
+}
+
+fn parse_args() -> Result<Cmd> {
+    let mut args = std::env::args().skip(1);
+
+    let subcmd = match args.next().as_deref() {
+        Some("-h") | Some("--help") => {
+            print!("{USAGE}");
+            std::process::exit(0);
+        }
+        Some("server") => "server",
+        Some("client") => "client",
+        Some(other) => {
+            eprintln!("error: unknown subcommand '{other}'\n{USAGE}");
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!("error: subcommand required\n{USAGE}");
+            std::process::exit(1);
+        }
+    };
+
+    // Collect remaining args into a flat list, splitting --flag=value pairs.
+    let mut tokens: Vec<String> = Vec::new();
+    for arg in args {
+        if let Some(rest) = arg.strip_prefix("--") {
+            if let Some(eq) = rest.find('=') {
+                tokens.push(format!("--{}", &rest[..eq]));
+                tokens.push(rest[eq + 1..].to_string());
+            } else {
+                tokens.push(arg);
+            }
+        } else {
+            tokens.push(arg);
+        }
+    }
+
+    let mut iter = tokens.into_iter();
+
+    if subcmd == "server" {
+        let mut bind = "0.0.0.0".to_string();
+        let mut control: u16 = 2222;
+        let mut secret: Option<String> = None;
+        let mut tcp: Vec<u16> = Vec::new();
+        let mut udp: Vec<u16> = Vec::new();
+
+        while let Some(flag) = iter.next() {
+            match flag.as_str() {
+                "-h" | "--help" => {
+                    print!("{USAGE}");
+                    std::process::exit(0);
+                }
+                "--bind" => {
+                    bind = iter.next().ok_or("--bind requires a value")?;
+                }
+                "--control" => {
+                    let v = iter.next().ok_or("--control requires a value")?;
+                    control = v.parse().map_err(|_| -> zeronat::Error {
+                        format!("--control must be a u16, got '{v}'").into()
+                    })?;
+                }
+                "--secret" => {
+                    secret = Some(iter.next().ok_or("--secret requires a value")?);
+                }
+                "--tcp" => {
+                    let v = iter.next().ok_or("--tcp requires a value")?;
+                    let port: u16 = v.parse().map_err(|_| -> zeronat::Error {
+                        format!("--tcp must be a u16, got '{v}'").into()
+                    })?;
+                    tcp.push(port);
+                }
+                "--udp" => {
+                    let v = iter.next().ok_or("--udp requires a value")?;
+                    let port: u16 = v.parse().map_err(|_| -> zeronat::Error {
+                        format!("--udp must be a u16, got '{v}'").into()
+                    })?;
+                    udp.push(port);
+                }
+                other => {
+                    eprintln!("error: unknown flag '{other}'");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        let secret = secret
+            .or_else(|| std::env::var("ZERONAT_SECRET").ok())
+            .ok_or("--secret or ZERONAT_SECRET is required")?;
+
+        Ok(Cmd::Server { bind, control, secret, tcp, udp })
+    } else {
+        // client
+        let mut server: Option<String> = None;
+        let mut secret: Option<String> = None;
+        let mut tcp: Vec<String> = Vec::new();
+        let mut udp: Vec<String> = Vec::new();
+        let mut transport = "auto".to_string();
+
+        while let Some(flag) = iter.next() {
+            match flag.as_str() {
+                "-h" | "--help" => {
+                    print!("{USAGE}");
+                    std::process::exit(0);
+                }
+                "--server" => {
+                    server = Some(iter.next().ok_or("--server requires a value")?);
+                }
+                "--secret" => {
+                    secret = Some(iter.next().ok_or("--secret requires a value")?);
+                }
+                "--tcp" => {
+                    let v = iter.next().ok_or("--tcp requires a value")?;
+                    tcp.push(v);
+                }
+                "--udp" => {
+                    let v = iter.next().ok_or("--udp requires a value")?;
+                    udp.push(v);
+                }
+                "--transport" => {
+                    transport = iter.next().ok_or("--transport requires a value")?;
+                }
+                other => {
+                    eprintln!("error: unknown flag '{other}'");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        let server = server.ok_or("--server is required")?;
+        let secret = secret
+            .or_else(|| std::env::var("ZERONAT_SECRET").ok())
+            .ok_or("--secret or ZERONAT_SECRET is required")?;
+
+        Ok(Cmd::Client { server, secret, tcp, udp, transport })
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cmd = parse_args()?;
     tokio::select! {
-        r = run(Cli::parse().cmd) => r,
+        r = run(cmd) => r,
         _ = shutdown() => Ok(()),
     }
 }
@@ -107,7 +236,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             udp,
         } => {
             if tcp.is_empty() && udp.is_empty() {
-                bail!("no ports to expose: pass at least one --tcp or --udp");
+                return Err("no ports to expose: pass at least one --tcp or --udp".into());
             }
             server::run(bind, control, secret, tcp, udp).await
         }
@@ -119,7 +248,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             transport,
         } => {
             if tcp.is_empty() && udp.is_empty() {
-                bail!("nothing to forward: pass at least one --tcp or --udp");
+                return Err("nothing to forward: pass at least one --tcp or --udp".into());
             }
             let tcp = tcp
                 .iter()
@@ -133,7 +262,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 "auto" => client::Transport::Auto,
                 "udp" => client::Transport::Udp,
                 "tcp" => client::Transport::Tcp,
-                other => bail!("invalid --transport '{other}' (expected auto|udp|tcp)"),
+                other => return Err(format!("invalid --transport '{other}' (expected auto|udp|tcp)").into()),
             };
             client::run(server, secret, tcp, udp, transport).await
         }

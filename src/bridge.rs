@@ -29,13 +29,13 @@ pub async fn tcp(plain: TcpStream, mut nr: NoiseReader, mut nw: NoiseWriter) {
             }
             nw.send(&buf[..n]).await?;
         }
-        anyhow::Ok(())
+        Ok::<_, crate::Error>(())
     };
     let down = async move {
         while let Ok(m) = nr.recv().await {
             pw.write_all(&m).await?;
         }
-        anyhow::Ok(())
+        Ok::<_, crate::Error>(())
     };
 
     tokio::select! {
@@ -53,12 +53,12 @@ pub async fn udp_client(local: UdpSocket, mut nr: NoiseReader, mut nw: NoiseWrit
             tokio::select! {
                 m = nr.recv() => {
                     local.send(&m?).await?;
-                    anyhow::Ok(true)
+                    Ok::<_, crate::Error>(true)
                 }
                 r = local.recv(&mut buf) => {
                     let n = r?;
                     nw.send(&buf[..n]).await?;
-                    anyhow::Ok(true)
+                    Ok::<_, crate::Error>(true)
                 }
             }
         })
@@ -84,12 +84,12 @@ pub async fn udp_server(
         let step = timeout(UDP_IDLE, async {
             tokio::select! {
                 d = dgram_rx.recv() => match d {
-                    Some(d) => { nw.send(&d).await?; anyhow::Ok(true) }
-                    None => anyhow::Ok(false),
+                    Some(d) => { nw.send(&d).await?; Ok::<_, crate::Error>(true) }
+                    None => Ok::<_, crate::Error>(false),
                 },
                 m = nr.recv() => {
                     socket.send_to(&m?, src).await?;
-                    anyhow::Ok(true)
+                    Ok::<_, crate::Error>(true)
                 }
             }
         })
@@ -108,14 +108,14 @@ pub async fn udp_client_stateless(local: UdpSocket, mut rx: DgramRx, tx: DgramTx
         let step = timeout(UDP_IDLE, async {
             tokio::select! {
                 m = rx.recv() => {
-                    let m = m.ok_or_else(|| anyhow::anyhow!("transport closed"))?;
+                    let m = m.ok_or("transport closed")?;
                     local.send(&m).await?;
-                    anyhow::Ok(true)
+                    Ok::<_, crate::Error>(true)
                 }
                 r = local.recv(&mut buf) => {
                     let n = r?;
                     tx.send(&buf[..n]).await?;
-                    anyhow::Ok(true)
+                    Ok::<_, crate::Error>(true)
                 }
             }
         })
@@ -139,13 +139,13 @@ pub async fn udp_server_stateless(
         let step = timeout(UDP_IDLE, async {
             tokio::select! {
                 d = dgram_rx.recv() => match d {
-                    Some(d) => { tx.send(&d).await?; anyhow::Ok(true) }
-                    None => anyhow::Ok(false),
+                    Some(d) => { tx.send(&d).await?; Ok::<_, crate::Error>(true) }
+                    None => Ok::<_, crate::Error>(false),
                 },
                 m = rx.recv() => {
-                    let m = m.ok_or_else(|| anyhow::anyhow!("transport closed"))?;
+                    let m = m.ok_or("transport closed")?;
                     socket.send_to(&m, src).await?;
-                    anyhow::Ok(true)
+                    Ok::<_, crate::Error>(true)
                 }
             }
         })

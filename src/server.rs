@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
+use crate::Result;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -160,7 +160,7 @@ pub(crate) async fn serve_stream(
             }
             Ok(())
         }
-        other => anyhow::bail!("unexpected first message: {other:?}"),
+        other => Err(format!("unexpected first message: {other:?}").into()),
     }
 }
 

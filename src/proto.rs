@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use crate::Result;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Proto {
@@ -52,7 +52,7 @@ impl Msg {
                 let proto = match b[1] {
                     1 => Proto::Tcp,
                     2 => Proto::Udp,
-                    n => bail!("unknown proto byte {n}"),
+                    n => return Err(format!("unknown proto byte {n}").into()),
                 };
                 let port = u16::from_be_bytes([b[2], b[3]]);
                 let id = u64::from_be_bytes(b[4..12].try_into().unwrap());
@@ -62,7 +62,7 @@ impl Msg {
                 let id = u64::from_be_bytes(b[1..9].try_into().unwrap());
                 Ok(Msg::Data { id })
             }
-            _ => bail!("malformed message ({} bytes)", b.len()),
+            _ => Err(format!("malformed message ({} bytes)", b.len()).into()),
         }
     }
 }

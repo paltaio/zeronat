@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use crate::Result;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::time::timeout as tokio_timeout;
@@ -70,7 +70,7 @@ async fn udp_session(client: Arc<Client>) -> Result<(Arc<Session>, crate::noise:
     let server: SocketAddr = client
         .server
         .parse()
-        .map_err(|_| anyhow::anyhow!("server must be host:port for UDP"))?;
+        .map_err(|_| -> crate::Error { "server must be host:port for UDP".into() })?;
     socket.connect(server).await?;
     let sess = kcp_session(socket.clone(), server, 1);
 
@@ -89,7 +89,7 @@ async fn udp_session(client: Arc<Client>) -> Result<(Arc<Session>, crate::noise:
     let (_conv, stream) = sess.open_conv(CLASS_KCP);
     let noise = tokio_timeout(UDP_HANDSHAKE_TIMEOUT, client_handshake(stream, &client.psk))
         .await
-        .map_err(|_| anyhow::anyhow!("udp handshake timed out"))??;
+        .map_err(|_| -> crate::Error { "udp handshake timed out".into() })??;
     Ok((sess, noise))
 }
 
@@ -125,7 +125,7 @@ async fn session(client: Arc<Client>) -> Result<()> {
 async fn tcp_control(client: Arc<Client>) -> Result<crate::noise::Noise> {
     let sock = TcpStream::connect(&client.server)
         .await
-        .with_context(|| format!("connecting to {}", client.server))?;
+        .map_err(|e| -> crate::Error { format!("connecting to {}: {e}", client.server).into() })?;
     sock.set_nodelay(true).ok();
     let noise = client_handshake(sock, &client.psk).await?;
     eprintln!("connected to {}", client.server);
@@ -203,7 +203,7 @@ async fn handle_open(
         Proto::Tcp => client.tcp.get(&port),
         Proto::Udp => client.udp.get(&port),
     }
-    .with_context(|| format!("no local target configured for {proto:?} :{port}"))?
+    .ok_or_else(|| -> crate::Error { format!("no local target configured for {proto:?} :{port}").into() })?
     .clone();
 
     match (link.as_ref(), proto) {
@@ -215,7 +215,7 @@ async fn handle_open(
             nw.send(&Msg::Data { id }.encode()).await?;
             let local = TcpStream::connect(&target)
                 .await
-                .with_context(|| format!("connecting to local {target}"))?;
+                .map_err(|e| -> crate::Error { format!("connecting to local {target}: {e}").into() })?;
             bridge::tcp(local, nr, nw).await;
         }
         (Link::Tcp, Proto::Udp) => {
@@ -227,7 +227,7 @@ async fn handle_open(
             local
                 .connect(&target)
                 .await
-                .with_context(|| format!("connecting to local {target}"))?;
+                .map_err(|e| -> crate::Error { format!("connecting to local {target}: {e}").into() })?;
             bridge::udp_client(local, nr, nw).await;
         }
         // --- UDP transport ---
@@ -237,7 +237,7 @@ async fn handle_open(
             nw.send(&Msg::Data { id }.encode()).await?;
             let local = TcpStream::connect(&target)
                 .await
-                .with_context(|| format!("connecting to local {target}"))?;
+                .map_err(|e| -> crate::Error { format!("connecting to local {target}: {e}").into() })?;
             bridge::tcp(local, nr, nw).await;
         }
         (Link::Udp(sess), Proto::Udp) => {
@@ -248,7 +248,7 @@ async fn handle_open(
             local
                 .connect(&target)
                 .await
-                .with_context(|| format!("connecting to local {target}"))?;
+                .map_err(|e| -> crate::Error { format!("connecting to local {target}: {e}").into() })?;
             let inbound = sess.register_dgram(conv);
             let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
             let rx = DgramRx::new(inbound, noise);

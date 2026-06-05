@@ -235,9 +235,8 @@ else
   TARGET=$(arch_target)
   say "Downloading zeronat ($TARGET) ..."
   TMP=$(mktemp -d)
-  curl -fsSL "$RELEASE_BASE/zeronat-$TARGET.tar.gz" -o "$TMP/z.tgz" \
+  curl -fsSL "$RELEASE_BASE/zeronat-$TARGET" -o "$TMP/zeronat" \
     || err "download failed (no release asset for $TARGET?)"
-  tar -xzf "$TMP/z.tgz" -C "$TMP"
   run install -m 0755 "$TMP/zeronat" "$BIN_PATH"
   rm -rf "$TMP"
   cat <<EOF | run tee "$UNIT" >/dev/null

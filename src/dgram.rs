@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use crate::Result;
 use tokio::sync::mpsc;
 
 use crate::kcp::CLASS_DGRAM;
@@ -27,7 +27,7 @@ impl DgramTx {
         match self.send_tx.try_send(pkt) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow::anyhow!("transport closed")),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err("transport closed".into()),
         }
     }
 }

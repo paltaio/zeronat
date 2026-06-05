@@ -49,18 +49,17 @@ jobs:
           echo "$v" | grep -q 'getrandom v0\.2\.' || { echo "getrandom drifted off 0.2.x; MIPS build will break"; exit 1; }
 
       - name: Build
+        env:
+          RUSTFLAGS: '-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort -Cforce-unwind-tables=no --cfg curve25519_dalek_backend="serial"'
         run: |
-          flags=""
-          case "${{ matrix.target }}" in
-            mips*) flags="-Zbuild-std=std,panic_abort" ;;  # tier 3: build std from source
-          esac
-          cross build --release --locked $flags --target ${{ matrix.target }}
+          cross build --release --locked \
+            -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
+            --target ${{ matrix.target }}
 
       - name: Package
         run: |
           install -D "target/${{ matrix.target }}/release/zeronat" "out/zeronat"
-          tar -C out -czf "zeronat-${{ matrix.target }}.tar.gz" zeronat
-          sha256sum "zeronat-${{ matrix.target }}.tar.gz" > "zeronat-${{ matrix.target }}.tar.gz.sha256"
+          install -m 0755 "target/${{ matrix.target }}/release/zeronat" "zeronat-${{ matrix.target }}"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
@@ -74,8 +73,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            zeronat-${{ matrix.target }}.tar.gz
-            zeronat-${{ matrix.target }}.tar.gz.sha256
+            zeronat-${{ matrix.target }}
 
   docker:
     needs: binaries
