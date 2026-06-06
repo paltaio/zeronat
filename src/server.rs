@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -81,6 +81,13 @@ impl Server {
     }
 }
 
+/// DHT announce settings. An unset IP is auto-detected via the DHT; an unset port
+/// defaults to the control port.
+pub struct DhtAnnounce {
+    pub ip: Option<Ipv4Addr>,
+    pub port: Option<u16>,
+}
+
 pub async fn run(
     bind: String,
     control_port: u16,
@@ -88,11 +95,30 @@ pub async fn run(
     tcp_ports: Vec<u16>,
     udp_ports: Vec<u16>,
     tap: Option<TapConfig>,
+    dht: Option<DhtAnnounce>,
 ) -> Result<()> {
     let tap = match &tap {
         Some(cfg) => Some(Arc::new(TapDevice::open(cfg)?)),
         None => None,
     };
+
+    if let Some(ann) = dht {
+        #[cfg(feature = "dht")]
+        {
+            let secret = secret.clone();
+            let ip = ann.ip;
+            let port = ann.port.unwrap_or(control_port);
+            tokio::spawn(async move {
+                crate::dht::announce_loop(&secret, ip, port).await;
+            });
+        }
+        #[cfg(not(feature = "dht"))]
+        {
+            let _ = ann;
+            return Err("this build has no dht support".into());
+        }
+    }
+
     let srv = Arc::new(Server {
         psk: crate::noise::derive_psk(&secret),
         next_id: Mutex::new(1),

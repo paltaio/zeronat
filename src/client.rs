@@ -44,6 +44,59 @@ enum Link {
     Udp(Arc<Session>), // data conns open KCP convs on the shared UDP session
 }
 
+/// How the server's control address is found: a fixed `host:port`, or looked up
+/// on the DHT by a secret-derived key.
+enum Discovery {
+    Static(String),
+    #[cfg(feature = "dht")]
+    Dht(Arc<crate::dht::Identity>),
+}
+
+impl Discovery {
+    fn new(server: &str, secret: &str) -> Result<Self> {
+        if server == "dht" {
+            #[cfg(feature = "dht")]
+            return Ok(Discovery::Dht(Arc::new(crate::dht::Identity::derive(
+                secret,
+            ))));
+            #[cfg(not(feature = "dht"))]
+            {
+                let _ = secret;
+                return Err("this build has no dht support; pass --server host:port".into());
+            }
+        }
+        Ok(Discovery::Static(server.to_string()))
+    }
+
+    /// Resolve to a concrete `host:port`. The DHT path serves the cached address
+    /// first so a reconnect stays off the network.
+    async fn resolve(&self) -> Result<String> {
+        match self {
+            Discovery::Static(s) => Ok(s.clone()),
+            #[cfg(feature = "dht")]
+            Discovery::Dht(id) => {
+                if let Some(addr) = crate::dht::read_cache(id) {
+                    return Ok(addr.to_string());
+                }
+                eprintln!("resolving server address via dht...");
+                let addr = crate::dht::resolve(id).await?;
+                eprintln!("dht: resolved server to {addr}");
+                crate::dht::write_cache(id, addr);
+                Ok(addr.to_string())
+            }
+        }
+    }
+
+    /// Drop a cached address after it failed to connect, so the next resolve
+    /// consults the DHT (the server's IP may have changed).
+    fn invalidate(&self) {
+        #[cfg(feature = "dht")]
+        if let Discovery::Dht(id) = self {
+            crate::dht::clear_cache(id);
+        }
+    }
+}
+
 pub async fn run(
     server: String,
     secret: String,
@@ -52,27 +105,38 @@ pub async fn run(
     transport: Transport,
     tap: Option<TapConfig>,
 ) -> Result<()> {
-    let client = Arc::new(Client {
-        server,
-        psk: crate::noise::derive_psk(&secret),
-        tcp: tcp.into_iter().collect(),
-        udp: udp.into_iter().collect(),
-        transport,
-    });
-
-    if let Some(cfg) = tap {
-        let tap = Arc::new(TapDevice::open(&cfg)?);
-        loop {
-            if let Err(e) = bridge_session(client.clone(), tap.clone()).await {
-                eprintln!("bridge connection lost: {e}");
-            }
-            sleep(RETRY_DELAY).await;
-        }
-    }
+    let psk = crate::noise::derive_psk(&secret);
+    let tcp: HashMap<u16, String> = tcp.into_iter().collect();
+    let udp: HashMap<u16, String> = udp.into_iter().collect();
+    let discovery = Discovery::new(&server, &secret)?;
+    let tap = match tap {
+        Some(cfg) => Some(Arc::new(TapDevice::open(&cfg)?)),
+        None => None,
+    };
 
     loop {
-        if let Err(e) = session(client.clone()).await {
-            eprintln!("control connection lost: {e}");
+        let addr = match discovery.resolve().await {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("server discovery failed: {e}");
+                sleep(RETRY_DELAY).await;
+                continue;
+            }
+        };
+        let client = Arc::new(Client {
+            server: addr,
+            psk,
+            tcp: tcp.clone(),
+            udp: udp.clone(),
+            transport,
+        });
+        let result = match &tap {
+            Some(tap) => bridge_session(client.clone(), tap.clone()).await,
+            None => session(client.clone()).await,
+        };
+        if let Err(e) = result {
+            eprintln!("connection lost: {e}");
+            discovery.invalidate();
         }
         sleep(RETRY_DELAY).await;
     }

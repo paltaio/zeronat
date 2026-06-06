@@ -1,8 +1,12 @@
 [package]
 name = "zeronat"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
+
+[features]
+default = ["dht"]
+dht = ["dep:ed25519-dalek", "dep:sha1"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
@@ -13,6 +17,8 @@ hmac = "0.12"
 kcp = { version = "0.6", default-features = false }
 getrandom = "~0.2"
 libc = "0.2"
+ed25519-dalek = { version = "2", default-features = false, optional = true }
+sha1 = { version = "0.10", default-features = false, optional = true }
 
 [dev-dependencies]
 snow = "0.9"

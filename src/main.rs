@@ -1,3 +1,5 @@
+use std::net::Ipv4Addr;
+
 use zeronat::tap::TapConfig;
 use zeronat::{client, server, Result};
 
@@ -19,9 +21,12 @@ server options:
   --tap <NAME>        L2 bridge mode: create/attach this TAP device
   --tap-mtu <N>       TAP MTU (default: 1400)
   --bridge <NAME>     Enslave the TAP to this existing bridge
+  --server dht        Publish this server's address to the DHT for discovery
+  --announce-ip <IP>  Public IPv4 to announce (default: auto-detected via DHT)
+  --announce-port <P> Public port to announce (default: control port)
 
 client options:
-  --server <ADDR>     Server control address, e.g. 203.0.113.10:2222
+  --server <ADDR>     Server control address host:port, or 'dht' to discover via DHT
   --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
   --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
   --udp <SPEC>        Forward UDP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
@@ -42,6 +47,9 @@ enum Cmd {
         tcp: Vec<u16>,
         udp: Vec<u16>,
         tap: Option<TapConfig>,
+        dht: bool,
+        announce_ip: Option<Ipv4Addr>,
+        announce_port: Option<u16>,
     },
     Client {
         server: String,
@@ -125,6 +133,9 @@ fn parse_args() -> Result<Cmd> {
         let mut tap_name: Option<String> = None;
         let mut tap_mtu: usize = DEFAULT_TAP_MTU;
         let mut bridge: Option<String> = None;
+        let mut dht = false;
+        let mut announce_ip: Option<Ipv4Addr> = None;
+        let mut announce_port: Option<u16> = None;
 
         while let Some(flag) = iter.next() {
             match flag.as_str() {
@@ -134,6 +145,25 @@ fn parse_args() -> Result<Cmd> {
                 }
                 "--bind" => {
                     bind = iter.next().ok_or("--bind requires a value")?;
+                }
+                "--server" => {
+                    let v = iter.next().ok_or("--server requires a value")?;
+                    if v != "dht" {
+                        return Err(format!("server --server only accepts 'dht', got '{v}'").into());
+                    }
+                    dht = true;
+                }
+                "--announce-ip" => {
+                    let v = iter.next().ok_or("--announce-ip requires a value")?;
+                    announce_ip = Some(v.parse().map_err(|_| -> zeronat::Error {
+                        format!("--announce-ip must be an IPv4 address, got '{v}'").into()
+                    })?);
+                }
+                "--announce-port" => {
+                    let v = iter.next().ok_or("--announce-port requires a value")?;
+                    announce_port = Some(v.parse().map_err(|_| -> zeronat::Error {
+                        format!("--announce-port must be a u16, got '{v}'").into()
+                    })?);
                 }
                 "--control" => {
                     let v = iter.next().ok_or("--control requires a value")?;
@@ -189,6 +219,9 @@ fn parse_args() -> Result<Cmd> {
             tcp,
             udp,
             tap,
+            dht,
+            announce_ip,
+            announce_port,
         })
     } else {
         // client
@@ -296,6 +329,9 @@ async fn run(cmd: Cmd) -> Result<()> {
             tcp,
             udp,
             tap,
+            dht,
+            announce_ip,
+            announce_port,
         } => {
             if tap.is_some() && (!tcp.is_empty() || !udp.is_empty()) {
                 return Err("--tap cannot be combined with --tcp/--udp forwards".into());
@@ -303,7 +339,11 @@ async fn run(cmd: Cmd) -> Result<()> {
             if tap.is_none() && tcp.is_empty() && udp.is_empty() {
                 return Err("nothing to do: pass --tap or at least one --tcp/--udp".into());
             }
-            server::run(bind, control, secret, tcp, udp, tap).await
+            let dht = dht.then_some(server::DhtAnnounce {
+                ip: announce_ip,
+                port: announce_port,
+            });
+            server::run(bind, control, secret, tcp, udp, tap, dht).await
         }
         Cmd::Client {
             server,

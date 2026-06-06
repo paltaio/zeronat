@@ -46,6 +46,19 @@ pppd plugin rp-pppoe.so zn0 user <user>
 
 `--bridge <name>` enslaves the TAP to an existing bridge; `--tap-mtu <n>` sets the MTU (default 1400). Needs `CAP_NET_ADMIN`: root, `setcap cap_net_admin+ep zeronat`, or Docker `--cap-add NET_ADMIN --device /dev/net/tun` (plus `--device /dev/ppp` for pppd).
 
+## DHT discovery
+
+For a server on a dynamic IP, `--server dht` publishes its address to the BitTorrent Mainline DHT and the client looks it up. The lookup key is derived from the shared secret, so no extra configuration is needed and the published address is signed and encrypted.
+
+```bash
+# Server publishes its address; IP is auto-detected from the DHT:
+ZERONAT_SECRET=s zeronat server --server dht --tcp 443
+# Client finds the server through the DHT:
+ZERONAT_SECRET=s zeronat client --server dht --tcp 443
+```
+
+`--announce-ip <ip>` overrides the detected IP and `--announce-port <port>` the announced port (default: the control port) when the server is behind a port-forward. The client caches the last-known address and only re-queries the DHT when it stops working.
+
 ## Build
 
 ```bash

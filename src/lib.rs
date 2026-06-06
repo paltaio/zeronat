@@ -4,6 +4,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub mod bridge;
 pub mod client;
 pub mod dgram;
+#[cfg(feature = "dht")]
+pub mod dht;
 pub mod kcp;
 pub mod noise;
 pub mod proto;
