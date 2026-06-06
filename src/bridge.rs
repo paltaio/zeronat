@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout;
 
 use crate::dgram::{DgramRx, DgramTx};
 use crate::noise::{NoiseReader, NoiseWriter};
+use crate::tap::TapDevice;
 
 const TCP_BUF: usize = 16 * 1024;
 const UDP_BUF: usize = 65535;
@@ -97,6 +98,49 @@ pub async fn udp_server(
         match step {
             Ok(Ok(true)) => {}
             _ => break,
+        }
+    }
+}
+
+/// Relay Ethernet frames between a TAP device and the unreliable datagram
+/// channel (UDP transport). Returns when either side fails or `cancel` fires
+/// (a newer bridge superseding this one).
+pub async fn tap_dgram(tap: Arc<TapDevice>, mut rx: DgramRx, tx: DgramTx, cancel: Arc<Notify>) {
+    loop {
+        tokio::select! {
+            _ = cancel.notified() => break,
+            frame = tap.read_frame() => match frame {
+                Ok(f) => { if tx.send(&f).await.is_err() { break; } }
+                Err(_) => break,
+            },
+            m = rx.recv() => match m {
+                Some(f) => { if tap.write_frame(&f).await.is_err() { break; } }
+                None => break,
+            },
+        }
+    }
+}
+
+/// Relay Ethernet frames between a TAP device and a reliable Noise stream (TCP
+/// fallback). Each `send`/`recv` is one record, so frame boundaries are
+/// preserved. Returns when either side closes or `cancel` fires.
+pub async fn tap_stream(
+    tap: Arc<TapDevice>,
+    mut nr: NoiseReader,
+    mut nw: NoiseWriter,
+    cancel: Arc<Notify>,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.notified() => break,
+            frame = tap.read_frame() => match frame {
+                Ok(f) => { if nw.send(&f).await.is_err() { break; } }
+                Err(_) => break,
+            },
+            m = nr.recv() => match m {
+                Ok(f) => { if tap.write_frame(&f).await.is_err() { break; } }
+                Err(_) => break,
+            },
         }
     }
 }

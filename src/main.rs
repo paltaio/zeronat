@@ -1,4 +1,7 @@
+use zeronat::tap::TapConfig;
 use zeronat::{client, server, Result};
+
+const DEFAULT_TAP_MTU: usize = 1400;
 
 static USAGE: &str = "\
 Usage: zeronat <SUBCOMMAND> [OPTIONS]
@@ -13,6 +16,9 @@ server options:
   --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
   --tcp <PORT>        Public TCP port to expose (repeatable)
   --udp <PORT>        Public UDP port to expose (repeatable)
+  --tap <NAME>        L2 bridge mode: create/attach this TAP device
+  --tap-mtu <N>       TAP MTU (default: 1400)
+  --bridge <NAME>     Enslave the TAP to this existing bridge
 
 client options:
   --server <ADDR>     Server control address, e.g. 203.0.113.10:2222
@@ -20,6 +26,9 @@ client options:
   --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
   --udp <SPEC>        Forward UDP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
   --transport <MODE>  auto|udp|tcp (default: auto)
+  --tap <NAME>        L2 bridge mode: create/attach this TAP device
+  --tap-mtu <N>       TAP MTU (default: 1400)
+  --bridge <NAME>     Enslave the TAP to this existing bridge
 
 Options:
   -h, --help          Print this help and exit
@@ -32,6 +41,7 @@ enum Cmd {
         secret: String,
         tcp: Vec<u16>,
         udp: Vec<u16>,
+        tap: Option<TapConfig>,
     },
     Client {
         server: String,
@@ -39,7 +49,12 @@ enum Cmd {
         tcp: Vec<String>,
         udp: Vec<String>,
         transport: String,
+        tap: Option<TapConfig>,
     },
+}
+
+fn build_tap(name: Option<String>, mtu: usize, bridge: Option<String>) -> Option<TapConfig> {
+    name.map(|name| TapConfig { name, mtu, bridge })
 }
 
 /// Parse a forward spec into (public_port, "host:port" target).
@@ -107,6 +122,9 @@ fn parse_args() -> Result<Cmd> {
         let mut secret: Option<String> = None;
         let mut tcp: Vec<u16> = Vec::new();
         let mut udp: Vec<u16> = Vec::new();
+        let mut tap_name: Option<String> = None;
+        let mut tap_mtu: usize = DEFAULT_TAP_MTU;
+        let mut bridge: Option<String> = None;
 
         while let Some(flag) = iter.next() {
             match flag.as_str() {
@@ -140,6 +158,18 @@ fn parse_args() -> Result<Cmd> {
                     })?;
                     udp.push(port);
                 }
+                "--tap" => {
+                    tap_name = Some(iter.next().ok_or("--tap requires a value")?);
+                }
+                "--tap-mtu" => {
+                    let v = iter.next().ok_or("--tap-mtu requires a value")?;
+                    tap_mtu = v.parse().map_err(|_| -> zeronat::Error {
+                        format!("--tap-mtu must be a positive integer, got '{v}'").into()
+                    })?;
+                }
+                "--bridge" => {
+                    bridge = Some(iter.next().ok_or("--bridge requires a value")?);
+                }
                 other => {
                     eprintln!("error: unknown flag '{other}'");
                     std::process::exit(1);
@@ -151,7 +181,15 @@ fn parse_args() -> Result<Cmd> {
             .or_else(|| std::env::var("ZERONAT_SECRET").ok())
             .ok_or("--secret or ZERONAT_SECRET is required")?;
 
-        Ok(Cmd::Server { bind, control, secret, tcp, udp })
+        let tap = build_tap(tap_name, tap_mtu, bridge);
+        Ok(Cmd::Server {
+            bind,
+            control,
+            secret,
+            tcp,
+            udp,
+            tap,
+        })
     } else {
         // client
         let mut server: Option<String> = None;
@@ -159,6 +197,9 @@ fn parse_args() -> Result<Cmd> {
         let mut tcp: Vec<String> = Vec::new();
         let mut udp: Vec<String> = Vec::new();
         let mut transport = "auto".to_string();
+        let mut tap_name: Option<String> = None;
+        let mut tap_mtu: usize = DEFAULT_TAP_MTU;
+        let mut bridge: Option<String> = None;
 
         while let Some(flag) = iter.next() {
             match flag.as_str() {
@@ -183,6 +224,18 @@ fn parse_args() -> Result<Cmd> {
                 "--transport" => {
                     transport = iter.next().ok_or("--transport requires a value")?;
                 }
+                "--tap" => {
+                    tap_name = Some(iter.next().ok_or("--tap requires a value")?);
+                }
+                "--tap-mtu" => {
+                    let v = iter.next().ok_or("--tap-mtu requires a value")?;
+                    tap_mtu = v.parse().map_err(|_| -> zeronat::Error {
+                        format!("--tap-mtu must be a positive integer, got '{v}'").into()
+                    })?;
+                }
+                "--bridge" => {
+                    bridge = Some(iter.next().ok_or("--bridge requires a value")?);
+                }
                 other => {
                     eprintln!("error: unknown flag '{other}'");
                     std::process::exit(1);
@@ -195,7 +248,15 @@ fn parse_args() -> Result<Cmd> {
             .or_else(|| std::env::var("ZERONAT_SECRET").ok())
             .ok_or("--secret or ZERONAT_SECRET is required")?;
 
-        Ok(Cmd::Client { server, secret, tcp, udp, transport })
+        let tap = build_tap(tap_name, tap_mtu, bridge);
+        Ok(Cmd::Client {
+            server,
+            secret,
+            tcp,
+            udp,
+            transport,
+            tap,
+        })
     }
 }
 
@@ -234,11 +295,15 @@ async fn run(cmd: Cmd) -> Result<()> {
             secret,
             tcp,
             udp,
+            tap,
         } => {
-            if tcp.is_empty() && udp.is_empty() {
-                return Err("no ports to expose: pass at least one --tcp or --udp".into());
+            if tap.is_some() && (!tcp.is_empty() || !udp.is_empty()) {
+                return Err("--tap cannot be combined with --tcp/--udp forwards".into());
             }
-            server::run(bind, control, secret, tcp, udp).await
+            if tap.is_none() && tcp.is_empty() && udp.is_empty() {
+                return Err("nothing to do: pass --tap or at least one --tcp/--udp".into());
+            }
+            server::run(bind, control, secret, tcp, udp, tap).await
         }
         Cmd::Client {
             server,
@@ -246,9 +311,13 @@ async fn run(cmd: Cmd) -> Result<()> {
             tcp,
             udp,
             transport,
+            tap,
         } => {
-            if tcp.is_empty() && udp.is_empty() {
-                return Err("nothing to forward: pass at least one --tcp or --udp".into());
+            if tap.is_some() && (!tcp.is_empty() || !udp.is_empty()) {
+                return Err("--tap cannot be combined with --tcp/--udp forwards".into());
+            }
+            if tap.is_none() && tcp.is_empty() && udp.is_empty() {
+                return Err("nothing to do: pass --tap or at least one --tcp/--udp".into());
             }
             let tcp = tcp
                 .iter()
@@ -262,9 +331,13 @@ async fn run(cmd: Cmd) -> Result<()> {
                 "auto" => client::Transport::Auto,
                 "udp" => client::Transport::Udp,
                 "tcp" => client::Transport::Tcp,
-                other => return Err(format!("invalid --transport '{other}' (expected auto|udp|tcp)").into()),
+                other => {
+                    return Err(
+                        format!("invalid --transport '{other}' (expected auto|udp|tcp)").into(),
+                    )
+                }
             };
-            client::run(server, secret, tcp, udp, transport).await
+            client::run(server, secret, tcp, udp, transport, tap).await
         }
     }
 }

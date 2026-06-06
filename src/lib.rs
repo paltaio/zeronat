@@ -8,3 +8,4 @@ pub mod kcp;
 pub mod noise;
 pub mod proto;
 pub mod server;
+pub mod tap;

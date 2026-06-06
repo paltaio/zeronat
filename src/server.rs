@@ -5,19 +5,23 @@ use std::time::Duration;
 
 use crate::Result;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::timeout;
 
 use crate::bridge;
 use crate::dgram::{DgramRx, DgramTx};
-use crate::kcp::{route, session, Accepted, Session};
+use crate::kcp::{route, session, Accepted, Session, BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{server_handshake, server_handshake_stateless, Noise, StatelessNoise};
 use crate::proto::{Msg, Proto};
+use crate::tap::{TapConfig, TapDevice};
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum ActiveTransport { Tcp, Udp }
+pub enum ActiveTransport {
+    Tcp,
+    Udp,
+}
 
 /// A parked public UDP source, the public socket its replies must go out on, and
 /// the channel carrying its inbound datagrams, awaiting the matching UDP-forward
@@ -31,6 +35,21 @@ pub(crate) struct Server {
     udp_pending: Mutex<HashMap<u64, UdpPending>>,
     control_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     active_transport: Mutex<ActiveTransport>,
+    tap: Option<Arc<TapDevice>>,
+    bridge_cancel: Mutex<Option<Arc<Notify>>>,
+}
+
+impl Server {
+    /// Take ownership of the bridge: cancel any previously running bridge relay
+    /// and return the cancel handle for the new one. The TAP is point-to-point,
+    /// so the newest bridge wins and the old relay stops touching the device.
+    fn supersede_bridge(&self) -> Arc<Notify> {
+        let cancel = Arc::new(Notify::new());
+        if let Some(prev) = self.bridge_cancel.lock().unwrap().replace(cancel.clone()) {
+            prev.notify_one();
+        }
+        cancel
+    }
 }
 
 impl Server {
@@ -68,7 +87,12 @@ pub async fn run(
     secret: String,
     tcp_ports: Vec<u16>,
     udp_ports: Vec<u16>,
+    tap: Option<TapConfig>,
 ) -> Result<()> {
+    let tap = match &tap {
+        Some(cfg) => Some(Arc::new(TapDevice::open(cfg)?)),
+        None => None,
+    };
     let srv = Arc::new(Server {
         psk: crate::noise::derive_psk(&secret),
         next_id: Mutex::new(1),
@@ -76,6 +100,8 @@ pub async fn run(
         udp_pending: Mutex::new(HashMap::new()),
         control_tx: Mutex::new(None),
         active_transport: Mutex::new(ActiveTransport::Tcp),
+        tap,
+        bridge_cancel: Mutex::new(None),
     });
 
     for port in tcp_ports {
@@ -155,6 +181,13 @@ pub(crate) async fn serve_stream(
             Ok(())
         }
         Msg::Data { id } => {
+            if id == BRIDGE_ID {
+                if let Some(tap) = srv.tap.clone() {
+                    let cancel = srv.supersede_bridge();
+                    bridge::tap_stream(tap, r, w, cancel).await;
+                }
+                return Ok(());
+            }
             if let Some(tx) = srv.pending.lock().unwrap().remove(&id) {
                 let _ = tx.send((r, w));
             }
@@ -239,7 +272,14 @@ async fn udp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
                     .unwrap()
                     .insert(id, (socket.clone(), src, drx));
                 if ctl
-                    .try_send(Msg::Open { proto: Proto::Udp, port, id }.encode())
+                    .try_send(
+                        Msg::Open {
+                            proto: Proto::Udp,
+                            port,
+                            id,
+                        }
+                        .encode(),
+                    )
                     .is_err()
                 {
                     srv.udp_pending.lock().unwrap().remove(&id);
@@ -283,7 +323,11 @@ async fn udp_control_listener(srv: Arc<Server>, bind: String, port: u16) -> Resu
                 let psk = srv.psk;
                 tokio::spawn(async move {
                     if let Ok((id, noise)) = server_handshake_stateless(stream, &psk).await {
-                        accept_udp_forward(srv, sess2, conv, id, noise).await;
+                        if conv == BRIDGE_CONV {
+                            accept_bridge(srv, sess2, conv, noise).await;
+                        } else {
+                            accept_udp_forward(srv, sess2, conv, id, noise).await;
+                        }
                     }
                 });
             }
@@ -316,4 +360,18 @@ async fn accept_udp_forward(
 
 fn take_udp_pending(srv: &Server, id: u64) -> Option<UdpPending> {
     srv.udp_pending.lock().unwrap().remove(&id)
+}
+
+/// Run the L2 bridge over the UDP datagram channel against the server's TAP. The
+/// bridge setup conv carries the fixed `BRIDGE_CONV`, also used as the datagram tag.
+async fn accept_bridge(srv: Arc<Server>, sess: Arc<Session>, conv: u32, noise: StatelessNoise) {
+    let Some(tap) = srv.tap.clone() else {
+        return;
+    };
+    let cancel = srv.supersede_bridge();
+    let noise = Arc::new(noise);
+    let inbound = sess.register_dgram(conv);
+    let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
+    let rx = DgramRx::new(inbound, noise);
+    bridge::tap_dgram(tap, rx, tx, cancel).await;
 }

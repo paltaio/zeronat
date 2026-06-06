@@ -18,6 +18,15 @@ pub const KCP_MTU: usize = 1350;
 /// an already-open stream conv.
 pub const SETUP_CONV_BIT: u32 = 0x8000_0000;
 
+/// Fixed conv id for the L2 bridge setup conv over UDP. Uses `SETUP_CONV_BIT`
+/// with zero low bits; auto-allocated stream convs start at 1 and UDP-forward
+/// setup convs derive from ids that also start at 1, so this value never
+/// collides with either.
+pub const BRIDGE_CONV: u32 = SETUP_CONV_BIT;
+
+/// Reserved stream id marking the L2 bridge data stream over the TCP fallback.
+pub const BRIDGE_ID: u64 = u64::MAX;
+
 const SOCKET_SEND_CAP: usize = 1024;
 const APP_CHAN_CAP: usize = 256;
 
@@ -51,7 +60,11 @@ fn new_kcp(conv: u32, tx: mpsc::Sender<Vec<u8>>, class: u8) -> Kcp<ChannelWriter
 }
 
 /// Drains the socket-sender channel to the single per-session peer address.
-async fn socket_writer(socket: Arc<UdpSocket>, peer: std::net::SocketAddr, mut rx: mpsc::Receiver<Vec<u8>>) {
+async fn socket_writer(
+    socket: Arc<UdpSocket>,
+    peer: std::net::SocketAddr,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+) {
     while let Some(pkt) = rx.recv().await {
         let _ = socket.send_to(&pkt, peer).await;
     }
@@ -59,9 +72,9 @@ async fn socket_writer(socket: Arc<UdpSocket>, peer: std::net::SocketAddr, mut r
 
 /// Channels connecting a `KcpStream` to its driver task.
 struct ConvChannels {
-    inbound_rx: mpsc::Receiver<Vec<u8>>,   // KCP packets (class byte stripped)
-    write_rx: mpsc::Receiver<Vec<u8>>,     // app bytes to send
-    read_tx: mpsc::Sender<Vec<u8>>,        // decoded app bytes out (empty Vec => EOF not used; closing the channel signals EOF)
+    inbound_rx: mpsc::Receiver<Vec<u8>>, // KCP packets (class byte stripped)
+    write_rx: mpsc::Receiver<Vec<u8>>,   // app bytes to send
+    read_tx: mpsc::Sender<Vec<u8>>, // decoded app bytes out (empty Vec => EOF not used; closing the channel signals EOF)
 }
 
 async fn drive_conv(mut kcp: Kcp<ChannelWriter>, mut ch: ConvChannels) {
@@ -103,7 +116,12 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc::{OwnedPermit, Sender};
 
-type ReserveFut = Pin<Box<dyn Future<Output = Result<OwnedPermit<Vec<u8>>, tokio::sync::mpsc::error::SendError<()>>> + Send>>;
+type ReserveFut = Pin<
+    Box<
+        dyn Future<Output = Result<OwnedPermit<Vec<u8>>, tokio::sync::mpsc::error::SendError<()>>>
+            + Send,
+    >,
+>;
 
 pub struct KcpStream {
     write_tx: Sender<Vec<u8>>,
@@ -115,12 +133,22 @@ pub struct KcpStream {
 
 impl KcpStream {
     pub fn new(write_tx: Sender<Vec<u8>>, read_rx: mpsc::Receiver<Vec<u8>>) -> Self {
-        KcpStream { write_tx, read_rx, read_buf: Vec::new(), read_pos: 0, reserve: None }
+        KcpStream {
+            write_tx,
+            read_rx,
+            read_buf: Vec::new(),
+            read_pos: 0,
+            reserve: None,
+        }
     }
 }
 
 impl AsyncRead for KcpStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         if self.read_pos >= self.read_buf.len() {
             match self.read_rx.poll_recv(cx) {
                 Poll::Ready(Some(chunk)) => {
@@ -139,7 +167,11 @@ impl AsyncRead for KcpStream {
 }
 
 impl AsyncWrite for KcpStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         loop {
             if let Some(fut) = self.reserve.as_mut() {
                 return match fut.as_mut().poll(cx) {
@@ -148,7 +180,9 @@ impl AsyncWrite for KcpStream {
                         self.reserve = None;
                         Poll::Ready(Ok(buf.len()))
                     }
-                    Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe))),
+                    Poll::Ready(Err(_)) => {
+                        Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+                    }
                     Poll::Pending => Poll::Pending,
                 };
             }
@@ -171,8 +205,8 @@ use std::sync::Mutex;
 /// Shared per-(socket,peer) multiplexing state.
 pub struct Session {
     send_tx: mpsc::Sender<Vec<u8>>,
-    convs: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,   // conv id -> inbound packets
-    dgrams: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,  // tag -> [nonce][ct] bodies
+    convs: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>, // conv id -> inbound packets
+    dgrams: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>, // tag -> [nonce][ct] bodies
     next_conv: Mutex<u32>,
 }
 
@@ -183,7 +217,14 @@ impl Session {
         let (read_tx, read_rx) = mpsc::channel(APP_CHAN_CAP);
         self.convs.lock().unwrap().insert(conv, inbound_tx);
         let kcp = new_kcp(conv, self.send_tx.clone(), class);
-        tokio::spawn(drive_conv(kcp, ConvChannels { inbound_rx, write_rx, read_tx }));
+        tokio::spawn(drive_conv(
+            kcp,
+            ConvChannels {
+                inbound_rx,
+                write_rx,
+                read_tx,
+            },
+        ));
         KcpStream::new(write_tx, read_rx)
     }
 
@@ -330,7 +371,10 @@ mod tests {
         let (_conv, stream) = cli.open_conv(CLASS_KCP);
         let (mut r, mut w) = client_handshake(stream, &psk).await.unwrap();
         w.send(b"over-kcp").await.unwrap();
-        let got = tokio::time::timeout(Duration::from_secs(5), r.recv()).await.unwrap().unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), r.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got, b"over-kcp");
 
         srv_run.abort();

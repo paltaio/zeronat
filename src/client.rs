@@ -5,15 +5,19 @@ use std::time::Duration;
 
 use crate::Result;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout as tokio_timeout;
 use tokio::time::{interval, sleep};
 
 use crate::bridge;
 use crate::dgram::{DgramRx, DgramTx};
-use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT};
+use crate::kcp::{
+    route, session as kcp_session, Session, BRIDGE_CONV, BRIDGE_ID, CLASS_KCP, CLASS_SETUP,
+    SETUP_CONV_BIT,
+};
 use crate::noise::{client_handshake, client_handshake_stateless};
 use crate::proto::{Msg, Proto};
+use crate::tap::{TapConfig, TapDevice};
 
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 const RETRY_DELAY: Duration = Duration::from_secs(3);
@@ -46,6 +50,7 @@ pub async fn run(
     tcp: Vec<(u16, String)>,
     udp: Vec<(u16, String)>,
     transport: Transport,
+    tap: Option<TapConfig>,
 ) -> Result<()> {
     let client = Arc::new(Client {
         server,
@@ -55,6 +60,16 @@ pub async fn run(
         transport,
     });
 
+    if let Some(cfg) = tap {
+        let tap = Arc::new(TapDevice::open(&cfg)?);
+        loop {
+            if let Err(e) = bridge_session(client.clone(), tap.clone()).await {
+                eprintln!("bridge connection lost: {e}");
+            }
+            sleep(RETRY_DELAY).await;
+        }
+    }
+
     loop {
         if let Err(e) = session(client.clone()).await {
             eprintln!("control connection lost: {e}");
@@ -63,9 +78,26 @@ pub async fn run(
     }
 }
 
-/// Establish the control channel over UDP/KCP. Returns the session and the
-/// handshaked control reader/writer, or an error to trigger TCP fallback.
-async fn udp_session(client: Arc<Client>) -> Result<(Arc<Session>, crate::noise::Noise)> {
+/// Bring up the L2 bridge: UDP first for Auto/Udp, TCP otherwise or as fallback.
+async fn bridge_session(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
+    if client.transport == Transport::Tcp {
+        return bridge_tcp(client, tap).await;
+    }
+    match bridge_udp(client.clone(), tap.clone()).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if client.transport == Transport::Udp {
+                return Err(e);
+            }
+            eprintln!("udp transport unavailable ({e}); falling back to tcp");
+            bridge_tcp(client, tap).await
+        }
+    }
+}
+
+/// Bind a local UDP socket, connect it to the server, start the KCP session, and
+/// spawn the inbound RX pump. Shared by the control and bridge UDP paths.
+async fn udp_connect(client: &Client) -> Result<Arc<Session>> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let server: SocketAddr = client
         .server
@@ -73,11 +105,8 @@ async fn udp_session(client: Arc<Client>) -> Result<(Arc<Session>, crate::noise:
         .map_err(|_| -> crate::Error { "server must be host:port for UDP".into() })?;
     socket.connect(server).await?;
     let sess = kcp_session(socket.clone(), server, 1);
-
-    // RX pump: route every inbound datagram.
     {
         let sess = sess.clone();
-        let socket = socket.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             while let Ok(n) = socket.recv(&mut buf).await {
@@ -85,7 +114,47 @@ async fn udp_session(client: Arc<Client>) -> Result<(Arc<Session>, crate::noise:
             }
         });
     }
+    Ok(sess)
+}
 
+/// L2 bridge over the UDP transport: frames ride the unreliable datagram channel.
+async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
+    let sess = udp_connect(&client).await?;
+    let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
+    let noise = tokio_timeout(
+        UDP_HANDSHAKE_TIMEOUT,
+        client_handshake_stateless(stream, &client.psk, BRIDGE_ID),
+    )
+    .await
+    .map_err(|_| -> crate::Error { "udp handshake timed out".into() })??;
+    eprintln!("bridge connected to {} over udp", client.server);
+
+    let noise = Arc::new(noise);
+    let inbound = sess.register_dgram(BRIDGE_CONV);
+    let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
+    let rx = DgramRx::new(inbound, noise);
+    // The client runs one bridge at a time, so nothing ever cancels it.
+    bridge::tap_dgram(tap, rx, tx, Arc::new(Notify::new())).await;
+    Ok(())
+}
+
+/// L2 bridge over the TCP fallback: frames ride a reliable Noise stream.
+async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
+    let sock = TcpStream::connect(&client.server)
+        .await
+        .map_err(|e| -> crate::Error { format!("connecting to {}: {e}", client.server).into() })?;
+    sock.set_nodelay(true).ok();
+    let (nr, mut nw) = client_handshake(sock, &client.psk).await?;
+    nw.send(&Msg::Data { id: BRIDGE_ID }.encode()).await?;
+    eprintln!("bridge connected to {} over tcp", client.server);
+    bridge::tap_stream(tap, nr, nw, Arc::new(Notify::new())).await;
+    Ok(())
+}
+
+/// Establish the control channel over UDP/KCP. Returns the session and the
+/// handshaked control reader/writer, or an error to trigger TCP fallback.
+async fn udp_session(client: Arc<Client>) -> Result<(Arc<Session>, crate::noise::Noise)> {
+    let sess = udp_connect(&client).await?;
     let (_conv, stream) = sess.open_conv(CLASS_KCP);
     let noise = tokio_timeout(UDP_HANDSHAKE_TIMEOUT, client_handshake(stream, &client.psk))
         .await
@@ -203,7 +272,9 @@ async fn handle_open(
         Proto::Tcp => client.tcp.get(&port),
         Proto::Udp => client.udp.get(&port),
     }
-    .ok_or_else(|| -> crate::Error { format!("no local target configured for {proto:?} :{port}").into() })?
+    .ok_or_else(|| -> crate::Error {
+        format!("no local target configured for {proto:?} :{port}").into()
+    })?
     .clone();
 
     match (link.as_ref(), proto) {
@@ -215,7 +286,9 @@ async fn handle_open(
             nw.send(&Msg::Data { id }.encode()).await?;
             let local = TcpStream::connect(&target)
                 .await
-                .map_err(|e| -> crate::Error { format!("connecting to local {target}: {e}").into() })?;
+                .map_err(|e| -> crate::Error {
+                    format!("connecting to local {target}: {e}").into()
+                })?;
             bridge::tcp(local, nr, nw).await;
         }
         (Link::Tcp, Proto::Udp) => {
@@ -224,10 +297,9 @@ async fn handle_open(
             let (nr, mut nw) = client_handshake(sock, &client.psk).await?;
             nw.send(&Msg::Data { id }.encode()).await?;
             let local = UdpSocket::bind("0.0.0.0:0").await?;
-            local
-                .connect(&target)
-                .await
-                .map_err(|e| -> crate::Error { format!("connecting to local {target}: {e}").into() })?;
+            local.connect(&target).await.map_err(|e| -> crate::Error {
+                format!("connecting to local {target}: {e}").into()
+            })?;
             bridge::udp_client(local, nr, nw).await;
         }
         // --- UDP transport ---
@@ -237,7 +309,9 @@ async fn handle_open(
             nw.send(&Msg::Data { id }.encode()).await?;
             let local = TcpStream::connect(&target)
                 .await
-                .map_err(|e| -> crate::Error { format!("connecting to local {target}: {e}").into() })?;
+                .map_err(|e| -> crate::Error {
+                    format!("connecting to local {target}: {e}").into()
+                })?;
             bridge::tcp(local, nr, nw).await;
         }
         (Link::Udp(sess), Proto::Udp) => {
@@ -245,10 +319,9 @@ async fn handle_open(
             let stream = sess.open_conv_with(CLASS_SETUP, conv);
             let noise = Arc::new(client_handshake_stateless(stream, &client.psk, id).await?);
             let local = UdpSocket::bind("0.0.0.0:0").await?;
-            local
-                .connect(&target)
-                .await
-                .map_err(|e| -> crate::Error { format!("connecting to local {target}: {e}").into() })?;
+            local.connect(&target).await.map_err(|e| -> crate::Error {
+                format!("connecting to local {target}: {e}").into()
+            })?;
             let inbound = sess.register_dgram(conv);
             let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
             let rx = DgramRx::new(inbound, noise);

@@ -15,7 +15,11 @@ pub struct DgramTx {
 
 impl DgramTx {
     pub fn new(send_tx: mpsc::Sender<Vec<u8>>, tag: u32, noise: Arc<StatelessNoise>) -> Self {
-        DgramTx { send_tx, tag, noise }
+        DgramTx {
+            send_tx,
+            tag,
+            noise,
+        }
     }
 
     pub async fn send(&self, plaintext: &[u8]) -> Result<()> {

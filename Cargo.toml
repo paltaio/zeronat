@@ -1,6 +1,6 @@
 [package]
 name = "zeronat"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 
@@ -12,6 +12,7 @@ blake2 = { version = "0.10", default-features = false }
 hmac = "0.12"
 kcp = { version = "0.6", default-features = false }
 getrandom = "~0.2"
+libc = "0.2"
 
 [dev-dependencies]
 snow = "0.9"

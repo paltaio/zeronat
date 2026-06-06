@@ -32,6 +32,20 @@ ZERONAT_SECRET=somelongsecret zeronat client \
 
 `--tcp 443` maps to `127.0.0.1:443`. Remap with `--tcp 443:127.0.0.1:8443` or point elsewhere with `--tcp 443:10.0.0.5:443`. `--udp` works the same way. The secret can be passed with `--secret` instead of the env var. The client picks the transport with `--transport auto|udp|tcp` (default `auto`). Open the control port (2222 UDP and TCP) on the server's firewall.
 
+## L2 bridge (TAP)
+
+`--tap` relays raw Ethernet frames over the tunnel, joining a TAP on each end into one L2 segment. Carries anything Ethernet, including PPPoE. Both ends need `--tap`; it cannot be combined with `--tcp`/`--udp`.
+
+```bash
+# Near the target segment (e.g. the PPPoE concentrator):
+ZERONAT_SECRET=s zeronat server --control 2222 --tap zn0 --bridge br0
+# Behind CG-NAT, then run e.g. pppd on zn0:
+ZERONAT_SECRET=s zeronat client --server <public-ip>:2222 --tap zn0
+pppd plugin rp-pppoe.so zn0 user <user>
+```
+
+`--bridge <name>` enslaves the TAP to an existing bridge; `--tap-mtu <n>` sets the MTU (default 1400). Needs `CAP_NET_ADMIN`: root, `setcap cap_net_admin+ep zeronat`, or Docker `--cap-add NET_ADMIN --device /dev/net/tun` (plus `--device /dev/ppp` for pppd).
+
 ## Build
 
 ```bash

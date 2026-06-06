@@ -53,10 +53,7 @@ fn hkdf2(ck: &[u8; HASHLEN], ikm: &[u8]) -> ([u8; HASHLEN], [u8; HASHLEN]) {
     (o1, o2)
 }
 
-fn hkdf3(
-    ck: &[u8; HASHLEN],
-    ikm: &[u8],
-) -> ([u8; HASHLEN], [u8; HASHLEN], [u8; HASHLEN]) {
+fn hkdf3(ck: &[u8; HASHLEN], ikm: &[u8]) -> ([u8; HASHLEN], [u8; HASHLEN], [u8; HASHLEN]) {
     let temp = hmac(ck, ikm);
     let o1 = hmac(&temp, &[0x01]);
     let mut msg2 = [0u8; HASHLEN + 1];
@@ -182,11 +179,7 @@ struct Keys {
 }
 
 /// Run the NNpsk0 initiator handshake to completion over `stream`.
-async fn run_initiator<S>(
-    stream: &mut S,
-    psk: &[u8; 32],
-    payload1: &[u8],
-) -> Result<Keys>
+async fn run_initiator<S>(stream: &mut S, psk: &[u8; 32], payload1: &[u8]) -> Result<Keys>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -512,7 +505,7 @@ mod tests {
         cw.send(&big).await.unwrap();
         assert_eq!(sr.recv().await.unwrap(), b"ping");
         assert_eq!(sr.recv().await.unwrap().len(), 65519); // first chunk
-        // server -> client
+                                                           // server -> client
         sw.send(b"pong").await.unwrap();
         assert_eq!(cr.recv().await.unwrap(), b"pong");
     }

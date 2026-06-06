@@ -71,6 +71,7 @@ async fn run_tunnel_test(transport: zeronat::client::Transport) {
         SECRET.into(),
         vec![public_tcp],
         vec![public_udp],
+        None,
     ));
 
     // Client dialing out, mapping public ports to the local echo services.
@@ -80,6 +81,7 @@ async fn run_tunnel_test(transport: zeronat::client::Transport) {
         vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
         vec![(public_udp, format!("127.0.0.1:{local_udp}"))],
         transport,
+        None,
     ));
 
     let body = async {
