@@ -82,10 +82,12 @@ jobs:
         with:
           components: rust-src
 
+      # zig 0.16 ships the FreeBSD system-library stubs (execinfo, kvm, ...) that
+      # std links; older zig fails to find them at link time.
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.13.0
+          version: 0.16.0
 
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@v2
