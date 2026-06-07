@@ -110,8 +110,52 @@ jobs:
           path: out/zeronat
           if-no-files-found: error
 
+  windows:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install clang and lld
+        run: sudo apt-get update && sudo apt-get install -y clang llvm lld
+
+      - name: Install cargo-xwin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+
+      # Windows requires unwind tables, so -Cforce-unwind-tables=no is omitted here.
+      - name: Build
+        env:
+          XWIN_ACCEPT_LICENSE: "1"
+          RUSTFLAGS: '-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort --cfg curve25519_dalek_backend="serial"'
+        run: |
+          cargo xwin build --release --locked \
+            -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
+            --target ${{ matrix.target }}
+
+      - name: Package
+        run: install -D "target/${{ matrix.target }}/release/zeronat.exe" "out/zeronat.exe"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: out/zeronat.exe
+          if-no-files-found: error
+
   release:
-    needs: [binaries, freebsd]
+    needs: [binaries, freebsd, windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -123,7 +167,12 @@ jobs:
         run: |
           mkdir -p out
           for d in artifacts/bin-*; do
-            install -m 0755 "$d/zeronat" "out/zeronat-${d#artifacts/bin-}"
+            name="${d#artifacts/bin-}"
+            if [ -f "$d/zeronat.exe" ]; then
+              install -m 0755 "$d/zeronat.exe" "out/zeronat-${name}.exe"
+            else
+              install -m 0755 "$d/zeronat" "out/zeronat-${name}"
+            fi
           done
       - uses: softprops/action-gh-release@v2
         with:
