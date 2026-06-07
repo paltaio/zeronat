@@ -157,13 +157,30 @@ pub async fn announce_loop(secret: &str, announce_ip: Option<Ipv4Addr>, port: u1
     }
 }
 
+fn cache_dir() -> Option<PathBuf> {
+    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
+        if !x.is_empty() {
+            return Some(PathBuf::from(x));
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(x) = std::env::var("LOCALAPPDATA") {
+        if !x.is_empty() {
+            return Some(PathBuf::from(x));
+        }
+    }
+    #[cfg(not(windows))]
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return Some(PathBuf::from(home).join(".cache"));
+        }
+    }
+    None
+}
+
 fn cache_file(id: &Identity) -> Option<PathBuf> {
-    let dir = match std::env::var("XDG_CACHE_HOME") {
-        Ok(x) if !x.is_empty() => PathBuf::from(x),
-        _ => PathBuf::from(std::env::var("HOME").ok()?).join(".cache"),
-    };
     let name: String = id.target.iter().map(|b| format!("{b:02x}")).collect();
-    Some(dir.join("zeronat").join(name))
+    Some(cache_dir()?.join("zeronat").join(name))
 }
 
 /// Last-known server address, if cached. Lets a reconnect skip the DHT.

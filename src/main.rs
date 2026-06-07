@@ -305,6 +305,7 @@ async fn main() -> Result<()> {
 /// Resolve on the first SIGTERM or SIGINT so the process exits promptly when a
 /// supervisor (Docker, systemd) stops it, including when it runs as PID 1 where
 /// the default signal disposition does not apply.
+#[cfg(unix)]
 async fn shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
     let (mut term, mut int) = match (
@@ -317,6 +318,26 @@ async fn shutdown() {
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
+    }
+}
+
+/// Resolve on Ctrl-C or a console break/close so a supervisor can stop the
+/// process promptly on Windows.
+#[cfg(windows)]
+async fn shutdown() {
+    use tokio::signal::windows;
+    let (mut cc, mut cb, mut cl) = match (
+        windows::ctrl_c(),
+        windows::ctrl_break(),
+        windows::ctrl_close(),
+    ) {
+        (Ok(cc), Ok(cb), Ok(cl)) => (cc, cb, cl),
+        _ => return std::future::pending().await,
+    };
+    tokio::select! {
+        _ = cc.recv() => {}
+        _ = cb.recv() => {}
+        _ = cl.recv() => {}
     }
 }
 
