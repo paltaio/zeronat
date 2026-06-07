@@ -4,11 +4,14 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
+#[cfg(target_os = "linux")]
+use tokio::sync::Notify;
 use tokio::time::timeout;
 
 use crate::dgram::{DgramRx, DgramTx};
 use crate::noise::{NoiseReader, NoiseWriter};
+#[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
 
 const TCP_BUF: usize = 16 * 1024;
@@ -105,6 +108,7 @@ pub async fn udp_server(
 /// Relay Ethernet frames between a TAP device and the unreliable datagram
 /// channel (UDP transport). Returns when either side fails or `cancel` fires
 /// (a newer bridge superseding this one).
+#[cfg(target_os = "linux")]
 pub async fn tap_dgram(tap: Arc<TapDevice>, mut rx: DgramRx, tx: DgramTx, cancel: Arc<Notify>) {
     loop {
         tokio::select! {
@@ -124,6 +128,7 @@ pub async fn tap_dgram(tap: Arc<TapDevice>, mut rx: DgramRx, tx: DgramTx, cancel
 /// Relay Ethernet frames between a TAP device and a reliable Noise stream (TCP
 /// fallback). Each `send`/`recv` is one record, so frame boundaries are
 /// preserved. Returns when either side closes or `cancel` fires.
+#[cfg(target_os = "linux")]
 pub async fn tap_stream(
     tap: Arc<TapDevice>,
     mut nr: NoiseReader,

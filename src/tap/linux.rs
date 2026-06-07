@@ -3,6 +3,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use tokio::io::unix::AsyncFd;
 
+use super::TapConfig;
 use crate::Result;
 
 // `_IOW('T', 202, int)`. MIPS uses a different `_IOC` direction encoding than the
@@ -21,13 +22,6 @@ const SIOCBRADDIF: u64 = 0x89a2;
 
 const IFF_TAP: i16 = 0x0002;
 const IFF_NO_PI: i16 = 0x1000;
-
-/// Bridge-mode configuration parsed from the CLI.
-pub struct TapConfig {
-    pub name: String,
-    pub mtu: usize,
-    pub bridge: Option<String>,
-}
 
 /// Userspace mirror of `struct ifreq`. The name is 16 bytes; the `ifru` union is
 /// sized for the largest 64-bit member (24 bytes). Oversizing relative to the

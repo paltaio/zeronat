@@ -5,15 +5,21 @@ use std::time::Duration;
 
 use crate::Result;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, oneshot, Notify};
+#[cfg(target_os = "linux")]
+use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::bridge;
 use crate::dgram::{DgramRx, DgramTx};
-use crate::kcp::{route, session, Accepted, Session, BRIDGE_CONV, BRIDGE_ID};
+use crate::kcp::{route, session, Accepted, Session};
+#[cfg(target_os = "linux")]
+use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{server_handshake, server_handshake_stateless, Noise, StatelessNoise};
 use crate::proto::{Msg, Proto};
-use crate::tap::{TapConfig, TapDevice};
+use crate::tap::TapConfig;
+#[cfg(target_os = "linux")]
+use crate::tap::TapDevice;
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -35,10 +41,13 @@ pub(crate) struct Server {
     udp_pending: Mutex<HashMap<u64, UdpPending>>,
     control_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     active_transport: Mutex<ActiveTransport>,
+    #[cfg(target_os = "linux")]
     tap: Option<Arc<TapDevice>>,
+    #[cfg(target_os = "linux")]
     bridge_cancel: Mutex<Option<Arc<Notify>>>,
 }
 
+#[cfg(target_os = "linux")]
 impl Server {
     /// Take ownership of the bridge: cancel any previously running bridge relay
     /// and return the cancel handle for the new one. The TAP is point-to-point,
@@ -97,10 +106,15 @@ pub async fn run(
     tap: Option<TapConfig>,
     dht: Option<DhtAnnounce>,
 ) -> Result<()> {
+    #[cfg(target_os = "linux")]
     let tap = match &tap {
         Some(cfg) => Some(Arc::new(TapDevice::open(cfg)?)),
         None => None,
     };
+    #[cfg(not(target_os = "linux"))]
+    if tap.is_some() {
+        return Err("L2 TAP bridge (--tap) is only supported on Linux".into());
+    }
 
     if let Some(ann) = dht {
         #[cfg(feature = "dht")]
@@ -126,7 +140,9 @@ pub async fn run(
         udp_pending: Mutex::new(HashMap::new()),
         control_tx: Mutex::new(None),
         active_transport: Mutex::new(ActiveTransport::Tcp),
+        #[cfg(target_os = "linux")]
         tap,
+        #[cfg(target_os = "linux")]
         bridge_cancel: Mutex::new(None),
     });
 
@@ -207,6 +223,7 @@ pub(crate) async fn serve_stream(
             Ok(())
         }
         Msg::Data { id } => {
+            #[cfg(target_os = "linux")]
             if id == BRIDGE_ID {
                 if let Some(tap) = srv.tap.clone() {
                     let cancel = srv.supersede_bridge();
@@ -349,11 +366,14 @@ async fn udp_control_listener(srv: Arc<Server>, bind: String, port: u16) -> Resu
                 let psk = srv.psk;
                 tokio::spawn(async move {
                     if let Ok((id, noise)) = server_handshake_stateless(stream, &psk).await {
+                        #[cfg(target_os = "linux")]
                         if conv == BRIDGE_CONV {
                             accept_bridge(srv, sess2, conv, noise).await;
                         } else {
                             accept_udp_forward(srv, sess2, conv, id, noise).await;
                         }
+                        #[cfg(not(target_os = "linux"))]
+                        accept_udp_forward(srv, sess2, conv, id, noise).await;
                     }
                 });
             }
@@ -390,6 +410,7 @@ fn take_udp_pending(srv: &Server, id: u64) -> Option<UdpPending> {
 
 /// Run the L2 bridge over the UDP datagram channel against the server's TAP. The
 /// bridge setup conv carries the fixed `BRIDGE_CONV`, also used as the datagram tag.
+#[cfg(target_os = "linux")]
 async fn accept_bridge(srv: Arc<Server>, sess: Arc<Session>, conv: u32, noise: StatelessNoise) {
     let Some(tap) = srv.tap.clone() else {
         return;

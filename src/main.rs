@@ -18,7 +18,7 @@ server options:
   --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
   --tcp <PORT>        Public TCP port to expose (repeatable)
   --udp <PORT>        Public UDP port to expose (repeatable)
-  --tap <NAME>        L2 bridge mode: create/attach this TAP device
+  --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
   --tap-mtu <N>       TAP MTU (default: 1400)
   --bridge <NAME>     Enslave the TAP to this existing bridge
   --server dht        Publish this server's address to the DHT for discovery
@@ -31,7 +31,7 @@ client options:
   --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
   --udp <SPEC>        Forward UDP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
   --transport <MODE>  auto|udp|tcp (default: auto)
-  --tap <NAME>        L2 bridge mode: create/attach this TAP device
+  --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
   --tap-mtu <N>       TAP MTU (default: 1400)
   --bridge <NAME>     Enslave the TAP to this existing bridge
 

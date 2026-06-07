@@ -5,19 +5,22 @@ use std::time::Duration;
 
 use crate::Result;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
+#[cfg(target_os = "linux")]
+use tokio::sync::Notify;
 use tokio::time::timeout as tokio_timeout;
 use tokio::time::{interval, sleep};
 
 use crate::bridge;
 use crate::dgram::{DgramRx, DgramTx};
-use crate::kcp::{
-    route, session as kcp_session, Session, BRIDGE_CONV, BRIDGE_ID, CLASS_KCP, CLASS_SETUP,
-    SETUP_CONV_BIT,
-};
+use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT};
+#[cfg(target_os = "linux")]
+use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{client_handshake, client_handshake_stateless};
 use crate::proto::{Msg, Proto};
-use crate::tap::{TapConfig, TapDevice};
+use crate::tap::TapConfig;
+#[cfg(target_os = "linux")]
+use crate::tap::TapDevice;
 
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 const RETRY_DELAY: Duration = Duration::from_secs(3);
@@ -109,10 +112,15 @@ pub async fn run(
     let tcp: HashMap<u16, String> = tcp.into_iter().collect();
     let udp: HashMap<u16, String> = udp.into_iter().collect();
     let discovery = Discovery::new(&server, &secret)?;
+    #[cfg(target_os = "linux")]
     let tap = match tap {
         Some(cfg) => Some(Arc::new(TapDevice::open(&cfg)?)),
         None => None,
     };
+    #[cfg(not(target_os = "linux"))]
+    if tap.is_some() {
+        return Err("L2 TAP bridge (--tap) is only supported on Linux".into());
+    }
 
     loop {
         let addr = match discovery.resolve().await {
@@ -130,10 +138,13 @@ pub async fn run(
             udp: udp.clone(),
             transport,
         });
+        #[cfg(target_os = "linux")]
         let result = match &tap {
             Some(tap) => bridge_session(client.clone(), tap.clone()).await,
             None => session(client.clone()).await,
         };
+        #[cfg(not(target_os = "linux"))]
+        let result = session(client.clone()).await;
         if let Err(e) = result {
             eprintln!("connection lost: {e}");
             discovery.invalidate();
@@ -143,6 +154,7 @@ pub async fn run(
 }
 
 /// Bring up the L2 bridge: UDP first for Auto/Udp, TCP otherwise or as fallback.
+#[cfg(target_os = "linux")]
 async fn bridge_session(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
     if client.transport == Transport::Tcp {
         return bridge_tcp(client, tap).await;
@@ -182,6 +194,7 @@ async fn udp_connect(client: &Client) -> Result<Arc<Session>> {
 }
 
 /// L2 bridge over the UDP transport: frames ride the unreliable datagram channel.
+#[cfg(target_os = "linux")]
 async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
     let sess = udp_connect(&client).await?;
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
@@ -203,6 +216,7 @@ async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
 }
 
 /// L2 bridge over the TCP fallback: frames ride a reliable Noise stream.
+#[cfg(target_os = "linux")]
 async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
     let sock = TcpStream::connect(&client.server)
         .await
