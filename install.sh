@@ -8,6 +8,12 @@
 #   --control PORT           tunnel control port (default 2222)
 #   --secret SECRET          shared secret (default: generated)
 #   --server-addr HOST[:PORT] (client only) where the server is reachable
+#   --dht                    find the server over the DHT instead of a fixed address
+#   --announce-ip IP         (server, with --dht) public IPv4 to announce
+#   --announce-port PORT     (server, with --dht) public port to announce
+#   --tap NAME               L2 bridge instead of ports: relay raw Ethernet (Linux)
+#   --bridge NAME            (with --tap) enslave the TAP to this existing bridge
+#   --tap-mtu N              (with --tap) TAP MTU (default 1400)
 #   -y, --yes                no prompts; fail if a required value is missing
 #   -h, --help
 #
@@ -25,6 +31,7 @@ BIN_PATH="/usr/local/bin/zeronat"
 UNIT="/etc/systemd/system/zeronat.service"
 
 MODE=""; METHOD=""; DEPLOY=""; SECRET=""; CONTROL="2222"; PORTS=""; SERVER_ADDR=""; ASSUME_YES=""
+USE_DHT=""; ANNOUNCE_IP=""; ANNOUNCE_PORT=""; TAP=""; BRIDGE=""; TAP_MTU=""; KIND=""
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
@@ -44,10 +51,16 @@ zeronat installer
   --control PORT            tunnel control port (default 2222)
   --secret SECRET           shared secret (default: generated)
   --server-addr HOST[:PORT] (client only) where the server is reachable
+  --dht                     find the server over the DHT (dynamic IP, no fixed address)
+  --announce-ip IP          (server, with --dht) public IPv4 to announce
+  --announce-port PORT      (server, with --dht) public port to announce
+  --tap NAME                L2 bridge instead of ports: relay raw Ethernet/PPPoE (Linux)
+  --bridge NAME             (with --tap) enslave the TAP to this existing bridge
+  --tap-mtu N               (with --tap) TAP MTU (default 1400)
   -y, --yes                 no prompts; fail if a required value is missing
   -h, --help
 
-With no options it runs interactively.
+With no options it runs interactively. Ports and --tap are mutually exclusive.
 EOF
 }
 
@@ -104,6 +117,12 @@ while [ $# -gt 0 ]; do
     --control) CONTROL="${2:-}"; shift ;;
     --ports) PORTS="${2:-}"; shift ;;
     --server-addr|--addr) SERVER_ADDR="${2:-}"; shift ;;
+    --dht) USE_DHT=1 ;;
+    --announce-ip) ANNOUNCE_IP="${2:-}"; shift ;;
+    --announce-port) ANNOUNCE_PORT="${2:-}"; shift ;;
+    --tap) TAP="${2:-}"; shift ;;
+    --bridge) BRIDGE="${2:-}"; shift ;;
+    --tap-mtu) TAP_MTU="${2:-}"; shift ;;
     -y|--yes) ASSUME_YES=1 ;;
     -h|--help) usage; exit 0 ;;
     *) err "unknown option: $1 (try --help)" ;;
@@ -146,26 +165,56 @@ if [ "$METHOD" = docker ]; then
   fi
 fi
 
-# --- ports ------------------------------------------------------------------
-[ -z "$PORTS" ] && PORTS=$(prompt "Ports to forward, space separated as PORT/PROTO (e.g. 443/tcp 80/tcp 51820/udp)" "")
-[ -z "$PORTS" ] && err "no ports given"
-ZN_ARGS=""
-for p in $PORTS; do
-  num=${p%/*}; proto=${p#*/}
-  case "$num" in ''|*[!0-9]*) err "bad port in '$p'" ;; esac
-  case "$proto" in
-    tcp) ZN_ARGS="$ZN_ARGS --tcp $num" ;;
-    udp) ZN_ARGS="$ZN_ARGS --udp $num" ;;
-    *) err "bad protocol in '$p' (use tcp or udp)" ;;
-  esac
-done
+# --- tunnel kind: forward ports or bridge raw Ethernet (TAP) ----------------
+if [ -n "$TAP" ]; then KIND=bridge
+elif [ -n "$PORTS" ]; then KIND=ports
+else
+  _t=$(prompt "Tunnel [p]orts (TCP/UDP) or L2 [b]ridge (raw Ethernet/PPPoE, Linux only)?" "p")
+  case "$_t" in b|B|bridge) KIND=bridge; TAP=$(prompt "TAP device name" "zn0") ;; *) KIND=ports ;; esac
+fi
 
-# --- server address (client) ------------------------------------------------
+ZN_ARGS=""
+if [ "$KIND" = bridge ]; then
+  [ -z "$TAP" ] && err "no TAP device name given"
+  ZN_ARGS=" --tap $TAP"
+  [ -n "$BRIDGE" ] && ZN_ARGS="$ZN_ARGS --bridge $BRIDGE"
+  [ -n "$TAP_MTU" ] && ZN_ARGS="$ZN_ARGS --tap-mtu $TAP_MTU"
+else
+  [ -z "$PORTS" ] && PORTS=$(prompt "Ports to forward, space separated as PORT/PROTO (e.g. 443/tcp 80/tcp 51820/udp)" "")
+  [ -z "$PORTS" ] && err "no ports given"
+  for p in $PORTS; do
+    num=${p%/*}; proto=${p#*/}
+    case "$num" in ''|*[!0-9]*) err "bad port in '$p'" ;; esac
+    case "$proto" in
+      tcp) ZN_ARGS="$ZN_ARGS --tcp $num" ;;
+      udp) ZN_ARGS="$ZN_ARGS --udp $num" ;;
+      *) err "bad protocol in '$p' (use tcp or udp)" ;;
+    esac
+  done
+fi
+
+# L2 bridge needs /dev/net/tun and CAP_NET_ADMIN; the stock compose file grants
+# neither, so fall back to docker run, which requests them directly.
+if [ "$METHOD" = docker ] && [ "$DEPLOY" = compose ] && [ "$KIND" = bridge ]; then
+  say "L2 bridge needs extra device access; using docker run instead of compose."
+  DEPLOY=run
+fi
+
+# --- discovery: fixed address or DHT ----------------------------------------
 if [ "$MODE" = client ]; then
-  [ -z "$SERVER_ADDR" ] && SERVER_ADDR=$(prompt "Server address (HOST or HOST:PORT)" "")
-  [ -z "$SERVER_ADDR" ] && err "client needs --server-addr HOST[:PORT]"
-  case "$SERVER_ADDR" in *:*) ;; *) SERVER_ADDR="${SERVER_ADDR}:${CONTROL}" ;; esac
-  CONTROL=${SERVER_ADDR##*:}
+  if [ -z "$USE_DHT" ] && [ -z "$SERVER_ADDR" ]; then
+    _d=$(prompt "Find the server by [a]ddress or [d]ht discovery (dynamic IP)?" "a")
+    case "$_d" in d|D|dht) USE_DHT=1 ;; esac
+  fi
+  if [ -z "$USE_DHT" ]; then
+    [ -z "$SERVER_ADDR" ] && SERVER_ADDR=$(prompt "Server address (HOST or HOST:PORT)" "")
+    [ -z "$SERVER_ADDR" ] && err "client needs --server-addr HOST[:PORT] or --dht"
+    case "$SERVER_ADDR" in *:*) ;; *) SERVER_ADDR="${SERVER_ADDR}:${CONTROL}" ;; esac
+    CONTROL=${SERVER_ADDR##*:}
+  fi
+elif [ "$MODE" = server ] && [ -z "$USE_DHT" ]; then
+  _d=$(prompt "Also publish the address to the DHT for dynamic-IP discovery? (y/n)" "n")
+  case "$_d" in y|Y|yes) USE_DHT=1 ;; esac
 fi
 
 # --- secret -----------------------------------------------------------------
@@ -174,6 +223,13 @@ fi
 # --- subcommand -------------------------------------------------------------
 if [ "$MODE" = server ]; then
   SUBCMD="server --control $CONTROL$ZN_ARGS"
+  if [ -n "$USE_DHT" ]; then
+    SUBCMD="$SUBCMD --server dht"
+    [ -n "$ANNOUNCE_IP" ] && SUBCMD="$SUBCMD --announce-ip $ANNOUNCE_IP"
+    [ -n "$ANNOUNCE_PORT" ] && SUBCMD="$SUBCMD --announce-port $ANNOUNCE_PORT"
+  fi
+elif [ -n "$USE_DHT" ]; then
+  SUBCMD="client --server dht$ZN_ARGS"
 else
   SUBCMD="client --server $SERVER_ADDR$ZN_ARGS"
 fi
@@ -184,9 +240,17 @@ say "Plan:"
 info "side:    $MODE"
 info "method:  $METHOD"
 [ "$METHOD" = docker ] && info "deploy:  $DEPLOY"
-info "ports:   $PORTS"
-[ "$MODE" = client ] && info "server:  $SERVER_ADDR"
-info "control: $CONTROL"
+if [ "$KIND" = bridge ]; then
+  info "bridge:  $TAP${BRIDGE:+ -> $BRIDGE}"
+else
+  info "ports:   $PORTS"
+fi
+if [ "$MODE" = client ]; then
+  if [ -n "$USE_DHT" ]; then info "server:  via DHT"; else info "server:  $SERVER_ADDR"; fi
+elif [ -n "$USE_DHT" ]; then
+  info "discovery: DHT publish"
+fi
+if [ "$MODE" = server ] || [ -z "$USE_DHT" ]; then info "control: $CONTROL"; fi
 info "secret:  $SECRET"
 say ""
 if [ -z "$ASSUME_YES" ] && has_tty; then
@@ -224,7 +288,9 @@ if [ "$METHOD" = docker ]; then
     say "Started via compose ($COMPOSE_FILE)."
     MANAGE="$DCF logs -f    # status: $DCF ps"
   else
-    RAN="docker run -d --name zeronat --restart unless-stopped --network host --env-file $ENV_FILE $IMAGE $SUBCMD"
+    DOCKER_TAP=""
+    [ "$KIND" = bridge ] && DOCKER_TAP="--cap-add NET_ADMIN --device /dev/net/tun "
+    RAN="docker run -d --name zeronat --restart unless-stopped --network host ${DOCKER_TAP}--env-file $ENV_FILE $IMAGE $SUBCMD"
     run docker pull "$IMAGE"
     # shellcheck disable=SC2086
     run $RAN
@@ -269,14 +335,22 @@ fi
 say "Done. Manage it with:"
 info "$MANAGE"
 say ""
+if [ "$KIND" = bridge ]; then FWD="--tap $TAP"; else FWD="--ports \"$PORTS\""; fi
+
 if [ "$MODE" = server ]; then
-  HOST=$(pub_ip)
   say "Run this on the machine behind CG-NAT (the client):"
-  say "  curl -fsSL $RAW_URL | sh -s -- \\"
-  say "    --client --server-addr $HOST:$CONTROL --secret $SECRET --ports \"$PORTS\""
-  [ "$HOST" = YOUR_SERVER_IP ] && info "(replace YOUR_SERVER_IP with this host's public address)"
+  if [ -n "$USE_DHT" ]; then
+    say "  curl -fsSL $RAW_URL | sh -s -- \\"
+    say "    --client --dht --secret $SECRET $FWD"
+  else
+    HOST=$(pub_ip)
+    say "  curl -fsSL $RAW_URL | sh -s -- \\"
+    say "    --client --server-addr $HOST:$CONTROL --secret $SECRET $FWD"
+    [ "$HOST" = YOUR_SERVER_IP ] && info "(replace YOUR_SERVER_IP with this host's public address)"
+  fi
 else
-  say "Make sure the server runs with the SAME secret and ports:"
+  if [ -n "$USE_DHT" ]; then SDISC="--dht"; else SDISC="--control $CONTROL"; fi
+  say "Make sure the server runs with the SAME secret:"
   say "  curl -fsSL $RAW_URL | sh -s -- \\"
-  say "    --server --control $CONTROL --secret $SECRET --ports \"$PORTS\""
+  say "    --server $SDISC --secret $SECRET $FWD"
 fi
