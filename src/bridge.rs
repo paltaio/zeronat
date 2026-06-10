@@ -62,7 +62,10 @@ pub async fn tcp(plain: TcpStream, mut nr: NoiseReader, mut nw: NoiseWriter) {
     let win = TCP_IDLE.as_secs();
     let idle = async {
         loop {
-            let idle_for = base.elapsed().as_secs().saturating_sub(last.load(Ordering::Relaxed) as u64);
+            let idle_for = base
+                .elapsed()
+                .as_secs()
+                .saturating_sub(last.load(Ordering::Relaxed) as u64);
             if idle_for >= win {
                 break;
             }

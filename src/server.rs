@@ -503,7 +503,8 @@ async fn udp_control_listener(srv: Arc<Server>, bind: String, port: u16) -> Resu
                     let Ok(permit) = srv.handshakes.clone().acquire_owned().await else {
                         return;
                     };
-                    let handshake = timeout(HANDSHAKE_TIMEOUT, server_handshake(stream, &psk)).await;
+                    let handshake =
+                        timeout(HANDSHAKE_TIMEOUT, server_handshake(stream, &psk)).await;
                     drop(permit);
                     if let Ok(Ok((r, w))) = handshake {
                         let _ = serve_stream(srv, r, w, ActiveTransport::Udp).await;
