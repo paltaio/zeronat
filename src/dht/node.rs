@@ -1,9 +1,12 @@
 //! A throwaway Mainline DHT client: bootstrap, an iterative `get` lookup that
 //! also collects write tokens and our externally-seen IP (BEP42), and a `put`.
-//! It keeps no routing table across calls; each lookup starts from the routers.
+//! It keeps no in-memory routing table; each lookup warm-starts from a persisted
+//! set of recently live nodes and falls back to the routers when that is thin.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::PathBuf;
+use std::time::Duration as StdDuration;
 
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Duration, Instant};
@@ -21,6 +24,10 @@ const K: usize = 8;
 const ROUNDS: u8 = 6;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const RECV_BUF: usize = 2048;
+/// Cap on persisted live DHT node addresses (6 bytes each on disk).
+const MAX_PERSISTED_NODES: usize = 64;
+/// Persisted nodes older than this are ignored, falling back to the routers.
+const NODE_CACHE_TTL: StdDuration = StdDuration::from_secs(24 * 3600);
 
 /// A DHT contact and, once it has answered a `get`, its write token.
 #[derive(Clone)]
@@ -71,15 +78,33 @@ impl Node {
     /// Iteratively walk toward `target`, collecting write tokens, stored values,
     /// and BEP42 IP votes.
     pub async fn lookup(&self, target: [u8; 20]) -> Result<Lookup> {
-        let boot = resolve_bootstrap().await?;
+        // Warm-start from previously live nodes; only when the cache is thin do we
+        // load the routers, sparing them the steady-state request load. The cache
+        // is pure optimization: a non-empty seed lets a lookup proceed even when
+        // every router is unreachable, and an empty seed still surfaces the same
+        // bootstrap-resolution error as before.
+        let cached = read_node_cache();
+        let mut seed: Vec<SocketAddrV4> = cached.clone();
+        if cached.len() < K {
+            if let Ok(boot) = resolve_bootstrap().await {
+                seed.extend(boot);
+            }
+        }
+        let mut deduped = HashSet::new();
+        seed.retain(|a| deduped.insert(*a));
+        if seed.is_empty() {
+            return Err("dht bootstrap resolution failed".into());
+        }
+
         let mut shortlist: Vec<Contact> = Vec::new();
         let mut seen: HashSet<SocketAddrV4> = HashSet::new();
         let mut queried: HashSet<SocketAddrV4> = HashSet::new();
         let mut storers: Vec<Contact> = Vec::new();
         let mut values: Vec<Value> = Vec::new();
         let mut ip_votes: HashMap<Ipv4Addr, u32> = HashMap::new();
+        let mut responders: Vec<SocketAddrV4> = Vec::new();
 
-        let mut current: Vec<Contact> = boot
+        let mut current: Vec<Contact> = seed
             .into_iter()
             .map(|addr| Contact {
                 id: [0u8; 20],
@@ -99,6 +124,7 @@ impl Node {
             // only switch to get once talking to discovered full nodes.
             let method: &[u8] = if round == 0 { b"find_node" } else { b"get" };
             for p in self.round(&current, round, &target, method).await {
+                responders.push(p.from);
                 if let Some(ip) = p.ip {
                     *ip_votes.entry(ip).or_default() += 1;
                 }
@@ -135,6 +161,19 @@ impl Node {
             .into_iter()
             .max_by_key(|&(_, n)| n)
             .map(|(ip, _)| ip);
+        // Persist currently-live nodes for the next lookup's warm start: storers
+        // (answered with a token) first, then any other responder seen this round.
+        let mut live: Vec<SocketAddrV4> = Vec::new();
+        let mut kept_live = HashSet::new();
+        for c in storers.iter().map(|c| c.addr).chain(responders) {
+            if kept_live.insert(c) {
+                live.push(c);
+            }
+            if live.len() >= MAX_PERSISTED_NODES {
+                break;
+            }
+        }
+        write_node_cache(&live);
         Ok(Lookup {
             storers,
             values,
@@ -205,6 +244,62 @@ impl Node {
         }
         out
     }
+}
+
+/// Shared, target-independent cache of live DHT routing nodes (6 bytes each).
+fn node_cache_file() -> Option<PathBuf> {
+    Some(super::cache_dir()?.join("zeronat").join("dht-nodes"))
+}
+
+/// Read fresh cached node addresses; a missing, stale, or corrupt file is empty.
+fn read_node_cache() -> Vec<SocketAddrV4> {
+    let Some(path) = node_cache_file() else {
+        return Vec::new();
+    };
+    let fresh = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age < NODE_CACHE_TTL)
+        .unwrap_or(false);
+    if !fresh {
+        return Vec::new();
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => decode_nodes(&bytes),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn write_node_cache(nodes: &[SocketAddrV4]) {
+    let Some(path) = node_cache_file() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, encode_nodes(nodes));
+}
+
+/// Pack addresses as 6 bytes each: 4-byte IPv4 + 2-byte big-endian port.
+fn encode_nodes(nodes: &[SocketAddrV4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nodes.len() * 6);
+    for a in nodes {
+        out.extend_from_slice(&a.ip().octets());
+        out.extend_from_slice(&a.port().to_be_bytes());
+    }
+    out
+}
+
+/// Parse the 6-byte node format; a trailing partial record is ignored.
+fn decode_nodes(b: &[u8]) -> Vec<SocketAddrV4> {
+    b.chunks_exact(6)
+        .map(|c| {
+            let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
+            let port = u16::from_be_bytes([c[4], c[5]]);
+            SocketAddrV4::new(ip, port)
+        })
+        .collect()
 }
 
 async fn resolve_bootstrap() -> Result<Vec<SocketAddrV4>> {
@@ -341,4 +436,33 @@ fn parse_ipv4(b: &[u8]) -> Option<Ipv4Addr> {
 
 fn to_array<const N: usize>(b: &[u8]) -> Option<[u8; N]> {
     b.try_into().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_list_roundtrip() {
+        let nodes = vec![
+            SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 6881),
+            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 25401),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1),
+        ];
+        let encoded = encode_nodes(&nodes);
+        assert_eq!(encoded.len(), nodes.len() * 6);
+        assert_eq!(decode_nodes(&encoded), nodes);
+    }
+
+    #[test]
+    fn node_list_decode_ignores_trailing_partial() {
+        let nodes = vec![SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4242)];
+        let mut buf = encode_nodes(&nodes);
+        // A truncated trailing record is dropped, not panicked on.
+        buf.extend_from_slice(&[9, 9, 9]);
+        assert_eq!(decode_nodes(&buf), nodes);
+        // Empty and sub-record buffers decode to nothing.
+        assert!(decode_nodes(&[]).is_empty());
+        assert!(decode_nodes(&[1, 2, 3, 4, 5]).is_empty());
+    }
 }

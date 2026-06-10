@@ -198,7 +198,7 @@ pub async fn announce_loop(secret: &str, announce_ip: Option<Ipv4Addr>, port: u1
     }
 }
 
-fn cache_dir() -> Option<PathBuf> {
+pub(super) fn cache_dir() -> Option<PathBuf> {
     if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
         if !x.is_empty() {
             return Some(PathBuf::from(x));
