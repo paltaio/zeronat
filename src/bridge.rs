@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,8 +33,10 @@ pub async fn tcp(plain: TcpStream, mut nr: NoiseReader, mut nw: NoiseWriter) {
     // A shared monotonic mark records the last byte moved either way; the watchdog
     // reaps the stream only after both directions stay idle for TCP_IDLE, i.e. a
     // black hole with no FIN/RST. Activity always restarts the window.
+    // Mark in whole seconds: 32-bit targets (mips) have no AtomicU64, and second
+    // resolution is ample for a 120s idle window.
     let base = Instant::now();
-    let last = Arc::new(AtomicU64::new(0));
+    let last = Arc::new(AtomicU32::new(0));
 
     let up_last = last.clone();
     let up = async move {
@@ -45,7 +47,7 @@ pub async fn tcp(plain: TcpStream, mut nr: NoiseReader, mut nw: NoiseWriter) {
                 break;
             }
             nw.send(&buf[..n]).await?;
-            up_last.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
+            up_last.store(base.elapsed().as_secs() as u32, Ordering::Relaxed);
         }
         Ok::<_, crate::Error>(())
     };
@@ -53,18 +55,18 @@ pub async fn tcp(plain: TcpStream, mut nr: NoiseReader, mut nw: NoiseWriter) {
     let down = async move {
         while let Ok(m) = nr.recv().await {
             pw.write_all(&m).await?;
-            down_last.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
+            down_last.store(base.elapsed().as_secs() as u32, Ordering::Relaxed);
         }
         Ok::<_, crate::Error>(())
     };
-    let win = TCP_IDLE.as_millis() as u64;
+    let win = TCP_IDLE.as_secs();
     let idle = async {
         loop {
-            let idle_for = (base.elapsed().as_millis() as u64).saturating_sub(last.load(Ordering::Relaxed));
+            let idle_for = base.elapsed().as_secs().saturating_sub(last.load(Ordering::Relaxed) as u64);
             if idle_for >= win {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(win - idle_for)).await;
+            tokio::time::sleep(Duration::from_secs(win - idle_for)).await;
         }
     };
 
