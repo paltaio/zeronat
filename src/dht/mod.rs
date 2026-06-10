@@ -21,6 +21,13 @@ use crate::Result;
 use node::Node;
 
 const REPUBLISH_INTERVAL: Duration = Duration::from_secs(600);
+/// Until the first successful publish, retry on this short delay so a server that
+/// boots before the network is up gets discovered in seconds, not ~10 minutes.
+const COLD_START_BACKOFF: Duration = Duration::from_secs(2);
+const COLD_START_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// A cached server address older than this is ignored, forcing a fresh DHT
+/// resolve so a stale-but-accepting old IP cannot pin the client forever.
+const CACHE_TTL: Duration = Duration::from_secs(6 * 3600);
 const ADDR_VERSION: u8 = 0x01;
 
 /// Secret-derived DHT identity shared by both peers.
@@ -61,6 +68,12 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Strictly increasing BEP44 seq: never below `last + 1`, so a backward wall-clock
+/// step can never lower the seq and make a republish un-storable under DHT CAS.
+fn next_seq(now: i64, last: i64) -> i64 {
+    now.max(last.saturating_add(1))
 }
 
 /// Seal `ip:port` into a BEP44 `v` value: `[nonce:8][ciphertext]`, the nonce
@@ -109,8 +122,11 @@ async fn publish(
     id: &Identity,
     announce_ip: Option<Ipv4Addr>,
     port: u16,
-    seq: i64,
 ) -> Result<(Ipv4Addr, usize)> {
+    // Persist the seq before the put so a crash between persist and put still
+    // leaves the next boot with a strictly higher seq, never a re-used one.
+    let seq = next_seq(now_unix(), read_seq(id));
+    write_seq(id, seq);
     let node = Node::new().await?;
     let lookup = node.lookup(id.target).await?;
     let ip = announce_ip
@@ -147,13 +163,38 @@ pub async fn resolve(id: &Identity) -> Result<SocketAddr> {
 /// changed WAN address propagates within one interval.
 pub async fn announce_loop(secret: &str, announce_ip: Option<Ipv4Addr>, port: u16) {
     let id = Identity::derive(secret);
+    // Until the first real publish, retry on a short, growing backoff so a boot
+    // that races the network recovers in seconds. After that, settle to the
+    // steady interval. A bootstrap/DNS failure returns Err and keeps us in the
+    // cold-start path; a put accepted by 0 nodes does not count as success.
+    let mut backoff = COLD_START_BACKOFF;
+    let mut warm = false;
     loop {
-        let seq = now_unix();
-        match publish(&id, announce_ip, port, seq).await {
-            Ok((ip, stored)) => eprintln!("dht: announced {ip}:{port} to {stored} nodes"),
-            Err(e) => eprintln!("dht: announce failed: {e}"),
+        let delay = match publish(&id, announce_ip, port).await {
+            Ok((ip, stored)) => {
+                eprintln!("dht: announced {ip}:{port} to {stored} nodes");
+                if stored > 0 {
+                    warm = true;
+                }
+                if warm {
+                    REPUBLISH_INTERVAL
+                } else {
+                    backoff
+                }
+            }
+            Err(e) => {
+                eprintln!("dht: announce failed: {e}");
+                if warm {
+                    REPUBLISH_INTERVAL
+                } else {
+                    backoff
+                }
+            }
+        };
+        if !warm {
+            backoff = (backoff * 2).min(COLD_START_BACKOFF_MAX);
         }
-        sleep(REPUBLISH_INTERVAL).await;
+        sleep(delay).await;
     }
 }
 
@@ -183,9 +224,44 @@ fn cache_file(id: &Identity) -> Option<PathBuf> {
     Some(cache_dir()?.join("zeronat").join(name))
 }
 
-/// Last-known server address, if cached. Lets a reconnect skip the DHT.
+/// Per-identity seq counter, stored alongside the address cache.
+fn seq_file(id: &Identity) -> Option<PathBuf> {
+    Some(cache_file(id)?.with_extension("seq"))
+}
+
+/// Last persisted seq, or 0 if the file is missing or corrupt.
+fn read_seq(id: &Identity) -> i64 {
+    seq_file(id)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_seq(id: &Identity, seq: i64) {
+    let Some(path) = seq_file(id) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, seq.to_string());
+}
+
+/// Last-known server address, if cached and fresh. Lets a reconnect skip the DHT.
+/// An entry older than `CACHE_TTL` is treated as a miss so a stale-but-accepting
+/// old IP cannot keep the client off the DHT forever.
 pub fn read_cache(id: &Identity) -> Option<SocketAddr> {
-    let s = std::fs::read_to_string(cache_file(id)?).ok()?;
+    let path = cache_file(id)?;
+    let fresh = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age < CACHE_TTL)
+        .unwrap_or(false);
+    if !fresh {
+        return None;
+    }
+    let s = std::fs::read_to_string(path).ok()?;
     s.trim().parse().ok()
 }
 
@@ -237,5 +313,44 @@ mod tests {
         let b = Identity::derive("other");
         let v = seal_addr(&a.addr_key, Ipv4Addr::LOCALHOST, 1, 5);
         assert_eq!(open_addr(&b.addr_key, &v), None);
+    }
+
+    #[test]
+    fn next_seq_is_strictly_monotonic_under_backward_clock() {
+        // Forward clock: seq tracks wall time.
+        assert_eq!(next_seq(1000, 0), 1000);
+        assert_eq!(next_seq(1001, 1000), 1001);
+        // Clock steps backward: seq still advances past the last value.
+        assert_eq!(next_seq(500, 1001), 1002);
+        assert_eq!(next_seq(0, 1002), 1003);
+        // Replay a descending clock from a high last seq; seq only ever climbs.
+        let mut last = 1003;
+        for now in [900, 800, 0, 42, 1] {
+            let s = next_seq(now, last);
+            assert!(s > last, "seq {s} must exceed last {last}");
+            last = s;
+        }
+    }
+
+    #[test]
+    fn seq_file_roundtrip_defaults_to_zero() {
+        let dir = std::env::temp_dir().join(format!("zeronat-seq-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("seq");
+        // Missing file reads as 0.
+        let read = |p: &std::path::Path| -> i64 {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(read(&path), 0);
+        std::fs::write(&path, "7").unwrap();
+        assert_eq!(read(&path), 7);
+        // Corrupt content reads as 0.
+        std::fs::write(&path, "not-a-number").unwrap();
+        assert_eq!(read(&path), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
