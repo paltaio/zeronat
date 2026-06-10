@@ -113,6 +113,8 @@ jobs:
           if-no-files-found: error
 
   windows:
+    # Temporarily disabled. Re-enable: drop `if: false` and add `windows` back to release.needs.
+    if: false
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -157,7 +159,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [binaries, freebsd, windows]
+    needs: [binaries, freebsd]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
