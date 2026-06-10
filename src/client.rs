@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::Result;
 use tokio::net::{TcpStream, UdpSocket};
@@ -29,12 +29,63 @@ const PING_INTERVAL: Duration = Duration::from_secs(25);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(90);
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 const UDP_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// A control session over UDP that lives at least this long is treated as a
+/// healthy path; a shorter one counts as a flap (handshake succeeds but the KCP
+/// link cannot be sustained over a lossy/MTU-broken UDP route).
+const UDP_MIN_HEALTHY: Duration = Duration::from_secs(30);
+/// Consecutive flapping/failed UDP attempts before Auto stops probing UDP.
+const UDP_QUICK_FAILS: u32 = 2;
+/// How long Auto prefers TCP after UDP flaps, before it re-probes UDP again.
+const UDP_COOLDOWN: Duration = Duration::from_secs(120);
+
+/// UDP-health memory carried across reconnects in Auto mode. Owned by the
+/// reconnect loop (not the Arc<Client>, not global) so each running client keeps
+/// its own monotonic view of whether the UDP path is currently usable.
+#[derive(Default)]
+struct UdpHealth {
+    fails: u32,
+    cooldown_until: Option<Instant>,
+}
+
+/// Auto-mode transport decision: probe UDP unless a flap cooldown is still active.
+/// Forced Udp/Tcp callers never consult this (their path is fixed upstream).
+fn choose_udp(state: &UdpHealth, now: Instant) -> bool {
+    match state.cooldown_until {
+        Some(until) => now >= until,
+        None => true,
+    }
+}
+
+/// Fold one UDP attempt's outcome into the cooldown memory. A healthy session
+/// clears the cooldown; UDP_QUICK_FAILS flaps in a row arms it for UDP_COOLDOWN.
+fn record(state: &mut UdpHealth, healthy: bool, now: Instant) {
+    if healthy {
+        state.fails = 0;
+        state.cooldown_until = None;
+    } else {
+        state.fails += 1;
+        if state.fails >= UDP_QUICK_FAILS {
+            state.cooldown_until = Some(now + UDP_COOLDOWN);
+            state.fails = 0;
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Transport {
     Auto,
     Udp,
     Tcp,
+}
+
+/// What an Auto-mode connection attempt did with UDP, so the reconnect loop can
+/// update its cooldown memory. `Skipped` means the attempt never touched UDP
+/// (forced TCP, or cooldown active), so it leaves the memory unchanged.
+#[derive(Clone, Copy, PartialEq)]
+enum UdpOutcome {
+    Skipped,
+    Healthy,
+    Unhealthy,
 }
 
 struct Client {
@@ -138,6 +189,8 @@ pub async fn run(
         return Err("L2 TAP bridge (--tap) is only supported on Linux".into());
     }
 
+    let mut udp_health = UdpHealth::default();
+
     loop {
         let addr = match discovery.resolve().await {
             Ok(a) => a,
@@ -154,13 +207,23 @@ pub async fn run(
             udp: udp.clone(),
             transport,
         });
+        // Auto only: skip the UDP probe while a flap cooldown is active. Forced
+        // Udp/Tcp ignore `try_udp` and keep their fixed path.
+        let try_udp = transport != Transport::Auto || choose_udp(&udp_health, Instant::now());
         #[cfg(target_os = "linux")]
-        let result = match &tap {
-            Some(tap) => bridge_session(client.clone(), tap.clone()).await,
-            None => session(client.clone()).await,
+        let (result, outcome) = match &tap {
+            Some(tap) => bridge_session(client.clone(), tap.clone(), try_udp).await,
+            None => session(client.clone(), try_udp).await,
         };
         #[cfg(not(target_os = "linux"))]
-        let result = session(client.clone()).await;
+        let (result, outcome) = session(client.clone(), try_udp).await;
+        if transport == Transport::Auto && outcome != UdpOutcome::Skipped {
+            record(
+                &mut udp_health,
+                outcome == UdpOutcome::Healthy,
+                Instant::now(),
+            );
+        }
         if let Err(e) = result {
             eprintln!("connection lost: {e}");
             discovery.invalidate();
@@ -170,19 +233,38 @@ pub async fn run(
 }
 
 /// Bring up the L2 bridge: UDP first for Auto/Udp, TCP otherwise or as fallback.
+/// Mirrors `session`: returns the UDP verdict so the reconnect loop can damp
+/// flapping in Auto mode. `bridge_udp` runs the data loop inline, so its return
+/// timing is the session lifetime used to judge health.
 #[cfg(target_os = "linux")]
-async fn bridge_session(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
-    if client.transport == Transport::Tcp {
-        return bridge_tcp(client, tap).await;
+async fn bridge_session(
+    client: Arc<Client>,
+    tap: Arc<TapDevice>,
+    try_udp: bool,
+) -> (Result<()>, UdpOutcome) {
+    let mode = client.transport;
+    if mode == Transport::Tcp || (mode == Transport::Auto && !try_udp) {
+        return (bridge_tcp(client, tap).await, UdpOutcome::Skipped);
     }
+    let started = Instant::now();
     match bridge_udp(client.clone(), tap.clone()).await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let healthy = started.elapsed() >= UDP_MIN_HEALTHY;
+            let outcome = if healthy {
+                UdpOutcome::Healthy
+            } else {
+                UdpOutcome::Unhealthy
+            };
+            (Ok(()), outcome)
+        }
         Err(e) => {
-            if client.transport == Transport::Udp {
-                return Err(e);
+            if mode == Transport::Udp {
+                return (Err(e), UdpOutcome::Skipped);
             }
+            // A short-lived bridge_udp returns Err with the handshake never even
+            // reached on some paths; treat any UDP failure here as a flap signal.
             eprintln!("udp transport unavailable ({e}); falling back to tcp");
-            bridge_tcp(client, tap).await
+            (bridge_tcp(client, tap).await, UdpOutcome::Unhealthy)
         }
     }
 }
@@ -267,31 +349,56 @@ async fn udp_session(
 }
 
 /// Establish the control connection and dispatch `Open` requests until it drops.
-async fn session(client: Arc<Client>) -> Result<()> {
+/// Returns the loop result paired with how UDP behaved this attempt, so the
+/// reconnect loop can damp UDP flapping (Auto only; see `UdpHealth`).
+async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome) {
     let mode = client.transport;
 
-    // Try UDP first for Auto/Udp; fall back to TCP for Auto/Tcp.
-    let (link, r, w) = if mode != Transport::Tcp {
+    // Try UDP first for Auto/Udp (unless cooldown skipped it); fall back to TCP
+    // for Auto/Tcp.
+    let probe_udp = mode != Transport::Tcp && (mode == Transport::Udp || try_udp);
+    let (link, r, w, started) = if probe_udp {
         match udp_session(client.clone()).await {
             Ok((sess, pump, (r, w))) => {
                 eprintln!("connected to {} over udp", client.server);
-                (Link::Udp(sess, pump), r, w)
+                (Link::Udp(sess, pump), r, w, Some(Instant::now()))
             }
             Err(e) => {
                 if mode == Transport::Udp {
-                    return Err(e);
+                    // Forced UDP never falls back; a failed connect is just an error.
+                    return (Err(e), UdpOutcome::Skipped);
                 }
+                // A failed UDP connect is itself a flap signal for the cooldown,
+                // independent of how the TCP fallback session fares afterwards.
                 eprintln!("udp transport unavailable ({e}); falling back to tcp");
-                let (r, w) = tcp_control(client.clone()).await?;
-                (Link::Tcp, r, w)
+                match tcp_control(client.clone()).await {
+                    Ok((r, w)) => {
+                        return (
+                            control_loop(client, Link::Tcp, r, w).await,
+                            UdpOutcome::Unhealthy,
+                        )
+                    }
+                    Err(e) => return (Err(e), UdpOutcome::Unhealthy),
+                }
             }
         }
     } else {
-        let (r, w) = tcp_control(client.clone()).await?;
-        (Link::Tcp, r, w)
+        match tcp_control(client.clone()).await {
+            Ok((r, w)) => (Link::Tcp, r, w, None),
+            Err(e) => return (Err(e), UdpOutcome::Skipped),
+        }
     };
 
-    control_loop(client, link, r, w).await
+    let result = control_loop(client, link, r, w).await;
+    // Health is measured from when the UDP control channel came up to when it
+    // returned; a short-lived UDP session is a flap. TCP-fallback paths report
+    // their UDP verdict above, so `started` here is always the UDP case.
+    let outcome = match started {
+        Some(t) if t.elapsed() >= UDP_MIN_HEALTHY => UdpOutcome::Healthy,
+        Some(_) => UdpOutcome::Unhealthy,
+        None => UdpOutcome::Skipped,
+    };
+    (result, outcome)
 }
 
 /// Dial the TCP control connection and run the Noise handshake.
@@ -449,4 +556,49 @@ async fn handle_open(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quick_fails_arm_cooldown_then_tcp_is_chosen() {
+        let mut s = UdpHealth::default();
+        let t0 = Instant::now();
+        // First flap: still probe UDP next time.
+        record(&mut s, false, t0);
+        assert!(choose_udp(&s, t0));
+        // Second consecutive flap reaches UDP_QUICK_FAILS and arms the cooldown.
+        record(&mut s, false, t0);
+        assert!(!choose_udp(&s, t0));
+        // Mid-cooldown still skips UDP; after it expires UDP is re-probed.
+        assert!(!choose_udp(&s, t0 + UDP_COOLDOWN - Duration::from_secs(1)));
+        assert!(choose_udp(&s, t0 + UDP_COOLDOWN));
+    }
+
+    #[test]
+    fn healthy_clears_cooldown_and_counter() {
+        let mut s = UdpHealth::default();
+        let t0 = Instant::now();
+        record(&mut s, false, t0);
+        record(&mut s, false, t0);
+        assert!(s.cooldown_until.is_some());
+        record(&mut s, true, t0);
+        assert_eq!(s.fails, 0);
+        assert!(s.cooldown_until.is_none());
+        assert!(choose_udp(&s, t0));
+    }
+
+    #[test]
+    fn isolated_flaps_never_arm_cooldown() {
+        let mut s = UdpHealth::default();
+        let t0 = Instant::now();
+        // A flap followed by a healthy session must not accumulate toward cooldown.
+        record(&mut s, false, t0);
+        record(&mut s, true, t0);
+        record(&mut s, false, t0);
+        assert!(s.cooldown_until.is_none());
+        assert!(choose_udp(&s, t0));
+    }
 }
