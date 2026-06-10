@@ -23,6 +23,12 @@ use crate::tap::TapDevice;
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Liveness window for the control channel. The client pings every 25s, so no
+/// inbound control frame for this long means the link is a black hole (no
+/// FIN/RST on a NAT rebind, WAN re-dial, or silent firewall drop). Sized to a
+/// few ping intervals to tolerate a missed ping without falsely tearing down a
+/// healthy idle link.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_INFLIGHT_HANDSHAKES: usize = 256;
 /// Pause after a transient accept/recv error so a persistent failure (e.g. EMFILE
 /// under fd pressure) does not spin the listener loop at 100% CPU.
@@ -227,7 +233,7 @@ pub(crate) async fn serve_stream(
     match Msg::decode(&r.recv().await?)? {
         Msg::Hello => {
             let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
-            *srv.control_tx.lock().unwrap() = Some(tx);
+            *srv.control_tx.lock().unwrap() = Some(tx.clone());
             *srv.active_transport.lock().unwrap() = transport;
             eprintln!("client connected");
             let mut w = w;
@@ -238,8 +244,24 @@ pub(crate) async fn serve_stream(
                     }
                 }
             });
-            while r.recv().await.is_ok() {}
-            *srv.control_tx.lock().unwrap() = None;
+            // Drain inbound control frames. Any frame (Ping, ...) resets the
+            // liveness deadline; reply to Ping with Pong so the client's own
+            // deadline also keeps resetting. A timeout (no inbound frame for the
+            // whole window) or a recv error breaks the loop and tears down: a
+            // black-holed link delivers no FIN/RST, so only the deadline catches it.
+            while let Ok(Ok(bytes)) = timeout(CONTROL_TIMEOUT, r.recv()).await {
+                if let Ok(Msg::Ping) = Msg::decode(&bytes) {
+                    tx.try_send(Msg::Pong.encode()).ok();
+                }
+            }
+            // Only clear control_tx if it still points at this session's channel;
+            // a newer client may have reconnected and overwritten it.
+            {
+                let mut ctl = srv.control_tx.lock().unwrap();
+                if ctl.as_ref().is_some_and(|cur| cur.same_channel(&tx)) {
+                    *ctl = None;
+                }
+            }
             writer.abort();
             eprintln!("client disconnected");
             Ok(())

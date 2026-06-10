@@ -9,7 +9,8 @@ pub enum Proto {
 /// Messages exchanged over the encrypted Noise channels.
 ///
 /// Control channel (client -> server): `Hello`, then periodic `Ping`.
-/// Control channel (server -> client): `Open` for each new public connection.
+/// Control channel (server -> client): `Pong` in reply to each `Ping`, and
+/// `Open` for each new public connection.
 /// Data channel (client -> server, first message): `Data` carrying the stream id.
 #[derive(Debug)]
 pub enum Msg {
@@ -17,6 +18,7 @@ pub enum Msg {
     Ping,
     Open { proto: Proto, port: u16, id: u64 },
     Data { id: u64 },
+    Pong,
 }
 
 impl Msg {
@@ -41,6 +43,7 @@ impl Msg {
                 b.extend_from_slice(&id.to_be_bytes());
                 b
             }
+            Msg::Pong => vec![4],
         }
     }
 
@@ -62,6 +65,7 @@ impl Msg {
                 let id = u64::from_be_bytes(b[1..9].try_into().unwrap());
                 Ok(Msg::Data { id })
             }
+            Some(4) => Ok(Msg::Pong),
             _ => Err(format!("malformed message ({} bytes)", b.len()).into()),
         }
     }

@@ -23,6 +23,10 @@ use crate::tap::TapConfig;
 use crate::tap::TapDevice;
 
 const PING_INTERVAL: Duration = Duration::from_secs(25);
+/// Liveness window for the control channel. The server replies Pong to every
+/// Ping, so no inbound frame for a few ping intervals means the link is a black
+/// hole (no FIN/RST on a NAT rebind, WAN re-dial, or silent firewall drop).
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(90);
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 const UDP_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -314,9 +318,13 @@ async fn control_loop(
     });
 
     let result = loop {
-        let msg = match r.recv().await {
-            Ok(m) => m,
-            Err(e) => break Err(e),
+        // Any inbound frame (Pong from our ping, or an Open) resets the deadline.
+        // No frame for the whole window means the link is a black hole with no
+        // FIN/RST; return Err so the outer reconnect loop re-resolves and redials.
+        let msg = match tokio_timeout(CONTROL_TIMEOUT, r.recv()).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => break Err(e),
+            Err(_) => break Err("control channel timed out (link dead)".into()),
         };
         match Msg::decode(&msg) {
             Ok(Msg::Open { proto, port, id }) => {
