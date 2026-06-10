@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -17,13 +18,25 @@ use crate::tap::TapDevice;
 const TCP_BUF: usize = 16 * 1024;
 const UDP_BUF: usize = 65535;
 pub const UDP_IDLE: Duration = Duration::from_secs(120);
+/// A forwarded TCP stream idle in both directions for this long is treated as
+/// dead (black-holed by a NAT/firewall with no FIN/RST) and reaped.
+pub const TCP_IDLE: Duration = Duration::from_secs(120);
 
 /// Copy bytes both ways between a plaintext TCP stream and the encrypted
-/// connection. Returns when either side closes.
+/// connection. Returns when either side closes or both fall idle for TCP_IDLE.
 pub async fn tcp(plain: TcpStream, mut nr: NoiseReader, mut nw: NoiseWriter) {
     plain.set_nodelay(true).ok();
     let (mut pr, mut pw) = plain.into_split();
 
+    // Both directions copy concurrently so a write blocked on backpressure in one
+    // never stalls the other (serializing them can deadlock a full-duplex stream).
+    // A shared monotonic mark records the last byte moved either way; the watchdog
+    // reaps the stream only after both directions stay idle for TCP_IDLE, i.e. a
+    // black hole with no FIN/RST. Activity always restarts the window.
+    let base = Instant::now();
+    let last = Arc::new(AtomicU64::new(0));
+
+    let up_last = last.clone();
     let up = async move {
         let mut buf = [0u8; TCP_BUF];
         loop {
@@ -32,19 +45,33 @@ pub async fn tcp(plain: TcpStream, mut nr: NoiseReader, mut nw: NoiseWriter) {
                 break;
             }
             nw.send(&buf[..n]).await?;
+            up_last.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
         Ok::<_, crate::Error>(())
     };
+    let down_last = last.clone();
     let down = async move {
         while let Ok(m) = nr.recv().await {
             pw.write_all(&m).await?;
+            down_last.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
         Ok::<_, crate::Error>(())
+    };
+    let win = TCP_IDLE.as_millis() as u64;
+    let idle = async {
+        loop {
+            let idle_for = (base.elapsed().as_millis() as u64).saturating_sub(last.load(Ordering::Relaxed));
+            if idle_for >= win {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(win - idle_for)).await;
+        }
     };
 
     tokio::select! {
         _ = up => {}
         _ = down => {}
+        _ = idle => {}
     }
 }
 

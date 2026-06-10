@@ -317,6 +317,10 @@ async fn control_loop(
         }
     });
 
+    // Handles of in-flight forward tasks spawned for this control session, so a
+    // teardown can abort black-holed forwards instead of leaking them.
+    let mut forwards: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     let result = loop {
         // Any inbound frame (Pong from our ping, or an Open) resets the deadline.
         // No frame for the whole window means the link is a black hole with no
@@ -330,11 +334,14 @@ async fn control_loop(
             Ok(Msg::Open { proto, port, id }) => {
                 let client = client.clone();
                 let link = link.clone();
-                tokio::spawn(async move {
+                // Drop handles of forwards that already finished so the tracking
+                // vector stays bounded over a long healthy session.
+                forwards.retain(|h| !h.is_finished());
+                forwards.push(tokio::spawn(async move {
                     if let Err(e) = handle_open(client, link, proto, port, id).await {
                         eprintln!("stream {id} ({proto:?} :{port}) failed: {e}");
                     }
-                });
+                }));
             }
             Ok(_) => {}
             Err(e) => break Err(e),
@@ -343,6 +350,11 @@ async fn control_loop(
 
     writer.abort();
     pinger.abort();
+    // Tear down forwards tied to this dead control session; abort is a no-op on
+    // tasks that already completed, so this never races into a panic.
+    for h in forwards {
+        h.abort();
+    }
     result
 }
 
