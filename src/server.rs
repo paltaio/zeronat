@@ -7,7 +7,7 @@ use crate::Result;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 #[cfg(target_os = "linux")]
 use tokio::sync::Notify;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::timeout;
 
 use crate::bridge;
@@ -22,6 +22,8 @@ use crate::tap::TapConfig;
 use crate::tap::TapDevice;
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_INFLIGHT_HANDSHAKES: usize = 256;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ActiveTransport {
@@ -41,6 +43,7 @@ pub(crate) struct Server {
     udp_pending: Mutex<HashMap<u64, UdpPending>>,
     control_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     active_transport: Mutex<ActiveTransport>,
+    handshakes: Arc<Semaphore>,
     #[cfg(target_os = "linux")]
     tap: Option<Arc<TapDevice>>,
     #[cfg(target_os = "linux")]
@@ -140,6 +143,7 @@ pub async fn run(
         udp_pending: Mutex::new(HashMap::new()),
         control_tx: Mutex::new(None),
         active_transport: Mutex::new(ActiveTransport::Tcp),
+        handshakes: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
         #[cfg(target_os = "linux")]
         tap,
         #[cfg(target_os = "linux")]
@@ -190,7 +194,13 @@ pub async fn run(
 
 async fn handle_incoming(srv: Arc<Server>, sock: TcpStream) -> Result<()> {
     sock.set_nodelay(true).ok();
-    let (r, w) = server_handshake(sock, &srv.psk).await?;
+    let (r, w) = {
+        let _permit = srv.handshakes.clone().acquire_owned().await?;
+        match timeout(HANDSHAKE_TIMEOUT, server_handshake(sock, &srv.psk)).await {
+            Ok(res) => res?,
+            Err(_) => return Err("handshake timed out".into()),
+        }
+    };
     serve_stream(srv, r, w, ActiveTransport::Tcp).await
 }
 
@@ -355,7 +365,12 @@ async fn udp_control_listener(srv: Arc<Server>, bind: String, port: u16) -> Resu
                 let srv = srv.clone();
                 let psk = srv.psk;
                 tokio::spawn(async move {
-                    if let Ok((r, w)) = server_handshake(stream, &psk).await {
+                    let Ok(permit) = srv.handshakes.clone().acquire_owned().await else {
+                        return;
+                    };
+                    let handshake = timeout(HANDSHAKE_TIMEOUT, server_handshake(stream, &psk)).await;
+                    drop(permit);
+                    if let Ok(Ok((r, w))) = handshake {
                         let _ = serve_stream(srv, r, w, ActiveTransport::Udp).await;
                     }
                 });
@@ -365,7 +380,13 @@ async fn udp_control_listener(srv: Arc<Server>, bind: String, port: u16) -> Resu
                 let sess2 = sess.clone();
                 let psk = srv.psk;
                 tokio::spawn(async move {
-                    if let Ok((id, noise)) = server_handshake_stateless(stream, &psk).await {
+                    let Ok(permit) = srv.handshakes.clone().acquire_owned().await else {
+                        return;
+                    };
+                    let handshake =
+                        timeout(HANDSHAKE_TIMEOUT, server_handshake_stateless(stream, &psk)).await;
+                    drop(permit);
+                    if let Ok(Ok((id, noise))) = handshake {
                         #[cfg(target_os = "linux")]
                         if conv == BRIDGE_CONV {
                             accept_bridge(srv, sess2, conv, noise).await;
