@@ -40,6 +40,11 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 const UDP_SESSION_TTL: Duration = Duration::from_secs(90);
 /// How often the control loop sweeps idle/empty sessions.
 const UDP_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Backstop TTL for a per-source data-listener entry. The bridge self-reaps at
+/// `bridge::UDP_IDLE` (120s), closing its channel, which is the precise reclaim
+/// signal; this is sized above that so the sweep never evicts a live bridge and
+/// only bounds an entry whose channel somehow lingers.
+const UDP_DATA_TTL: Duration = Duration::from_secs(180);
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ActiveTransport {
@@ -321,27 +326,47 @@ async fn tcp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
 
 async fn udp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
     let socket = Arc::new(UdpSocket::bind((bind.as_str(), port)).await?);
-    let mut sessions: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    // Each entry holds the bridge's inbound channel and the last time a datagram
+    // reached it. A closed channel (bridge ended) or a stale TTL evicts the entry,
+    // so a one-shot/vanished source cannot pin a dead Sender slot forever.
+    let mut sessions: HashMap<SocketAddr, (mpsc::Sender<Vec<u8>>, Instant)> = HashMap::new();
     let mut buf = [0u8; 65535];
+    let mut sweep = tokio::time::interval(UDP_SWEEP_INTERVAL);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         // A transient recv error must not kill the forwarded UDP port; log, back
-        // off briefly, and keep serving.
-        let (n, src) = match socket.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("udp listener :{port} recv error: {e}");
-                tokio::time::sleep(ACCEPT_BACKOFF).await;
+        // off briefly, and keep serving. The sweep runs between recvs.
+        let (n, src) = tokio::select! {
+            r = socket.recv_from(&mut buf) => match r {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("udp listener :{port} recv error: {e}");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    continue;
+                }
+            },
+            _ = sweep.tick() => {
+                let now = Instant::now();
+                sessions.retain(|_, (tx, last)| {
+                    !tx.is_closed() && now.duration_since(*last) < UDP_DATA_TTL
+                });
                 continue;
             }
         };
         let data = buf[..n].to_vec();
 
         // Route to an existing session; recover the datagram if it is dead.
-        let data = if let Some(tx) = sessions.get(&src) {
+        let data = if let Some((tx, last)) = sessions.get_mut(&src) {
             match tx.try_send(data) {
-                Ok(()) => continue,
-                Err(mpsc::error::TrySendError::Full(_)) => continue,
+                Ok(()) => {
+                    *last = Instant::now();
+                    continue;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    *last = Instant::now();
+                    continue;
+                }
                 Err(mpsc::error::TrySendError::Closed(v)) => {
                     sessions.remove(&src);
                     v
@@ -353,7 +378,7 @@ async fn udp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
 
         let (dtx, drx) = mpsc::channel::<Vec<u8>>(64);
         dtx.try_send(data).ok();
-        sessions.insert(src, dtx);
+        sessions.insert(src, (dtx, Instant::now()));
 
         let transport = *srv.active_transport.lock().unwrap();
         match transport {
@@ -396,6 +421,15 @@ async fn udp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
                 {
                     srv.udp_pending.lock().unwrap().remove(&id);
                     sessions.remove(&src);
+                } else {
+                    // Reclaim the parked entry if the matching setup conv never
+                    // arrives (vanished/spoofed source). `remove` by id is a no-op
+                    // once `take_udp_pending` claimed it, so this is idempotent.
+                    let srv = srv.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(OPEN_TIMEOUT).await;
+                        srv.udp_pending.lock().unwrap().remove(&id);
+                    });
                 }
             }
         }

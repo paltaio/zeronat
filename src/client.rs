@@ -45,10 +45,22 @@ struct Client {
     transport: Transport,
 }
 
+/// Aborts its task when dropped. Ties a detached pump's lifetime to the scope
+/// that owns this guard, so the task cannot outlive the connection it serves.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// How the control loop opens data connections back to the server.
 enum Link {
-    Tcp,               // data conns dial new TcpStreams
-    Udp(Arc<Session>), // data conns open KCP convs on the shared UDP session
+    Tcp, // data conns dial new TcpStreams
+    // data conns open KCP convs on the shared UDP session; the guard aborts the
+    // session's RX pump when this Link drops at control teardown (held for Drop).
+    Udp(Arc<Session>, #[allow(dead_code)] AbortOnDrop),
 }
 
 /// How the server's control address is found: a fixed `host:port`, or looked up
@@ -177,7 +189,7 @@ async fn bridge_session(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> 
 
 /// Bind a local UDP socket, connect it to the server, start the KCP session, and
 /// spawn the inbound RX pump. Shared by the control and bridge UDP paths.
-async fn udp_connect(client: &Client) -> Result<Arc<Session>> {
+async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop)> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let server: SocketAddr = client
         .server
@@ -185,22 +197,27 @@ async fn udp_connect(client: &Client) -> Result<Arc<Session>> {
         .map_err(|_| -> crate::Error { "server must be host:port for UDP".into() })?;
     socket.connect(server).await?;
     let sess = kcp_session(socket.clone(), server, 1);
-    {
+    // A connected UDP socket whose peer black-holes never errors on recv, so this
+    // pump must be aborted on teardown; the returned guard ties it to the caller's
+    // connection scope and fires on both handshake-failure and control-death paths.
+    let pump = {
         let sess = sess.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             while let Ok(n) = socket.recv(&mut buf).await {
                 route(&sess, &buf[..n]);
             }
-        });
-    }
-    Ok(sess)
+        })
+    };
+    Ok((sess, AbortOnDrop(pump)))
 }
 
 /// L2 bridge over the UDP transport: frames ride the unreliable datagram channel.
 #[cfg(target_os = "linux")]
 async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
-    let sess = udp_connect(&client).await?;
+    // `_pump` aborts the session RX pump when this scope ends (handshake failure
+    // or bridge teardown), so a reconnect cannot leave the old pump running.
+    let (sess, _pump) = udp_connect(&client).await?;
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
     let noise = tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
@@ -235,13 +252,18 @@ async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
 
 /// Establish the control channel over UDP/KCP. Returns the session and the
 /// handshaked control reader/writer, or an error to trigger TCP fallback.
-async fn udp_session(client: Arc<Client>) -> Result<(Arc<Session>, crate::noise::Noise)> {
-    let sess = udp_connect(&client).await?;
+async fn udp_session(
+    client: Arc<Client>,
+) -> Result<(Arc<Session>, AbortOnDrop, crate::noise::Noise)> {
+    // On handshake failure the `?` below drops `pump`, aborting the RX pump before
+    // this scope returns Err; on success it is handed to the Link for the control
+    // session's lifetime so control death aborts it too.
+    let (sess, pump) = udp_connect(&client).await?;
     let (_conv, stream) = sess.open_conv(CLASS_KCP);
     let noise = tokio_timeout(UDP_HANDSHAKE_TIMEOUT, client_handshake(stream, &client.psk))
         .await
         .map_err(|_| -> crate::Error { "udp handshake timed out".into() })??;
-    Ok((sess, noise))
+    Ok((sess, pump, noise))
 }
 
 /// Establish the control connection and dispatch `Open` requests until it drops.
@@ -251,9 +273,9 @@ async fn session(client: Arc<Client>) -> Result<()> {
     // Try UDP first for Auto/Udp; fall back to TCP for Auto/Tcp.
     let (link, r, w) = if mode != Transport::Tcp {
         match udp_session(client.clone()).await {
-            Ok((sess, (r, w))) => {
+            Ok((sess, pump, (r, w))) => {
                 eprintln!("connected to {} over udp", client.server);
-                (Link::Udp(sess), r, w)
+                (Link::Udp(sess, pump), r, w)
             }
             Err(e) => {
                 if mode == Transport::Udp {
@@ -401,7 +423,7 @@ async fn handle_open(
             bridge::udp_client(local, nr, nw).await;
         }
         // --- UDP transport ---
-        (Link::Udp(sess), Proto::Tcp) => {
+        (Link::Udp(sess, _), Proto::Tcp) => {
             let (_conv, stream) = sess.open_conv(CLASS_KCP);
             let (nr, mut nw) = client_handshake(stream, &client.psk).await?;
             nw.send(&Msg::Data { id }.encode()).await?;
@@ -412,7 +434,7 @@ async fn handle_open(
                 })?;
             bridge::tcp(local, nr, nw).await;
         }
-        (Link::Udp(sess), Proto::Udp) => {
+        (Link::Udp(sess, _), Proto::Udp) => {
             let conv = (id as u32) | SETUP_CONV_BIT;
             let stream = sess.open_conv_with(CLASS_SETUP, conv);
             let noise = Arc::new(client_handshake_stateless(stream, &client.psk, id).await?);
