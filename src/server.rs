@@ -24,6 +24,9 @@ use crate::tap::TapDevice;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_INFLIGHT_HANDSHAKES: usize = 256;
+/// Pause after a transient accept/recv error so a persistent failure (e.g. EMFILE
+/// under fd pressure) does not spin the listener loop at 100% CPU.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ActiveTransport {
@@ -182,7 +185,16 @@ pub async fn run(
     let l = TcpListener::bind((bind.as_str(), control_port)).await?;
     eprintln!("control listening on {bind}:{control_port}");
     loop {
-        let (sock, peer) = l.accept().await?;
+        // A transient accept error (EMFILE, ECONNABORTED, ...) must not kill the
+        // control loop or the process; log it, back off briefly, and keep serving.
+        let (sock, peer) = match l.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("control accept error: {e}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+        };
         let srv = srv.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_incoming(srv, sock).await {
@@ -253,7 +265,16 @@ pub(crate) async fn serve_stream(
 async fn tcp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
     let l = TcpListener::bind((bind.as_str(), port)).await?;
     loop {
-        let (public, _) = l.accept().await?;
+        // Keep the forwarded port alive across transient accept errors so fd
+        // pressure does not silently and permanently kill this listener.
+        let (public, _) = match l.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("tcp listener :{port} accept error: {e}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+        };
         let srv = srv.clone();
         tokio::spawn(async move {
             let Some((id, rx)) = srv.open(Proto::Tcp, port) else {
@@ -275,7 +296,16 @@ async fn udp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
     let mut buf = [0u8; 65535];
 
     loop {
-        let (n, src) = socket.recv_from(&mut buf).await?;
+        // A transient recv error must not kill the forwarded UDP port; log, back
+        // off briefly, and keep serving.
+        let (n, src) = match socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("udp listener :{port} recv error: {e}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+        };
         let data = buf[..n].to_vec();
 
         // Route to an existing session; recover the datagram if it is dead.
@@ -354,7 +384,16 @@ async fn udp_control_listener(srv: Arc<Server>, bind: String, port: u16) -> Resu
     let mut buf = vec![0u8; 65535];
 
     loop {
-        let (n, src) = socket.recv_from(&mut buf).await?;
+        // A transient recv error must not kill the control loop or the process;
+        // log, back off briefly, and keep serving.
+        let (n, src) = match socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("udp control recv error: {e}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+        };
         let sess = sessions
             .entry(src)
             .or_insert_with(|| session(socket.clone(), src, 0))
