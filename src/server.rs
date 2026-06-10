@@ -8,7 +8,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 #[cfg(target_os = "linux")]
 use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot, Semaphore};
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 use crate::bridge;
 use crate::dgram::{DgramRx, DgramTx};
@@ -33,6 +33,13 @@ const MAX_INFLIGHT_HANDSHAKES: usize = 256;
 /// Pause after a transient accept/recv error so a persistent failure (e.g. EMFILE
 /// under fd pressure) does not spin the listener loop at 100% CPU.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+/// Idle window for a per-source UDP control session. A real client sends KCP ACKs
+/// and 25s control pings, so a session silent this long is dead (NAT rebind, churn,
+/// or stray probe traffic). The sweep evicts it, bounding the session map on a
+/// public port. Sized above the control ping interval so a healthy link survives.
+const UDP_SESSION_TTL: Duration = Duration::from_secs(90);
+/// How often the control loop sweeps idle/empty sessions.
+const UDP_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ActiveTransport {
@@ -402,26 +409,59 @@ async fn udp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
 async fn udp_control_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
     let socket = Arc::new(UdpSocket::bind((bind.as_str(), port)).await?);
     eprintln!("udp control listening on {bind}:{port}");
-    let mut sessions: HashMap<SocketAddr, Arc<Session>> = HashMap::new();
+    // Each entry holds the session and the last time a datagram reached it. The
+    // map only retains a source once a datagram from it routes to a valid conv,
+    // and the periodic sweep evicts idle or conv-less entries, so the map cannot
+    // grow without bound from stray/unroutable traffic on a public port.
+    let mut sessions: HashMap<SocketAddr, (Arc<Session>, Instant)> = HashMap::new();
     let mut buf = vec![0u8; 65535];
+    let mut sweep = tokio::time::interval(UDP_SWEEP_INTERVAL);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         // A transient recv error must not kill the control loop or the process;
-        // log, back off briefly, and keep serving.
-        let (n, src) = match socket.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("udp control recv error: {e}");
-                tokio::time::sleep(ACCEPT_BACKOFF).await;
+        // log, back off briefly, and keep serving. The sweep runs between recvs;
+        // dropping a session's `Arc` closes its send channel and ends socket_writer.
+        let (n, src) = tokio::select! {
+            r = socket.recv_from(&mut buf) => match r {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("udp control recv error: {e}");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    continue;
+                }
+            },
+            _ = sweep.tick() => {
+                let now = Instant::now();
+                sessions.retain(|_, (sess, last)| {
+                    now.duration_since(*last) < UDP_SESSION_TTL && !sess.is_idle()
+                });
                 continue;
             }
         };
-        let sess = sessions
-            .entry(src)
-            .or_insert_with(|| session(socket.clone(), src, 0))
-            .clone();
 
-        match route(&sess, &buf[..n]) {
+        // Route through the existing session for this source, or a fresh candidate.
+        // A candidate that yields no valid conv is dropped on this iteration, so
+        // stray/unroutable datagrams leave no lasting session or socket_writer task.
+        let (sess, known) = match sessions.get(&src) {
+            Some((sess, _)) => (sess.clone(), true),
+            None => (session(socket.clone(), src, 0), false),
+        };
+
+        let accepted = route(&sess, &buf[..n]);
+        if known {
+            // Existing session: refresh its activity deadline.
+            if let Some(entry) = sessions.get_mut(&src) {
+                entry.1 = Instant::now();
+            }
+        } else if accepted.is_some() || !sess.is_idle() {
+            // First datagram from this source routed to a valid conv: retain it.
+            sessions.insert(src, (sess.clone(), Instant::now()));
+        }
+        // Otherwise `sess` is a candidate that routed nothing; dropping it here
+        // closes its send channel and ends its socket_writer task.
+
+        match accepted {
             Some(Accepted::Stream { stream, .. }) => {
                 let srv = srv.clone();
                 let psk = srv.psk;
@@ -480,7 +520,8 @@ async fn accept_udp_forward(
         return;
     };
     let noise = Arc::new(noise);
-    let inbound = sess.register_dgram(conv);
+    // `_guard` keeps the session counted live for the whole bridge.
+    let (inbound, _guard) = sess.register_dgram(conv);
     let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
     let rx = DgramRx::new(inbound, noise);
     crate::bridge::udp_server_stateless(public_socket, public_src, dgram_rx, rx, tx).await;
@@ -499,7 +540,8 @@ async fn accept_bridge(srv: Arc<Server>, sess: Arc<Session>, conv: u32, noise: S
     };
     let cancel = srv.supersede_bridge();
     let noise = Arc::new(noise);
-    let inbound = sess.register_dgram(conv);
+    // `_guard` keeps the session counted live for the whole bridge.
+    let (inbound, _guard) = sess.register_dgram(conv);
     let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
     let rx = DgramRx::new(inbound, noise);
     bridge::tap_dgram(tap, rx, tx, cancel).await;

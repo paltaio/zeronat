@@ -211,7 +211,7 @@ async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
     eprintln!("bridge connected to {} over udp", client.server);
 
     let noise = Arc::new(noise);
-    let inbound = sess.register_dgram(BRIDGE_CONV);
+    let (inbound, _guard) = sess.register_dgram(BRIDGE_CONV);
     let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
     let rx = DgramRx::new(inbound, noise);
     // The client runs one bridge at a time, so nothing ever cancels it.
@@ -408,7 +408,7 @@ async fn handle_open(
             local.connect(&target).await.map_err(|e| -> crate::Error {
                 format!("connecting to local {target}: {e}").into()
             })?;
-            let inbound = sess.register_dgram(conv);
+            let (inbound, _guard) = sess.register_dgram(conv);
             let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
             let rx = DgramRx::new(inbound, noise);
             bridge::udp_client_stateless(local, rx, tx).await;

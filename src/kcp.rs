@@ -200,7 +200,18 @@ impl AsyncWrite for KcpStream {
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+
+/// Drops the session's live-conv counter when a conv driver or dgram receiver
+/// ends, so an idle session can be detected and reclaimed.
+pub struct ConvGuard(Arc<AtomicUsize>);
+
+impl Drop for ConvGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Shared per-(socket,peer) multiplexing state.
 pub struct Session {
@@ -208,6 +219,9 @@ pub struct Session {
     convs: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>, // conv id -> inbound packets
     dgrams: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>, // tag -> [nonce][ct] bodies
     next_conv: Mutex<u32>,
+    // Count of live conv drivers + dgram receivers; reaches zero when the session
+    // carries nothing, letting the control listener reclaim it.
+    live: Arc<AtomicUsize>,
 }
 
 impl Session {
@@ -216,16 +230,28 @@ impl Session {
         let (write_tx, write_rx) = mpsc::channel(APP_CHAN_CAP);
         let (read_tx, read_rx) = mpsc::channel(APP_CHAN_CAP);
         self.convs.lock().unwrap().insert(conv, inbound_tx);
+        self.live.fetch_add(1, Ordering::Relaxed);
+        let guard = ConvGuard(self.live.clone());
         let kcp = new_kcp(conv, self.send_tx.clone(), class);
-        tokio::spawn(drive_conv(
-            kcp,
-            ConvChannels {
-                inbound_rx,
-                write_rx,
-                read_tx,
-            },
-        ));
+        tokio::spawn(async move {
+            let _guard = guard;
+            drive_conv(
+                kcp,
+                ConvChannels {
+                    inbound_rx,
+                    write_rx,
+                    read_tx,
+                },
+            )
+            .await;
+        });
         KcpStream::new(write_tx, read_rx)
+    }
+
+    /// True once the session carries no live conv or dgram (and never did, or all
+    /// have ended). A freshly built session reads zero until a conv is opened.
+    pub fn is_idle(&self) -> bool {
+        self.live.load(Ordering::Relaxed) == 0
     }
 
     /// Initiator: open a stream/setup conv with a caller-chosen conv id.
@@ -263,10 +289,13 @@ impl Session {
         }
     }
 
-    pub fn register_dgram(&self, tag: u32) -> mpsc::Receiver<Vec<u8>> {
+    /// Register a dgram tag. The returned guard must outlive the dgram bridge so
+    /// the session is not reclaimed while the bridge is still running.
+    pub fn register_dgram(&self, tag: u32) -> (mpsc::Receiver<Vec<u8>>, ConvGuard) {
         let (tx, rx) = mpsc::channel(APP_CHAN_CAP);
         self.dgrams.lock().unwrap().insert(tag, tx);
-        rx
+        self.live.fetch_add(1, Ordering::Relaxed);
+        (rx, ConvGuard(self.live.clone()))
     }
 
     pub fn send_tx(&self) -> mpsc::Sender<Vec<u8>> {
@@ -290,6 +319,7 @@ pub fn session(socket: Arc<UdpSocket>, peer: SocketAddr, first_conv: u32) -> Arc
         convs: Mutex::new(HashMap::new()),
         dgrams: Mutex::new(HashMap::new()),
         next_conv: Mutex::new(first_conv),
+        live: Arc::new(AtomicUsize::new(0)),
     })
 }
 
