@@ -30,6 +30,13 @@ pub const BRIDGE_ID: u64 = u64::MAX;
 const SOCKET_SEND_CAP: usize = 1024;
 const APP_CHAN_CAP: usize = 256;
 
+/// Per-conv idle deadline. A conv with no inbound packet for this long is dead
+/// (KCP has no FIN, so a silent peer never signals close). Set far above the
+/// KCP RTO and any normal inter-packet gap so an active-but-slow conv survives,
+/// and >= the app-level 90s control deadline so the app layer trips first on the
+/// control conv (the client pings every 25s, well within this window).
+const CONV_IDLE: Duration = Duration::from_secs(180);
+
 /// `std::io::Write` sink handed to a `Kcp`. Each `write` is one KCP packet; we
 /// prefix the class byte and hand it to the socket-sender channel without
 /// blocking (KCP retransmits anything dropped under backpressure).
@@ -82,6 +89,9 @@ async fn drive_conv(mut kcp: Kcp<ChannelWriter>, mut ch: ConvChannels) {
     let now_ms = move || base.elapsed().as_millis() as u32;
     let mut buf = vec![0u8; 65535];
     let mut write_open = true;
+    // Monotonic last-progress mark; immune to wall-clock steps. Reset on every
+    // inbound packet so an active conv never trips the idle deadline.
+    let mut last_seen = Instant::now();
 
     loop {
         let now = now_ms();
@@ -97,14 +107,18 @@ async fn drive_conv(mut kcp: Kcp<ChannelWriter>, mut ch: ConvChannels) {
         let delay = kcp.check(now_ms()).max(1);
         tokio::select! {
             pkt = ch.inbound_rx.recv() => match pkt {
-                Some(p) => { let _ = kcp.input(&p); }
+                Some(p) => { let _ = kcp.input(&p); last_seen = Instant::now(); }
                 None => return, // mux dropped this conv
             },
             data = ch.write_rx.recv(), if write_open => match data {
                 Some(d) => { let _ = kcp.send(&d); }
                 None => { write_open = false; }
             },
-            _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {
+                if last_seen.elapsed() >= CONV_IDLE {
+                    return; // silent peer; reclaim KCP state and the map entry
+                }
+            }
         }
     }
 }
@@ -203,21 +217,31 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// Drops the session's live-conv counter when a conv driver or dgram receiver
-/// ends, so an idle session can be detected and reclaimed.
-pub struct ConvGuard(Arc<AtomicUsize>);
+type ConvMap = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
+
+/// When a conv driver or dgram receiver ends, decrements the session's live
+/// counter (so an idle session can be reclaimed) and erases its own entry from
+/// the owning map (so the convs/dgrams maps stay bounded by concurrent, not
+/// cumulative, connections). One guard, both cleanups, fires on every exit path.
+pub struct ConvGuard {
+    live: Arc<AtomicUsize>,
+    map: ConvMap,
+    key: u32,
+}
 
 impl Drop for ConvGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        // std::sync::Mutex only, no .await in this scope: cannot block a runtime.
+        self.map.lock().unwrap().remove(&self.key);
+        self.live.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 /// Shared per-(socket,peer) multiplexing state.
 pub struct Session {
     send_tx: mpsc::Sender<Vec<u8>>,
-    convs: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>, // conv id -> inbound packets
-    dgrams: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>, // tag -> [nonce][ct] bodies
+    convs: ConvMap,  // conv id -> inbound packets
+    dgrams: ConvMap, // tag -> [nonce][ct] bodies
     next_conv: Mutex<u32>,
     // Count of live conv drivers + dgram receivers; reaches zero when the session
     // carries nothing, letting the control listener reclaim it.
@@ -231,7 +255,11 @@ impl Session {
         let (read_tx, read_rx) = mpsc::channel(APP_CHAN_CAP);
         self.convs.lock().unwrap().insert(conv, inbound_tx);
         self.live.fetch_add(1, Ordering::Relaxed);
-        let guard = ConvGuard(self.live.clone());
+        let guard = ConvGuard {
+            live: self.live.clone(),
+            map: self.convs.clone(),
+            key: conv,
+        };
         let kcp = new_kcp(conv, self.send_tx.clone(), class);
         tokio::spawn(async move {
             let _guard = guard;
@@ -295,7 +323,12 @@ impl Session {
         let (tx, rx) = mpsc::channel(APP_CHAN_CAP);
         self.dgrams.lock().unwrap().insert(tag, tx);
         self.live.fetch_add(1, Ordering::Relaxed);
-        (rx, ConvGuard(self.live.clone()))
+        let guard = ConvGuard {
+            live: self.live.clone(),
+            map: self.dgrams.clone(),
+            key: tag,
+        };
+        (rx, guard)
     }
 
     pub fn send_tx(&self) -> mpsc::Sender<Vec<u8>> {
@@ -316,8 +349,8 @@ pub fn session(socket: Arc<UdpSocket>, peer: SocketAddr, first_conv: u32) -> Arc
     tokio::spawn(socket_writer(socket, peer, send_rx));
     Arc::new(Session {
         send_tx,
-        convs: Mutex::new(HashMap::new()),
-        dgrams: Mutex::new(HashMap::new()),
+        convs: Arc::new(Mutex::new(HashMap::new())),
+        dgrams: Arc::new(Mutex::new(HashMap::new())),
         next_conv: Mutex::new(first_conv),
         live: Arc::new(AtomicUsize::new(0)),
     })
