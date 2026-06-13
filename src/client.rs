@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 use crate::Result;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
-#[cfg(target_os = "linux")]
 use tokio::sync::Notify;
 use tokio::time::timeout as tokio_timeout;
 use tokio::time::{interval, sleep};
@@ -146,7 +145,9 @@ enum Link {
     Tcp, // data conns dial new TcpStreams
     // data conns open KCP convs on the shared UDP session; the guard aborts the
     // session's RX pump when this Link drops at control teardown (held for Drop).
-    Udp(Arc<Session>, #[allow(dead_code)] AbortOnDrop),
+    // The Notify fires when that pump sees the peer vanish, so the control loop can
+    // tear down at once instead of waiting out CONTROL_TIMEOUT.
+    Udp(Arc<Session>, #[allow(dead_code)] AbortOnDrop, Arc<Notify>),
 }
 
 /// How the server's control address is found: a fixed `host:port`, or looked up
@@ -327,7 +328,7 @@ async fn bridge_session(
 
 /// Bind a local UDP socket, connect it to the server, start the KCP session, and
 /// spawn the inbound RX pump. Shared by the control and bridge UDP paths.
-async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop)> {
+async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop, Arc<Notify>)> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let server: SocketAddr = client
         .server
@@ -338,16 +339,36 @@ async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop)> {
     // A connected UDP socket whose peer black-holes never errors on recv, so this
     // pump must be aborted on teardown; the returned guard ties it to the caller's
     // connection scope and fires on both handshake-failure and control-death paths.
+    // A peer that vanishes ungracefully (server restart) does surface an ICMP
+    // port-unreachable as ConnectionRefused/ConnectionReset; firing `cancel` then
+    // makes the owner tear down in seconds instead of waiting out CONTROL_TIMEOUT.
+    let cancel = Arc::new(Notify::new());
     let pump = {
         let sess = sess.clone();
+        let cancel = cancel.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            while let Ok(n) = socket.recv(&mut buf).await {
-                route(&sess, &buf[..n]);
+            loop {
+                match socket.recv(&mut buf).await {
+                    Ok(n) => {
+                        route(&sess, &buf[..n]);
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        cancel.notify_one();
+                        return;
+                    }
+                    Err(e) => eprintln!("udp recv error: {e}"),
+                }
             }
         })
     };
-    Ok((sess, AbortOnDrop(pump)))
+    Ok((sess, AbortOnDrop(pump), cancel))
 }
 
 /// L2 bridge over the UDP transport: frames ride the unreliable datagram channel.
@@ -358,7 +379,7 @@ async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop)> {
 async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bool) {
     // `_pump` aborts the session RX pump when this scope ends (handshake failure
     // or bridge teardown), so a reconnect cannot leave the old pump running.
-    let (sess, _pump) = match udp_connect(&client).await {
+    let (sess, _pump, cancel) = match udp_connect(&client).await {
         Ok(v) => v,
         Err(e) => return (Err(e), false),
     };
@@ -379,8 +400,9 @@ async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bo
     let (inbound, _guard) = sess.register_dgram(BRIDGE_CONV);
     let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
     let rx = DgramRx::new(inbound, noise);
-    // The client runs one bridge at a time, so nothing ever cancels it.
-    bridge::tap_dgram(tap, rx, tx, Arc::new(Notify::new())).await;
+    // `cancel` fires only when the RX pump sees the peer vanish (server restart),
+    // tearing the bridge down at once instead of stalling until the next reconnect.
+    bridge::tap_dgram(tap, rx, tx, cancel).await;
     (Ok(()), true)
 }
 
@@ -414,16 +436,16 @@ async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bo
 /// handshaked control reader/writer, or an error to trigger TCP fallback.
 async fn udp_session(
     client: Arc<Client>,
-) -> Result<(Arc<Session>, AbortOnDrop, crate::noise::Noise)> {
+) -> Result<(Arc<Session>, AbortOnDrop, Arc<Notify>, crate::noise::Noise)> {
     // On handshake failure the `?` below drops `pump`, aborting the RX pump before
     // this scope returns Err; on success it is handed to the Link for the control
     // session's lifetime so control death aborts it too.
-    let (sess, pump) = udp_connect(&client).await?;
+    let (sess, pump, cancel) = udp_connect(&client).await?;
     let (_conv, stream) = sess.open_conv(CLASS_KCP);
     let noise = tokio_timeout(UDP_HANDSHAKE_TIMEOUT, client_handshake(stream, &client.psk))
         .await
         .map_err(|_| -> crate::Error { "udp handshake timed out".into() })??;
-    Ok((sess, pump, noise))
+    Ok((sess, pump, cancel, noise))
 }
 
 /// Establish the control connection and dispatch `Open` requests until it drops.
@@ -439,9 +461,9 @@ async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome,
     let probe_udp = mode != Transport::Tcp && (mode == Transport::Udp || try_udp);
     let (link, r, w, started) = if probe_udp {
         match udp_session(client.clone()).await {
-            Ok((sess, pump, (r, w))) => {
+            Ok((sess, pump, cancel, (r, w))) => {
                 eprintln!("connected to {} over udp", client.server);
-                (Link::Udp(sess, pump), r, w, Some(Instant::now()))
+                (Link::Udp(sess, pump, cancel), r, w, Some(Instant::now()))
             }
             Err(e) => {
                 if mode == Transport::Udp {
@@ -502,6 +524,10 @@ async fn control_loop(
     w: crate::noise::NoiseWriter,
 ) -> Result<()> {
     let link = Arc::new(link);
+    let cancel = match link.as_ref() {
+        Link::Udp(_, _, cancel) => Some(cancel.clone()),
+        Link::Tcp => None,
+    };
 
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
     tx.try_send(Msg::Hello.encode()).ok();
@@ -535,10 +561,22 @@ async fn control_loop(
         // Any inbound frame (Pong from our ping, or an Open) resets the deadline.
         // No frame for the whole window means the link is a black hole with no
         // FIN/RST; return Err so the outer reconnect loop re-resolves and redials.
-        let msg = match tokio_timeout(CONTROL_TIMEOUT, r.recv()).await {
-            Ok(Ok(m)) => m,
-            Ok(Err(e)) => break Err(e),
-            Err(_) => break Err("control channel timed out (link dead)".into()),
+        let recv = tokio_timeout(CONTROL_TIMEOUT, r.recv());
+        let died = async {
+            match &cancel {
+                Some(c) => c.notified().await,
+                None => std::future::pending().await,
+            }
+        };
+        let msg = tokio::select! {
+            // The RX pump saw the peer vanish (ICMP unreachable on UDP); tear down
+            // now rather than waiting out CONTROL_TIMEOUT for the deadline to lapse.
+            _ = died => break Err("udp peer unreachable (link dead)".into()),
+            res = recv => match res {
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) => break Err(e),
+                Err(_) => break Err("control channel timed out (link dead)".into()),
+            },
         };
         match Msg::decode(&msg) {
             Ok(Msg::Open { proto, port, id }) => {
@@ -619,7 +657,7 @@ async fn handle_open(
             bridge::udp_client(local, nr, nw).await;
         }
         // --- UDP transport ---
-        (Link::Udp(sess, _), Proto::Tcp) => {
+        (Link::Udp(sess, _, _), Proto::Tcp) => {
             let (_conv, stream) = sess.open_conv(CLASS_KCP);
             let (nr, mut nw) = tokio_timeout(
                 OPEN_HANDSHAKE_TIMEOUT,
@@ -635,7 +673,7 @@ async fn handle_open(
                 })?;
             bridge::tcp(local, nr, nw).await;
         }
-        (Link::Udp(sess, _), Proto::Udp) => {
+        (Link::Udp(sess, _, _), Proto::Udp) => {
             let conv = (id as u32) | SETUP_CONV_BIT;
             let stream = sess.open_conv_with(CLASS_SETUP, conv);
             let noise = Arc::new(
