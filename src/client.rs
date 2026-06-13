@@ -33,6 +33,11 @@ const RETRY_DELAY: Duration = Duration::from_secs(3);
 /// forever; the delay doubles per failed cycle up to this ceiling.
 const RETRY_DELAY_MAX: Duration = Duration::from_secs(60);
 const UDP_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Bound for a per-forward connect plus Noise handshake back to the server. The
+/// server abandons a half-open forward at its own OPEN_TIMEOUT, so a black-holed
+/// TCP handshake (kernel retransmits for ~15 min) or stalled KCP conv must not
+/// keep the fd and task alive long after the server has moved on.
+const OPEN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// A control session over UDP that lives at least this long is treated as a
 /// healthy path; a shorter one counts as a flap (handshake succeeds but the KCP
 /// link cannot be sustained over a lossy/MTU-broken UDP route).
@@ -583,9 +588,13 @@ async fn handle_open(
     match (link.as_ref(), proto) {
         // --- TCP transport (unchanged behavior) ---
         (Link::Tcp, Proto::Tcp) => {
-            let sock = TcpStream::connect(&client.server).await?;
-            sock.set_nodelay(true).ok();
-            let (nr, mut nw) = client_handshake(sock, &client.psk).await?;
+            let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
+                let sock = TcpStream::connect(&client.server).await?;
+                sock.set_nodelay(true).ok();
+                client_handshake(sock, &client.psk).await
+            })
+            .await
+            .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
             nw.send(&Msg::Data { id }.encode()).await?;
             let local = TcpStream::connect(&target)
                 .await
@@ -595,9 +604,13 @@ async fn handle_open(
             bridge::tcp(local, nr, nw).await;
         }
         (Link::Tcp, Proto::Udp) => {
-            let sock = TcpStream::connect(&client.server).await?;
-            sock.set_nodelay(true).ok();
-            let (nr, mut nw) = client_handshake(sock, &client.psk).await?;
+            let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
+                let sock = TcpStream::connect(&client.server).await?;
+                sock.set_nodelay(true).ok();
+                client_handshake(sock, &client.psk).await
+            })
+            .await
+            .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
             nw.send(&Msg::Data { id }.encode()).await?;
             let local = UdpSocket::bind("0.0.0.0:0").await?;
             local.connect(&target).await.map_err(|e| -> crate::Error {
@@ -608,7 +621,12 @@ async fn handle_open(
         // --- UDP transport ---
         (Link::Udp(sess, _), Proto::Tcp) => {
             let (_conv, stream) = sess.open_conv(CLASS_KCP);
-            let (nr, mut nw) = client_handshake(stream, &client.psk).await?;
+            let (nr, mut nw) = tokio_timeout(
+                OPEN_HANDSHAKE_TIMEOUT,
+                client_handshake(stream, &client.psk),
+            )
+            .await
+            .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
             nw.send(&Msg::Data { id }.encode()).await?;
             let local = TcpStream::connect(&target)
                 .await
@@ -620,7 +638,14 @@ async fn handle_open(
         (Link::Udp(sess, _), Proto::Udp) => {
             let conv = (id as u32) | SETUP_CONV_BIT;
             let stream = sess.open_conv_with(CLASS_SETUP, conv);
-            let noise = Arc::new(client_handshake_stateless(stream, &client.psk, id).await?);
+            let noise = Arc::new(
+                tokio_timeout(
+                    OPEN_HANDSHAKE_TIMEOUT,
+                    client_handshake_stateless(stream, &client.psk, id),
+                )
+                .await
+                .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??,
+            );
             let local = UdpSocket::bind("0.0.0.0:0").await?;
             local.connect(&target).await.map_err(|e| -> crate::Error {
                 format!("connecting to local {target}: {e}").into()
