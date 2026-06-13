@@ -211,12 +211,12 @@ pub async fn run(
         // Udp/Tcp ignore `try_udp` and keep their fixed path.
         let try_udp = transport != Transport::Auto || choose_udp(&udp_health, Instant::now());
         #[cfg(target_os = "linux")]
-        let (result, outcome) = match &tap {
+        let (result, outcome, established) = match &tap {
             Some(tap) => bridge_session(client.clone(), tap.clone(), try_udp).await,
             None => session(client.clone(), try_udp).await,
         };
         #[cfg(not(target_os = "linux"))]
-        let (result, outcome) = session(client.clone(), try_udp).await;
+        let (result, outcome, established) = session(client.clone(), try_udp).await;
         if transport == Transport::Auto && outcome != UdpOutcome::Skipped {
             record(
                 &mut udp_health,
@@ -226,7 +226,13 @@ pub async fn run(
         }
         if let Err(e) = result {
             eprintln!("connection lost: {e}");
-            discovery.invalidate();
+            // Only a failure to establish against the cached address invalidates
+            // it; a long-lived session dying from a transient blip keeps the cache
+            // so the redial stays off the DHT. If the IP truly moved, the next
+            // redial fails to establish and that clears it.
+            if !established {
+                discovery.invalidate();
+            }
         }
         sleep(RETRY_DELAY).await;
     }
@@ -241,30 +247,36 @@ async fn bridge_session(
     client: Arc<Client>,
     tap: Arc<TapDevice>,
     try_udp: bool,
-) -> (Result<()>, UdpOutcome) {
+) -> (Result<()>, UdpOutcome, bool) {
     let mode = client.transport;
     if mode == Transport::Tcp || (mode == Transport::Auto && !try_udp) {
-        return (bridge_tcp(client, tap).await, UdpOutcome::Skipped);
+        let (result, established) = bridge_tcp(client, tap).await;
+        return (result, UdpOutcome::Skipped, established);
     }
     let started = Instant::now();
     match bridge_udp(client.clone(), tap.clone()).await {
-        Ok(()) => {
+        (Ok(()), established) => {
             let healthy = started.elapsed() >= UDP_MIN_HEALTHY;
             let outcome = if healthy {
                 UdpOutcome::Healthy
             } else {
                 UdpOutcome::Unhealthy
             };
-            (Ok(()), outcome)
+            (Ok(()), outcome, established)
         }
-        Err(e) => {
+        (Err(e), established) => {
             if mode == Transport::Udp {
-                return (Err(e), UdpOutcome::Skipped);
+                return (Err(e), UdpOutcome::Skipped, established);
             }
             // A short-lived bridge_udp returns Err with the handshake never even
             // reached on some paths; treat any UDP failure here as a flap signal.
             eprintln!("udp transport unavailable ({e}); falling back to tcp");
-            (bridge_tcp(client, tap).await, UdpOutcome::Unhealthy)
+            let (result, tcp_established) = bridge_tcp(client, tap).await;
+            (
+                result,
+                UdpOutcome::Unhealthy,
+                established || tcp_established,
+            )
         }
     }
 }
@@ -295,18 +307,28 @@ async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop)> {
 }
 
 /// L2 bridge over the UDP transport: frames ride the unreliable datagram channel.
+/// The bool is whether the handshake established before the bridge ran or failed,
+/// so the reconnect loop can tell a failed connect from an established-then-dead
+/// session.
 #[cfg(target_os = "linux")]
-async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
+async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bool) {
     // `_pump` aborts the session RX pump when this scope ends (handshake failure
     // or bridge teardown), so a reconnect cannot leave the old pump running.
-    let (sess, _pump) = udp_connect(&client).await?;
+    let (sess, _pump) = match udp_connect(&client).await {
+        Ok(v) => v,
+        Err(e) => return (Err(e), false),
+    };
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
-    let noise = tokio_timeout(
+    let noise = match tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
         client_handshake_stateless(stream, &client.psk, BRIDGE_ID),
     )
     .await
-    .map_err(|_| -> crate::Error { "udp handshake timed out".into() })??;
+    {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return (Err(e), false),
+        Err(_) => return (Err("udp handshake timed out".into()), false),
+    };
     eprintln!("bridge connected to {} over udp", client.server);
 
     let noise = Arc::new(noise);
@@ -315,21 +337,33 @@ async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
     let rx = DgramRx::new(inbound, noise);
     // The client runs one bridge at a time, so nothing ever cancels it.
     bridge::tap_dgram(tap, rx, tx, Arc::new(Notify::new())).await;
-    Ok(())
+    (Ok(()), true)
 }
 
-/// L2 bridge over the TCP fallback: frames ride a reliable Noise stream.
+/// L2 bridge over the TCP fallback: frames ride a reliable Noise stream. The bool
+/// is whether the handshake established before the bridge ran or failed.
 #[cfg(target_os = "linux")]
-async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> Result<()> {
-    let sock = TcpStream::connect(&client.server)
-        .await
-        .map_err(|e| -> crate::Error { format!("connecting to {}: {e}", client.server).into() })?;
+async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bool) {
+    let sock = match TcpStream::connect(&client.server).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                Err(format!("connecting to {}: {e}", client.server).into()),
+                false,
+            )
+        }
+    };
     sock.set_nodelay(true).ok();
-    let (nr, mut nw) = client_handshake(sock, &client.psk).await?;
-    nw.send(&Msg::Data { id: BRIDGE_ID }.encode()).await?;
+    let (nr, mut nw) = match client_handshake(sock, &client.psk).await {
+        Ok(v) => v,
+        Err(e) => return (Err(e), false),
+    };
+    if let Err(e) = nw.send(&Msg::Data { id: BRIDGE_ID }.encode()).await {
+        return (Err(e), true);
+    }
     eprintln!("bridge connected to {} over tcp", client.server);
     bridge::tap_stream(tap, nr, nw, Arc::new(Notify::new())).await;
-    Ok(())
+    (Ok(()), true)
 }
 
 /// Establish the control channel over UDP/KCP. Returns the session and the
@@ -349,9 +383,11 @@ async fn udp_session(
 }
 
 /// Establish the control connection and dispatch `Open` requests until it drops.
-/// Returns the loop result paired with how UDP behaved this attempt, so the
-/// reconnect loop can damp UDP flapping (Auto only; see `UdpHealth`).
-async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome) {
+/// Returns the loop result, how UDP behaved this attempt (so the reconnect loop
+/// can damp UDP flapping; Auto only, see `UdpHealth`), and whether the control
+/// channel ever established (reaching `control_loop` means connect and handshake
+/// both succeeded; a later death is not a failure to establish).
+async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome, bool) {
     let mode = client.transport;
 
     // Try UDP first for Auto/Udp (unless cooldown skipped it); fall back to TCP
@@ -366,7 +402,7 @@ async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome)
             Err(e) => {
                 if mode == Transport::Udp {
                     // Forced UDP never falls back; a failed connect is just an error.
-                    return (Err(e), UdpOutcome::Skipped);
+                    return (Err(e), UdpOutcome::Skipped, false);
                 }
                 // A failed UDP connect is itself a flap signal for the cooldown,
                 // independent of how the TCP fallback session fares afterwards.
@@ -376,16 +412,17 @@ async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome)
                         return (
                             control_loop(client, Link::Tcp, r, w).await,
                             UdpOutcome::Unhealthy,
+                            true,
                         )
                     }
-                    Err(e) => return (Err(e), UdpOutcome::Unhealthy),
+                    Err(e) => return (Err(e), UdpOutcome::Unhealthy, false),
                 }
             }
         }
     } else {
         match tcp_control(client.clone()).await {
             Ok((r, w)) => (Link::Tcp, r, w, None),
-            Err(e) => return (Err(e), UdpOutcome::Skipped),
+            Err(e) => return (Err(e), UdpOutcome::Skipped, false),
         }
     };
 
@@ -398,7 +435,7 @@ async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome)
         Some(_) => UdpOutcome::Unhealthy,
         None => UdpOutcome::Skipped,
     };
-    (result, outcome)
+    (result, outcome, true)
 }
 
 /// Dial the TCP control connection and run the Noise handshake.
