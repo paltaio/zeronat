@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
-use crate::dgram::{DgramRx, DgramTx};
+use crate::dgram::{DgramRx, DgramTx, Frame};
 use crate::noise::{NoiseReader, NoiseWriter};
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
@@ -181,7 +181,8 @@ pub async fn tap_dgram(tap: Arc<TapDevice>, mut rx: DgramRx, tx: DgramTx, cancel
                 Err(_) => break,
             },
             m = rx.recv() => match m {
-                Some(f) => { if tap.write_frame(&f).await.is_err() { break; } }
+                Some(Frame::Data(f)) => { if tap.write_frame(&f).await.is_err() { break; } }
+                Some(Frame::Keepalive) => {}
                 None => break,
             },
         }
@@ -216,25 +217,30 @@ pub async fn tap_stream(
 /// Client side of a UDP-forward stream over the raw datagram channel.
 pub async fn udp_client_stateless(local: UdpSocket, mut rx: DgramRx, tx: DgramTx) {
     let mut buf = [0u8; UDP_BUF];
+    let half = UDP_IDLE / 2;
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_in = Instant::now();
     loop {
-        let step = timeout(UDP_IDLE, async {
-            tokio::select! {
-                m = rx.recv() => {
-                    let m = m.ok_or("transport closed")?;
-                    local.send(&m).await?;
-                    Ok::<_, crate::Error>(true)
+        let alive = tokio::select! {
+            m = rx.recv() => match m {
+                Some(f) => {
+                    last_in = Instant::now();
+                    match f {
+                        Frame::Keepalive => true,
+                        Frame::Data(d) => local.send(&d).await.is_ok(),
+                    }
                 }
-                r = local.recv(&mut buf) => {
-                    let n = r?;
-                    tx.send(&buf[..n]).await?;
-                    Ok::<_, crate::Error>(true)
-                }
-            }
-        })
-        .await;
-        match step {
-            Ok(Ok(true)) => {}
-            _ => break,
+                None => false,
+            },
+            r = local.recv(&mut buf) => match r {
+                Ok(n) => tx.send(&buf[..n]).await.is_ok(),
+                Err(_) => false,
+            },
+            _ = tick.tick() => last_in.elapsed() < UDP_IDLE && tx.probe().await.is_ok(),
+        };
+        if !alive {
+            break;
         }
     }
 }
@@ -247,24 +253,30 @@ pub async fn udp_server_stateless(
     mut rx: DgramRx,
     tx: DgramTx,
 ) {
+    let half = UDP_IDLE / 2;
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_in = Instant::now();
     loop {
-        let step = timeout(UDP_IDLE, async {
-            tokio::select! {
-                d = dgram_rx.recv() => match d {
-                    Some(d) => { tx.send(&d).await?; Ok::<_, crate::Error>(true) }
-                    None => Ok::<_, crate::Error>(false),
-                },
-                m = rx.recv() => {
-                    let m = m.ok_or("transport closed")?;
-                    socket.send_to(&m, src).await?;
-                    Ok::<_, crate::Error>(true)
+        let alive = tokio::select! {
+            d = dgram_rx.recv() => match d {
+                Some(d) => tx.send(&d).await.is_ok(),
+                None => false,
+            },
+            m = rx.recv() => match m {
+                Some(f) => {
+                    last_in = Instant::now();
+                    match f {
+                        Frame::Keepalive => true,
+                        Frame::Data(d) => socket.send_to(&d, src).await.is_ok(),
+                    }
                 }
-            }
-        })
-        .await;
-        match step {
-            Ok(Ok(true)) => {}
-            _ => break,
+                None => false,
+            },
+            _ = tick.tick() => last_in.elapsed() < UDP_IDLE && tx.probe().await.is_ok(),
+        };
+        if !alive {
+            break;
         }
     }
 }
