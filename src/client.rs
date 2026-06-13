@@ -32,6 +32,10 @@ const RETRY_DELAY: Duration = Duration::from_secs(3);
 /// forever; the delay doubles per failed cycle up to this ceiling.
 const RETRY_DELAY_MAX: Duration = Duration::from_secs(60);
 const UDP_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Pause after a transient recv error on the RX pump so a persistent ready-error
+/// (e.g. HostUnreachable/NetworkUnreachable on a connected UDP socket) does not
+/// spin the loop at 100% CPU or flood logs.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// Bound for a per-forward connect plus Noise handshake back to the server. The
 /// server abandons a half-open forward at its own OPEN_TIMEOUT, so a black-holed
 /// TCP handshake (kernel retransmits for ~15 min) or stalled KCP conv must not
@@ -363,7 +367,10 @@ async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop, Arc<
                         cancel.notify_one();
                         return;
                     }
-                    Err(e) => eprintln!("udp recv error: {e}"),
+                    Err(e) => {
+                        eprintln!("udp recv error: {e}");
+                        sleep(RECV_ERROR_BACKOFF).await;
+                    }
                 }
             }
         })
