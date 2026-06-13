@@ -28,6 +28,10 @@ const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// hole (no FIN/RST on a NAT rebind, WAN re-dial, or silent firewall drop).
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(90);
 const RETRY_DELAY: Duration = Duration::from_secs(3);
+/// Cap for the reconnect backoff. A server that stays down (especially in DHT
+/// mode, where each cycle runs a full lookup) must not redial every RETRY_DELAY
+/// forever; the delay doubles per failed cycle up to this ceiling.
+const RETRY_DELAY_MAX: Duration = Duration::from_secs(60);
 const UDP_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// A control session over UDP that lives at least this long is treated as a
 /// healthy path; a shorter one counts as a flap (handshake succeeds but the KCP
@@ -68,6 +72,32 @@ fn record(state: &mut UdpHealth, healthy: bool, now: Instant) {
             state.cooldown_until = Some(now + UDP_COOLDOWN);
             state.fails = 0;
         }
+    }
+}
+
+/// Exponential backoff for the reconnect loop. Owned by the loop (like
+/// `UdpHealth`) so each running client keeps its own redial cadence. Starts at
+/// RETRY_DELAY, doubles after every failed cycle, and is capped at
+/// RETRY_DELAY_MAX; a cycle that established a control session resets it.
+struct Backoff(Duration);
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Backoff(RETRY_DELAY)
+    }
+}
+
+impl Backoff {
+    fn delay(&self) -> Duration {
+        self.0
+    }
+
+    fn fail(&mut self) {
+        self.0 = (self.0 * 2).min(RETRY_DELAY_MAX);
+    }
+
+    fn reset(&mut self) {
+        self.0 = RETRY_DELAY;
     }
 }
 
@@ -190,13 +220,15 @@ pub async fn run(
     }
 
     let mut udp_health = UdpHealth::default();
+    let mut backoff = Backoff::default();
 
     loop {
         let addr = match discovery.resolve().await {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("server discovery failed: {e}");
-                sleep(RETRY_DELAY).await;
+                sleep(backoff.delay()).await;
+                backoff.fail();
                 continue;
             }
         };
@@ -234,7 +266,14 @@ pub async fn run(
                 discovery.invalidate();
             }
         }
-        sleep(RETRY_DELAY).await;
+        // A cycle that brought the control channel up is a fresh start; one that
+        // never established (down server, failed handshake) widens the redial gap.
+        if established {
+            backoff.reset();
+        } else {
+            backoff.fail();
+        }
+        sleep(backoff.delay()).await;
     }
 }
 
