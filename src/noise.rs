@@ -371,6 +371,16 @@ impl NoiseWriter {
         }
         Ok(())
     }
+
+    /// Send a single empty-plaintext frame as a liveness probe. The receiver
+    /// decodes a zero-length payload and treats it as a keepalive without
+    /// forwarding it to the target. `send(&[])` would emit nothing, so this is
+    /// the explicit one-frame form.
+    pub async fn probe(&mut self) -> Result<()> {
+        let ct = aead_encrypt(&self.send_key, self.send_n, &[], &[]);
+        self.send_n += 1;
+        write_frame(&mut self.wh, &ct).await
+    }
 }
 
 async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
