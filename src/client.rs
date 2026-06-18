@@ -129,6 +129,7 @@ enum UdpOutcome {
 struct Client {
     server: String,
     psk: [u8; 32],
+    client_id: String,
     tcp: HashMap<u16, String>,
     udp: HashMap<u16, String>,
     transport: Transport,
@@ -214,8 +215,10 @@ pub async fn run(
     udp: Vec<(u16, String)>,
     transport: Transport,
     tap: Option<TapConfig>,
+    id_prefix: Option<String>,
 ) -> Result<()> {
     let psk = crate::noise::derive_psk(&secret);
+    let client_id = crate::identity::derive_client_id(id_prefix.as_deref());
     let tcp: HashMap<u16, String> = tcp.into_iter().collect();
     let udp: HashMap<u16, String> = udp.into_iter().collect();
     let discovery = Discovery::new(&server, &secret)?;
@@ -245,6 +248,7 @@ pub async fn run(
         let client = Arc::new(Client {
             server: addr,
             psk,
+            client_id: client_id.clone(),
             tcp: tcp.clone(),
             udp: udp.clone(),
             transport,
@@ -537,7 +541,14 @@ async fn control_loop(
     };
 
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
-    tx.try_send(Msg::Hello.encode()).ok();
+    tx.try_send(
+        Msg::ClientHello {
+            version: crate::identity::PROTO_VERSION,
+            client_id: client.client_id.clone(),
+        }
+        .encode(),
+    )
+    .ok();
 
     let mut w = w;
     let writer = tokio::spawn(async move {

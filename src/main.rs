@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 
 use zeronat::tap::TapConfig;
-use zeronat::{client, server, Result};
+use zeronat::{admin, client, server, Result};
 
 const DEFAULT_TAP_MTU: usize = 1400;
 
@@ -11,11 +11,13 @@ Usage: zeronat <SUBCOMMAND> [OPTIONS]
 Subcommands:
   server   Run on the public host (VPS)
   client   Run on the host behind CG-NAT
+  admin    Inspect topology (one-shot)
 
 server options:
   --bind <ADDR>       Address to bind on (default: 0.0.0.0)
   --control <PORT>    Control port (default: 2222)
   --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
+  --id <ID>           Server identity label (default: 0)
   --tcp <PORT>        Public TCP port to expose (repeatable)
   --udp <PORT>        Public UDP port to expose (repeatable)
   --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
@@ -28,12 +30,18 @@ server options:
 client options:
   --server <ADDR>     Server control address host:port, or 'dht' to discover via DHT
   --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
+  --id <PREFIX>       Client id prefix (default: short hostname)
   --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
   --udp <SPEC>        Forward UDP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
   --transport <MODE>  auto|udp|tcp (default: auto)
   --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
   --tap-mtu <N>       TAP MTU (default: 1400)
   --bridge <NAME>     Enslave the TAP to this existing bridge
+
+admin options:
+  show                Print the server's current topology (default command)
+  --server <ADDR>     Server control address host:port
+  --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
 
 Options:
   -h, --help          Print this help and exit
@@ -44,6 +52,7 @@ enum Cmd {
         bind: String,
         control: u16,
         secret: String,
+        server_id: String,
         tcp: Vec<u16>,
         udp: Vec<u16>,
         tap: Option<TapConfig>,
@@ -54,10 +63,15 @@ enum Cmd {
     Client {
         server: String,
         secret: String,
+        id_prefix: Option<String>,
         tcp: Vec<String>,
         udp: Vec<String>,
         transport: String,
         tap: Option<TapConfig>,
+    },
+    Admin {
+        server: String,
+        secret: String,
     },
 }
 
@@ -97,6 +111,7 @@ fn parse_args() -> Result<Cmd> {
         }
         Some("server") => "server",
         Some("client") => "client",
+        Some("admin") => "admin",
         Some(other) => {
             eprintln!("error: unknown subcommand '{other}'\n{USAGE}");
             std::process::exit(1);
@@ -128,6 +143,7 @@ fn parse_args() -> Result<Cmd> {
         let mut bind = "0.0.0.0".to_string();
         let mut control: u16 = 2222;
         let mut secret: Option<String> = None;
+        let mut server_id = "0".to_string();
         let mut tcp: Vec<u16> = Vec::new();
         let mut udp: Vec<u16> = Vec::new();
         let mut tap_name: Option<String> = None;
@@ -174,6 +190,9 @@ fn parse_args() -> Result<Cmd> {
                 "--secret" => {
                     secret = Some(iter.next().ok_or("--secret requires a value")?);
                 }
+                "--id" => {
+                    server_id = iter.next().ok_or("--id requires a value")?;
+                }
                 "--tcp" => {
                     let v = iter.next().ok_or("--tcp requires a value")?;
                     let port: u16 = v.parse().map_err(|_| -> zeronat::Error {
@@ -216,6 +235,7 @@ fn parse_args() -> Result<Cmd> {
             bind,
             control,
             secret,
+            server_id,
             tcp,
             udp,
             tap,
@@ -223,10 +243,11 @@ fn parse_args() -> Result<Cmd> {
             announce_ip,
             announce_port,
         })
-    } else {
+    } else if subcmd == "client" {
         // client
         let mut server: Option<String> = None;
         let mut secret: Option<String> = None;
+        let mut id_prefix: Option<String> = None;
         let mut tcp: Vec<String> = Vec::new();
         let mut udp: Vec<String> = Vec::new();
         let mut transport = "auto".to_string();
@@ -245,6 +266,9 @@ fn parse_args() -> Result<Cmd> {
                 }
                 "--secret" => {
                     secret = Some(iter.next().ok_or("--secret requires a value")?);
+                }
+                "--id" => {
+                    id_prefix = Some(iter.next().ok_or("--id requires a value")?);
                 }
                 "--tcp" => {
                     let v = iter.next().ok_or("--tcp requires a value")?;
@@ -285,11 +309,54 @@ fn parse_args() -> Result<Cmd> {
         Ok(Cmd::Client {
             server,
             secret,
+            id_prefix,
             tcp,
             udp,
             transport,
             tap,
         })
+    } else {
+        // admin
+        let mut command: Option<String> = None;
+        let mut server: Option<String> = None;
+        let mut secret: Option<String> = None;
+
+        while let Some(flag) = iter.next() {
+            match flag.as_str() {
+                "-h" | "--help" => {
+                    print!("{USAGE}");
+                    std::process::exit(0);
+                }
+                "--server" => {
+                    server = Some(iter.next().ok_or("--server requires a value")?);
+                }
+                "--secret" => {
+                    secret = Some(iter.next().ok_or("--secret requires a value")?);
+                }
+                other if other.starts_with('-') => {
+                    eprintln!("error: unknown flag '{other}'");
+                    std::process::exit(1);
+                }
+                other => {
+                    if command.is_some() {
+                        return Err(format!("unexpected argument '{other}'").into());
+                    }
+                    command = Some(other.to_string());
+                }
+            }
+        }
+
+        match command.as_deref() {
+            None | Some("show") => {}
+            Some(other) => return Err(format!("unknown admin command '{other}'").into()),
+        }
+
+        let server = server.ok_or("--server is required")?;
+        let secret = secret
+            .or_else(|| std::env::var("ZERONAT_SECRET").ok())
+            .ok_or("--secret or ZERONAT_SECRET is required")?;
+
+        Ok(Cmd::Admin { server, secret })
     }
 }
 
@@ -347,6 +414,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             bind,
             control,
             secret,
+            server_id,
             tcp,
             udp,
             tap,
@@ -364,11 +432,12 @@ async fn run(cmd: Cmd) -> Result<()> {
                 ip: announce_ip,
                 port: announce_port,
             });
-            server::run(bind, control, secret, tcp, udp, tap, dht).await
+            server::run(bind, control, secret, tcp, udp, tap, dht, server_id).await
         }
         Cmd::Client {
             server,
             secret,
+            id_prefix,
             tcp,
             udp,
             transport,
@@ -398,7 +467,8 @@ async fn run(cmd: Cmd) -> Result<()> {
                     )
                 }
             };
-            client::run(server, secret, tcp, udp, transport, tap).await
+            client::run(server, secret, tcp, udp, transport, tap, id_prefix).await
         }
+        Cmd::Admin { server, secret } => admin::show(server, secret).await,
     }
 }

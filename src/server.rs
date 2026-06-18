@@ -16,7 +16,7 @@ use crate::kcp::{route, session, Accepted, Session};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{server_handshake, server_handshake_stateless, Noise, StatelessNoise};
-use crate::proto::{Msg, Proto};
+use crate::proto::{ClientEntry, Listener, Msg, Proto, SnapshotBody};
 use crate::tap::TapConfig;
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
@@ -59,10 +59,14 @@ type UdpPending = (Arc<UdpSocket>, SocketAddr, mpsc::Receiver<Vec<u8>>);
 
 pub(crate) struct Server {
     psk: [u8; 32],
+    server_id: String,
+    tcp_ports: Vec<u16>,
+    udp_ports: Vec<u16>,
     next_id: Mutex<u64>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Noise>>>,
     udp_pending: Mutex<HashMap<u64, UdpPending>>,
     control_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    current_client: Mutex<Option<(String, ActiveTransport)>>,
     active_transport: Mutex<ActiveTransport>,
     handshakes: Arc<Semaphore>,
     #[cfg(target_os = "linux")]
@@ -121,6 +125,7 @@ pub struct DhtAnnounce {
     pub port: Option<u16>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     bind: String,
     control_port: u16,
@@ -129,6 +134,7 @@ pub async fn run(
     udp_ports: Vec<u16>,
     tap: Option<TapConfig>,
     dht: Option<DhtAnnounce>,
+    server_id: String,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     let tap = match &tap {
@@ -159,10 +165,14 @@ pub async fn run(
 
     let srv = Arc::new(Server {
         psk: crate::noise::derive_psk(&secret),
+        server_id,
+        tcp_ports: tcp_ports.clone(),
+        udp_ports: udp_ports.clone(),
         next_id: Mutex::new(1),
         pending: Mutex::new(HashMap::new()),
         udp_pending: Mutex::new(HashMap::new()),
         control_tx: Mutex::new(None),
+        current_client: Mutex::new(None),
         active_transport: Mutex::new(ActiveTransport::Tcp),
         handshakes: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
         #[cfg(target_os = "linux")]
@@ -243,11 +253,15 @@ pub(crate) async fn serve_stream(
     transport: ActiveTransport,
 ) -> Result<()> {
     match Msg::decode(&r.recv().await?)? {
-        Msg::Hello => {
+        Msg::ClientHello { version, client_id } => {
+            if version != crate::identity::PROTO_VERSION {
+                return Err("unsupported protocol version".into());
+            }
             let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
             *srv.control_tx.lock().unwrap() = Some(tx.clone());
             *srv.active_transport.lock().unwrap() = transport;
-            eprintln!("client connected");
+            *srv.current_client.lock().unwrap() = Some((client_id.clone(), transport));
+            eprintln!("client connected: {client_id}");
             let mut w = w;
             let writer = tokio::spawn(async move {
                 while let Some(bytes) = rx.recv().await {
@@ -267,15 +281,59 @@ pub(crate) async fn serve_stream(
                 }
             }
             // Only clear control_tx if it still points at this session's channel;
-            // a newer client may have reconnected and overwritten it.
+            // a newer client may have reconnected and overwritten it. current_client
+            // is set alongside control_tx, so it is cleared under the same guard.
             {
                 let mut ctl = srv.control_tx.lock().unwrap();
                 if ctl.as_ref().is_some_and(|cur| cur.same_channel(&tx)) {
                     *ctl = None;
+                    *srv.current_client.lock().unwrap() = None;
                 }
             }
             writer.abort();
             eprintln!("client disconnected");
+            Ok(())
+        }
+        Msg::AdminHello { version, mode } => {
+            if version != crate::identity::PROTO_VERSION {
+                return Err("unsupported protocol version".into());
+            }
+            if mode != 0 {
+                return Err("unsupported admin mode".into());
+            }
+            let listeners = srv
+                .tcp_ports
+                .iter()
+                .map(|&port| Listener {
+                    proto: Proto::Tcp,
+                    port,
+                })
+                .chain(srv.udp_ports.iter().map(|&port| Listener {
+                    proto: Proto::Udp,
+                    port,
+                }))
+                .collect();
+            let client = srv
+                .current_client
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|(id, t)| ClientEntry {
+                    client_id: id,
+                    transport: match t {
+                        ActiveTransport::Tcp => 1,
+                        ActiveTransport::Udp => 2,
+                    },
+                });
+            let body = SnapshotBody {
+                version: crate::identity::PROTO_VERSION,
+                server_id: srv.server_id.clone(),
+                listeners,
+                client,
+            };
+            eprintln!("admin connected");
+            let mut w = w;
+            w.send(&Msg::Snapshot(body).encode()).await?;
             Ok(())
         }
         Msg::Data { id } => {
