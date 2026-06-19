@@ -421,20 +421,11 @@ async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bo
 /// is whether the handshake established before the bridge ran or failed.
 #[cfg(target_os = "linux")]
 async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bool) {
-    let sock = match TcpStream::connect(&client.server).await {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                Err(format!("connecting to {}: {e}", client.server).into()),
-                false,
-            )
-        }
-    };
-    sock.set_nodelay(true).ok();
-    let (nr, mut nw) = match client_handshake(sock, &client.psk).await {
-        Ok(v) => v,
-        Err(e) => return (Err(e), false),
-    };
+    let (nr, mut nw) =
+        match connect_and_handshake(&client.server, &client.psk, OPEN_HANDSHAKE_TIMEOUT).await {
+            Ok(v) => v,
+            Err(e) => return (Err(e), false),
+        };
     if let Err(e) = nw.send(&Msg::Data { id: BRIDGE_ID }.encode()).await {
         return (Err(e), true);
     }
@@ -515,13 +506,31 @@ async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome,
     (result, outcome, true)
 }
 
+/// Dial `addr`, disable Nagle, and run the Noise handshake, bounding the whole
+/// connect-plus-handshake under `timeout`. A path that black-holes mid-handshake
+/// (msg1 ACKed but msg2 never arrives on a NAT remap, WAN re-dial, or silent
+/// firewall drop) would otherwise park on the kernel read for the retransmit
+/// window (~15 min, or forever with keepalive off); the timeout turns that into
+/// an Err so the caller can back off and redial in seconds.
+async fn connect_and_handshake(
+    addr: &str,
+    psk: &[u8; 32],
+    timeout: Duration,
+) -> Result<crate::noise::Noise> {
+    tokio_timeout(timeout, async {
+        let sock = TcpStream::connect(addr)
+            .await
+            .map_err(|e| -> crate::Error { format!("connecting to {addr}: {e}").into() })?;
+        sock.set_nodelay(true).ok();
+        client_handshake(sock, psk).await
+    })
+    .await
+    .map_err(|_| -> crate::Error { format!("tcp handshake to {addr} timed out").into() })?
+}
+
 /// Dial the TCP control connection and run the Noise handshake.
 async fn tcp_control(client: Arc<Client>) -> Result<crate::noise::Noise> {
-    let sock = TcpStream::connect(&client.server)
-        .await
-        .map_err(|e| -> crate::Error { format!("connecting to {}: {e}", client.server).into() })?;
-    sock.set_nodelay(true).ok();
-    let noise = client_handshake(sock, &client.psk).await?;
+    let noise = connect_and_handshake(&client.server, &client.psk, OPEN_HANDSHAKE_TIMEOUT).await?;
     eprintln!("connected to {}", client.server);
     Ok(noise)
 }
@@ -757,5 +766,25 @@ mod tests {
         record(&mut s, false, t0);
         assert!(s.cooldown_until.is_none());
         assert!(choose_udp(&s, t0));
+    }
+
+    // A path that completes the TCP handshake but never sends Noise msg2 must
+    // not park the initiator on the kernel read; connect_and_handshake has to
+    // give up at its timeout, not the multi-minute retransmit window.
+    #[tokio::test(start_paused = true)]
+    async fn handshake_blackhole_times_out() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        // Accept and hold the connection open without ever writing msg2.
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(sock);
+        });
+
+        let res = connect_and_handshake(&addr, &[0u8; 32], OPEN_HANDSHAKE_TIMEOUT).await;
+        assert!(res.is_err(), "expected timeout error, got Ok");
     }
 }

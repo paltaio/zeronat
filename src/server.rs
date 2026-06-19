@@ -43,6 +43,21 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 const UDP_SESSION_TTL: Duration = Duration::from_secs(90);
 /// How often the control loop sweeps idle/empty sessions.
 const UDP_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Cap on concurrent per-source sessions the public UDP control port retains. A
+/// single operator runs one client (one session), so this sits far above real
+/// usage; it exists only so a flood of distinct source addresses on the public
+/// port cannot grow the session map (and its socket_writer tasks) without bound.
+/// With `kcp::MAX_CONVS_PER_SESSION`, the worst-case conv-driver-buffer ceiling
+/// is MAX_UDP_SESSIONS * MAX_CONVS_PER_SESSION * ~64KB ~= 512 * 256 * 64KB ~= 8GB.
+const MAX_UDP_SESSIONS: usize = 512;
+
+/// Admission test for a datagram from an unknown source at the control port: a
+/// new source is admitted only while the session map is below the cap. Known
+/// sources bypass this (they already hold a slot), so a flood of fresh sources
+/// cannot evict or starve an established session.
+fn admit_new_udp_session(session_count: usize) -> bool {
+    session_count < MAX_UDP_SESSIONS
+}
 /// Backstop TTL for a per-source data-listener entry. The bridge self-reaps at
 /// `bridge::UDP_IDLE` (120s), closing its channel, which is the precise reclaim
 /// signal; this is sized above that so the sweep never evicts a live bridge and
@@ -322,17 +337,18 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
     }
 
     let bind = bind_ip.to_string();
+    let (udp_control, l) = bind_control_sockets(&bind, control_port).await?;
+    eprintln!("udp control listening on {bind}:{control_port}");
     {
         let srv = srv.clone();
-        let bind = bind.clone();
+        let udp_control = udp_control.clone();
         tokio::spawn(async move {
-            if let Err(e) = udp_control_listener(srv, bind, control_port).await {
+            if let Err(e) = udp_control_listener(srv, udp_control).await {
                 eprintln!("udp control listener stopped: {e}");
             }
         });
     }
 
-    let l = TcpListener::bind((bind.as_str(), control_port)).await?;
     eprintln!("control listening on {bind}:{control_port}");
     loop {
         // A transient accept error (EMFILE, ECONNABORTED, ...) must not kill the
@@ -374,7 +390,15 @@ pub(crate) async fn serve_stream(
     w: crate::noise::NoiseWriter,
     transport: ActiveTransport,
 ) -> Result<()> {
-    match Msg::decode(&r.recv().await?)? {
+    // Guard the first role frame: a peer can finish the handshake then never send
+    // its role, parking this task and its fd forever (half-death, NAT rebind,
+    // buggy reconnect). Bound it so the task and fd are released, mirroring the
+    // post-ClientHello control loop.
+    let first = match timeout(CONTROL_TIMEOUT, r.recv()).await {
+        Ok(res) => res?,
+        Err(_) => return Err("timed out waiting for role frame".into()),
+    };
+    match Msg::decode(&first)? {
         Msg::ClientHello { version, client_id } => {
             if version != crate::identity::PROTO_VERSION {
                 return Err("unsupported protocol version".into());
@@ -446,7 +470,13 @@ pub(crate) async fn serve_stream(
                 }
                 1 => {
                     eprintln!("admin connected (mutate)");
-                    let req = Msg::decode(&r.recv().await?)?;
+                    // Same guard as the first role frame: an admin that says it
+                    // will mutate but never sends the request must not park here.
+                    let bytes = match timeout(CONTROL_TIMEOUT, r.recv()).await {
+                        Ok(res) => res?,
+                        Err(_) => return Err("timed out waiting for admin request".into()),
+                    };
+                    let req = Msg::decode(&bytes)?;
                     let (ok, msg) = apply_mutation(&srv, req).await;
                     eprintln!("admin mutation: ok={ok} {msg}");
                     let mut w = w;
@@ -943,9 +973,20 @@ async fn udp_listener(
 /// registry, and dispatch accepted convs: stream convs run the streaming server
 /// handshake plus `serve_stream`; setup convs run the stateless handshake plus the
 /// UDP-forward bridge.
-async fn udp_control_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
-    let socket = Arc::new(UdpSocket::bind((bind.as_str(), port)).await?);
-    eprintln!("udp control listening on {bind}:{port}");
+// Bind both control sockets up front so a transient bind failure (EMFILE/
+// ENOBUFS/ENOMEM) propagates out of run() and lets the supervisor restart the
+// process. The UDP/KCP control transport must not be silently lost while the
+// TCP listener keeps the process alive, so both binds are symmetric and fatal.
+async fn bind_control_sockets(
+    bind: &str,
+    control_port: u16,
+) -> Result<(Arc<UdpSocket>, TcpListener)> {
+    let udp_control = Arc::new(UdpSocket::bind((bind, control_port)).await?);
+    let tcp_control = TcpListener::bind((bind, control_port)).await?;
+    Ok((udp_control, tcp_control))
+}
+
+async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Result<()> {
     // Each entry holds the session and the last time a datagram reached it. The
     // map only retains a source once a datagram from it routes to a valid conv,
     // and the periodic sweep evicts idle or conv-less entries, so the map cannot
@@ -982,7 +1023,17 @@ async fn udp_control_listener(srv: Arc<Server>, bind: String, port: u16) -> Resu
         // stray/unroutable datagrams leave no lasting session or socket_writer task.
         let (sess, known) = match sessions.get(&src) {
             Some((sess, _)) => (sess.clone(), true),
-            None => (session(socket.clone(), src, 0), false),
+            None => {
+                // Unknown source at the session cap: drop the datagram and build
+                // no candidate session (so no socket_writer task spawns). A flood
+                // of distinct sources cannot grow the map past the cap; existing
+                // sessions keep routing. The sweep reclaims idle entries, freeing
+                // room for new sources once the flood stops.
+                if !admit_new_udp_session(sessions.len()) {
+                    continue;
+                }
+                (session(socket.clone(), src, 0), false)
+            }
         };
 
         let accepted = route(&sess, &buf[..n]);
@@ -1089,4 +1140,156 @@ async fn accept_bridge(srv: Arc<Server>, sess: Arc<Session>, conv: u32, noise: S
     let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
     let rx = DgramRx::new(inbound, noise);
     bridge::tap_dgram(tap, rx, tx, cancel).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The UDP control bind must be fatal, exactly like the TCP control bind, so
+    // a transient failure propagates out of run() and the supervisor restarts.
+    // run() binds both sockets via bind_control_sockets; here we hold the UDP
+    // control port first and assert the helper returns Err instead of swallowing
+    // it. EADDRINUSE stands in for the EMFILE/ENOBUFS/ENOMEM cases that need root.
+    // The session admission gate must enforce MAX_UDP_SESSIONS exactly: admit
+    // while below the cap, refuse at and above it. This is the bound that stops a
+    // flood of distinct source addresses on the public control port from growing
+    // the session map (and its socket_writer tasks) without limit.
+    #[test]
+    fn admit_new_udp_session_enforces_cap() {
+        assert!(admit_new_udp_session(0));
+        assert!(admit_new_udp_session(MAX_UDP_SESSIONS - 1));
+        assert!(!admit_new_udp_session(MAX_UDP_SESSIONS));
+        assert!(!admit_new_udp_session(MAX_UDP_SESSIONS + 10_000));
+    }
+
+    // The control loop only gates *unknown* sources on the cap; a known source
+    // already holds a slot and routes regardless of map fullness. This mirrors
+    // that branch: at the cap, an established session still routes (real traffic
+    // is not starved) while a fresh source is refused admission.
+    #[test]
+    fn established_session_not_starved_by_flood() {
+        let mut sessions: HashMap<SocketAddr, ()> = HashMap::new();
+        let established: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        sessions.insert(established, ());
+        while sessions.len() < MAX_UDP_SESSIONS {
+            let n = sessions.len() as u32;
+            sessions.insert(format!("127.0.0.2:{}", n + 1).parse().unwrap(), ());
+        }
+
+        // A fresh source at the cap is refused: no new entry, no socket_writer.
+        assert!(!admit_new_udp_session(sessions.len()));
+        // The established source is a known key: it routes without re-admission.
+        assert!(sessions.contains_key(&established));
+    }
+
+    #[tokio::test]
+    async fn udp_control_bind_failure_is_fatal() {
+        let bind = "127.0.0.1";
+        let held = UdpSocket::bind((bind, 0u16)).await.expect("bind probe");
+        let port = held.local_addr().expect("local addr").port();
+
+        let err = bind_control_sockets(bind, port).await;
+        assert!(
+            err.is_err(),
+            "occupied udp control port must make bind_control_sockets return Err"
+        );
+    }
+
+    // A free port binds both control sockets and yields a usable pair.
+    #[tokio::test]
+    async fn bind_control_sockets_binds_both() {
+        let bind = "127.0.0.1";
+        let (udp, tcp) = bind_control_sockets(bind, 0)
+            .await
+            .expect("bind both control sockets");
+        assert!(udp.local_addr().is_ok());
+        assert!(tcp.local_addr().is_ok());
+    }
+
+    fn test_server() -> Arc<Server> {
+        Arc::new(Server {
+            psk: crate::noise::derive_psk("test-secret"),
+            server_id: "test".into(),
+            next_id: Mutex::new(1),
+            pending: Mutex::new(HashMap::new()),
+            udp_pending: Mutex::new(HashMap::new()),
+            clients: Mutex::new(HashMap::new()),
+            routes: Mutex::new(HashMap::new()),
+            listeners: Mutex::new(HashMap::new()),
+            handshakes: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
+            config_path: None,
+            file_id: None,
+            file_control: None,
+            save_lock: tokio::sync::Mutex::new(()),
+            #[cfg(target_os = "linux")]
+            tap: None,
+            #[cfg(target_os = "linux")]
+            bridge_cancel: Mutex::new(None),
+        })
+    }
+
+    // A peer that finishes the handshake then never sends its role frame must not
+    // park serve_stream forever (the fd/task leak this guard closes). Under paused
+    // time the CONTROL_TIMEOUT window elapses with no real wait, and serve_stream
+    // returns Err so the task and its half of the duplex are dropped. The client
+    // handshake end is held open for the whole window to model a live-but-silent
+    // peer (a closed end would fail the read early and hide the timeout path).
+    #[tokio::test(start_paused = true)]
+    async fn serve_stream_times_out_silent_role_frame() {
+        let srv = test_server();
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let psk = srv.psk;
+
+        let client = tokio::spawn(async move {
+            let (_cr, _cw) = crate::noise::client_handshake(client_io, &psk)
+                .await
+                .expect("client handshake");
+            // Never send a role frame; keep the connection open and idle.
+            std::future::pending::<()>().await;
+        });
+
+        let (r, w) = crate::noise::server_handshake(server_io, &srv.psk)
+            .await
+            .expect("server handshake");
+        let res = serve_stream(srv, r, w, ActiveTransport::Tcp).await;
+        assert!(
+            res.is_err(),
+            "silent role frame must time out and release the task"
+        );
+        client.abort();
+    }
+
+    // The admin mutate path takes a second read after AdminHello. An admin that
+    // announces mode 1 then never sends the request must hit the same guard.
+    #[tokio::test(start_paused = true)]
+    async fn serve_stream_times_out_silent_admin_request() {
+        let srv = test_server();
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let psk = srv.psk;
+
+        let client = tokio::spawn(async move {
+            let (_cr, mut cw) = crate::noise::client_handshake(client_io, &psk)
+                .await
+                .expect("client handshake");
+            let hello = Msg::AdminHello {
+                version: crate::identity::PROTO_VERSION,
+                mode: 1,
+            }
+            .encode();
+            cw.send(&hello).await.expect("send admin hello");
+            // Never send the mutation request; keep the connection open and idle.
+            std::future::pending::<()>().await;
+        });
+
+        let (r, w) = crate::noise::server_handshake(server_io, &srv.psk)
+            .await
+            .expect("server handshake");
+        let res = serve_stream(srv, r, w, ActiveTransport::Tcp).await;
+        assert!(
+            res.is_err(),
+            "silent admin request must time out and release the task"
+        );
+        client.abort();
+    }
 }

@@ -30,6 +30,15 @@ pub const BRIDGE_ID: u64 = u64::MAX;
 const SOCKET_SEND_CAP: usize = 1024;
 const APP_CHAN_CAP: usize = 256;
 
+/// Cap on concurrent convs a single peer session may hold open. A legitimate
+/// client carries the control conv plus a handful of TCP/UDP-forward convs, so
+/// this sits orders of magnitude above real usage; it exists only to stop one
+/// source on the public control port from streaming unbounded distinct conv-ids
+/// and spawning a driver (each holds a ~64KB recv buffer) per id. Combined with
+/// `server::MAX_UDP_SESSIONS`, the worst-case driver-buffer ceiling is
+/// MAX_UDP_SESSIONS * MAX_CONVS_PER_SESSION * ~64KB ~= 512 * 256 * 64KB ~= 8GB.
+pub const MAX_CONVS_PER_SESSION: usize = 256;
+
 /// Per-conv idle deadline. A conv with no inbound packet for this long is dead
 /// (KCP has no FIN, so a silent peer never signals close). Set far above the
 /// KCP RTO and any normal inter-packet gap so an active-but-slow conv survives,
@@ -299,9 +308,20 @@ impl Session {
     }
 
     fn route_kcp(&self, conv: u32, class: u8, payload: Vec<u8>) -> Option<KcpStream> {
-        if let Some(tx) = self.convs.lock().unwrap().get(&conv) {
-            let _ = tx.try_send(payload);
-            return None;
+        {
+            let convs = self.convs.lock().unwrap();
+            if let Some(tx) = convs.get(&conv) {
+                let _ = tx.try_send(payload);
+                return None;
+            }
+            // Unknown conv beyond the per-session cap: drop the datagram and spawn
+            // no driver. Existing convs keep flowing; only new ids are refused, so
+            // one flooding source cannot grow this session's driver count without
+            // bound. The map len is the live conv count (ConvGuard erases an entry
+            // when its driver ends), and the check holds the lock so it is exact.
+            if convs.len() >= MAX_CONVS_PER_SESSION {
+                return None;
+            }
         }
         // Unknown conv: a peer-initiated connection. Create it, deliver the packet.
         let stream = self.spawn_conv(conv, class);
@@ -442,5 +462,38 @@ mod tests {
 
         srv_run.abort();
         cli_run.abort();
+    }
+
+    /// One CLASS_KCP datagram (class byte + minimal KCP header) naming `conv`,
+    /// the shape `route` parses on the public control port.
+    fn kcp_datagram(conv: u32) -> Vec<u8> {
+        let mut pkt = vec![0u8; 1 + kcp::KCP_OVERHEAD];
+        pkt[0] = CLASS_KCP;
+        kcp::set_conv(&mut pkt[1..], conv);
+        pkt
+    }
+
+    // A flood of distinct conv-ids from one peer must never grow the session's
+    // live conv count past MAX_CONVS_PER_SESSION: beyond the cap each unknown
+    // conv is dropped with no driver spawned, while convs already open keep
+    // their slot. This is the anti-OOM bound on a single source.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn route_kcp_caps_convs_per_session() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = sock.local_addr().unwrap();
+        let sess = session(sock, peer, 0);
+
+        for conv in 0..(MAX_CONVS_PER_SESSION as u32 + 200) {
+            route(&sess, &kcp_datagram(conv));
+            assert!(
+                sess.convs.lock().unwrap().len() <= MAX_CONVS_PER_SESSION,
+                "conv count exceeded cap at conv {conv}"
+            );
+        }
+        assert_eq!(
+            sess.convs.lock().unwrap().len(),
+            MAX_CONVS_PER_SESSION,
+            "first MAX_CONVS_PER_SESSION convs must stay open; the rest dropped"
+        );
     }
 }
