@@ -1,0 +1,12 @@
+services:
+  zeronat:
+    image: ${ZERONAT_IMAGE:-ghcr.io/paltaio/zeronat:latest}
+    container_name: zeronat
+    network_mode: host
+    restart: unless-stopped
+    env_file: .env
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    command: ${ZERONAT_ARGS}

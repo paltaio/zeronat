@@ -79,6 +79,18 @@ gen_secret() {
   else head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; fi
 }
 
+# Read a secret already on disk so re-running the installer does not silently
+# rotate it (which would break every client). Reads through `run` because the
+# env file is mode 600, and checks both layouts (compose .env and run/systemd).
+existing_secret() {
+  for _f in "$ETC_DIR/.env" "$ENV_FILE"; do
+    [ -f "$_f" ] || continue
+    _s=$(run cat "$_f" 2>/dev/null | sed -n 's/^ZERONAT_SECRET=//p' | head -n1)
+    [ -n "$_s" ] && { printf '%s' "$_s"; return 0; }
+  done
+  return 1
+}
+
 pub_ip() {
   for u in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
     _ip=$(curl -fsSL --max-time 5 "$u" 2>/dev/null | tr -d '[:space:]') || _ip=""
@@ -193,13 +205,6 @@ else
   done
 fi
 
-# L2 bridge needs /dev/net/tun and CAP_NET_ADMIN; the stock compose file grants
-# neither, so fall back to docker run, which requests them directly.
-if [ "$METHOD" = docker ] && [ "$DEPLOY" = compose ] && [ "$KIND" = bridge ]; then
-  say "L2 bridge needs extra device access; using docker run instead of compose."
-  DEPLOY=run
-fi
-
 # --- discovery: fixed address or DHT ----------------------------------------
 if [ "$MODE" = client ]; then
   if [ -z "$USE_DHT" ] && [ -z "$SERVER_ADDR" ]; then
@@ -218,7 +223,15 @@ elif [ "$MODE" = server ] && [ -z "$USE_DHT" ]; then
 fi
 
 # --- secret -----------------------------------------------------------------
-[ -z "$SECRET" ] && SECRET=$(gen_secret)
+# Precedence: --secret > a secret already in /etc/zeronat (a re-run must not
+# rotate it and break clients) > a freshly generated one.
+if [ -z "$SECRET" ]; then
+  if SECRET=$(existing_secret); then
+    say "reusing existing secret from $ETC_DIR"
+  else
+    SECRET=$(gen_secret)
+  fi
+fi
 
 # --- subcommand -------------------------------------------------------------
 if [ "$MODE" = server ]; then
@@ -277,7 +290,12 @@ if [ "$METHOD" = docker ]; then
 
   if [ "$DEPLOY" = compose ]; then
     COMPOSE_FILE="$ETC_DIR/compose.yml"
-    _c=$(curl -fsSL "$RAW_BASE/compose.yml") || err "could not fetch compose.yml"
+    # The bridge template grants CAP_NET_ADMIN and /dev/net/tun, which the TAP
+    # device needs; the port-forward template omits them so it starts on hosts
+    # without the tun module.
+    COMPOSE_SRC="compose.yml"
+    [ "$KIND" = bridge ] && COMPOSE_SRC="compose.bridge.yml"
+    _c=$(curl -fsSL "$RAW_BASE/$COMPOSE_SRC") || err "could not fetch $COMPOSE_SRC"
     printf '%s\n' "$_c" | run tee "$COMPOSE_FILE" >/dev/null
     DCF="$DC -f $COMPOSE_FILE --project-directory $ETC_DIR"
     RAN="$DCF up -d   # edit $ETC_DIR/.env to change ports/secret"
