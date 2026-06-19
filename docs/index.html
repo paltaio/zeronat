@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zeronat - encrypted reverse tunnel for CG-NAT</title>
+<meta name="description" content="Minimal encrypted reverse tunnel for services behind CG-NAT. Single static Rust binary, TCP + UDP, Noise-encrypted.">
+<style>
+  *{box-sizing:border-box}
+  :root{
+    --bg:#fbfaf8; --fg:#21201c; --muted:#6f6b62; --border:#e7e3db;
+    --code-bg:#f3f1ec; --accent:#a4502a; --accent-soft:rgba(164,80,42,.09);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#100e0b; --fg:#e9e6df; --muted:#9a948a; --border:#272320;
+      --code-bg:#1a1713; --accent:#d98a5c; --accent-soft:rgba(217,138,92,.14);
+    }
+  }
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:16px/1.65 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  a{color:var(--accent)}
+  a:hover{text-decoration:underline}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+
+  .layout{max-width:1060px;margin:0 auto;display:flex;gap:52px;padding:0 28px}
+
+  .sidebar{width:178px;flex:none;position:sticky;top:0;align-self:flex-start;
+    height:100vh;overflow-y:auto;padding:34px 0 24px;display:flex;flex-direction:column}
+  .brand{font-weight:700;font-size:18px;letter-spacing:-.01em;margin:0 0 2px}
+  .brand-sub{color:var(--muted);font-size:12.5px;margin:0 0 22px;line-height:1.4}
+  .nav-list{display:flex;flex-direction:column;gap:1px}
+  .nav-link{color:var(--muted);font-size:14px;text-decoration:none;
+    padding:3px 10px;border-left:2px solid transparent;border-radius:0 4px 4px 0}
+  .nav-link:hover{color:var(--fg);background:var(--accent-soft);text-decoration:none}
+  .nav-link.is-active{color:var(--accent);border-left-color:var(--accent);font-weight:600}
+  .ext{margin-top:auto;padding-top:20px;font-size:13px;color:var(--muted)}
+  .ext a{color:var(--muted)}
+  .ext a:hover{color:var(--accent)}
+
+  .content{flex:1;min-width:0;max-width:752px;padding:34px 0 14vh}
+  section{scroll-margin-top:24px}
+  h2{font-size:15px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
+    font-weight:600;margin:40px 0 10px}
+  h3{font-size:15px;margin:22px 0 6px;font-weight:600}
+  p{margin:11px 0}
+  ul{padding-left:18px;margin:11px 0}
+  li{margin:5px 0}
+
+  pre{background:var(--code-bg);border:1px solid var(--border);border-radius:5px;
+    padding:13px 15px;overflow-x:auto;font-size:13.5px;line-height:1.55;margin:13px 0}
+  pre code{background:none;border:0;padding:0;font-size:inherit}
+  pre .c{color:var(--muted)}
+  :not(pre)>code{background:var(--code-bg);border:1px solid var(--border);
+    border-radius:4px;padding:1px 5px;font-size:.86em}
+
+  table{border-collapse:collapse;width:100%;margin:13px 0;font-size:13.5px}
+  th,td{text-align:left;border-bottom:1px solid var(--border);padding:7px 12px 7px 0;vertical-align:top}
+  th{color:var(--muted);font-weight:600}
+  td:first-child{white-space:nowrap;padding-right:20px}
+  td code{white-space:nowrap}
+
+  .foot{margin-top:48px;padding-top:18px;border-top:1px solid var(--border);
+    color:var(--muted);font-size:13.5px}
+
+  @media (max-width:800px){
+    .layout{flex-direction:column;gap:0;padding:0 22px}
+    .sidebar{position:static;height:auto;width:auto;padding:24px 0 14px;
+      border-bottom:1px solid var(--border)}
+    .brand-sub{margin-bottom:14px}
+    .nav-list{flex-direction:row;flex-wrap:wrap;gap:2px 6px}
+    .nav-link{border-left:0;padding:3px 8px;border-radius:4px}
+    .nav-link.is-active{border-left:0;background:var(--accent-soft)}
+    .ext{margin-top:14px}
+    .content{padding:26px 0 56px}
+  }
+</style>
+</head>
+<body>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h1 class="brand">zeronat</h1>
+    <div class="brand-sub">encrypted reverse tunnel for CG-NAT</div>
+    <nav class="nav-list">
+      <a class="nav-link" href="#overview">Overview</a>
+      <a class="nav-link" href="#install">Install</a>
+      <a class="nav-link" href="#start">Quick start</a>
+      <a class="nav-link" href="#forwarding">Forwarding</a>
+      <a class="nav-link" href="#transport">Transport</a>
+      <a class="nav-link" href="#routing">Routing</a>
+      <a class="nav-link" href="#admin">Admin</a>
+      <a class="nav-link" href="#tap">L2 bridge</a>
+      <a class="nav-link" href="#dht">DHT discovery</a>
+      <a class="nav-link" href="#build">Build</a>
+      <a class="nav-link" href="#cli">CLI reference</a>
+      <a class="nav-link" href="#scope">Scope</a>
+    </nav>
+    <div class="ext"><a href="https://github.com/paltaio/zeronat">github</a></div>
+  </aside>
+
+  <main class="content">
+
+    <section id="overview">
+      <h2>Overview</h2>
+      <p>You have a service behind CG-NAT (home or office) and a cheap cloud VM with a public IP. zeronat
+      exposes your local ports through the VM without accounts or third-party services, just a VPS.</p>
+      <p>The server runs on the public host. The client runs behind NAT, dials out, and holds one control
+      connection. Traffic hitting a public port on the server is forwarded to the matching local service on
+      the client. Every connection is authenticated and encrypted with Noise (<code>NNpsk0</code>, X25519 +
+      ChaCha20-Poly1305 + BLAKE2s) keyed by a shared secret. Forwarding is terminate-and-forward at L4.</p>
+    </section>
+
+    <section id="install">
+      <h2>Install</h2>
+      <p>On the public host (interactive, or pass flags):</p>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/paltaio/zeronat/main/install.sh | sh -s -- --server</code></pre>
+      <p>It picks Docker or a systemd service, generates the secret, asks which ports to forward, and prints
+      the matching command to run on the machine behind CG-NAT. Run <code>install.sh --help</code> for all
+      options.</p>
+<pre><code>docker pull ghcr.io/paltaio/zeronat</code></pre>
+    </section>
+
+    <section id="start">
+      <h2>Quick start</h2>
+<pre><code><span class="c"># On the public host (VPS):</span>
+ZERONAT_SECRET=somelongsecret zeronat server \
+  --control 2222 --tcp 443 --tcp 80 --udp 51820
+
+<span class="c"># On the host behind CG-NAT:</span>
+ZERONAT_SECRET=somelongsecret zeronat client \
+  --server &lt;public-ip&gt;:2222 --tcp 443 --tcp 80 --udp 51820</code></pre>
+      <p>The secret can be passed with <code>--secret</code> instead of the env var. Open the control port
+      (2222, both UDP and TCP) on the server's firewall.</p>
+    </section>
+
+    <section id="forwarding">
+      <h2>Forwarding</h2>
+      <p>On the server, <code>--tcp PORT</code> and <code>--udp PORT</code> name the public ports to expose.
+      On the client, the same flags take a forward spec mapping that public port to a local target:</p>
+      <table>
+        <thead><tr><th>Client spec</th><th>Forwards to</th></tr></thead>
+        <tbody>
+          <tr><td><code>--tcp 443</code></td><td><code>127.0.0.1:443</code></td></tr>
+          <tr><td><code>--tcp 443:8443</code></td><td><code>127.0.0.1:8443</code></td></tr>
+          <tr><td><code>--tcp 443:10.0.0.5:443</code></td><td><code>10.0.0.5:443</code></td></tr>
+        </tbody>
+      </table>
+      <p><code>--udp</code> works the same way. Both flags are repeatable.</p>
+    </section>
+
+    <section id="transport">
+      <h2>Transport</h2>
+      <p>The tunnel runs over UDP/KCP by default and falls back to TCP when the UDP handshake gets no reply.
+      Both share the control port (2222). The client picks the transport with
+      <code>--transport auto|udp|tcp</code> (default <code>auto</code>).</p>
+      <ul>
+        <li>UDP (KCP): reliable ARQ over UDP carries the control channel and TCP-forward data; loss-tolerant
+        UDP forwards ride as raw datagrams.</li>
+        <li>TCP: fallback for networks that block or break UDP.</li>
+      </ul>
+    </section>
+
+    <section id="routing">
+      <h2>Multi-client routing</h2>
+      <p>Multiple clients can connect to one server. A route maps a listener (<code>bind_ip</code>,
+      <code>proto</code>, <code>port</code>) to a client id. New connections go to the routed client;
+      connections already open on the previous client drain until they close. There is no round-robin,
+      health checking, or failover. The switch is a deliberate config change.</p>
+      <p>A client id is the <code>--id</code> prefix (default: short hostname) plus a short derived suffix,
+      for example <code>rpi-2-ab12</code>.</p>
+      <p>Load listeners, routes, and identity from a file with <code>--config</code>:</p>
+<pre><code>zeronat server --config /etc/zeronat/server.toml</code></pre>
+<pre><code><span class="c"># server.toml</span>
+[server]
+id = "zn01"
+control = "0.0.0.0:2222"
+
+[[listeners]]
+bind_ip = "0.0.0.0"
+proto = "tcp"
+port = 8080
+
+[[routes]]
+bind_ip = "0.0.0.0"
+proto = "tcp"
+port = 8080
+client = "rpi-2-ab12"</code></pre>
+      <p>CLI <code>--tcp</code>/<code>--udp</code> forwards merge with the file's listeners. To change the
+      topology, edit the file and restart the server. A malformed config aborts startup rather than
+      booting half-configured.</p>
+    </section>
+
+    <section id="admin">
+      <h2>Admin</h2>
+      <p>Inspect a running server's topology over the control port (read-only, one-shot):</p>
+<pre><code>ZERONAT_SECRET=$SECRET zeronat admin --server &lt;public-ip&gt;:2222 show</code></pre>
+      <p>It prints the server, its routes, connected clients, and active listeners.</p>
+    </section>
+
+    <section id="tap">
+      <h2>L2 bridge (TAP)</h2>
+      <p><code>--tap</code> relays raw Ethernet frames over the tunnel, joining a TAP on each end into one L2
+      segment. It carries anything Ethernet, including PPPoE. Both ends need <code>--tap</code>; it cannot be
+      combined with <code>--tcp</code>/<code>--udp</code>.</p>
+<pre><code><span class="c"># Near the target segment (e.g. the PPPoE concentrator):</span>
+ZERONAT_SECRET=s zeronat server --control 2222 --tap zn0 --bridge br0
+
+<span class="c"># Behind CG-NAT, then run e.g. pppd on zn0:</span>
+ZERONAT_SECRET=s zeronat client --server &lt;public-ip&gt;:2222 --tap zn0
+pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
+      <p><code>--bridge &lt;name&gt;</code> enslaves the TAP to an existing bridge; <code>--tap-mtu &lt;n&gt;</code>
+      sets the MTU (default 1400). Linux only. Needs <code>CAP_NET_ADMIN</code>: root,
+      <code>setcap cap_net_admin+ep zeronat</code>, or Docker
+      <code>--cap-add NET_ADMIN --device /dev/net/tun</code> (plus <code>--device /dev/ppp</code> for pppd).</p>
+    </section>
+
+    <section id="dht">
+      <h2>DHT discovery</h2>
+      <p>For a server on a dynamic IP, <code>--server dht</code> publishes its address to the BitTorrent
+      Mainline DHT and the client looks it up. The lookup key is derived from the shared secret, so no extra
+      configuration is needed and the published address is signed and encrypted.</p>
+<pre><code><span class="c"># Server publishes its address; IP is auto-detected from the DHT:</span>
+ZERONAT_SECRET=s zeronat server --server dht --tcp 443
+
+<span class="c"># Client finds the server through the DHT:</span>
+ZERONAT_SECRET=s zeronat client --server dht --tcp 443</code></pre>
+      <p><code>--announce-ip &lt;ip&gt;</code> overrides the detected IP and <code>--announce-port &lt;port&gt;</code>
+      the announced port (default: the control port) when the server sits behind a port-forward. The client
+      caches the last-known address and re-queries the DHT only when it stops working.</p>
+    </section>
+
+    <section id="build">
+      <h2>Build</h2>
+<pre><code>cargo build --release    <span class="c"># dynamic binary</span>
+./build.sh               <span class="c"># static musl binary</span></code></pre>
+      <p><code>build.sh</code> uses the nightly toolchain (<code>rust-src</code> component) for a
+      size-optimized static build.</p>
+    </section>
+
+    <section id="cli">
+      <h2>CLI reference</h2>
+
+      <h3>zeronat server</h3>
+      <table>
+        <tbody>
+          <tr><td><code>--bind &lt;ADDR&gt;</code></td><td>Address to bind on (default 0.0.0.0)</td></tr>
+          <tr><td><code>--control &lt;PORT&gt;</code></td><td>Control port (default 2222)</td></tr>
+          <tr><td><code>--secret &lt;SECRET&gt;</code></td><td>Shared secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
+          <tr><td><code>--id &lt;ID&gt;</code></td><td>Server identity label (default 0)</td></tr>
+          <tr><td><code>--config &lt;PATH&gt;</code></td><td>Load listeners, routes, and identity from a config file</td></tr>
+          <tr><td><code>--tcp &lt;PORT&gt;</code></td><td>Public TCP port to expose (repeatable)</td></tr>
+          <tr><td><code>--udp &lt;PORT&gt;</code></td><td>Public UDP port to expose (repeatable)</td></tr>
+          <tr><td><code>--tap &lt;NAME&gt;</code></td><td>L2 bridge mode (Linux): create or attach this TAP device</td></tr>
+          <tr><td><code>--tap-mtu &lt;N&gt;</code></td><td>TAP MTU (default 1400)</td></tr>
+          <tr><td><code>--bridge &lt;NAME&gt;</code></td><td>Enslave the TAP to this existing bridge</td></tr>
+          <tr><td><code>--server dht</code></td><td>Publish this server's address to the DHT for discovery</td></tr>
+          <tr><td><code>--announce-ip &lt;IP&gt;</code></td><td>Public IPv4 to announce (default: auto-detected via DHT)</td></tr>
+          <tr><td><code>--announce-port &lt;P&gt;</code></td><td>Public port to announce (default: control port)</td></tr>
+        </tbody>
+      </table>
+
+      <h3>zeronat client</h3>
+      <table>
+        <tbody>
+          <tr><td><code>--server &lt;ADDR&gt;</code></td><td>Server control address <code>host:port</code>, or <code>dht</code> to discover via DHT</td></tr>
+          <tr><td><code>--secret &lt;SECRET&gt;</code></td><td>Shared secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
+          <tr><td><code>--id &lt;PREFIX&gt;</code></td><td>Client id prefix (default: short hostname)</td></tr>
+          <tr><td><code>--tcp &lt;SPEC&gt;</code></td><td>Forward TCP: <code>PORT</code> | <code>PORT:LOCALPORT</code> | <code>PORT:HOST:PORT</code> (repeatable)</td></tr>
+          <tr><td><code>--udp &lt;SPEC&gt;</code></td><td>Forward UDP, same spec as <code>--tcp</code> (repeatable)</td></tr>
+          <tr><td><code>--transport &lt;MODE&gt;</code></td><td><code>auto</code> | <code>udp</code> | <code>tcp</code> (default auto)</td></tr>
+          <tr><td><code>--tap &lt;NAME&gt;</code></td><td>L2 bridge mode (Linux): create or attach this TAP device</td></tr>
+          <tr><td><code>--tap-mtu &lt;N&gt;</code></td><td>TAP MTU (default 1400)</td></tr>
+          <tr><td><code>--bridge &lt;NAME&gt;</code></td><td>Enslave the TAP to this existing bridge</td></tr>
+        </tbody>
+      </table>
+
+      <h3>zeronat admin</h3>
+      <table>
+        <tbody>
+          <tr><td><code>show</code></td><td>Print the server's current topology (default command)</td></tr>
+          <tr><td><code>--server &lt;ADDR&gt;</code></td><td>Server control address <code>host:port</code></td></tr>
+          <tr><td><code>--secret &lt;SECRET&gt;</code></td><td>Shared secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="scope">
+      <h2>Scope</h2>
+      <p>Built for a single operator with one shared secret. The secret is one master key: any client can
+      derive the server key and other client keys, so there is no per-client isolation or revocation. It is
+      not hardened against a hostile public internet: no connection rate limiting and unbounded session
+      tracking. Acceptable for self-owned infrastructure.</p>
+      <p class="foot">MIT, Copyright (c) 2026 Palta Studios.</p>
+    </section>
+
+  </main>
+</div>
+
+<script>
+  const links = [...document.querySelectorAll('.nav-link')];
+  const sections = [...document.querySelectorAll('section[id]')];
+  const activate = () => {
+    let id = sections[0].id;
+    for (const s of sections) {
+      if (s.getBoundingClientRect().top <= 120) id = s.id;
+    }
+    if (innerHeight + scrollY >= document.documentElement.scrollHeight - 4) {
+      id = sections[sections.length - 1].id;
+    }
+    for (const l of links) {
+      l.classList.toggle('is-active', l.getAttribute('href').slice(1) === id);
+    }
+  };
+  activate();
+  addEventListener('scroll', activate, { passive: true });
+  addEventListener('resize', activate);
+</script>
+</body>
+</html>
