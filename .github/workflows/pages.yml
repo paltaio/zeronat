@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "docs/index.html"
+      - "install.sh"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -30,6 +31,7 @@ jobs:
         run: |
           mkdir -p _site
           cp docs/index.html _site/index.html
+          cp install.sh _site/install.sh
           touch _site/.nojekyll
 
       - uses: actions/upload-pages-artifact@v3
