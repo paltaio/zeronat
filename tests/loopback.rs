@@ -668,8 +668,8 @@ async fn reconnect_same_id_supersede() {
 
 /// Allocate a fresh, process-unique temp directory for a config file.
 fn temp_config_dir(tag: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(
         "zeronat-loopback-{tag}-{}-{}",
         std::process::id(),
@@ -878,8 +878,8 @@ async fn runtime_node_does_not_persist() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn save_failure_reports_error() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
 
     let body = async {
         let control = free_tcp_port();

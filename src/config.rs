@@ -13,7 +13,7 @@ use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::proto::Proto;
 use crate::Result;
@@ -43,7 +43,7 @@ pub struct ServerConfig {
 
 /// Unique-per-attempt suffix for atomic-save temp files, so concurrent saves in
 /// the same process never collide on the temp name.
-static COUNTER: AtomicU64 = AtomicU64::new(0);
+static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Which table the parser is currently filling.
 enum Section {
@@ -509,7 +509,7 @@ pub fn save_atomic(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn sample() -> ServerConfig {
         ServerConfig {
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn save_atomic_roundtrip() {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
+        static SEQ: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
             "zeronat-cfg-{}-{}",
             std::process::id(),
