@@ -1,11 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::Result;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-#[cfg(target_os = "linux")]
 use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{timeout, Instant};
@@ -16,7 +15,7 @@ use crate::kcp::{route, session, Accepted, Session};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{server_handshake, server_handshake_stateless, Noise, StatelessNoise};
-use crate::proto::{ClientEntry, Listener, Msg, Proto, SnapshotBody};
+use crate::proto::{proto_name, ClientEntry, Listener, Msg, Proto, RouteEntry, SnapshotBody};
 use crate::tap::TapConfig;
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
@@ -52,6 +51,25 @@ pub enum ActiveTransport {
     Udp,
 }
 
+/// A public listener keyed by its bind IP, protocol, and port. The same tuple
+/// keys the route table, so a public connection maps directly to a route.
+type RouteKey = (Ipv4Addr, Proto, u16);
+
+/// A connected client's control channel and the transport it arrived on. Cloned
+/// out of the registry per public connection so a `try_send` never holds a lock.
+#[derive(Clone)]
+struct ClientHandle {
+    tx: mpsc::Sender<Vec<u8>>,
+    transport: ActiveTransport,
+}
+
+/// A running listener's teardown handles: `cancel` stops the accept/recv loop and
+/// `bridges` collects active TCP bridge tasks so they can be aborted on removal.
+struct ListenerHandle {
+    cancel: Arc<Notify>,
+    bridges: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
 /// A parked public UDP source, the public socket its replies must go out on, and
 /// the channel carrying its inbound datagrams, awaiting the matching UDP-forward
 /// setup conv.
@@ -60,14 +78,12 @@ type UdpPending = (Arc<UdpSocket>, SocketAddr, mpsc::Receiver<Vec<u8>>);
 pub(crate) struct Server {
     psk: [u8; 32],
     server_id: String,
-    tcp_ports: Vec<u16>,
-    udp_ports: Vec<u16>,
     next_id: Mutex<u64>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Noise>>>,
     udp_pending: Mutex<HashMap<u64, UdpPending>>,
-    control_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
-    current_client: Mutex<Option<(String, ActiveTransport)>>,
-    active_transport: Mutex<ActiveTransport>,
+    clients: Mutex<HashMap<String, ClientHandle>>,
+    routes: Mutex<HashMap<RouteKey, String>>,
+    listeners: Mutex<HashMap<RouteKey, ListenerHandle>>,
     handshakes: Arc<Semaphore>,
     #[cfg(target_os = "linux")]
     tap: Option<Arc<TapDevice>>,
@@ -97,20 +113,38 @@ impl Server {
         next
     }
 
-    fn control(&self) -> Option<mpsc::Sender<Vec<u8>>> {
-        self.control_tx.lock().unwrap().clone()
+    /// Resolve a public listener key to the client that should serve it. An
+    /// explicit route wins; with no route and exactly one connected client, that
+    /// client is the implicit target (single-client deployments need no route).
+    /// Locks are taken and dropped one at a time, never across a `try_send`.
+    fn route_to(&self, key: RouteKey) -> Option<ClientHandle> {
+        let routed_id = self.routes.lock().unwrap().get(&key).cloned();
+        if let Some(id) = routed_id {
+            return self.clients.lock().unwrap().get(&id).cloned();
+        }
+        let clients = self.clients.lock().unwrap();
+        if clients.len() == 1 {
+            clients.values().next().cloned()
+        } else {
+            None
+        }
     }
 
-    /// Register a new public stream, notify the client, and return the channel
-    /// that will receive the matching data connection. `None` if no client is
-    /// currently connected.
-    fn open(&self, proto: Proto, port: u16) -> Option<(u64, oneshot::Receiver<Noise>)> {
-        let ctl = self.control()?;
+    /// Register a new public stream against the routed client, notify it, and
+    /// return the channel that will receive the matching data connection. `None`
+    /// if no client serves this key. The `try_send` runs outside every lock.
+    fn open(
+        &self,
+        bind_ip: Ipv4Addr,
+        proto: Proto,
+        port: u16,
+    ) -> Option<(u64, oneshot::Receiver<Noise>)> {
+        let handle = self.route_to((bind_ip, proto, port))?;
         let id = self.next_id();
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         let msg = Msg::Open { proto, port, id }.encode();
-        if ctl.try_send(msg).is_err() {
+        if handle.tx.try_send(msg).is_err() {
             self.pending.lock().unwrap().remove(&id);
             return None;
         }
@@ -146,6 +180,10 @@ pub async fn run(
         return Err("L2 TAP bridge (--tap) is only supported on Linux".into());
     }
 
+    let bind_ip: Ipv4Addr = bind.parse().map_err(|_| -> crate::Error {
+        format!("--bind must be an IPv4 address, got '{bind}'").into()
+    })?;
+
     if let Some(ann) = dht {
         #[cfg(feature = "dht")]
         {
@@ -166,14 +204,12 @@ pub async fn run(
     let srv = Arc::new(Server {
         psk: crate::noise::derive_psk(&secret),
         server_id,
-        tcp_ports: tcp_ports.clone(),
-        udp_ports: udp_ports.clone(),
         next_id: Mutex::new(1),
         pending: Mutex::new(HashMap::new()),
         udp_pending: Mutex::new(HashMap::new()),
-        control_tx: Mutex::new(None),
-        current_client: Mutex::new(None),
-        active_transport: Mutex::new(ActiveTransport::Tcp),
+        clients: Mutex::new(HashMap::new()),
+        routes: Mutex::new(HashMap::new()),
+        listeners: Mutex::new(HashMap::new()),
         handshakes: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
         #[cfg(target_os = "linux")]
         tap,
@@ -181,23 +217,17 @@ pub async fn run(
         bridge_cancel: Mutex::new(None),
     });
 
+    // A CLI-supplied forwarded port that is already in use must not kill the
+    // server: log it and keep the others serving, as the single-listener path did.
     for port in tcp_ports {
-        let srv = srv.clone();
-        let bind = bind.clone();
-        tokio::spawn(async move {
-            if let Err(e) = tcp_listener(srv, bind, port).await {
-                eprintln!("tcp listener :{port} stopped: {e}");
-            }
-        });
+        if let Err(e) = spawn_listener(&srv, bind_ip, Proto::Tcp, port).await {
+            eprintln!("{e}");
+        }
     }
     for port in udp_ports {
-        let srv = srv.clone();
-        let bind = bind.clone();
-        tokio::spawn(async move {
-            if let Err(e) = udp_listener(srv, bind, port).await {
-                eprintln!("udp listener :{port} stopped: {e}");
-            }
-        });
+        if let Err(e) = spawn_listener(&srv, bind_ip, Proto::Udp, port).await {
+            eprintln!("{e}");
+        }
     }
 
     {
@@ -244,7 +274,7 @@ async fn handle_incoming(srv: Arc<Server>, sock: TcpStream) -> Result<()> {
     serve_stream(srv, r, w, ActiveTransport::Tcp).await
 }
 
-/// Dispatch a freshly handshaked stream (control or TCP-forward data),
+/// Dispatch a freshly handshaked stream (control, admin, or data),
 /// transport-agnostic. The first message decides the role.
 pub(crate) async fn serve_stream(
     srv: Arc<Server>,
@@ -258,10 +288,23 @@ pub(crate) async fn serve_stream(
                 return Err("unsupported protocol version".into());
             }
             let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
-            *srv.control_tx.lock().unwrap() = Some(tx.clone());
-            *srv.active_transport.lock().unwrap() = transport;
-            *srv.current_client.lock().unwrap() = Some((client_id.clone(), transport));
-            eprintln!("client connected: {client_id}");
+            // Register this session under its client_id. A reconnect with the same
+            // id supersedes the previous handle in one lock acquisition, so the
+            // routing slot is reclaimed immediately; the old reader self-reaps.
+            let superseded = {
+                let mut clients = srv.clients.lock().unwrap();
+                clients.insert(
+                    client_id.clone(),
+                    ClientHandle {
+                        tx: tx.clone(),
+                        transport,
+                    },
+                )
+            };
+            if superseded.is_some() {
+                eprintln!("client {client_id} reconnected, superseding previous session");
+            }
+            eprintln!("client {client_id} connected");
             let mut w = w;
             let writer = tokio::spawn(async move {
                 while let Some(bytes) = rx.recv().await {
@@ -280,61 +323,46 @@ pub(crate) async fn serve_stream(
                     tx.try_send(Msg::Pong.encode()).ok();
                 }
             }
-            // Only clear control_tx if it still points at this session's channel;
-            // a newer client may have reconnected and overwritten it. current_client
-            // is set alongside control_tx, so it is cleared under the same guard.
+            // Remove this client only if the registry still points at this
+            // session's channel. A superseding session overwrote the entry, so its
+            // tx no longer matches and this teardown is a no-op; the new session's
+            // slot is preserved. A superseded reader runs this same no-op once it
+            // times out, which is why the stale reader is left to self-reap.
             {
-                let mut ctl = srv.control_tx.lock().unwrap();
-                if ctl.as_ref().is_some_and(|cur| cur.same_channel(&tx)) {
-                    *ctl = None;
-                    *srv.current_client.lock().unwrap() = None;
+                let mut clients = srv.clients.lock().unwrap();
+                if clients
+                    .get(&client_id)
+                    .is_some_and(|h| h.tx.same_channel(&tx))
+                {
+                    clients.remove(&client_id);
                 }
             }
             writer.abort();
-            eprintln!("client disconnected");
+            eprintln!("client {client_id} disconnected");
             Ok(())
         }
         Msg::AdminHello { version, mode } => {
             if version != crate::identity::PROTO_VERSION {
                 return Err("unsupported protocol version".into());
             }
-            if mode != 0 {
-                return Err("unsupported admin mode".into());
+            match mode {
+                0 => {
+                    eprintln!("admin connected (snapshot)");
+                    let mut w = w;
+                    w.send(&Msg::Snapshot(srv.snapshot()).encode()).await?;
+                    Ok(())
+                }
+                1 => {
+                    eprintln!("admin connected (mutate)");
+                    let req = Msg::decode(&r.recv().await?)?;
+                    let (ok, msg) = apply_mutation(&srv, req).await;
+                    eprintln!("admin mutation: ok={ok} {msg}");
+                    let mut w = w;
+                    w.send(&Msg::MutationResult { ok, msg }.encode()).await?;
+                    Ok(())
+                }
+                other => Err(format!("unsupported admin mode {other}").into()),
             }
-            let listeners = srv
-                .tcp_ports
-                .iter()
-                .map(|&port| Listener {
-                    proto: Proto::Tcp,
-                    port,
-                })
-                .chain(srv.udp_ports.iter().map(|&port| Listener {
-                    proto: Proto::Udp,
-                    port,
-                }))
-                .collect();
-            let client = srv
-                .current_client
-                .lock()
-                .unwrap()
-                .clone()
-                .map(|(id, t)| ClientEntry {
-                    client_id: id,
-                    transport: match t {
-                        ActiveTransport::Tcp => 1,
-                        ActiveTransport::Udp => 2,
-                    },
-                });
-            let body = SnapshotBody {
-                version: crate::identity::PROTO_VERSION,
-                server_id: srv.server_id.clone(),
-                listeners,
-                client,
-            };
-            eprintln!("admin connected");
-            let mut w = w;
-            w.send(&Msg::Snapshot(body).encode()).await?;
-            Ok(())
         }
         Msg::Data { id } => {
             #[cfg(target_os = "linux")]
@@ -354,22 +382,216 @@ pub(crate) async fn serve_stream(
     }
 }
 
-async fn tcp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
-    let l = TcpListener::bind((bind.as_str(), port)).await?;
-    loop {
-        // Keep the forwarded port alive across transient accept errors so fd
-        // pressure does not silently and permanently kill this listener.
-        let (public, _) = match l.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("tcp listener :{port} accept error: {e}");
-                tokio::time::sleep(ACCEPT_BACKOFF).await;
-                continue;
+impl Server {
+    /// Build a point-in-time snapshot of this server's topology. Each lock is held
+    /// only long enough to copy its contents; the connected client ids are snapped
+    /// into a local set so route states are computed without re-locking `clients`.
+    fn snapshot(&self) -> SnapshotBody {
+        let (connected, clients): (HashSet<String>, Vec<ClientEntry>) = {
+            let map = self.clients.lock().unwrap();
+            let connected = map.keys().cloned().collect();
+            let clients = map
+                .iter()
+                .map(|(id, h)| ClientEntry {
+                    client_id: id.clone(),
+                    transport: match h.transport {
+                        ActiveTransport::Tcp => 1,
+                        ActiveTransport::Udp => 2,
+                    },
+                })
+                .collect();
+            (connected, clients)
+        };
+        let listeners = self
+            .listeners
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|&(bind_ip, proto, port)| Listener {
+                bind_ip,
+                proto,
+                port,
+            })
+            .collect();
+        let routes = self
+            .routes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&(bind_ip, proto, port), client_id)| RouteEntry {
+                bind_ip,
+                proto,
+                port,
+                client_id: client_id.clone(),
+                state: if connected.contains(client_id) { 0 } else { 1 },
+            })
+            .collect();
+        SnapshotBody {
+            version: crate::identity::PROTO_VERSION,
+            server_id: self.server_id.clone(),
+            listeners,
+            clients,
+            routes,
+        }
+    }
+}
+
+/// Apply one admin mutation against the running server. Returns `(ok, msg)`:
+/// `(true, "")` on success, `(false, reason)` on a bind/registry error.
+async fn apply_mutation(srv: &Arc<Server>, req: Msg) -> (bool, String) {
+    match req {
+        Msg::AddListener {
+            bind_ip,
+            proto,
+            port,
+        } => match spawn_listener(srv, bind_ip, proto, port).await {
+            Ok(()) => (true, String::new()),
+            Err(e) => (false, e.to_string()),
+        },
+        Msg::RemoveListener {
+            bind_ip,
+            proto,
+            port,
+        } => match remove_listener(srv, (bind_ip, proto, port)) {
+            Ok(()) => (true, String::new()),
+            Err(e) => (false, e.to_string()),
+        },
+        Msg::SetRoute {
+            bind_ip,
+            proto,
+            port,
+            client_id,
+        } => {
+            srv.routes
+                .lock()
+                .unwrap()
+                .insert((bind_ip, proto, port), client_id);
+            (true, String::new())
+        }
+        Msg::ClearRoute {
+            bind_ip,
+            proto,
+            port,
+        } => {
+            srv.routes.lock().unwrap().remove(&(bind_ip, proto, port));
+            (true, String::new())
+        }
+        other => (false, format!("unexpected mutation message: {other:?}")),
+    }
+}
+
+/// Bind the requested public port synchronously, register a cancellable listener,
+/// and spawn its accept/recv loop. The bind happens before the registry insert so
+/// an in-use port reports its error to the caller instead of failing in a task.
+async fn spawn_listener(
+    srv: &Arc<Server>,
+    bind_ip: Ipv4Addr,
+    proto: Proto,
+    port: u16,
+) -> Result<()> {
+    let key = (bind_ip, proto, port);
+    if srv.listeners.lock().unwrap().contains_key(&key) {
+        return Err(format!(
+            "listener {bind_ip} {} {port} already exists",
+            proto_name(proto)
+        )
+        .into());
+    }
+
+    let cancel = Arc::new(Notify::new());
+    let bridges = Arc::new(Mutex::new(Vec::new()));
+
+    match proto {
+        Proto::Tcp => {
+            let l = TcpListener::bind((bind_ip, port))
+                .await
+                .map_err(|e| -> crate::Error {
+                    format!("cannot bind {bind_ip}:{port}: {e}").into()
+                })?;
+            srv.listeners.lock().unwrap().insert(
+                key,
+                ListenerHandle {
+                    cancel: cancel.clone(),
+                    bridges: bridges.clone(),
+                },
+            );
+            let srv = srv.clone();
+            tokio::spawn(async move {
+                tcp_listener(srv, l, bind_ip, port, cancel, bridges).await;
+            });
+        }
+        Proto::Udp => {
+            let socket = Arc::new(UdpSocket::bind((bind_ip, port)).await.map_err(
+                |e| -> crate::Error { format!("cannot bind {bind_ip}:{port}: {e}").into() },
+            )?);
+            srv.listeners.lock().unwrap().insert(
+                key,
+                ListenerHandle {
+                    cancel: cancel.clone(),
+                    bridges,
+                },
+            );
+            let srv = srv.clone();
+            tokio::spawn(async move {
+                udp_listener(srv, socket, bind_ip, port, cancel).await;
+            });
+        }
+    }
+    eprintln!("listener added: {bind_ip} {} {port}", proto_name(proto));
+    Ok(())
+}
+
+/// Remove a listener: cancel its accept/recv loop, then abort any active TCP
+/// bridges it spawned. Cancelling the loop releases the bound socket so the port
+/// stops accepting; for UDP the loop also drops its per-source sessions map, which
+/// closes every inbound channel and tears down active UDP sources.
+fn remove_listener(srv: &Server, key: RouteKey) -> Result<()> {
+    let handle = srv.listeners.lock().unwrap().remove(&key);
+    match handle {
+        Some(h) => {
+            h.cancel.notify_one();
+            for bridge in h.bridges.lock().unwrap().drain(..) {
+                bridge.abort();
             }
+            let (bind_ip, proto, port) = key;
+            eprintln!("listener removed: {bind_ip} {} {port}", proto_name(proto));
+            Ok(())
+        }
+        None => {
+            let (bind_ip, proto, port) = key;
+            Err(format!("no such listener {bind_ip} {} {port}", proto_name(proto)).into())
+        }
+    }
+}
+
+/// Accept public TCP connections on a pre-bound listener and bridge each to the
+/// routed client, until `cancel` fires. Active bridge tasks are pushed into the
+/// shared `bridges` vector so `remove_listener` can abort them on teardown.
+async fn tcp_listener(
+    srv: Arc<Server>,
+    l: TcpListener,
+    bind_ip: Ipv4Addr,
+    port: u16,
+    cancel: Arc<Notify>,
+    bridges: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+) {
+    loop {
+        let public = tokio::select! {
+            _ = cancel.notified() => break,
+            r = l.accept() => match r {
+                Ok((public, _)) => public,
+                // Keep the forwarded port alive across transient accept errors so
+                // fd pressure does not silently and permanently kill this listener.
+                Err(e) => {
+                    eprintln!("tcp listener {bind_ip}:{port} accept error: {e}");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    continue;
+                }
+            },
         };
         let srv = srv.clone();
-        tokio::spawn(async move {
-            let Some((id, rx)) = srv.open(Proto::Tcp, port) else {
+        let handle = tokio::spawn(async move {
+            let Some((id, rx)) = srv.open(bind_ip, Proto::Tcp, port) else {
                 return;
             };
             match timeout(OPEN_TIMEOUT, rx).await {
@@ -379,11 +601,25 @@ async fn tcp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
                 }
             }
         });
+        let mut active = bridges.lock().unwrap();
+        active.push(handle);
+        // Bound the tracking vector over a long-lived listener.
+        active.retain(|h| !h.is_finished());
     }
 }
 
-async fn udp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
-    let socket = Arc::new(UdpSocket::bind((bind.as_str(), port)).await?);
+/// Accept public UDP datagrams on a pre-bound socket, demux per source, and bridge
+/// each source to the routed client, until `cancel` fires. On cancel the task
+/// returns, dropping `sessions`; that closes every per-source `dtx`, which ends the
+/// matching `bridge::udp_server` / `udp_server_stateless` and tears down active UDP
+/// sources (see `accept_udp_forward`'s teardown comment).
+async fn udp_listener(
+    srv: Arc<Server>,
+    socket: Arc<UdpSocket>,
+    bind_ip: Ipv4Addr,
+    port: u16,
+    cancel: Arc<Notify>,
+) {
     // Each entry holds the bridge's inbound channel and the last time a datagram
     // reached it. A closed channel (bridge ended) or a stale TTL evicts the entry,
     // so a one-shot/vanished source cannot pin a dead Sender slot forever.
@@ -396,10 +632,11 @@ async fn udp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
         // A transient recv error must not kill the forwarded UDP port; log, back
         // off briefly, and keep serving. The sweep runs between recvs.
         let (n, src) = tokio::select! {
+            _ = cancel.notified() => break,
             r = socket.recv_from(&mut buf) => match r {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("udp listener :{port} recv error: {e}");
+                    eprintln!("udp listener {bind_ip}:{port} recv error: {e}");
                     tokio::time::sleep(ACCEPT_BACKOFF).await;
                     continue;
                 }
@@ -434,14 +671,19 @@ async fn udp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
             data
         };
 
+        // Resolve the client serving this listener before parking the source. A
+        // source with no route (and no single-client fallback) is dropped.
+        let Some(handle) = srv.route_to((bind_ip, Proto::Udp, port)) else {
+            continue;
+        };
+
         let (dtx, drx) = mpsc::channel::<Vec<u8>>(64);
         dtx.try_send(data).ok();
         sessions.insert(src, (dtx, Instant::now()));
 
-        let transport = *srv.active_transport.lock().unwrap();
-        match transport {
+        match handle.transport {
             ActiveTransport::Tcp => {
-                let Some((id, rx)) = srv.open(Proto::Udp, port) else {
+                let Some((id, rx)) = srv.open(bind_ip, Proto::Udp, port) else {
                     sessions.remove(&src);
                     continue;
                 };
@@ -457,16 +699,13 @@ async fn udp_listener(srv: Arc<Server>, bind: String, port: u16) -> Result<()> {
                 });
             }
             ActiveTransport::Udp => {
-                let Some(ctl) = srv.control() else {
-                    sessions.remove(&src);
-                    continue;
-                };
                 let id = srv.next_id();
                 srv.udp_pending
                     .lock()
                     .unwrap()
                     .insert(id, (socket.clone(), src, drx));
-                if ctl
+                if handle
+                    .tx
                     .try_send(
                         Msg::Open {
                             proto: Proto::Udp,
@@ -602,6 +841,12 @@ async fn udp_control_listener(srv: Arc<Server>, bind: String, port: u16) -> Resu
 /// the setup conv carries the same id, with `conv` (== `(id as u32) | high bit`) used
 /// as the datagram tag. Replies must go out on the parked public socket so the public
 /// client sees them from the port it sent to.
+///
+/// Cross-task UDP-source teardown chain: `udp_listener` owns the per-source sessions
+/// map and the receiving end (`dgram_rx`) of each source's channel. When that
+/// listener is removed (or torn down), it drops the map, closing every `dgram_rx`;
+/// `udp_server_stateless` observes the closed receiver, ends, and drops its
+/// `ConvGuard`, releasing the session slot.
 async fn accept_udp_forward(
     srv: Arc<Server>,
     sess: Arc<Session>,

@@ -1,6 +1,8 @@
+use std::net::Ipv4Addr;
+
 use crate::Result;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Proto {
     Tcp,
     Udp,
@@ -9,16 +11,28 @@ pub enum Proto {
 /// A public port the server is listening on, as reported in a `Snapshot`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Listener {
+    pub bind_ip: Ipv4Addr,
     pub proto: Proto,
     pub port: u16,
 }
 
-/// The currently connected client, as reported in a `Snapshot`. `transport` is
-/// the observed control transport: 1 = tcp, 2 = udp.
+/// A connected client, as reported in a `Snapshot`. `transport` is the observed
+/// control transport: 1 = tcp, 2 = udp.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientEntry {
     pub client_id: String,
     pub transport: u8,
+}
+
+/// A route in the server's table, as reported in a `Snapshot`. `state` is 0 when
+/// the target client is connected (active) and 1 when it is offline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteEntry {
+    pub bind_ip: Ipv4Addr,
+    pub proto: Proto,
+    pub port: u16,
+    pub client_id: String,
+    pub state: u8,
 }
 
 /// A point-in-time view of one server's topology, returned to admin on request.
@@ -27,7 +41,8 @@ pub struct SnapshotBody {
     pub version: u8,
     pub server_id: String,
     pub listeners: Vec<Listener>,
-    pub client: Option<ClientEntry>,
+    pub clients: Vec<ClientEntry>,
+    pub routes: Vec<RouteEntry>,
 }
 
 /// Messages exchanged over the encrypted Noise channels.
@@ -36,16 +51,55 @@ pub struct SnapshotBody {
 /// Control channel (server -> client): `Pong` in reply to each `Ping`, and
 /// `Open` for each new public connection.
 /// Data channel (client -> server, first message): `Data` carrying the stream id.
-/// Admin channel (admin -> server): `AdminHello`; server replies `Snapshot`.
+/// Admin channel (admin -> server): `AdminHello` mode 0 -> `Snapshot`; mode 1 ->
+/// one mutation message (`AddListener`/`RemoveListener`/`SetRoute`/`ClearRoute`),
+/// answered by `MutationResult`.
 #[derive(Debug)]
 pub enum Msg {
     Ping,
-    Open { proto: Proto, port: u16, id: u64 },
-    Data { id: u64 },
+    Open {
+        proto: Proto,
+        port: u16,
+        id: u64,
+    },
+    Data {
+        id: u64,
+    },
     Pong,
-    ClientHello { version: u8, client_id: String },
-    AdminHello { version: u8, mode: u8 },
+    ClientHello {
+        version: u8,
+        client_id: String,
+    },
+    AdminHello {
+        version: u8,
+        mode: u8,
+    },
     Snapshot(SnapshotBody),
+    AddListener {
+        bind_ip: Ipv4Addr,
+        proto: Proto,
+        port: u16,
+    },
+    RemoveListener {
+        bind_ip: Ipv4Addr,
+        proto: Proto,
+        port: u16,
+    },
+    SetRoute {
+        bind_ip: Ipv4Addr,
+        proto: Proto,
+        port: u16,
+        client_id: String,
+    },
+    ClearRoute {
+        bind_ip: Ipv4Addr,
+        proto: Proto,
+        port: u16,
+    },
+    MutationResult {
+        ok: bool,
+        msg: String,
+    },
 }
 
 fn proto_byte(p: Proto) -> u8 {
@@ -60,6 +114,14 @@ fn proto_from_byte(n: u8) -> Result<Proto> {
         1 => Ok(Proto::Tcp),
         2 => Ok(Proto::Udp),
         n => Err(format!("unknown proto byte {n}").into()),
+    }
+}
+
+/// Lowercase protocol name for logs and admin output.
+pub(crate) fn proto_name(p: Proto) -> &'static str {
+    match p {
+        Proto::Tcp => "tcp",
+        Proto::Udp => "udp",
     }
 }
 
@@ -86,6 +148,21 @@ fn take_str(b: &[u8], at: &mut usize) -> Result<String> {
         .map_err(|_| -> crate::Error { "invalid utf-8 in string".into() })?;
     *at += len;
     Ok(s)
+}
+
+/// Append the 4 octets of an IPv4 address.
+fn put_ip(b: &mut Vec<u8>, ip: Ipv4Addr) {
+    b.extend_from_slice(&ip.octets());
+}
+
+/// Read 4 octets at `*at` as an IPv4 address, advancing the cursor.
+fn take_ip(b: &[u8], at: &mut usize) -> Result<Ipv4Addr> {
+    if *at + 4 > b.len() {
+        return Err("truncated ipv4 address".into());
+    }
+    let ip = Ipv4Addr::new(b[*at], b[*at + 1], b[*at + 2], b[*at + 3]);
+    *at += 4;
+    Ok(ip)
 }
 
 impl Msg {
@@ -125,17 +202,82 @@ impl Msg {
                 debug_assert!(snap.listeners.len() <= u16::MAX as usize);
                 b.extend_from_slice(&(snap.listeners.len() as u16).to_be_bytes());
                 for l in &snap.listeners {
+                    put_ip(&mut b, l.bind_ip);
                     b.push(proto_byte(l.proto));
                     b.extend_from_slice(&l.port.to_be_bytes());
                 }
-                match &snap.client {
-                    Some(c) => {
-                        b.push(1);
-                        put_str(&mut b, &c.client_id);
-                        b.push(c.transport);
-                    }
-                    None => b.push(0),
+                debug_assert!(snap.clients.len() <= u16::MAX as usize);
+                b.extend_from_slice(&(snap.clients.len() as u16).to_be_bytes());
+                for c in &snap.clients {
+                    put_str(&mut b, &c.client_id);
+                    b.push(c.transport);
                 }
+                debug_assert!(snap.routes.len() <= u16::MAX as usize);
+                b.extend_from_slice(&(snap.routes.len() as u16).to_be_bytes());
+                for route in &snap.routes {
+                    put_ip(&mut b, route.bind_ip);
+                    b.push(proto_byte(route.proto));
+                    b.extend_from_slice(&route.port.to_be_bytes());
+                    put_str(&mut b, &route.client_id);
+                    b.push(route.state);
+                }
+                b
+            }
+            Msg::AddListener {
+                bind_ip,
+                proto,
+                port,
+            } => {
+                let mut b = Vec::with_capacity(8);
+                b.push(8);
+                put_ip(&mut b, *bind_ip);
+                b.push(proto_byte(*proto));
+                b.extend_from_slice(&port.to_be_bytes());
+                b
+            }
+            Msg::RemoveListener {
+                bind_ip,
+                proto,
+                port,
+            } => {
+                let mut b = Vec::with_capacity(8);
+                b.push(9);
+                put_ip(&mut b, *bind_ip);
+                b.push(proto_byte(*proto));
+                b.extend_from_slice(&port.to_be_bytes());
+                b
+            }
+            Msg::SetRoute {
+                bind_ip,
+                proto,
+                port,
+                client_id,
+            } => {
+                let mut b = Vec::new();
+                b.push(10);
+                put_ip(&mut b, *bind_ip);
+                b.push(proto_byte(*proto));
+                b.extend_from_slice(&port.to_be_bytes());
+                put_str(&mut b, client_id);
+                b
+            }
+            Msg::ClearRoute {
+                bind_ip,
+                proto,
+                port,
+            } => {
+                let mut b = Vec::with_capacity(8);
+                b.push(11);
+                put_ip(&mut b, *bind_ip);
+                b.push(proto_byte(*proto));
+                b.extend_from_slice(&port.to_be_bytes());
+                b
+            }
+            Msg::MutationResult { ok, msg } => {
+                let mut b = Vec::new();
+                b.push(12);
+                b.push(u8::from(*ok));
+                put_str(&mut b, msg);
                 b
             }
         }
@@ -183,40 +325,73 @@ impl Msg {
                 }
                 let count = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
                 at += 2;
-                let mut listeners = Vec::with_capacity(count);
+                let mut listeners = Vec::new();
                 for _ in 0..count {
+                    let bind_ip = take_ip(b, &mut at)?;
                     if at + 3 > b.len() {
                         return Err("truncated listener".into());
                     }
                     let proto = proto_from_byte(b[at])?;
                     let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
                     at += 3;
-                    listeners.push(Listener { proto, port });
+                    listeners.push(Listener {
+                        bind_ip,
+                        proto,
+                        port,
+                    });
                 }
-                if at >= b.len() {
-                    return Err("truncated client present flag".into());
+                if at + 2 > b.len() {
+                    return Err("truncated client count".into());
                 }
-                let present = b[at];
-                at += 1;
-                let client = match present {
-                    0 => None,
-                    1 => {
-                        let client_id = take_str(b, &mut at)?;
-                        if at >= b.len() {
-                            return Err("truncated client transport".into());
-                        }
-                        let transport = b[at];
-                        at += 1;
-                        if transport != 1 && transport != 2 {
-                            return Err(format!("unknown transport byte {transport}").into());
-                        }
-                        Some(ClientEntry {
-                            client_id,
-                            transport,
-                        })
+                let count = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
+                at += 2;
+                let mut clients = Vec::new();
+                for _ in 0..count {
+                    let client_id = take_str(b, &mut at)?;
+                    if at >= b.len() {
+                        return Err("truncated client transport".into());
                     }
-                    n => return Err(format!("unknown client present flag {n}").into()),
-                };
+                    let transport = b[at];
+                    at += 1;
+                    if transport != 1 && transport != 2 {
+                        return Err(format!("unknown transport byte {transport}").into());
+                    }
+                    clients.push(ClientEntry {
+                        client_id,
+                        transport,
+                    });
+                }
+                if at + 2 > b.len() {
+                    return Err("truncated route count".into());
+                }
+                let count = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
+                at += 2;
+                let mut routes = Vec::new();
+                for _ in 0..count {
+                    let bind_ip = take_ip(b, &mut at)?;
+                    if at + 3 > b.len() {
+                        return Err("truncated route".into());
+                    }
+                    let proto = proto_from_byte(b[at])?;
+                    let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
+                    at += 3;
+                    let client_id = take_str(b, &mut at)?;
+                    if at >= b.len() {
+                        return Err("truncated route state".into());
+                    }
+                    let state = b[at];
+                    at += 1;
+                    if state != 0 && state != 1 {
+                        return Err(format!("unknown route state byte {state}").into());
+                    }
+                    routes.push(RouteEntry {
+                        bind_ip,
+                        proto,
+                        port,
+                        client_id,
+                        state,
+                    });
+                }
                 if at != b.len() {
                     return Err("trailing bytes in snapshot".into());
                 }
@@ -224,8 +399,78 @@ impl Msg {
                     version,
                     server_id,
                     listeners,
-                    client,
+                    clients,
+                    routes,
                 }))
+            }
+            Some(8) if b.len() == 8 => {
+                let mut at = 1;
+                let bind_ip = take_ip(b, &mut at)?;
+                let proto = proto_from_byte(b[at])?;
+                let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
+                Ok(Msg::AddListener {
+                    bind_ip,
+                    proto,
+                    port,
+                })
+            }
+            Some(9) if b.len() == 8 => {
+                let mut at = 1;
+                let bind_ip = take_ip(b, &mut at)?;
+                let proto = proto_from_byte(b[at])?;
+                let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
+                Ok(Msg::RemoveListener {
+                    bind_ip,
+                    proto,
+                    port,
+                })
+            }
+            Some(10) => {
+                let mut at = 1;
+                let bind_ip = take_ip(b, &mut at)?;
+                if at + 3 > b.len() {
+                    return Err("truncated set route".into());
+                }
+                let proto = proto_from_byte(b[at])?;
+                let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
+                at += 3;
+                let client_id = take_str(b, &mut at)?;
+                if at != b.len() {
+                    return Err("trailing bytes in set route".into());
+                }
+                Ok(Msg::SetRoute {
+                    bind_ip,
+                    proto,
+                    port,
+                    client_id,
+                })
+            }
+            Some(11) if b.len() == 8 => {
+                let mut at = 1;
+                let bind_ip = take_ip(b, &mut at)?;
+                let proto = proto_from_byte(b[at])?;
+                let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
+                Ok(Msg::ClearRoute {
+                    bind_ip,
+                    proto,
+                    port,
+                })
+            }
+            Some(12) => {
+                if b.len() < 2 {
+                    return Err("truncated mutation result".into());
+                }
+                let ok = match b[1] {
+                    0 => false,
+                    1 => true,
+                    n => return Err(format!("unknown mutation result ok byte {n}").into()),
+                };
+                let mut at = 2;
+                let msg = take_str(b, &mut at)?;
+                if at != b.len() {
+                    return Err("trailing bytes in mutation result".into());
+                }
+                Ok(Msg::MutationResult { ok, msg })
             }
             _ => Err(format!("malformed message ({} bytes)", b.len()).into()),
         }
@@ -259,40 +504,70 @@ mod tests {
 
     #[test]
     fn admin_hello_roundtrip() {
-        let m = Msg::AdminHello {
-            version: 1,
-            mode: 0,
-        };
-        match roundtrip(&m) {
-            Msg::AdminHello { version, mode } => {
-                assert_eq!(version, 1);
-                assert_eq!(mode, 0);
+        for mode in [0u8, 1u8] {
+            let m = Msg::AdminHello { version: 1, mode };
+            match roundtrip(&m) {
+                Msg::AdminHello { version, mode: got } => {
+                    assert_eq!(version, 1);
+                    assert_eq!(got, mode);
+                }
+                other => panic!("expected admin hello, got {other:?}"),
             }
-            other => panic!("expected admin hello, got {other:?}"),
         }
         assert!(Msg::decode(&[6, 1]).is_err());
         assert!(Msg::decode(&[6, 1, 0, 0]).is_err());
     }
 
     #[test]
-    fn snapshot_roundtrip() {
+    fn snapshot_grown_roundtrip() {
         let body = SnapshotBody {
             version: 1,
             server_id: "0".into(),
             listeners: vec![
                 Listener {
+                    bind_ip: Ipv4Addr::UNSPECIFIED,
                     proto: Proto::Tcp,
                     port: 443,
                 },
                 Listener {
+                    bind_ip: Ipv4Addr::new(203, 0, 113, 10),
                     proto: Proto::Udp,
                     port: 51820,
                 },
             ],
-            client: Some(ClientEntry {
-                client_id: "rpi-2-ab12".into(),
-                transport: 1,
-            }),
+            clients: vec![
+                ClientEntry {
+                    client_id: "rpi-1-ab12".into(),
+                    transport: 1,
+                },
+                ClientEntry {
+                    client_id: "rpi-2-cd34".into(),
+                    transport: 2,
+                },
+            ],
+            routes: vec![
+                RouteEntry {
+                    bind_ip: Ipv4Addr::LOCALHOST,
+                    proto: Proto::Tcp,
+                    port: 443,
+                    client_id: "rpi-1-ab12".into(),
+                    state: 0,
+                },
+                RouteEntry {
+                    bind_ip: Ipv4Addr::new(203, 0, 113, 10),
+                    proto: Proto::Udp,
+                    port: 51820,
+                    client_id: "rpi-2-cd34".into(),
+                    state: 0,
+                },
+                RouteEntry {
+                    bind_ip: Ipv4Addr::new(198, 51, 100, 20),
+                    proto: Proto::Tcp,
+                    port: 8443,
+                    client_id: "nat-box-ef56".into(),
+                    state: 1,
+                },
+            ],
         };
         match roundtrip(&Msg::Snapshot(body.clone())) {
             Msg::Snapshot(decoded) => assert_eq!(decoded, body),
@@ -303,12 +578,124 @@ mod tests {
             version: 1,
             server_id: "srv".into(),
             listeners: Vec::new(),
-            client: None,
+            clients: Vec::new(),
+            routes: Vec::new(),
         };
         match roundtrip(&Msg::Snapshot(empty.clone())) {
             Msg::Snapshot(decoded) => assert_eq!(decoded, empty),
             other => panic!("expected snapshot, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mutation_roundtrips() {
+        let add = Msg::AddListener {
+            bind_ip: Ipv4Addr::new(127, 0, 0, 1),
+            proto: Proto::Tcp,
+            port: 8443,
+        };
+        match roundtrip(&add) {
+            Msg::AddListener {
+                bind_ip,
+                proto,
+                port,
+            } => {
+                assert_eq!(bind_ip, Ipv4Addr::new(127, 0, 0, 1));
+                assert_eq!(proto, Proto::Tcp);
+                assert_eq!(port, 8443);
+            }
+            other => panic!("expected add listener, got {other:?}"),
+        }
+
+        let remove = Msg::RemoveListener {
+            bind_ip: Ipv4Addr::UNSPECIFIED,
+            proto: Proto::Udp,
+            port: 51820,
+        };
+        match roundtrip(&remove) {
+            Msg::RemoveListener {
+                bind_ip,
+                proto,
+                port,
+            } => {
+                assert_eq!(bind_ip, Ipv4Addr::UNSPECIFIED);
+                assert_eq!(proto, Proto::Udp);
+                assert_eq!(port, 51820);
+            }
+            other => panic!("expected remove listener, got {other:?}"),
+        }
+
+        let set = Msg::SetRoute {
+            bind_ip: Ipv4Addr::LOCALHOST,
+            proto: Proto::Tcp,
+            port: 443,
+            client_id: "rpi-2-ab12".into(),
+        };
+        match roundtrip(&set) {
+            Msg::SetRoute {
+                bind_ip,
+                proto,
+                port,
+                client_id,
+            } => {
+                assert_eq!(bind_ip, Ipv4Addr::LOCALHOST);
+                assert_eq!(proto, Proto::Tcp);
+                assert_eq!(port, 443);
+                assert_eq!(client_id, "rpi-2-ab12");
+            }
+            other => panic!("expected set route, got {other:?}"),
+        }
+
+        let clear = Msg::ClearRoute {
+            bind_ip: Ipv4Addr::LOCALHOST,
+            proto: Proto::Udp,
+            port: 53,
+        };
+        match roundtrip(&clear) {
+            Msg::ClearRoute {
+                bind_ip,
+                proto,
+                port,
+            } => {
+                assert_eq!(bind_ip, Ipv4Addr::LOCALHOST);
+                assert_eq!(proto, Proto::Udp);
+                assert_eq!(port, 53);
+            }
+            other => panic!("expected clear route, got {other:?}"),
+        }
+
+        for (ok, text) in [(true, ""), (false, "no such listener")] {
+            let m = Msg::MutationResult {
+                ok,
+                msg: text.into(),
+            };
+            match roundtrip(&m) {
+                Msg::MutationResult { ok: got_ok, msg } => {
+                    assert_eq!(got_ok, ok);
+                    assert_eq!(msg, text);
+                }
+                other => panic!("expected mutation result, got {other:?}"),
+            }
+        }
+
+        // Malformed: AddListener with the wrong length.
+        assert!(Msg::decode(&[8, 127, 0, 0, 1, 1, 0]).is_err());
+        // Malformed: SetRoute truncated mid client_id length.
+        assert!(Msg::decode(&[10, 127, 0, 0, 1, 1, 1, 0xbb, 0]).is_err());
+        // Malformed: SetRoute with trailing bytes after the client_id.
+        let mut set_bytes = set.encode();
+        set_bytes.push(0xff);
+        assert!(Msg::decode(&set_bytes).is_err());
+        // Malformed: MutationResult ok byte not in {0, 1}.
+        assert!(Msg::decode(&[12, 2, 0, 0]).is_err());
+        // Malformed: MutationResult with trailing bytes.
+        let mut mr = Msg::MutationResult {
+            ok: true,
+            msg: "x".into(),
+        }
+        .encode();
+        mr.push(0x00);
+        assert!(Msg::decode(&mr).is_err());
     }
 
     #[test]
@@ -330,13 +717,17 @@ mod tests {
             version: 1,
             server_id: "0".into(),
             listeners: Vec::new(),
-            client: Some(ClientEntry {
+            clients: vec![ClientEntry {
                 client_id: "rpi".into(),
                 transport: 1,
-            }),
+            }],
+            routes: Vec::new(),
         })
         .encode();
-        *snap.last_mut().unwrap() = 3;
+        // The last byte is the empty-routes count low byte; back up to the
+        // transport byte (which precedes the two route-count bytes) and corrupt it.
+        let n = snap.len();
+        snap[n - 3] = 3;
         assert!(Msg::decode(&snap).is_err());
     }
 
