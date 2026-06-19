@@ -1,5 +1,6 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
+use zeronat::proto::{Proto, Source};
 use zeronat::tap::TapConfig;
 use zeronat::{admin, client, server, Result};
 
@@ -18,6 +19,7 @@ server options:
   --control <PORT>    Control port (default: 2222)
   --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
   --id <ID>           Server identity label (default: 0)
+  --config <PATH>     Load listeners/routes/identity from a config file
   --tcp <PORT>        Public TCP port to expose (repeatable)
   --udp <PORT>        Public UDP port to expose (repeatable)
   --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
@@ -49,16 +51,17 @@ Options:
 
 enum Cmd {
     Server {
-        bind: String,
-        control: u16,
+        bind: Option<Ipv4Addr>,
+        control: Option<u16>,
         secret: String,
-        server_id: String,
+        server_id: Option<String>,
         tcp: Vec<u16>,
         udp: Vec<u16>,
         tap: Option<TapConfig>,
         dht: bool,
         announce_ip: Option<Ipv4Addr>,
         announce_port: Option<u16>,
+        config: Option<std::path::PathBuf>,
     },
     Client {
         server: String,
@@ -140,10 +143,10 @@ fn parse_args() -> Result<Cmd> {
     let mut iter = tokens.into_iter();
 
     if subcmd == "server" {
-        let mut bind = "0.0.0.0".to_string();
-        let mut control: u16 = 2222;
+        let mut bind: Option<Ipv4Addr> = None;
+        let mut control: Option<u16> = None;
         let mut secret: Option<String> = None;
-        let mut server_id = "0".to_string();
+        let mut server_id: Option<String> = None;
         let mut tcp: Vec<u16> = Vec::new();
         let mut udp: Vec<u16> = Vec::new();
         let mut tap_name: Option<String> = None;
@@ -152,6 +155,7 @@ fn parse_args() -> Result<Cmd> {
         let mut dht = false;
         let mut announce_ip: Option<Ipv4Addr> = None;
         let mut announce_port: Option<u16> = None;
+        let mut config: Option<std::path::PathBuf> = None;
 
         while let Some(flag) = iter.next() {
             match flag.as_str() {
@@ -160,7 +164,13 @@ fn parse_args() -> Result<Cmd> {
                     std::process::exit(0);
                 }
                 "--bind" => {
-                    bind = iter.next().ok_or("--bind requires a value")?;
+                    let v = iter.next().ok_or("--bind requires a value")?;
+                    bind = Some(v.parse().map_err(|_| -> zeronat::Error {
+                        format!("--bind must be an IPv4 address, got '{v}'").into()
+                    })?);
+                }
+                "--config" => {
+                    config = Some(iter.next().ok_or("--config requires a value")?.into());
                 }
                 "--server" => {
                     let v = iter.next().ok_or("--server requires a value")?;
@@ -183,15 +193,15 @@ fn parse_args() -> Result<Cmd> {
                 }
                 "--control" => {
                     let v = iter.next().ok_or("--control requires a value")?;
-                    control = v.parse().map_err(|_| -> zeronat::Error {
+                    control = Some(v.parse().map_err(|_| -> zeronat::Error {
                         format!("--control must be a u16, got '{v}'").into()
-                    })?;
+                    })?);
                 }
                 "--secret" => {
                     secret = Some(iter.next().ok_or("--secret requires a value")?);
                 }
                 "--id" => {
-                    server_id = iter.next().ok_or("--id requires a value")?;
+                    server_id = Some(iter.next().ok_or("--id requires a value")?);
                 }
                 "--tcp" => {
                     let v = iter.next().ok_or("--tcp requires a value")?;
@@ -242,6 +252,7 @@ fn parse_args() -> Result<Cmd> {
             dht,
             announce_ip,
             announce_port,
+            config,
         })
     } else if subcmd == "client" {
         // client
@@ -421,18 +432,112 @@ async fn run(cmd: Cmd) -> Result<()> {
             dht,
             announce_ip,
             announce_port,
+            config,
         } => {
-            if tap.is_some() && (!tcp.is_empty() || !udp.is_empty()) {
+            // A malformed config must fail loud at startup, not boot half-configured.
+            let file = match &config {
+                Some(path) => zeronat::config::load(path)?,
+                None => zeronat::config::ServerConfig::default(),
+            };
+
+            let server_id = server_id
+                .or_else(|| file.id.clone())
+                .unwrap_or_else(|| "0".to_string());
+
+            // The file's `control` (if any) names the default control endpoint;
+            // CLI --bind/--control override the address and port respectively.
+            let (file_ip, file_port) = match &file.control {
+                Some(ctrl) => {
+                    let addr: SocketAddrV4 = ctrl.parse().map_err(|_| -> zeronat::Error {
+                        format!("[server].control must be IPv4:port, got '{ctrl}'").into()
+                    })?;
+                    (Some(*addr.ip()), Some(addr.port()))
+                }
+                None => (None, None),
+            };
+            let bind_ip = bind.or(file_ip).unwrap_or(Ipv4Addr::UNSPECIFIED);
+            let control_port = control.or(file_port).unwrap_or(2222);
+
+            // Listeners: start from the file's, then fold in CLI forwards. A CLI
+            // port that matches a file listener locks that file listener (kept as
+            // File so it still persists); a CLI-only port is a locked Cli listener.
+            let mut listeners: Vec<server::ListenerSpec> = file
+                .listeners
+                .iter()
+                .map(|l| server::ListenerSpec {
+                    bind_ip: l.bind_ip,
+                    proto: l.proto,
+                    port: l.port,
+                    source: Source::File,
+                    cli_locked: false,
+                })
+                .collect();
+            let mut add_cli_listener = |proto: Proto, port: u16| {
+                let key = (bind_ip, proto, port);
+                if let Some(spec) = listeners
+                    .iter_mut()
+                    .find(|s| (s.bind_ip, s.proto, s.port) == key)
+                {
+                    spec.cli_locked = true;
+                } else {
+                    listeners.push(server::ListenerSpec {
+                        bind_ip,
+                        proto,
+                        port,
+                        source: Source::Cli,
+                        cli_locked: true,
+                    });
+                }
+            };
+            for port in &tcp {
+                add_cli_listener(Proto::Tcp, *port);
+            }
+            for port in &udp {
+                add_cli_listener(Proto::Udp, *port);
+            }
+
+            let routes: Vec<server::RouteSpec> = file
+                .routes
+                .iter()
+                .map(|r| server::RouteSpec {
+                    bind_ip: r.bind_ip,
+                    proto: r.proto,
+                    port: r.port,
+                    client_id: r.client.clone(),
+                    source: Source::File,
+                })
+                .collect();
+
+            // Validate against the merged set: a config-only server with listeners
+            // and no CLI flags is valid, and --tap still cannot coexist with forwards.
+            if tap.is_some() && !listeners.is_empty() {
                 return Err("--tap cannot be combined with --tcp/--udp forwards".into());
             }
-            if tap.is_none() && tcp.is_empty() && udp.is_empty() {
-                return Err("nothing to do: pass --tap or at least one --tcp/--udp".into());
+            if tap.is_none() && listeners.is_empty() {
+                return Err(
+                    "nothing to do: pass --tap, a --config with listeners, or at least one --tcp/--udp"
+                        .into(),
+                );
             }
+
             let dht = dht.then_some(server::DhtAnnounce {
                 ip: announce_ip,
                 port: announce_port,
             });
-            server::run(bind, control, secret, tcp, udp, tap, dht, server_id).await
+            server::run(server::ServerSettings {
+                bind: bind_ip,
+                control_port,
+                secret,
+                server_id,
+                tap,
+                dht,
+                listeners,
+                routes,
+                config_path: config,
+                file_id: file.id,
+                file_control: file.control,
+            })
+            .await
         }
         Cmd::Client {
             server,

@@ -8,12 +8,23 @@ pub enum Proto {
     Udp,
 }
 
+/// Where a mutable setting came from. `File` is loaded from config and persisted
+/// on mutation; `Cli` is passed as a process arg and read-only to admin; `Runtime`
+/// is applied this process lifetime on a node with no config file and is not saved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    File,
+    Cli,
+    Runtime,
+}
+
 /// A public port the server is listening on, as reported in a `Snapshot`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Listener {
     pub bind_ip: Ipv4Addr,
     pub proto: Proto,
     pub port: u16,
+    pub source: Source,
 }
 
 /// A connected client, as reported in a `Snapshot`. `transport` is the observed
@@ -33,6 +44,7 @@ pub struct RouteEntry {
     pub port: u16,
     pub client_id: String,
     pub state: u8,
+    pub source: Source,
 }
 
 /// A point-in-time view of one server's topology, returned to admin on request.
@@ -114,6 +126,23 @@ fn proto_from_byte(n: u8) -> Result<Proto> {
         1 => Ok(Proto::Tcp),
         2 => Ok(Proto::Udp),
         n => Err(format!("unknown proto byte {n}").into()),
+    }
+}
+
+pub(crate) fn source_byte(s: Source) -> u8 {
+    match s {
+        Source::File => 0,
+        Source::Cli => 1,
+        Source::Runtime => 2,
+    }
+}
+
+fn source_from_byte(n: u8) -> Result<Source> {
+    match n {
+        0 => Ok(Source::File),
+        1 => Ok(Source::Cli),
+        2 => Ok(Source::Runtime),
+        n => Err(format!("unknown source byte {n}").into()),
     }
 }
 
@@ -205,6 +234,7 @@ impl Msg {
                     put_ip(&mut b, l.bind_ip);
                     b.push(proto_byte(l.proto));
                     b.extend_from_slice(&l.port.to_be_bytes());
+                    b.push(source_byte(l.source));
                 }
                 debug_assert!(snap.clients.len() <= u16::MAX as usize);
                 b.extend_from_slice(&(snap.clients.len() as u16).to_be_bytes());
@@ -220,6 +250,7 @@ impl Msg {
                     b.extend_from_slice(&route.port.to_be_bytes());
                     put_str(&mut b, &route.client_id);
                     b.push(route.state);
+                    b.push(source_byte(route.source));
                 }
                 b
             }
@@ -328,16 +359,18 @@ impl Msg {
                 let mut listeners = Vec::new();
                 for _ in 0..count {
                     let bind_ip = take_ip(b, &mut at)?;
-                    if at + 3 > b.len() {
+                    if at + 4 > b.len() {
                         return Err("truncated listener".into());
                     }
                     let proto = proto_from_byte(b[at])?;
                     let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
-                    at += 3;
+                    let source = source_from_byte(b[at + 3])?;
+                    at += 4;
                     listeners.push(Listener {
                         bind_ip,
                         proto,
                         port,
+                        source,
                     });
                 }
                 if at + 2 > b.len() {
@@ -376,20 +409,22 @@ impl Msg {
                     let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
                     at += 3;
                     let client_id = take_str(b, &mut at)?;
-                    if at >= b.len() {
+                    if at + 2 > b.len() {
                         return Err("truncated route state".into());
                     }
                     let state = b[at];
-                    at += 1;
                     if state != 0 && state != 1 {
                         return Err(format!("unknown route state byte {state}").into());
                     }
+                    let source = source_from_byte(b[at + 1])?;
+                    at += 2;
                     routes.push(RouteEntry {
                         bind_ip,
                         proto,
                         port,
                         client_id,
                         state,
+                        source,
                     });
                 }
                 if at != b.len() {
@@ -528,11 +563,13 @@ mod tests {
                     bind_ip: Ipv4Addr::UNSPECIFIED,
                     proto: Proto::Tcp,
                     port: 443,
+                    source: Source::File,
                 },
                 Listener {
                     bind_ip: Ipv4Addr::new(203, 0, 113, 10),
                     proto: Proto::Udp,
                     port: 51820,
+                    source: Source::Cli,
                 },
             ],
             clients: vec![
@@ -552,6 +589,7 @@ mod tests {
                     port: 443,
                     client_id: "rpi-1-ab12".into(),
                     state: 0,
+                    source: Source::File,
                 },
                 RouteEntry {
                     bind_ip: Ipv4Addr::new(203, 0, 113, 10),
@@ -559,6 +597,7 @@ mod tests {
                     port: 51820,
                     client_id: "rpi-2-cd34".into(),
                     state: 0,
+                    source: Source::Runtime,
                 },
                 RouteEntry {
                     bind_ip: Ipv4Addr::new(198, 51, 100, 20),
@@ -566,6 +605,7 @@ mod tests {
                     port: 8443,
                     client_id: "nat-box-ef56".into(),
                     state: 1,
+                    source: Source::Cli,
                 },
             ],
         };
@@ -728,6 +768,48 @@ mod tests {
         // transport byte (which precedes the two route-count bytes) and corrupt it.
         let n = snap.len();
         snap[n - 3] = 3;
+        assert!(Msg::decode(&snap).is_err());
+
+        // tag-7 with a bad listener source byte (5). A single listener and no
+        // clients/routes puts the listener source byte before the two zero
+        // counts (client + route), i.e. five bytes from the end.
+        let mut snap = Msg::Snapshot(SnapshotBody {
+            version: 1,
+            server_id: "0".into(),
+            listeners: vec![Listener {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Tcp,
+                port: 443,
+                source: Source::File,
+            }],
+            clients: Vec::new(),
+            routes: Vec::new(),
+        })
+        .encode();
+        let n = snap.len();
+        snap[n - 5] = 5;
+        assert!(Msg::decode(&snap).is_err());
+
+        // tag-7 with a bad route source byte (7). A single route and no
+        // clients/listeners puts the route source byte at the very end, after the
+        // route state byte.
+        let mut snap = Msg::Snapshot(SnapshotBody {
+            version: 1,
+            server_id: "0".into(),
+            listeners: Vec::new(),
+            clients: Vec::new(),
+            routes: vec![RouteEntry {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Tcp,
+                port: 443,
+                client_id: "rpi".into(),
+                state: 0,
+                source: Source::File,
+            }],
+        })
+        .encode();
+        let n = snap.len();
+        snap[n - 1] = 7;
         assert!(Msg::decode(&snap).is_err());
     }
 

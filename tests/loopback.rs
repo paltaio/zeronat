@@ -1,12 +1,52 @@
+use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::{sleep, timeout};
 
-use zeronat::proto::{Msg, Proto};
+use zeronat::proto::{Msg, Proto, Source};
+use zeronat::server::{ListenerSpec, ServerSettings};
 
 const SECRET: &str = "integration-test-secret";
+
+/// Build a `ServerSettings` for a config-less (runtime-only) server: localhost
+/// bind, removable runtime-sourced listeners, no routes, no config file. The
+/// dedicated CLI-lock test pins its own cli-locked listener; here listeners stay
+/// removable so the add/remove path is exercisable. Tests override fields as needed.
+fn cli_settings(control: u16, tcp: Vec<u16>, udp: Vec<u16>) -> ServerSettings {
+    let mut listeners: Vec<ListenerSpec> = tcp
+        .into_iter()
+        .map(|port| ListenerSpec {
+            bind_ip: Ipv4Addr::LOCALHOST,
+            proto: Proto::Tcp,
+            port,
+            source: Source::Runtime,
+            cli_locked: false,
+        })
+        .collect();
+    listeners.extend(udp.into_iter().map(|port| ListenerSpec {
+        bind_ip: Ipv4Addr::LOCALHOST,
+        proto: Proto::Udp,
+        port,
+        source: Source::Runtime,
+        cli_locked: false,
+    }));
+    ServerSettings {
+        bind: Ipv4Addr::LOCALHOST,
+        control_port: control,
+        secret: SECRET.into(),
+        server_id: "0".into(),
+        tap: None,
+        dht: None,
+        listeners,
+        routes: Vec::new(),
+        config_path: None,
+        file_id: None,
+        file_control: None,
+    }
+}
 
 fn free_tcp_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -98,16 +138,11 @@ fn start_tunnel(transport: zeronat::client::Transport) -> Tunnel {
     tokio::spawn(udp_echo(local_udp));
 
     // Server on the "public" side.
-    tokio::spawn(zeronat::server::run(
-        "127.0.0.1".into(),
+    tokio::spawn(zeronat::server::run(cli_settings(
         control,
-        SECRET.into(),
         vec![public_tcp],
         vec![public_udp],
-        None,
-        None,
-        "0".into(),
-    ));
+    )));
 
     // Client dialing out, mapping public ports to the local echo services.
     tokio::spawn(zeronat::client::run(
@@ -336,16 +371,11 @@ async fn multi_client_route_switch() {
         tokio::spawn(tcp_tagged(target1, b"ONE"));
         tokio::spawn(tcp_tagged(target2, b"TWO"));
 
-        tokio::spawn(zeronat::server::run(
-            "127.0.0.1".into(),
+        tokio::spawn(zeronat::server::run(cli_settings(
             control,
-            SECRET.into(),
             vec![public_tcp],
             vec![],
-            None,
-            None,
-            "0".into(),
-        ));
+        )));
 
         // Two clients, each mapping the same public port to its own target.
         tokio::spawn(zeronat::client::run(
@@ -583,16 +613,11 @@ async fn reconnect_same_id_supersede() {
 
         tokio::spawn(tcp_echo(local_tcp));
 
-        tokio::spawn(zeronat::server::run(
-            "127.0.0.1".into(),
+        tokio::spawn(zeronat::server::run(cli_settings(
             control,
-            SECRET.into(),
             vec![public_tcp],
             vec![],
-            None,
-            None,
-            "0".into(),
-        ));
+        )));
 
         // Two clients with the same prefix on the same host resolve to the same
         // full id, so the second supersedes the first in the registry.
@@ -639,4 +664,263 @@ async fn reconnect_same_id_supersede() {
     timeout(Duration::from_secs(30), body)
         .await
         .expect("reconnect supersede did not complete within 30s");
+}
+
+/// Allocate a fresh, process-unique temp directory for a config file.
+fn temp_config_dir(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "zeronat-loopback-{tag}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_autosave_persists_route() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let local_tcp = free_tcp_port();
+
+        tokio::spawn(tcp_echo(local_tcp));
+
+        // Config-backed server: a CLI listener so the client can connect, and a
+        // config_path so mutations auto-save. The file starts absent; save_atomic
+        // creates it on the first persisted mutation.
+        let dir = temp_config_dir("autosave");
+        let path = dir.join("server.toml");
+        let mut settings = cli_settings(control, vec![public_tcp], vec![]);
+        settings.config_path = Some(path.clone());
+        tokio::spawn(zeronat::server::run(settings));
+
+        // One client maps the public port to its echo, so it serves the route.
+        tokio::spawn(zeronat::client::run(
+            format!("127.0.0.1:{control}"),
+            SECRET.into(),
+            vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
+            vec![],
+            zeronat::client::Transport::Tcp,
+            None,
+            Some("rpi".into()),
+        ));
+
+        let snap = wait_clients(control, 1).await;
+        let client_id = snap.clients[0].client_id.clone();
+
+        // SetRoute over the mutate protocol; the server must persist it.
+        let (ok, msg) = admin_mutate(
+            control,
+            Msg::SetRoute {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Tcp,
+                port: public_tcp,
+                client_id: client_id.clone(),
+            },
+        )
+        .await;
+        assert!(ok, "SetRoute on a config-backed server failed: {msg}");
+
+        // The on-disk config now carries the route.
+        let cfg = zeronat::config::load(&path).expect("config file written");
+        assert!(
+            cfg.routes
+                .iter()
+                .any(|r| r.proto == Proto::Tcp && r.port == public_tcp && r.client == client_id),
+            "persisted config missing the route: {:?}",
+            cfg.routes
+        );
+
+        // ClearRoute persists the removal: the file no longer contains the route.
+        let (ok, msg) = admin_mutate(
+            control,
+            Msg::ClearRoute {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Tcp,
+                port: public_tcp,
+            },
+        )
+        .await;
+        assert!(ok, "ClearRoute on a config-backed server failed: {msg}");
+        let cfg = zeronat::config::load(&path).expect("config file still present");
+        assert!(
+            !cfg.routes
+                .iter()
+                .any(|r| r.proto == Proto::Tcp && r.port == public_tcp),
+            "cleared route still present in config: {:?}",
+            cfg.routes
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("config autosave did not complete within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_listener_remove_refused() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let local_tcp = free_tcp_port();
+
+        tokio::spawn(tcp_echo(local_tcp));
+
+        // A CLI-locked listener that admin must refuse to remove.
+        let mut settings = cli_settings(control, vec![], vec![]);
+        settings.listeners = vec![ListenerSpec {
+            bind_ip: Ipv4Addr::LOCALHOST,
+            proto: Proto::Tcp,
+            port: public_tcp,
+            source: Source::Cli,
+            cli_locked: true,
+        }];
+        tokio::spawn(zeronat::server::run(settings));
+
+        tokio::spawn(zeronat::client::run(
+            format!("127.0.0.1:{control}"),
+            SECRET.into(),
+            vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
+            vec![],
+            zeronat::client::Transport::Tcp,
+            None,
+            Some("rpi".into()),
+        ));
+        wait_clients(control, 1).await;
+
+        let (ok, msg) = admin_mutate(
+            control,
+            Msg::RemoveListener {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Tcp,
+                port: public_tcp,
+            },
+        )
+        .await;
+        assert!(!ok, "CLI-locked listener removal must be refused");
+        assert!(
+            msg.contains("controlled by CLI args"),
+            "unexpected refusal message: {msg}"
+        );
+
+        // The listener is still live: a fresh public connection still bridges.
+        let _conn = wait_tcp_path(public_tcp).await;
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("cli listener remove refusal did not complete within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_node_does_not_persist() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let local_tcp = free_tcp_port();
+
+        tokio::spawn(tcp_echo(local_tcp));
+
+        // No config_path: a runtime-only node. Mutations apply in memory but are
+        // marked `runtime` and never written.
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control,
+            vec![public_tcp],
+            vec![],
+        )));
+
+        tokio::spawn(zeronat::client::run(
+            format!("127.0.0.1:{control}"),
+            SECRET.into(),
+            vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
+            vec![],
+            zeronat::client::Transport::Tcp,
+            None,
+            Some("rpi".into()),
+        ));
+
+        let snap = wait_clients(control, 1).await;
+        let client_id = snap.clients[0].client_id.clone();
+
+        let (ok, msg) = admin_mutate(
+            control,
+            Msg::SetRoute {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Tcp,
+                port: public_tcp,
+                client_id: client_id.clone(),
+            },
+        )
+        .await;
+        assert!(ok, "SetRoute on a runtime node failed: {msg}");
+
+        // The route is live but marked runtime in the snapshot (nothing is written
+        // because there is no config path).
+        let snap = fetch_snapshot(control).await;
+        let route = snap
+            .routes
+            .iter()
+            .find(|r| r.proto == Proto::Tcp && r.port == public_tcp)
+            .expect("route present in snapshot");
+        assert_eq!(route.source, Source::Runtime, "route must be runtime-owned");
+        assert_eq!(route.client_id, client_id);
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("runtime node persistence check did not complete within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_failure_reports_error() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+
+        // A config path whose parent is a regular file: every atomic save fails
+        // because the temp file cannot be created under a non-directory.
+        let blocker = std::env::temp_dir().join(format!(
+            "zeronat-blocker-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut settings = cli_settings(control, vec![public_tcp], vec![]);
+        settings.config_path = Some(blocker.join("server.toml"));
+        tokio::spawn(zeronat::server::run(settings));
+
+        let (ok, msg) = admin_mutate(
+            control,
+            Msg::SetRoute {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Tcp,
+                port: public_tcp,
+                client_id: "rpi-x".into(),
+            },
+        )
+        .await;
+        assert!(!ok, "a save to an unwritable path must report failure");
+        assert!(msg.contains("rejected config save"), "msg was: {msg}");
+
+        // The mutation still applied in memory despite the save failure.
+        let snap = fetch_snapshot(control).await;
+        assert!(
+            snap.routes.iter().any(|r| r.port == public_tcp),
+            "route must stay live in memory even though persistence failed"
+        );
+
+        std::fs::remove_file(&blocker).ok();
+    };
+
+    timeout(Duration::from_secs(20), body)
+        .await
+        .expect("save-failure check did not complete within 20s");
 }

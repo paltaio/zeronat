@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,12 +11,15 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{timeout, Instant};
 
 use crate::bridge;
+use crate::config;
 use crate::dgram::{DgramRx, DgramTx};
 use crate::kcp::{route, session, Accepted, Session};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{server_handshake, server_handshake_stateless, Noise, StatelessNoise};
-use crate::proto::{proto_name, ClientEntry, Listener, Msg, Proto, RouteEntry, SnapshotBody};
+use crate::proto::{
+    proto_name, ClientEntry, Listener, Msg, Proto, RouteEntry, SnapshotBody, Source,
+};
 use crate::tap::TapConfig;
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
@@ -65,9 +69,22 @@ struct ClientHandle {
 
 /// A running listener's teardown handles: `cancel` stops the accept/recv loop and
 /// `bridges` collects active TCP bridge tasks so they can be aborted on removal.
+/// `source` records where the listener came from; `cli_locked` marks a listener
+/// pinned by a CLI arg, which admin may not remove and which persists as `File`
+/// only when it is also declared in the config file.
 struct ListenerHandle {
     cancel: Arc<Notify>,
     bridges: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    source: Source,
+    cli_locked: bool,
+}
+
+/// A route's target client and where the route came from. Bundled so a mutation
+/// updates the target and its source atomically under one `routes` lock.
+#[derive(Clone)]
+struct Route {
+    client_id: String,
+    source: Source,
 }
 
 /// A parked public UDP source, the public socket its replies must go out on, and
@@ -82,9 +99,18 @@ pub(crate) struct Server {
     pending: Mutex<HashMap<u64, oneshot::Sender<Noise>>>,
     udp_pending: Mutex<HashMap<u64, UdpPending>>,
     clients: Mutex<HashMap<String, ClientHandle>>,
-    routes: Mutex<HashMap<RouteKey, String>>,
+    routes: Mutex<HashMap<RouteKey, Route>>,
     listeners: Mutex<HashMap<RouteKey, ListenerHandle>>,
     handshakes: Arc<Semaphore>,
+    /// Config file backing this server, or `None` for a runtime-only node that
+    /// never writes. `file_id`/`file_control` preserve the loaded `[server]`
+    /// verbatim so an auto-save never bakes CLI-sourced identity into the file.
+    config_path: Option<PathBuf>,
+    file_id: Option<String>,
+    file_control: Option<String>,
+    /// Serializes config writes so two concurrent admin sessions never interleave
+    /// a save.
+    save_lock: tokio::sync::Mutex<()>,
     #[cfg(target_os = "linux")]
     tap: Option<Arc<TapDevice>>,
     #[cfg(target_os = "linux")]
@@ -118,7 +144,12 @@ impl Server {
     /// client is the implicit target (single-client deployments need no route).
     /// Locks are taken and dropped one at a time, never across a `try_send`.
     fn route_to(&self, key: RouteKey) -> Option<ClientHandle> {
-        let routed_id = self.routes.lock().unwrap().get(&key).cloned();
+        let routed_id = self
+            .routes
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|r| r.client_id.clone());
         if let Some(id) = routed_id {
             return self.clients.lock().unwrap().get(&id).cloned();
         }
@@ -159,17 +190,58 @@ pub struct DhtAnnounce {
     pub port: Option<u16>,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    bind: String,
-    control_port: u16,
-    secret: String,
-    tcp_ports: Vec<u16>,
-    udp_ports: Vec<u16>,
-    tap: Option<TapConfig>,
-    dht: Option<DhtAnnounce>,
-    server_id: String,
-) -> Result<()> {
+/// One public listener the server starts at boot, with its config source. A
+/// `cli_locked` listener is pinned by a CLI arg: admin may not remove it, and it
+/// is persisted only when it is also a file-declared listener (`source == File`).
+pub struct ListenerSpec {
+    pub bind_ip: Ipv4Addr,
+    pub proto: Proto,
+    pub port: u16,
+    pub source: Source,
+    pub cli_locked: bool,
+}
+
+/// One route the server seeds at boot, with its config source.
+pub struct RouteSpec {
+    pub bind_ip: Ipv4Addr,
+    pub proto: Proto,
+    pub port: u16,
+    pub client_id: String,
+    pub source: Source,
+}
+
+/// Everything the server needs to boot. `config_path` is the file to auto-save
+/// mutations into, or `None` for a runtime-only node. `file_id`/`file_control`
+/// carry the loaded `[server]` table so a save preserves it verbatim.
+pub struct ServerSettings {
+    pub bind: Ipv4Addr,
+    pub control_port: u16,
+    pub secret: String,
+    pub server_id: String,
+    pub tap: Option<TapConfig>,
+    pub dht: Option<DhtAnnounce>,
+    pub listeners: Vec<ListenerSpec>,
+    pub routes: Vec<RouteSpec>,
+    pub config_path: Option<PathBuf>,
+    pub file_id: Option<String>,
+    pub file_control: Option<String>,
+}
+
+pub async fn run(settings: ServerSettings) -> Result<()> {
+    let ServerSettings {
+        bind,
+        control_port,
+        secret,
+        server_id,
+        tap,
+        dht,
+        listeners,
+        routes,
+        config_path,
+        file_id,
+        file_control,
+    } = settings;
+
     #[cfg(target_os = "linux")]
     let tap = match &tap {
         Some(cfg) => Some(Arc::new(TapDevice::open(cfg)?)),
@@ -180,9 +252,7 @@ pub async fn run(
         return Err("L2 TAP bridge (--tap) is only supported on Linux".into());
     }
 
-    let bind_ip: Ipv4Addr = bind.parse().map_err(|_| -> crate::Error {
-        format!("--bind must be an IPv4 address, got '{bind}'").into()
-    })?;
+    let bind_ip = bind;
 
     if let Some(ann) = dht {
         #[cfg(feature = "dht")]
@@ -208,28 +278,50 @@ pub async fn run(
         pending: Mutex::new(HashMap::new()),
         udp_pending: Mutex::new(HashMap::new()),
         clients: Mutex::new(HashMap::new()),
-        routes: Mutex::new(HashMap::new()),
+        routes: Mutex::new(
+            routes
+                .into_iter()
+                .map(|r| {
+                    (
+                        (r.bind_ip, r.proto, r.port),
+                        Route {
+                            client_id: r.client_id,
+                            source: r.source,
+                        },
+                    )
+                })
+                .collect(),
+        ),
         listeners: Mutex::new(HashMap::new()),
         handshakes: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
+        config_path,
+        file_id,
+        file_control,
+        save_lock: tokio::sync::Mutex::new(()),
         #[cfg(target_os = "linux")]
         tap,
         #[cfg(target_os = "linux")]
         bridge_cancel: Mutex::new(None),
     });
 
-    // A CLI-supplied forwarded port that is already in use must not kill the
-    // server: log it and keep the others serving, as the single-listener path did.
-    for port in tcp_ports {
-        if let Err(e) = spawn_listener(&srv, bind_ip, Proto::Tcp, port).await {
-            eprintln!("{e}");
-        }
-    }
-    for port in udp_ports {
-        if let Err(e) = spawn_listener(&srv, bind_ip, Proto::Udp, port).await {
+    // A configured forwarded port that is already in use must not kill the server:
+    // log it and keep the others serving, as the single-listener path did.
+    for spec in listeners {
+        if let Err(e) = spawn_listener(
+            &srv,
+            spec.bind_ip,
+            spec.proto,
+            spec.port,
+            spec.source,
+            spec.cli_locked,
+        )
+        .await
+        {
             eprintln!("{e}");
         }
     }
 
+    let bind = bind_ip.to_string();
     {
         let srv = srv.clone();
         let bind = bind.clone();
@@ -406,11 +498,14 @@ impl Server {
             .listeners
             .lock()
             .unwrap()
-            .keys()
-            .map(|&(bind_ip, proto, port)| Listener {
+            .iter()
+            .map(|(&(bind_ip, proto, port), h)| Listener {
                 bind_ip,
                 proto,
                 port,
+                // A CLI-locked listener displays as `cli` so admin sees it cannot
+                // be removed, even when it is also a file-declared listener.
+                source: if h.cli_locked { Source::Cli } else { h.source },
             })
             .collect();
         let routes = self
@@ -418,12 +513,17 @@ impl Server {
             .lock()
             .unwrap()
             .iter()
-            .map(|(&(bind_ip, proto, port), client_id)| RouteEntry {
+            .map(|(&(bind_ip, proto, port), route)| RouteEntry {
                 bind_ip,
                 proto,
                 port,
-                client_id: client_id.clone(),
-                state: if connected.contains(client_id) { 0 } else { 1 },
+                client_id: route.client_id.clone(),
+                state: if connected.contains(&route.client_id) {
+                    0
+                } else {
+                    1
+                },
+                source: route.source,
             })
             .collect();
         SnapshotBody {
@@ -434,39 +534,127 @@ impl Server {
             routes,
         }
     }
+
+    /// Serialize the file-owned topology and write it crash-safely to the backing
+    /// config. A runtime-only node (no `config_path`) never writes. The write runs
+    /// under `save_lock` so two concurrent admin saves cannot interleave, and the
+    /// blocking fsync+rename runs on a blocking thread so no tokio worker stalls.
+    ///
+    /// Only `Source::File` listeners and routes are serialized: CLI- and runtime-
+    /// owned entries stay live in memory and are merely excluded from the file. The
+    /// `[server]` table is preserved verbatim from the loaded file, so a CLI
+    /// override of id/control is never baked into the saved config.
+    async fn persist(&self) -> Result<()> {
+        let Some(path) = self.config_path.clone() else {
+            return Ok(());
+        };
+        let _guard = self.save_lock.lock().await;
+
+        // Snapshot each map independently, releasing one lock before taking the
+        // next, so persist never holds two of the maps at once.
+        let listeners: Vec<config::CfgListener> = self
+            .listeners
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, h)| h.source == Source::File)
+            .map(|(&(bind_ip, proto, port), _)| config::CfgListener {
+                bind_ip,
+                proto,
+                port,
+            })
+            .collect();
+        let routes: Vec<config::CfgRoute> = self
+            .routes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.source == Source::File)
+            .map(|(&(bind_ip, proto, port), r)| config::CfgRoute {
+                bind_ip,
+                proto,
+                port,
+                client: r.client_id.clone(),
+            })
+            .collect();
+        let cfg = config::ServerConfig {
+            id: self.file_id.clone(),
+            control: self.file_control.clone(),
+            listeners,
+            routes,
+        };
+
+        let text = config::serialize(&cfg);
+        match tokio::task::spawn_blocking(move || config::save_atomic(&path, &text)).await {
+            Ok(res) => res,
+            Err(e) => Err(format!("config save task failed: {e}").into()),
+        }
+    }
 }
 
-/// Apply one admin mutation against the running server. Returns `(ok, msg)`:
-/// `(true, "")` on success, `(false, reason)` on a bind/registry error.
+/// Apply one admin mutation against the running server, persisting to the config
+/// file when the node is config-backed. Returns `(ok, msg)`: `(true, "")` on a
+/// success that also persisted (or needed no save), `(false, reason)` on a
+/// bind/registry/lock error or on a save failure. A save failure returns `false`
+/// even though the mutation already applied in memory, so a scripted admin detects
+/// that the on-disk config did not change.
 async fn apply_mutation(srv: &Arc<Server>, req: Msg) -> (bool, String) {
+    // File-owned on a config-backed node, runtime-owned otherwise.
+    let mutation_source = if srv.config_path.is_some() {
+        Source::File
+    } else {
+        Source::Runtime
+    };
     match req {
         Msg::AddListener {
             bind_ip,
             proto,
             port,
-        } => match spawn_listener(srv, bind_ip, proto, port).await {
-            Ok(()) => (true, String::new()),
+        } => match spawn_listener(srv, bind_ip, proto, port, mutation_source, false).await {
+            Ok(()) => save_after_mutation(srv).await,
             Err(e) => (false, e.to_string()),
         },
         Msg::RemoveListener {
             bind_ip,
             proto,
             port,
-        } => match remove_listener(srv, (bind_ip, proto, port)) {
-            Ok(()) => (true, String::new()),
-            Err(e) => (false, e.to_string()),
-        },
+        } => {
+            // A CLI-locked listener is owned by the process args; refuse to remove
+            // it so the operator does not silently lose a pinned forward.
+            if srv
+                .listeners
+                .lock()
+                .unwrap()
+                .get(&(bind_ip, proto, port))
+                .is_some_and(|h| h.cli_locked)
+            {
+                return (
+                    false,
+                    format!(
+                        "listener {bind_ip} {} {port} is controlled by CLI args",
+                        proto_name(proto)
+                    ),
+                );
+            }
+            match remove_listener(srv, (bind_ip, proto, port)) {
+                Ok(()) => save_after_mutation(srv).await,
+                Err(e) => (false, e.to_string()),
+            }
+        }
         Msg::SetRoute {
             bind_ip,
             proto,
             port,
             client_id,
         } => {
-            srv.routes
-                .lock()
-                .unwrap()
-                .insert((bind_ip, proto, port), client_id);
-            (true, String::new())
+            srv.routes.lock().unwrap().insert(
+                (bind_ip, proto, port),
+                Route {
+                    client_id,
+                    source: mutation_source,
+                },
+            );
+            save_after_mutation(srv).await
         }
         Msg::ClearRoute {
             bind_ip,
@@ -474,9 +662,21 @@ async fn apply_mutation(srv: &Arc<Server>, req: Msg) -> (bool, String) {
             port,
         } => {
             srv.routes.lock().unwrap().remove(&(bind_ip, proto, port));
-            (true, String::new())
+            save_after_mutation(srv).await
         }
         other => (false, format!("unexpected mutation message: {other:?}")),
+    }
+}
+
+/// Persist after an applied mutation and map the outcome to an admin `(ok, msg)`.
+/// A runtime-only node never writes, so this is `(true, "")` there too.
+async fn save_after_mutation(srv: &Arc<Server>) -> (bool, String) {
+    match srv.persist().await {
+        Ok(()) => (true, String::new()),
+        Err(e) => (
+            false,
+            format!("server {} rejected config save: {e}", srv.server_id),
+        ),
     }
 }
 
@@ -488,6 +688,8 @@ async fn spawn_listener(
     bind_ip: Ipv4Addr,
     proto: Proto,
     port: u16,
+    source: Source,
+    cli_locked: bool,
 ) -> Result<()> {
     let key = (bind_ip, proto, port);
     if srv.listeners.lock().unwrap().contains_key(&key) {
@@ -513,6 +715,8 @@ async fn spawn_listener(
                 ListenerHandle {
                     cancel: cancel.clone(),
                     bridges: bridges.clone(),
+                    source,
+                    cli_locked,
                 },
             );
             let srv = srv.clone();
@@ -529,6 +733,8 @@ async fn spawn_listener(
                 ListenerHandle {
                     cancel: cancel.clone(),
                     bridges,
+                    source,
+                    cli_locked,
                 },
             );
             let srv = srv.clone();

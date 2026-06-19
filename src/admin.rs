@@ -1,4 +1,4 @@
-use crate::proto::{proto_name, Msg, SnapshotBody};
+use crate::proto::{proto_name, Msg, SnapshotBody, Source};
 use crate::Result;
 use tokio::net::TcpStream;
 
@@ -34,6 +34,14 @@ fn route_state(state: u8) -> &'static str {
     }
 }
 
+fn source_name(source: Source) -> &'static str {
+    match source {
+        Source::File => "file",
+        Source::Cli => "cli",
+        Source::Runtime => "runtime",
+    }
+}
+
 /// Render a snapshot to a human-readable report. Pure (no IO) so it is testable.
 fn render(snap: &SnapshotBody, addr: &str) -> String {
     let mut out = String::new();
@@ -52,18 +60,19 @@ fn render(snap: &SnapshotBody, addr: &str) -> String {
         out.push_str("  (no routes)\n");
     } else {
         out.push_str(&format!(
-            "  {:<8}  {:<15}  {:<5}  {:<5}  {:<16}  {}\n",
-            "SERVER", "BIND IP", "PROTO", "PORT", "TARGET", "STATE"
+            "  {:<8}  {:<15}  {:<5}  {:<5}  {:<16}  {:<14}  {}\n",
+            "SERVER", "BIND IP", "PROTO", "PORT", "TARGET", "STATE", "SOURCE"
         ));
         for route in &snap.routes {
             out.push_str(&format!(
-                "  {:<8}  {:<15}  {:<5}  {:<5}  {:<16}  {}\n",
+                "  {:<8}  {:<15}  {:<5}  {:<5}  {:<16}  {:<14}  {}\n",
                 snap.server_id,
                 route.bind_ip,
                 proto_name(route.proto),
                 route.port,
                 route.client_id,
                 route_state(route.state),
+                source_name(route.source),
             ));
         }
     }
@@ -85,15 +94,16 @@ fn render(snap: &SnapshotBody, addr: &str) -> String {
         out.push_str("  (none)\n");
     } else {
         out.push_str(&format!(
-            "  {:<5}  {:<15}  {}\n",
-            "PROTO", "BIND IP", "PORT"
+            "  {:<5}  {:<15}  {:<5}  {}\n",
+            "PROTO", "BIND IP", "PORT", "SOURCE"
         ));
         for l in &snap.listeners {
             out.push_str(&format!(
-                "  {:<5}  {:<15}  {}\n",
+                "  {:<5}  {:<15}  {:<5}  {}\n",
                 proto_name(l.proto),
                 l.bind_ip,
-                l.port
+                l.port,
+                source_name(l.source),
             ));
         }
     }
@@ -104,7 +114,7 @@ fn render(snap: &SnapshotBody, addr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{ClientEntry, Listener, Proto, RouteEntry};
+    use crate::proto::{ClientEntry, Listener, Proto, RouteEntry, Source};
     use std::net::Ipv4Addr;
 
     #[test]
@@ -117,11 +127,13 @@ mod tests {
                     bind_ip: Ipv4Addr::LOCALHOST,
                     proto: Proto::Tcp,
                     port: 443,
+                    source: Source::File,
                 },
                 Listener {
                     bind_ip: Ipv4Addr::LOCALHOST,
                     proto: Proto::Udp,
                     port: 51820,
+                    source: Source::Cli,
                 },
             ],
             clients: vec![ClientEntry {
@@ -134,6 +146,7 @@ mod tests {
                 port: 443,
                 client_id: "rpi-2-ab12".into(),
                 state: 0,
+                source: Source::Runtime,
             }],
         };
         let s = render(&snap, "vps.example:2222");
@@ -148,6 +161,11 @@ mod tests {
         assert!(s.contains("51820"));
         assert!(s.contains("127.0.0.1"));
         assert!(s.contains("rpi-2-ab12  connected to 0"));
+        // SOURCE column: the file listener, cli listener, and runtime route.
+        assert!(s.contains("SOURCE"));
+        assert!(s.contains("file"));
+        assert!(s.contains("cli"));
+        assert!(s.contains("runtime"));
     }
 
     #[test]
