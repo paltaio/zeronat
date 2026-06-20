@@ -14,3 +14,5 @@ pub mod noise;
 pub mod proto;
 pub mod server;
 pub mod tap;
+#[cfg(all(feature = "tui", unix))]
+pub mod tui;

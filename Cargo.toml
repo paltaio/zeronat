@@ -5,8 +5,10 @@ edition = "2021"
 license = "MIT"
 
 [features]
-default = ["dht"]
+default = ["dht", "tui"]
 dht = ["dep:ed25519-dalek", "dep:sha1"]
+# Interactive admin console (unix only; falls back to one-shot output without it).
+tui = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
@@ -19,8 +21,8 @@ getrandom = "~0.2"
 ed25519-dalek = { version = "2", default-features = false, optional = true }
 sha1 = { version = "0.10", default-features = false, optional = true }
 
-# The L2 TAP bridge (Linux-only) is the sole user of libc.
-[target.'cfg(target_os = "linux")'.dependencies]
+# Used by the Linux TAP bridge and the unix interactive console (termios/ioctl).
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

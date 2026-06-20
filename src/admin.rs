@@ -6,9 +6,17 @@ use tokio::net::TcpStream;
 /// Read-only: the admin path never registers as a client or evicts a live one.
 pub async fn show(server: String, secret: String) -> Result<()> {
     let psk = crate::noise::derive_psk(&secret);
-    let sock = TcpStream::connect(&server).await?;
+    let snap = fetch_snapshot(&server, &psk).await?;
+    print!("{}", render(&snap, &server));
+    Ok(())
+}
+
+/// Open a fresh admin connection, request one snapshot, and return it. Each call
+/// is a complete connect/handshake/exchange so callers hold no long-lived state.
+pub async fn fetch_snapshot(server: &str, psk: &[u8; 32]) -> Result<SnapshotBody> {
+    let sock = TcpStream::connect(server).await?;
     sock.set_nodelay(true).ok();
-    let (mut r, mut w) = crate::noise::client_handshake(sock, &psk).await?;
+    let (mut r, mut w) = crate::noise::client_handshake(sock, psk).await?;
     w.send(
         &Msg::AdminHello {
             version: crate::identity::PROTO_VERSION,
@@ -19,11 +27,31 @@ pub async fn show(server: String, secret: String) -> Result<()> {
     .await?;
     let body = r.recv().await?;
     match Msg::decode(&body)? {
-        Msg::Snapshot(snap) => {
-            print!("{}", render(&snap, &server));
-            Ok(())
-        }
+        Msg::Snapshot(snap) => Ok(snap),
         other => Err(format!("expected snapshot, got {other:?}").into()),
+    }
+}
+
+/// Send one mutation (`AddListener`/`RemoveListener`/`SetRoute`/`ClearRoute`) and
+/// return the server's `(ok, message)` verdict. Transport errors propagate as
+/// `Err`; an applied-but-rejected mutation comes back as `Ok((false, reason))`.
+pub async fn mutate(server: &str, psk: &[u8; 32], req: Msg) -> Result<(bool, String)> {
+    let sock = TcpStream::connect(server).await?;
+    sock.set_nodelay(true).ok();
+    let (mut r, mut w) = crate::noise::client_handshake(sock, psk).await?;
+    w.send(
+        &Msg::AdminHello {
+            version: crate::identity::PROTO_VERSION,
+            mode: 1,
+        }
+        .encode(),
+    )
+    .await?;
+    w.send(&req.encode()).await?;
+    let body = r.recv().await?;
+    match Msg::decode(&body)? {
+        Msg::MutationResult { ok, msg } => Ok((ok, msg)),
+        other => Err(format!("expected mutation result, got {other:?}").into()),
     }
 }
 

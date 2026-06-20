@@ -12,7 +12,7 @@ Usage: zeronat <SUBCOMMAND> [OPTIONS]
 Subcommands:
   server   Run on the public host (VPS)
   client   Run on the host behind CG-NAT
-  admin    Inspect topology (one-shot)
+  admin    Inspect and control topology (interactive on a terminal)
 
 server options:
   --bind <ADDR>       Address to bind on (default: 0.0.0.0)
@@ -41,7 +41,9 @@ client options:
   --bridge <NAME>     Enslave the TAP to this existing bridge
 
 admin options:
-  show                Print the server's current topology (default command)
+  (no command)        Open the interactive console on a terminal; prints a
+                      one-shot snapshot when piped or redirected
+  show                Print the server's current topology and exit
   --server <ADDR>     Server control address host:port
   --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
 
@@ -75,7 +77,19 @@ enum Cmd {
     Admin {
         server: String,
         secret: String,
+        interactive: bool,
     },
+}
+
+/// Whether `admin` with no command should open the interactive console: only
+/// when built with the console and stdout is a terminal.
+#[cfg(all(feature = "tui", unix))]
+fn interactive_default() -> bool {
+    zeronat::tui::stdout_is_tty()
+}
+#[cfg(not(all(feature = "tui", unix)))]
+fn interactive_default() -> bool {
+    false
 }
 
 fn build_tap(name: Option<String>, mtu: usize, bridge: Option<String>) -> Option<TapConfig> {
@@ -367,12 +381,27 @@ fn parse_args() -> Result<Cmd> {
             .or_else(|| std::env::var("ZERONAT_SECRET").ok())
             .ok_or("--secret or ZERONAT_SECRET is required")?;
 
-        Ok(Cmd::Admin { server, secret })
+        let interactive = command.is_none() && interactive_default();
+        Ok(Cmd::Admin {
+            server,
+            secret,
+            interactive,
+        })
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = run_main().await {
+        // Print via Display, not Debug. The size-optimized release build
+        // (-Zfmt-debug=none) compiles Debug formatting to nothing, so a
+        // `main() -> Result` would surface every fatal error as a blank line.
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run_main() -> Result<()> {
     let cmd = parse_args()?;
     tokio::select! {
         r = run(cmd) => r,
@@ -574,6 +603,17 @@ async fn run(cmd: Cmd) -> Result<()> {
             };
             client::run(server, secret, tcp, udp, transport, tap, id_prefix).await
         }
-        Cmd::Admin { server, secret } => admin::show(server, secret).await,
+        Cmd::Admin {
+            server,
+            secret,
+            interactive,
+        } => {
+            #[cfg(all(feature = "tui", unix))]
+            if interactive {
+                return zeronat::tui::run(server, secret).await;
+            }
+            let _ = interactive;
+            admin::show(server, secret).await
+        }
     }
 }
