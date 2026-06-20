@@ -1,9 +1,10 @@
 use std::io;
+use std::net::Ipv4Addr;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use tokio::io::unix::AsyncFd;
 
-use super::TapConfig;
+use super::{TapConfig, TunConfig};
 use crate::Result;
 
 // `_IOW('T', 202, int)`. MIPS uses a different `_IOC` direction encoding than the
@@ -14,14 +15,25 @@ const TUNSETIFF: u64 = 0x800454ca;
 const TUNSETIFF: u64 = 0x400454ca;
 
 // SIOC* request numbers are fixed across architectures.
+const SIOCSIFADDR: u64 = 0x8916;
+const SIOCSIFNETMASK: u64 = 0x891c;
 const SIOCGIFFLAGS: u64 = 0x8913;
 const SIOCSIFFLAGS: u64 = 0x8914;
 const SIOCSIFMTU: u64 = 0x8922;
 const SIOCGIFINDEX: u64 = 0x8933;
 const SIOCBRADDIF: u64 = 0x89a2;
 
+const IFF_TUN: i16 = 0x0001;
 const IFF_TAP: i16 = 0x0002;
 const IFF_NO_PI: i16 = 0x1000;
+
+/// The `/24`-style mask for a prefix length, as an address. `prefix_len` is
+/// clamped to 32; a prefix of 0 yields `0.0.0.0`.
+fn netmask_from_prefix(prefix_len: u8) -> Ipv4Addr {
+    let bits = prefix_len.min(32);
+    let mask: u32 = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+    Ipv4Addr::from(mask)
+}
 
 /// Userspace mirror of `struct ifreq`. The name is 16 bytes; the `ifru` union is
 /// sized for the largest 64-bit member (24 bytes). Oversizing relative to the
@@ -63,9 +75,42 @@ impl IfReq {
     fn get_ifindex(&self) -> i32 {
         unsafe { std::ptr::read_unaligned(self.ifru.as_ptr() as *const i32) }
     }
+    /// Write a `sockaddr_in` for `addr` into the `ifru` union, for the address and
+    /// netmask ioctls. Layout: `sin_family` (u16, host order), `sin_port` (u16,
+    /// unused), `sin_addr` (4 octets, network order), then zero padding.
+    fn set_sockaddr_in(&mut self, addr: Ipv4Addr) {
+        self.ifru = [0u8; 24];
+        unsafe {
+            std::ptr::write_unaligned(self.ifru.as_mut_ptr() as *mut u16, libc::AF_INET as u16);
+        }
+        self.ifru[4..8].copy_from_slice(&addr.octets());
+    }
 }
 
-/// Bring the device up, set its MTU, and optionally enslave it to a bridge. Runs
+/// Run one `ifreq` ioctl on `sock`, mapping a kernel error to a labeled `Err`.
+fn ioctl_ifr(sock: RawFd, req: u64, ifr: &mut IfReq, label: &str) -> Result<()> {
+    if unsafe { libc::ioctl(sock, req as _, ifr as *mut IfReq as *mut libc::c_void) } < 0 {
+        return Err(format!("{label}: {}", io::Error::last_os_error()).into());
+    }
+    Ok(())
+}
+
+fn set_mtu_ioctl(sock: RawFd, name: &str, mtu: usize) -> Result<()> {
+    let mut ifr = IfReq::new(name)?;
+    ifr.set_mtu(mtu as i32);
+    ioctl_ifr(sock, SIOCSIFMTU, &mut ifr, &format!("SIOCSIFMTU {name}"))
+}
+
+/// Bring the interface up and mark it running.
+fn bring_up(sock: RawFd, name: &str) -> Result<()> {
+    let mut ifr = IfReq::new(name)?;
+    ioctl_ifr(sock, SIOCGIFFLAGS, &mut ifr, &format!("SIOCGIFFLAGS {name}"))?;
+    let flags = ifr.get_flags() | (libc::IFF_UP as i16) | (libc::IFF_RUNNING as i16);
+    ifr.set_flags(flags);
+    ioctl_ifr(sock, SIOCSIFFLAGS, &mut ifr, &format!("SIOCSIFFLAGS {name}"))
+}
+
+/// Bring an L2 TAP up, set its MTU, and optionally enslave it to a bridge. Runs
 /// on a throwaway `AF_INET` socket; the tun fd cannot carry these ioctls.
 fn configure(name: &str, mtu: usize, bridge: Option<&str>) -> Result<()> {
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
@@ -78,72 +123,49 @@ fn configure(name: &str, mtu: usize, bridge: Option<&str>) -> Result<()> {
 }
 
 fn configure_inner(sock: RawFd, name: &str, mtu: usize, bridge: Option<&str>) -> Result<()> {
-    let mut ifr = IfReq::new(name)?;
-    ifr.set_mtu(mtu as i32);
-    if unsafe {
-        libc::ioctl(
-            sock,
-            SIOCSIFMTU as _,
-            &mut ifr as *mut IfReq as *mut libc::c_void,
-        )
-    } < 0
-    {
-        return Err(format!("SIOCSIFMTU {name}: {}", io::Error::last_os_error()).into());
-    }
-
-    let mut ifr = IfReq::new(name)?;
-    if unsafe {
-        libc::ioctl(
-            sock,
-            SIOCGIFFLAGS as _,
-            &mut ifr as *mut IfReq as *mut libc::c_void,
-        )
-    } < 0
-    {
-        return Err(format!("SIOCGIFFLAGS {name}: {}", io::Error::last_os_error()).into());
-    }
-    let flags = ifr.get_flags() | (libc::IFF_UP as i16) | (libc::IFF_RUNNING as i16);
-    ifr.set_flags(flags);
-    if unsafe {
-        libc::ioctl(
-            sock,
-            SIOCSIFFLAGS as _,
-            &mut ifr as *mut IfReq as *mut libc::c_void,
-        )
-    } < 0
-    {
-        return Err(format!("SIOCSIFFLAGS {name}: {}", io::Error::last_os_error()).into());
-    }
+    set_mtu_ioctl(sock, name, mtu)?;
+    bring_up(sock, name)?;
 
     if let Some(br) = bridge {
         let mut ifr = IfReq::new(name)?;
-        if unsafe {
-            libc::ioctl(
-                sock,
-                SIOCGIFINDEX as _,
-                &mut ifr as *mut IfReq as *mut libc::c_void,
-            )
-        } < 0
-        {
-            return Err(format!("SIOCGIFINDEX {name}: {}", io::Error::last_os_error()).into());
-        }
+        ioctl_ifr(sock, SIOCGIFINDEX, &mut ifr, &format!("SIOCGIFINDEX {name}"))?;
         let idx = ifr.get_ifindex();
         let mut brifr = IfReq::new(br)?;
         brifr.set_ifindex(idx);
-        if unsafe {
-            libc::ioctl(
-                sock,
-                SIOCBRADDIF as _,
-                &mut brifr as *mut IfReq as *mut libc::c_void,
-            )
-        } < 0
-        {
-            return Err(
-                format!("SIOCBRADDIF {br} <- {name}: {}", io::Error::last_os_error()).into(),
-            );
-        }
+        ioctl_ifr(
+            sock,
+            SIOCBRADDIF,
+            &mut brifr,
+            &format!("SIOCBRADDIF {br} <- {name}"),
+        )?;
     }
     Ok(())
+}
+
+/// Assign an L3 TUN's address and netmask, set its MTU, and bring it up. Runs on
+/// a throwaway `AF_INET` socket; the tun fd cannot carry these ioctls.
+fn configure_tun(name: &str, mtu: usize, addr: Ipv4Addr, netmask: Ipv4Addr) -> Result<()> {
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let res = (|| {
+        let mut ifr = IfReq::new(name)?;
+        ifr.set_sockaddr_in(addr);
+        ioctl_ifr(sock, SIOCSIFADDR, &mut ifr, &format!("SIOCSIFADDR {name}"))?;
+        let mut ifr = IfReq::new(name)?;
+        ifr.set_sockaddr_in(netmask);
+        ioctl_ifr(
+            sock,
+            SIOCSIFNETMASK,
+            &mut ifr,
+            &format!("SIOCSIFNETMASK {name}"),
+        )?;
+        set_mtu_ioctl(sock, name, mtu)?;
+        bring_up(sock, name)
+    })();
+    unsafe { libc::close(sock) };
+    res
 }
 
 /// Owns the tun fd and closes it on drop.
@@ -161,10 +183,11 @@ impl Drop for TunFd {
     }
 }
 
-/// An attached TAP device. Frames are read and written whole: the device is
-/// opened with `IFF_NO_PI`, so one read is one Ethernet frame and one write sends
-/// one frame. `read_frame`/`write_frame` take `&self` so a single device can be
-/// driven from both arms of a `select!` and shared across reconnects via `Arc`.
+/// An attached tun/tap device (`open` for L2 TAP, `open_tun` for L3 TUN). Frames
+/// are read and written whole: the device is opened with `IFF_NO_PI`, so one read
+/// is one Ethernet frame (TAP) or one IP packet (TUN) and one write sends one.
+/// `read_frame`/`write_frame` take `&self` so a single device can be driven from
+/// both arms of a `select!` and shared across reconnects via `Arc`.
 pub struct TapDevice {
     fd: AsyncFd<TunFd>,
     mtu: usize,
@@ -199,6 +222,42 @@ impl TapDevice {
             return Err(format!("TUNSETIFF {}: {e}", cfg.name).into());
         }
         if let Err(e) = configure(&cfg.name, cfg.mtu, cfg.bridge.as_deref()) {
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        Self::from_raw(fd, cfg.mtu)
+    }
+
+    /// Open `/dev/net/tun`, attach (creating it if absent) the named TUN, assign
+    /// its address/netmask, set its MTU, and bring it up. A TUN read is one whole
+    /// IP packet; the same `read_frame`/`write_frame` path as TAP carries it.
+    pub fn open_tun(cfg: &TunConfig) -> Result<Self> {
+        let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+        if fd < 0 {
+            return Err(format!("open /dev/net/tun: {}", io::Error::last_os_error()).into());
+        }
+        let mut ifr = match IfReq::new(&cfg.name) {
+            Ok(r) => r,
+            Err(e) => {
+                unsafe { libc::close(fd) };
+                return Err(e);
+            }
+        };
+        ifr.set_flags(IFF_TUN | IFF_NO_PI);
+        if unsafe {
+            libc::ioctl(
+                fd,
+                TUNSETIFF as _,
+                &mut ifr as *mut IfReq as *mut libc::c_void,
+            )
+        } < 0
+        {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(format!("TUNSETIFF {}: {e}", cfg.name).into());
+        }
+        let netmask = netmask_from_prefix(cfg.prefix_len);
+        if let Err(e) = configure_tun(&cfg.name, cfg.mtu, cfg.addr, netmask) {
             unsafe { libc::close(fd) };
             return Err(e);
         }
@@ -293,6 +352,28 @@ mod tests {
     #[test]
     fn name_too_long_rejected() {
         assert!(IfReq::new("0123456789abcdef").is_err());
+    }
+
+    #[test]
+    fn netmask_from_prefix_values() {
+        assert_eq!(netmask_from_prefix(24), Ipv4Addr::new(255, 255, 255, 0));
+        assert_eq!(netmask_from_prefix(16), Ipv4Addr::new(255, 255, 0, 0));
+        assert_eq!(netmask_from_prefix(32), Ipv4Addr::new(255, 255, 255, 255));
+        assert_eq!(netmask_from_prefix(0), Ipv4Addr::new(0, 0, 0, 0));
+        // Out-of-range prefixes clamp instead of panicking on the shift.
+        assert_eq!(netmask_from_prefix(33), Ipv4Addr::new(255, 255, 255, 255));
+    }
+
+    #[test]
+    fn sockaddr_in_layout() {
+        let mut ifr = IfReq::new("zn0").unwrap();
+        ifr.set_sockaddr_in(Ipv4Addr::new(10, 7, 9, 1));
+        // sin_family = AF_INET in host byte order at offset 0.
+        let fam = unsafe { std::ptr::read_unaligned(ifr.ifru.as_ptr() as *const u16) };
+        assert_eq!(fam, libc::AF_INET as u16);
+        // sin_port (offset 2) unused; sin_addr (offset 4) holds the octets.
+        assert_eq!(&ifr.ifru[2..4], &[0, 0]);
+        assert_eq!(&ifr.ifru[4..8], &[10, 7, 9, 1]);
     }
 
     fn nonblocking_dgram_socketpair() -> (RawFd, RawFd) {

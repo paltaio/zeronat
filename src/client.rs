@@ -17,7 +17,7 @@ use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP,
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{client_handshake, client_handshake_stateless};
 use crate::proto::{Msg, Proto};
-use crate::tap::TapConfig;
+use crate::tap::{TapConfig, TunConfig};
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
 
@@ -208,6 +208,7 @@ impl Discovery {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     server: String,
     secret: String,
@@ -215,6 +216,7 @@ pub async fn run(
     udp: Vec<(u16, String)>,
     transport: Transport,
     tap: Option<TapConfig>,
+    tun: Option<TunConfig>,
     id_prefix: Option<String>,
 ) -> Result<()> {
     let psk = crate::noise::derive_psk(&secret);
@@ -222,14 +224,19 @@ pub async fn run(
     let tcp: HashMap<u16, String> = tcp.into_iter().collect();
     let udp: HashMap<u16, String> = udp.into_iter().collect();
     let discovery = Discovery::new(&server, &secret)?;
+    // TAP and TUN share the same device I/O and tunnel datapath; only the open
+    // (L2 bridge vs L3 address) differs. Either becomes the single bridge device.
     #[cfg(target_os = "linux")]
-    let tap = match tap {
-        Some(cfg) => Some(Arc::new(TapDevice::open(&cfg)?)),
-        None => None,
+    let tap = if let Some(cfg) = &tun {
+        Some(Arc::new(TapDevice::open_tun(cfg)?))
+    } else if let Some(cfg) = &tap {
+        Some(Arc::new(TapDevice::open(cfg)?))
+    } else {
+        None
     };
     #[cfg(not(target_os = "linux"))]
-    if tap.is_some() {
-        return Err("L2 TAP bridge (--tap) is only supported on Linux".into());
+    if tap.is_some() || tun.is_some() {
+        return Err("L2/L3 tunnel modes (--tap/--tun) are only supported on Linux".into());
     }
 
     let mut udp_health = UdpHealth::default();

@@ -39,6 +39,7 @@ fn cli_settings(control: u16, tcp: Vec<u16>, udp: Vec<u16>) -> ServerSettings {
         secret: SECRET.into(),
         server_id: "0".into(),
         tap: None,
+        tun: None,
         dht: None,
         listeners,
         routes: Vec::new(),
@@ -151,6 +152,7 @@ fn start_tunnel(transport: zeronat::client::Transport) -> Tunnel {
         vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
         vec![(public_udp, format!("127.0.0.1:{local_udp}"))],
         transport,
+        None,
         None,
         Some("rpi".into()),
     ));
@@ -385,6 +387,7 @@ async fn multi_client_route_switch() {
             vec![],
             zeronat::client::Transport::Tcp,
             None,
+            None,
             Some("rpi-1".into()),
         ));
         tokio::spawn(zeronat::client::run(
@@ -393,6 +396,7 @@ async fn multi_client_route_switch() {
             vec![(public_tcp, format!("127.0.0.1:{target2}"))],
             vec![],
             zeronat::client::Transport::Tcp,
+            None,
             None,
             Some("rpi-2".into()),
         ));
@@ -628,6 +632,7 @@ async fn reconnect_same_id_supersede() {
             vec![],
             zeronat::client::Transport::Tcp,
             None,
+            None,
             Some("dup".into()),
         ));
         tokio::spawn(zeronat::client::run(
@@ -636,6 +641,7 @@ async fn reconnect_same_id_supersede() {
             vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
             vec![],
             zeronat::client::Transport::Tcp,
+            None,
             None,
             Some("dup".into()),
         ));
@@ -704,6 +710,7 @@ async fn config_autosave_persists_route() {
             vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
             vec![],
             zeronat::client::Transport::Tcp,
+            None,
             None,
             Some("rpi".into()),
         ));
@@ -789,6 +796,7 @@ async fn cli_listener_remove_refused() {
             vec![],
             zeronat::client::Transport::Tcp,
             None,
+            None,
             Some("rpi".into()),
         ));
         wait_clients(control, 1).await;
@@ -840,6 +848,7 @@ async fn runtime_node_does_not_persist() {
             vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
             vec![],
             zeronat::client::Transport::Tcp,
+            None,
             None,
             Some("rpi".into()),
         ));

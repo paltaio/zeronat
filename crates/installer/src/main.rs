@@ -85,6 +85,7 @@ zeronat installer
   --method docker|systemd   install method (default: docker if present, else systemd)
   --deploy compose|run      (docker only) compose file or plain docker run
   --ports \"443/tcp 80/tcp 51820/udp\"
+  --all                     forward every port plus ICMP; keeps SSH on the server
   --control PORT            tunnel control port (default 2222)
   --secret SECRET           shared secret (default: generated)
   --server-addr HOST[:PORT] (client only) where the server is reachable
@@ -98,7 +99,7 @@ zeronat installer
   -n, --dry-run             preview the steps without making changes
   -h, --help
 
-With no options it runs the interactive wizard. --ports and --tap are mutually exclusive.";
+With no options it runs the interactive wizard. --ports, --tap, and --all are mutually exclusive.";
 
 fn real_main() -> i32 {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -135,6 +136,7 @@ fn real_main() -> i32 {
         have_docker,
         have_compose,
         existing_secret: existing,
+        ssh_port: sys::ssh_port(),
     };
 
     if headless {

@@ -150,6 +150,31 @@ pub fn existing_secret() -> Option<String> {
     None
 }
 
+/// The SSH port to offer to protect in all-traffic mode: the port of the current
+/// SSH session when the installer is run over one, else the first `Port` in
+/// sshd_config, else 22.
+pub fn ssh_port() -> u16 {
+    // SSH_CONNECTION is "clientip clientport serverip serverport"; the 4th field
+    // is the port the operator is connected through, i.e. the one to keep.
+    if let Ok(c) = std::env::var("SSH_CONNECTION") {
+        if let Some(p) = c.split_whitespace().nth(3).and_then(|s| s.parse().ok()) {
+            return p;
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string("/etc/ssh/sshd_config") {
+        for line in text.lines() {
+            if let Some(rest) = line.trim().strip_prefix("Port ") {
+                if let Ok(p) = rest.trim().parse::<u16>() {
+                    if p != 0 {
+                        return p;
+                    }
+                }
+            }
+        }
+    }
+    22
+}
+
 pub fn arch_target() -> Result<&'static str, String> {
     let m = Command::new("uname")
         .arg("-m")

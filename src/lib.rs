@@ -10,6 +10,8 @@ pub mod dgram;
 pub mod dht;
 pub mod identity;
 pub mod kcp;
+#[cfg(target_os = "linux")]
+pub mod netfilter;
 pub mod noise;
 pub mod proto;
 pub mod server;

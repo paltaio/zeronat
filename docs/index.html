@@ -92,6 +92,7 @@
       <a class="nav-link" href="#transport">Transport</a>
       <a class="nav-link" href="#routing">Routing</a>
       <a class="nav-link" href="#admin">Admin</a>
+      <a class="nav-link" href="#allports">All ports</a>
       <a class="nav-link" href="#tap">L2 bridge</a>
       <a class="nav-link" href="#dht">DHT discovery</a>
       <a class="nav-link" href="#build">Build</a>
@@ -116,7 +117,7 @@
     <section id="install">
       <h2>Install</h2>
 <pre><code>curl -fsSL https://paltaio.github.io/zeronat/get.sh | sh</code></pre>
-      <p>Picks Docker or a systemd service, generates the secret, asks which ports to forward, and prints the
+      <p>Picks Docker or a systemd service, generates the secret, asks what to forward, and prints the
       matching command to run on the machine behind CG-NAT.</p>
 <pre><code>docker pull ghcr.io/paltaio/zeronat</code></pre>
     </section>
@@ -198,6 +199,25 @@ client = "rpi-2-ab12"</code></pre>
       <p>It prints the server, its routes, connected clients, and active listeners.</p>
     </section>
 
+    <section id="allports">
+      <h2>All ports</h2>
+      <p><code>--tun</code> forwards every port plus ICMP to one client over an L3 tunnel, instead of naming
+      ports. The server sends all inbound traffic except the control port (and any <code>--except</code>
+      ports) to the client and source-NATs the replies; the tunnel subnet is derived from the shared secret.
+      Both ends need <code>--tun</code>; it cannot be combined with <code>--tcp</code>/<code>--udp</code> or
+      <code>--tap</code>.</p>
+<pre><code><span class="c"># Server (VPS): forward every port to the client, keep SSH on 22:</span>
+ZERONAT_SECRET=s zeronat server --control 2222 --tun --except 22
+
+<span class="c"># Client (behind CG-NAT): local services receive on the same port:</span>
+ZERONAT_SECRET=s zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
+      <p>Every port except the control port routes to the client, including the server's own SSH; keep it
+      reachable with <code>--except &lt;ssh-port&gt;</code> (repeatable). The client needs no NAT: local services
+      receive the traffic on the same port, so they must listen on <code>0.0.0.0</code> or the tunnel address.</p>
+      <p>Linux only. The server needs root or <code>CAP_NET_ADMIN</code>, <code>/dev/net/tun</code>, and
+      <code>nft</code> or <code>iptables</code> to program the NAT.</p>
+    </section>
+
     <section id="tap">
       <h2>L2 bridge (TAP)</h2>
       <p><code>--tap</code> relays raw Ethernet frames over the tunnel, joining a TAP on each end into one L2
@@ -251,6 +271,8 @@ ZERONAT_SECRET=s zeronat client --server dht --tcp 443</code></pre>
           <tr><td><code>--config &lt;PATH&gt;</code></td><td>Load listeners, routes, and identity from a config file</td></tr>
           <tr><td><code>--tcp &lt;PORT&gt;</code></td><td>Public TCP port to expose (repeatable)</td></tr>
           <tr><td><code>--udp &lt;PORT&gt;</code></td><td>Public UDP port to expose (repeatable)</td></tr>
+          <tr><td><code>--tun</code></td><td>All-ports mode (Linux): forward every port except control plus ICMP to the client</td></tr>
+          <tr><td><code>--except &lt;PORT&gt;</code></td><td>Port to keep on the host in <code>--tun</code> mode (repeatable)</td></tr>
           <tr><td><code>--tap &lt;NAME&gt;</code></td><td>L2 bridge mode (Linux): create or attach this TAP device</td></tr>
           <tr><td><code>--tap-mtu &lt;N&gt;</code></td><td>TAP MTU (default 1400)</td></tr>
           <tr><td><code>--bridge &lt;NAME&gt;</code></td><td>Enslave the TAP to this existing bridge</td></tr>
@@ -269,6 +291,7 @@ ZERONAT_SECRET=s zeronat client --server dht --tcp 443</code></pre>
           <tr><td><code>--tcp &lt;SPEC&gt;</code></td><td>Forward TCP: <code>PORT</code> | <code>PORT:LOCALPORT</code> | <code>PORT:HOST:PORT</code> (repeatable)</td></tr>
           <tr><td><code>--udp &lt;SPEC&gt;</code></td><td>Forward UDP, same spec as <code>--tcp</code> (repeatable)</td></tr>
           <tr><td><code>--transport &lt;MODE&gt;</code></td><td><code>auto</code> | <code>udp</code> | <code>tcp</code> (default auto)</td></tr>
+          <tr><td><code>--tun</code></td><td>All-ports mode (Linux): receive every forwarded port on local services</td></tr>
           <tr><td><code>--tap &lt;NAME&gt;</code></td><td>L2 bridge mode (Linux): create or attach this TAP device</td></tr>
           <tr><td><code>--tap-mtu &lt;N&gt;</code></td><td>TAP MTU (default 1400)</td></tr>
           <tr><td><code>--bridge &lt;NAME&gt;</code></td><td>Enslave the TAP to this existing bridge</td></tr>

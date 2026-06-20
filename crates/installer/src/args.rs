@@ -25,6 +25,7 @@ pub struct Parsed {
     pub tap: Option<String>,
     pub bridge: Option<String>,
     pub tap_mtu: Option<String>,
+    pub all: bool,
     pub headless: bool,
     pub dry: bool,
     pub help: bool,
@@ -35,6 +36,7 @@ pub struct Host {
     pub have_docker: bool,
     pub have_compose: bool,
     pub existing_secret: Option<String>,
+    pub ssh_port: u16,
 }
 
 pub fn parse(args: &[String]) -> Result<Parsed, String> {
@@ -64,6 +66,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             "--tap" => p.tap = Some(take(&mut i, a)?),
             "--bridge" => p.bridge = Some(take(&mut i, a)?),
             "--tap-mtu" => p.tap_mtu = Some(take(&mut i, a)?),
+            "--all" => p.all = true,
             "-y" | "--yes" => p.headless = true,
             "--dry-run" | "-n" => p.dry = true,
             "-h" | "--help" => p.help = true,
@@ -102,15 +105,14 @@ fn valid_ports(spec: &str) -> Result<(), String> {
 /// the caller (set by `-y` or by the absence of a controlling terminal), not the
 /// raw `p.headless` flag, so non-tty runs are validated exactly like `-y`.
 pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> {
-    // L2 bridge and port forwarding are mutually exclusive: the zeronat binary
-    // rejects --tap together with --tcp/--udp, so reject the conflict here too
-    // rather than silently dropping the ports.
-    if p.tap.is_some() && p.ports.is_some() {
-        return Err(
-            "--tap and --ports cannot be combined (L2 bridge or port forwarding, not both)".into(),
-        );
+    // The three carry modes are mutually exclusive: the zeronat binary rejects
+    // overlapping --tcp/--udp/--tap/--tun, so reject the conflict here too rather
+    // than silently dropping one.
+    if (p.tap.is_some() as u8 + p.ports.is_some() as u8 + p.all as u8) > 1 {
+        return Err("--ports, --tap, and --all are mutually exclusive".into());
     }
     let mut cfg = Config::new(host.have_docker, host.have_compose, host.existing_secret.clone());
+    cfg.ssh_port = host.ssh_port;
 
     // mode
     if let Some(m) = p.mode {
@@ -166,14 +168,16 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
         cfg.control = c.clone();
     }
 
-    // kind: --tap => bridge, --ports => ports.
-    if let Some(t) = &p.tap {
+    // kind: --all => all traffic, --tap => bridge, --ports => ports.
+    if p.all {
+        cfg.kind = Kind::All;
+    } else if let Some(t) = &p.tap {
         cfg.kind = Kind::Bridge;
         cfg.tap = t.clone();
     } else if p.ports.is_some() {
         cfg.kind = Kind::Ports;
     } else if headless {
-        return Err("specify --ports or --tap".into());
+        return Err("specify --ports, --tap, or --all".into());
     }
     if let Some(b) = &p.bridge {
         cfg.bridge = b.clone();
@@ -194,6 +198,8 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
                 }
             }
             Kind::Ports => valid_ports(&cfg.ports)?,
+            // All-traffic has no field to validate; the SSH port is auto-kept.
+            Kind::All => {}
         }
     }
 
@@ -248,6 +254,7 @@ mod tests {
             have_docker: false,
             have_compose: false,
             existing_secret: None,
+            ssh_port: 22,
         }
     }
 
@@ -296,6 +303,22 @@ mod tests {
     fn addr_alias() {
         let p = parse(&s(&["--addr", "vps:1234"])).unwrap();
         assert_eq!(p.server_addr.as_deref(), Some("vps:1234"));
+    }
+
+    #[test]
+    fn all_flag_selects_all_traffic() {
+        let p = parse(&s(&["--server", "--all"])).unwrap();
+        assert!(p.all);
+        let cfg = build(&p, &host(), true).unwrap();
+        assert!(cfg.kind == Kind::All);
+    }
+
+    #[test]
+    fn all_conflicts_with_ports_and_tap() {
+        let p = parse(&s(&["--server", "--all", "--ports", "80/tcp"])).unwrap();
+        assert!(build(&p, &host(), true).is_err());
+        let p = parse(&s(&["--server", "--all", "--tap", "zn0"])).unwrap();
+        assert!(build(&p, &host(), true).is_err());
     }
 
     #[test]

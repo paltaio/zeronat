@@ -2,6 +2,19 @@ use blake2::{Blake2s256, Digest};
 
 pub const PROTO_VERSION: u8 = 1;
 
+/// Derive the tunnel's private `/24` from the secret. Both ends compute the same
+/// network with no exchange: the server takes `.1` and the single client takes
+/// `.2`. The base sits in `10.0.0.0/8` with the two middle octets taken from the
+/// secret hash, so two unrelated deployments are very unlikely to collide. The
+/// returned value is the network base, e.g. `[10, x, y, 0]`.
+pub fn derive_tun_subnet(secret: &str) -> [u8; 4] {
+    let mut h = Blake2s256::new();
+    h.update(b"zeronat-tun-subnet-v1");
+    h.update(secret.as_bytes());
+    let out = h.finalize();
+    [10, out[0], out[1], 0]
+}
+
 /// Derive a stable client identity label. The prefix is the caller's label when
 /// non-empty, otherwise the short hostname; the suffix disambiguates hosts that
 /// share a prefix and must stay constant across restarts of the same machine.
@@ -115,5 +128,16 @@ mod tests {
         let suffix = machine_suffix();
         assert_eq!(suffix.len(), 4);
         assert!(is_hex_lower(&suffix));
+    }
+
+    #[test]
+    fn tun_subnet_is_stable_and_private() {
+        let a = derive_tun_subnet("hunter2");
+        let b = derive_tun_subnet("hunter2");
+        assert_eq!(a, b);
+        assert_eq!(a[0], 10);
+        assert_eq!(a[3], 0);
+        // A different secret yields a different network (with overwhelming odds).
+        assert_ne!(derive_tun_subnet("hunter2"), derive_tun_subnet("other"));
     }
 }

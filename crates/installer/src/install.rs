@@ -103,6 +103,7 @@ fn zn_args(cfg: &Config) -> String {
                 }
             })
             .collect(),
+        Kind::All => " --tun".to_string(),
     }
 }
 
@@ -120,6 +121,11 @@ pub fn subcmd(cfg: &Config) -> String {
     match cfg.mode {
         Mode::Server => {
             let mut s = format!("server --control {}{a}", cfg.control);
+            // Keep SSH on the server (it would otherwise route to the client like
+            // every other port).
+            if cfg.kind == Kind::All && cfg.exclude_ssh {
+                s.push_str(&format!(" --except {}", cfg.ssh_port));
+            }
             if cfg.use_dht {
                 s.push_str(" --server dht");
                 if !cfg.announce_ip.is_empty() {
@@ -140,6 +146,7 @@ fn forward_flag(cfg: &Config) -> String {
     match cfg.kind {
         Kind::Bridge => format!("--tap {}", cfg.tap),
         Kind::Ports => format!("--ports \"{}\"", cfg.ports),
+        Kind::All => "--all".to_string(),
     }
 }
 
@@ -238,6 +245,7 @@ fn check_forwards(cfg: &Config) -> Result<(), String> {
                 return Err("no ports given".into());
             }
         }
+        Kind::All => {}
     }
     Ok(())
 }
@@ -330,10 +338,11 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(String
     let _ = r.run(true, "docker", &["rm", "-f", "zeronat"]);
 
     if cfg.deploy == Deploy::Compose {
-        let src = if cfg.kind == Kind::Bridge {
-            "compose.bridge.yml"
-        } else {
+        // TAP and all-traffic (TUN) both need NET_ADMIN and /dev/net/tun.
+        let src = if cfg.kind == Kind::Ports {
             "compose.yml"
+        } else {
+            "compose.bridge.yml"
         };
         r.step(format!("fetching {src}"));
         let url = format!("{RAW_BASE}/{src}");
@@ -384,7 +393,7 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(String
             "--network".into(),
             "host".into(),
         ];
-        if cfg.kind == Kind::Bridge {
+        if cfg.kind != Kind::Ports {
             args.extend([
                 "--cap-add".into(),
                 "NET_ADMIN".into(),
@@ -653,6 +662,45 @@ mod tests {
             subcmd(&c),
             "server --control 2222 --tcp 443 --server dht --announce-ip 203.0.113.1 --announce-port 9000"
         );
+    }
+
+    #[test]
+    fn server_all_traffic_excepts_ssh_port() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.kind = Kind::All;
+        c.ssh_port = 2200;
+        assert_eq!(subcmd(&c), "server --control 2222 --tun --except 2200");
+    }
+
+    #[test]
+    fn server_all_traffic_forward_everything() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.kind = Kind::All;
+        c.exclude_ssh = false;
+        assert_eq!(subcmd(&c), "server --control 2222 --tun");
+    }
+
+    #[test]
+    fn client_all_traffic_has_no_except() {
+        let mut c = cfg();
+        c.mode = Mode::Client;
+        c.kind = Kind::All;
+        c.server_addr = "1.2.3.4".into();
+        assert_eq!(subcmd(&c), "client --server 1.2.3.4:2222 --tun");
+    }
+
+    #[test]
+    fn all_traffic_peer_uses_all_flag() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.kind = Kind::All;
+        c.use_dht = true;
+        c.secret = "s".into();
+        let (_, cmd) = peer_steps(&c);
+        assert!(cmd.contains("--client"), "{cmd}");
+        assert!(cmd.contains("--all"), "{cmd}");
     }
 
     #[test]

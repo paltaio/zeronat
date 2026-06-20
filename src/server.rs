@@ -16,11 +16,13 @@ use crate::dgram::{DgramRx, DgramTx};
 use crate::kcp::{route, session, Accepted, Session};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
+#[cfg(target_os = "linux")]
+use crate::netfilter;
 use crate::noise::{server_handshake, server_handshake_stateless, Noise, StatelessNoise};
 use crate::proto::{
     proto_name, ClientEntry, Listener, Msg, Proto, RouteEntry, SnapshotBody, Source,
 };
-use crate::tap::TapConfig;
+use crate::tap::{TapConfig, TunConfig};
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
 
@@ -225,6 +227,17 @@ pub struct RouteSpec {
     pub source: Source,
 }
 
+/// TUN all-ports mode. The server forwards every inbound port (except the
+/// control port and `except`) plus ICMP to one client over an L3 tunnel.
+/// `device` is the server's tunnel endpoint (address `.1`); `client_ip` (`.2`)
+/// is the NAT target. `subnet` is the tunnel network base.
+pub struct ServerTun {
+    pub device: TunConfig,
+    pub subnet: Ipv4Addr,
+    pub client_ip: Ipv4Addr,
+    pub except: Vec<u16>,
+}
+
 /// Everything the server needs to boot. `config_path` is the file to auto-save
 /// mutations into, or `None` for a runtime-only node. `file_id`/`file_control`
 /// carry the loaded `[server]` table so a save preserves it verbatim.
@@ -234,6 +247,7 @@ pub struct ServerSettings {
     pub secret: String,
     pub server_id: String,
     pub tap: Option<TapConfig>,
+    pub tun: Option<ServerTun>,
     pub dht: Option<DhtAnnounce>,
     pub listeners: Vec<ListenerSpec>,
     pub routes: Vec<RouteSpec>,
@@ -249,6 +263,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         secret,
         server_id,
         tap,
+        tun,
         dht,
         listeners,
         routes,
@@ -257,14 +272,57 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         file_control,
     } = settings;
 
+    // The TUN NAT guard tears the rules down when this future is dropped: on the
+    // SIGTERM/SIGINT cancel in main, or on an early-return error (the accept loop
+    // never returns normally). Held in the frame for the process lifetime; a bare
+    // `_` binding would drop it immediately.
     #[cfg(target_os = "linux")]
-    let tap = match &tap {
-        Some(cfg) => Some(Arc::new(TapDevice::open(cfg)?)),
-        None => None,
+    let mut _nat_guard: Option<netfilter::NatGuard> = None;
+    #[cfg(target_os = "linux")]
+    let tap = if let Some(st) = &tun {
+        let dev = Arc::new(TapDevice::open_tun(&st.device)?);
+        let plan = netfilter::NatPlan {
+            iface: st.device.name.clone(),
+            subnet: st.subnet,
+            prefix_len: st.device.prefix_len,
+            server_ip: st.device.addr,
+            client_ip: st.client_ip,
+            control_port,
+            mtu: st.device.mtu,
+            except: st.except.clone(),
+        };
+        match netfilter::install(&plan) {
+            netfilter::Outcome::Installed(g) => {
+                let extra = if st.except.is_empty() {
+                    String::new()
+                } else {
+                    format!(" + {} excluded", st.except.len())
+                };
+                eprintln!(
+                    "tun {}: forwarding all ports (except control{extra}) to {} via {}",
+                    st.device.name,
+                    st.client_ip,
+                    g.backend_name(),
+                );
+                if control_port != 22 && !st.except.contains(&22) {
+                    eprintln!(
+                        "warning: port 22 (SSH) now routes to the client; pass --except 22 to keep \
+                         administering this server over SSH"
+                    );
+                }
+                _nat_guard = Some(g);
+            }
+            netfilter::Outcome::Degraded(msg) => eprint!("{msg}"),
+        }
+        Some(dev)
+    } else if let Some(cfg) = &tap {
+        Some(Arc::new(TapDevice::open(cfg)?))
+    } else {
+        None
     };
     #[cfg(not(target_os = "linux"))]
-    if tap.is_some() {
-        return Err("L2 TAP bridge (--tap) is only supported on Linux".into());
+    if tap.is_some() || tun.is_some() {
+        return Err("L2/L3 tunnel modes (--tap/--tun) are only supported on Linux".into());
     }
 
     let bind_ip = bind;

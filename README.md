@@ -12,7 +12,7 @@ The server runs on the public host. The client runs behind NAT, dials out, and h
 curl -fsSL https://paltaio.github.io/zeronat/get.sh | sh
 ```
 
-Picks Docker or a systemd service, generates the secret, asks which ports to forward, and prints the command to run behind CG-NAT.
+Picks Docker or a systemd service, generates the secret, asks what to forward, and prints the command to run behind CG-NAT.
 
 ## Usage
 
@@ -26,7 +26,7 @@ ZERONAT_SECRET=somelongsecret zeronat client --server <public-ip>:2222 --tcp 443
 
 `--tcp 443` maps to `127.0.0.1:443`. Remap with `--tcp 443:10.0.0.5:443`; `--udp` works the same. Open the control port (2222, UDP and TCP) on the server's firewall.
 
-Routing, the TAP bridge, DHT discovery, and the full CLI live at https://paltaio.github.io/zeronat/.
+Routing, all-ports forwarding, the TAP bridge, DHT discovery, and the full CLI live at https://paltaio.github.io/zeronat/.
 
 ## License
 

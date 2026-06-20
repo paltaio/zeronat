@@ -5,6 +5,15 @@ use zeronat::tap::TapConfig;
 use zeronat::{admin, client, server, Result};
 
 const DEFAULT_TAP_MTU: usize = 1400;
+const DEFAULT_TUN_NAME: &str = "zn0";
+const TUN_PREFIX_LEN: u8 = 24;
+
+/// The tunnel `/24` for `secret`: `(network base, server .1, client .2)`.
+fn tun_addrs(secret: &str) -> (Ipv4Addr, Ipv4Addr, Ipv4Addr) {
+    let base = zeronat::identity::derive_tun_subnet(secret);
+    let host = |h: u8| Ipv4Addr::new(base[0], base[1], base[2], h);
+    (host(0), host(1), host(2))
+}
 
 static USAGE: &str = "\
 Usage: zeronat <SUBCOMMAND> [OPTIONS]
@@ -22,8 +31,11 @@ server options:
   --config <PATH>     Load listeners/routes/identity from a config file
   --tcp <PORT>        Public TCP port to expose (repeatable)
   --udp <PORT>        Public UDP port to expose (repeatable)
+  --tun               L3 all-ports mode (Linux only): forward every port except
+                      the control port (and --except) plus ICMP to the client
+  --except <PORT>     Port to keep on the host in --tun mode (repeatable)
   --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
-  --tap-mtu <N>       TAP MTU (default: 1400)
+  --tap-mtu <N>       TAP/TUN MTU (default: 1400; alias --tun-mtu)
   --bridge <NAME>     Enslave the TAP to this existing bridge
   --server dht        Publish this server's address to the DHT for discovery
   --announce-ip <IP>  Public IPv4 to announce (default: auto-detected via DHT)
@@ -35,9 +47,11 @@ client options:
   --id <PREFIX>       Client id prefix (default: short hostname)
   --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
   --udp <SPEC>        Forward UDP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
+  --tun               L3 all-ports mode (Linux only): receive every forwarded
+                      port on local services (bind 0.0.0.0 or the tunnel address)
   --transport <MODE>  auto|udp|tcp (default: auto)
   --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
-  --tap-mtu <N>       TAP MTU (default: 1400)
+  --tap-mtu <N>       TAP/TUN MTU (default: 1400; alias --tun-mtu)
   --bridge <NAME>     Enslave the TAP to this existing bridge
 
 admin options:
@@ -60,6 +74,9 @@ enum Cmd {
         tcp: Vec<u16>,
         udp: Vec<u16>,
         tap: Option<TapConfig>,
+        tun: bool,
+        mtu: usize,
+        except: Vec<u16>,
         dht: bool,
         announce_ip: Option<Ipv4Addr>,
         announce_port: Option<u16>,
@@ -73,6 +90,8 @@ enum Cmd {
         udp: Vec<String>,
         transport: String,
         tap: Option<TapConfig>,
+        tun: bool,
+        mtu: usize,
     },
     Admin {
         server: String,
@@ -166,6 +185,8 @@ fn parse_args() -> Result<Cmd> {
         let mut tap_name: Option<String> = None;
         let mut tap_mtu: usize = DEFAULT_TAP_MTU;
         let mut bridge: Option<String> = None;
+        let mut tun = false;
+        let mut except: Vec<u16> = Vec::new();
         let mut dht = false;
         let mut announce_ip: Option<Ipv4Addr> = None;
         let mut announce_port: Option<u16> = None;
@@ -234,7 +255,7 @@ fn parse_args() -> Result<Cmd> {
                 "--tap" => {
                     tap_name = Some(iter.next().ok_or("--tap requires a value")?);
                 }
-                "--tap-mtu" => {
+                "--tap-mtu" | "--tun-mtu" => {
                     let v = iter.next().ok_or("--tap-mtu requires a value")?;
                     tap_mtu = v.parse().map_err(|_| -> zeronat::Error {
                         format!("--tap-mtu must be a positive integer, got '{v}'").into()
@@ -242,6 +263,16 @@ fn parse_args() -> Result<Cmd> {
                 }
                 "--bridge" => {
                     bridge = Some(iter.next().ok_or("--bridge requires a value")?);
+                }
+                "--tun" => {
+                    tun = true;
+                }
+                "--except" => {
+                    let v = iter.next().ok_or("--except requires a value")?;
+                    let port: u16 = v.parse().map_err(|_| -> zeronat::Error {
+                        format!("--except must be a u16, got '{v}'").into()
+                    })?;
+                    except.push(port);
                 }
                 other => {
                     eprintln!("error: unknown flag '{other}'");
@@ -254,6 +285,10 @@ fn parse_args() -> Result<Cmd> {
             .or_else(|| std::env::var("ZERONAT_SECRET").ok())
             .ok_or("--secret or ZERONAT_SECRET is required")?;
 
+        if tun && bridge.is_some() {
+            return Err("--bridge applies to --tap only, not --tun".into());
+        }
+
         let tap = build_tap(tap_name, tap_mtu, bridge);
         Ok(Cmd::Server {
             bind,
@@ -263,6 +298,9 @@ fn parse_args() -> Result<Cmd> {
             tcp,
             udp,
             tap,
+            tun,
+            mtu: tap_mtu,
+            except,
             dht,
             announce_ip,
             announce_port,
@@ -279,12 +317,16 @@ fn parse_args() -> Result<Cmd> {
         let mut tap_name: Option<String> = None;
         let mut tap_mtu: usize = DEFAULT_TAP_MTU;
         let mut bridge: Option<String> = None;
+        let mut tun = false;
 
         while let Some(flag) = iter.next() {
             match flag.as_str() {
                 "-h" | "--help" => {
                     print!("{USAGE}");
                     std::process::exit(0);
+                }
+                "--tun" => {
+                    tun = true;
                 }
                 "--server" => {
                     server = Some(iter.next().ok_or("--server requires a value")?);
@@ -309,7 +351,7 @@ fn parse_args() -> Result<Cmd> {
                 "--tap" => {
                     tap_name = Some(iter.next().ok_or("--tap requires a value")?);
                 }
-                "--tap-mtu" => {
+                "--tap-mtu" | "--tun-mtu" => {
                     let v = iter.next().ok_or("--tap-mtu requires a value")?;
                     tap_mtu = v.parse().map_err(|_| -> zeronat::Error {
                         format!("--tap-mtu must be a positive integer, got '{v}'").into()
@@ -330,6 +372,10 @@ fn parse_args() -> Result<Cmd> {
             .or_else(|| std::env::var("ZERONAT_SECRET").ok())
             .ok_or("--secret or ZERONAT_SECRET is required")?;
 
+        if tun && bridge.is_some() {
+            return Err("--bridge applies to --tap only, not --tun".into());
+        }
+
         let tap = build_tap(tap_name, tap_mtu, bridge);
         Ok(Cmd::Client {
             server,
@@ -338,6 +384,8 @@ fn parse_args() -> Result<Cmd> {
             tcp,
             udp,
             transport,
+            tun,
+            mtu: tap_mtu,
             tap,
         })
     } else {
@@ -458,6 +506,9 @@ async fn run(cmd: Cmd) -> Result<()> {
             tcp,
             udp,
             tap,
+            tun,
+            mtu,
+            except,
             dht,
             announce_ip,
             announce_port,
@@ -537,17 +588,62 @@ async fn run(cmd: Cmd) -> Result<()> {
                 })
                 .collect();
 
-            // Validate against the merged set: a config-only server with listeners
-            // and no CLI flags is valid, and --tap still cannot coexist with forwards.
+            // Validate against the merged set. --tun owns every port and cannot
+            // coexist with --tap or any per-port forward; --tap cannot coexist
+            // with forwards; a config-only server with listeners is valid.
+            if tun {
+                if tap.is_some() {
+                    return Err("--tun cannot be combined with --tap".into());
+                }
+                if !listeners.is_empty() || !routes.is_empty() {
+                    return Err(
+                        "--tun cannot be combined with --tcp/--udp or config listeners/routes"
+                            .into(),
+                    );
+                }
+                // The iptables fallback matches kept ports with the multiport
+                // module, which caps at 15 ports (control port + exclusions).
+                let mut kept: Vec<u16> =
+                    except.iter().copied().filter(|&p| p != control_port).collect();
+                kept.sort_unstable();
+                kept.dedup();
+                if kept.len() + 1 > 15 {
+                    return Err(format!(
+                        "--except has {} distinct ports; at most 14 are allowed besides the control port",
+                        kept.len()
+                    )
+                    .into());
+                }
+            }
+            if !except.is_empty() && !tun {
+                return Err("--except requires --tun".into());
+            }
             if tap.is_some() && !listeners.is_empty() {
                 return Err("--tap cannot be combined with --tcp/--udp forwards".into());
             }
-            if tap.is_none() && listeners.is_empty() {
+            if !tun && tap.is_none() && listeners.is_empty() {
                 return Err(
-                    "nothing to do: pass --tap, a --config with listeners, or at least one --tcp/--udp"
+                    "nothing to do: pass --tun, --tap, a --config with listeners, or at least one --tcp/--udp"
                         .into(),
                 );
             }
+
+            let tun = if tun {
+                let (subnet, server_ip, client_ip) = tun_addrs(&secret);
+                Some(server::ServerTun {
+                    device: zeronat::tap::TunConfig {
+                        name: DEFAULT_TUN_NAME.to_string(),
+                        mtu,
+                        addr: server_ip,
+                        prefix_len: TUN_PREFIX_LEN,
+                    },
+                    subnet,
+                    client_ip,
+                    except,
+                })
+            } else {
+                None
+            };
 
             let dht = dht.then_some(server::DhtAnnounce {
                 ip: announce_ip,
@@ -559,6 +655,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 secret,
                 server_id,
                 tap,
+                tun,
                 dht,
                 listeners,
                 routes,
@@ -576,13 +673,34 @@ async fn run(cmd: Cmd) -> Result<()> {
             udp,
             transport,
             tap,
+            tun,
+            mtu,
         } => {
+            if tun {
+                if tap.is_some() {
+                    return Err("--tun cannot be combined with --tap".into());
+                }
+                if !tcp.is_empty() || !udp.is_empty() {
+                    return Err("--tun cannot be combined with --tcp/--udp forwards".into());
+                }
+            }
             if tap.is_some() && (!tcp.is_empty() || !udp.is_empty()) {
                 return Err("--tap cannot be combined with --tcp/--udp forwards".into());
             }
-            if tap.is_none() && tcp.is_empty() && udp.is_empty() {
-                return Err("nothing to do: pass --tap or at least one --tcp/--udp".into());
+            if !tun && tap.is_none() && tcp.is_empty() && udp.is_empty() {
+                return Err("nothing to do: pass --tun, --tap, or at least one --tcp/--udp".into());
             }
+            let tun = if tun {
+                let (_subnet, _server_ip, client_ip) = tun_addrs(&secret);
+                Some(zeronat::tap::TunConfig {
+                    name: DEFAULT_TUN_NAME.to_string(),
+                    mtu,
+                    addr: client_ip,
+                    prefix_len: TUN_PREFIX_LEN,
+                })
+            } else {
+                None
+            };
             let tcp = tcp
                 .iter()
                 .map(|s| parse_forward(s))
@@ -601,7 +719,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                     )
                 }
             };
-            client::run(server, secret, tcp, udp, transport, tap, id_prefix).await
+            client::run(server, secret, tcp, udp, transport, tap, tun, id_prefix).await
         }
         Cmd::Admin {
             server,

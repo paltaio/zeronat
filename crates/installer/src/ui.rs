@@ -26,6 +26,7 @@ pub enum Deploy {
 pub enum Kind {
     Ports,
     Bridge,
+    All,
 }
 #[derive(Clone, Copy, PartialEq)]
 pub enum SecretMode {
@@ -70,6 +71,9 @@ pub struct Config {
     pub have_docker: bool,
     pub have_compose: bool,
     pub existing_secret: Option<String>,
+    /// All-traffic mode: keep `ssh_port` on the server instead of forwarding it.
+    pub exclude_ssh: bool,
+    pub ssh_port: u16,
 }
 
 impl Config {
@@ -101,6 +105,8 @@ impl Config {
             have_docker,
             have_compose,
             existing_secret,
+            exclude_ssh: true,
+            ssh_port: 22,
         }
     }
 }
@@ -113,6 +119,7 @@ enum Step {
     Kind,
     Ports,
     Tap,
+    SshExclude,
     Discovery,
     ServerAddr,
     Control,
@@ -172,9 +179,15 @@ impl App {
             Step::Method if self.cfg.method == Method::Docker => Step::Deploy,
             Step::Method => Step::Kind,
             Step::Deploy => Step::Kind,
-            Step::Kind if self.cfg.kind == Kind::Ports => Step::Ports,
-            Step::Kind => Step::Tap,
-            Step::Ports | Step::Tap => Step::Discovery,
+            Step::Kind => match self.cfg.kind {
+                Kind::Ports => Step::Ports,
+                Kind::Bridge => Step::Tap,
+                // Only the server loses its ports to the client, so only it is
+                // asked whether to keep SSH.
+                Kind::All if self.cfg.mode == Mode::Server => Step::SshExclude,
+                Kind::All => Step::Discovery,
+            },
+            Step::Ports | Step::Tap | Step::SshExclude => Step::Discovery,
             Step::Discovery => match self.cfg.mode {
                 Mode::Server => Step::Control,
                 Mode::Client if self.cfg.use_dht => Step::Secret,
@@ -324,8 +337,22 @@ impl App {
                     desc: "expose TCP/UDP ports through the tunnel",
                 },
                 Opt {
+                    label: "All traffic",
+                    desc: "forward every port plus ICMP (Linux, root)",
+                },
+                Opt {
                     label: "L2 bridge (TAP)",
                     desc: "relay raw Ethernet / PPPoE (Linux, root)",
+                },
+            ],
+            Step::SshExclude => vec![
+                Opt {
+                    label: "Keep SSH on this host",
+                    desc: "exclude the SSH port so you keep remote access",
+                },
+                Opt {
+                    label: "Forward every port",
+                    desc: "SSH included; only safe with console access",
                 },
             ],
             Step::Discovery => match self.cfg.mode {
@@ -378,7 +405,12 @@ impl App {
             Step::Mode => (self.cfg.mode == Mode::Client) as usize,
             Step::Method => (self.cfg.method == Method::Systemd && self.cfg.have_docker) as usize,
             Step::Deploy => (self.cfg.deploy == Deploy::Run && self.cfg.have_compose) as usize,
-            Step::Kind => (self.cfg.kind == Kind::Bridge) as usize,
+            Step::Kind => match self.cfg.kind {
+                Kind::Ports => 0,
+                Kind::All => 1,
+                Kind::Bridge => 2,
+            },
+            Step::SshExclude => (!self.cfg.exclude_ssh) as usize,
             Step::Discovery => self.cfg.use_dht as usize,
             Step::Secret => {
                 let has = self.cfg.existing_secret.is_some();
@@ -416,12 +448,13 @@ impl App {
                 };
             }
             Step::Kind => {
-                self.cfg.kind = if self.sel == 0 {
-                    Kind::Ports
-                } else {
-                    Kind::Bridge
+                self.cfg.kind = match self.sel {
+                    0 => Kind::Ports,
+                    1 => Kind::All,
+                    _ => Kind::Bridge,
                 }
             }
+            Step::SshExclude => self.cfg.exclude_ssh = self.sel == 0,
             Step::Discovery => self.cfg.use_dht = self.sel == 1,
             Step::Secret => {
                 let has = self.cfg.existing_secret.is_some();
@@ -625,6 +658,8 @@ impl App {
             self.summary_rows(w, &mut body);
         } else if self.step == Step::Ports {
             self.ports_rows(w, &mut body);
+        } else if self.step == Step::SshExclude {
+            self.ssh_rows(w, &mut body);
         } else if App::is_input(self.step) {
             self.input_rows(w, &mut body);
         } else {
@@ -660,6 +695,7 @@ impl App {
             Step::Kind => "What should the tunnel carry?",
             Step::Ports => "Ports to forward",
             Step::Tap => "TAP device name",
+            Step::SshExclude => "Forward every port?",
             Step::Discovery => match self.cfg.mode {
                 Mode::Server => "How will clients reach this server?",
                 Mode::Client => "How should the client find the server?",
@@ -724,6 +760,20 @@ impl App {
         }
     }
 
+    fn ssh_rows(&self, w: usize, body: &mut Vec<String>) {
+        let mut warn = Line::new();
+        warn.add(
+            WARN,
+            &format!(
+                "  every port forwards to the client, SSH (port {}) included",
+                self.cfg.ssh_port
+            ),
+        );
+        body.push(zntui::frame::row(w, warn));
+        body.push(zntui::frame::blank(w));
+        self.select_rows(w, body);
+    }
+
     fn input_rows(&self, w: usize, body: &mut Vec<String>) {
         let mut l = Line::new();
         l.add(MUTED, "  > ");
@@ -772,6 +822,16 @@ impl App {
         match self.cfg.kind {
             Kind::Ports => add("ports", self.cfg.ports.clone(), PLAIN),
             Kind::Bridge => add("bridge", self.cfg.tap.clone(), PLAIN),
+            Kind::All => {
+                add("forward", "all traffic".into(), PLAIN);
+                if self.cfg.mode == Mode::Server {
+                    if self.cfg.exclude_ssh {
+                        add("ssh", format!("port {} kept on host", self.cfg.ssh_port), GOOD);
+                    } else {
+                        add("ssh", "forwarded (no exclusion)".into(), WARN);
+                    }
+                }
+            }
         }
         match self.cfg.mode {
             Mode::Client if self.cfg.use_dht => add("server", "via DHT".to_string(), PLAIN),
