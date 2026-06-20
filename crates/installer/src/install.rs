@@ -14,7 +14,7 @@ const RAW_BASE: &str = "https://raw.githubusercontent.com/paltaio/zeronat/main";
 const RELEASE_BASE: &str = "https://github.com/paltaio/zeronat/releases/latest/download";
 const IMAGE: &str = "ghcr.io/paltaio/zeronat:latest";
 const ETC_DIR: &str = "/etc/zeronat";
-const ENV_FILE: &str = "/etc/zeronat/zeronat.env";
+const ENV_FILE: &str = "/etc/zeronat/.env";
 const COMPOSE_FILE: &str = "/etc/zeronat/compose.yml";
 const BIN_PATH: &str = "/usr/local/bin/zeronat";
 const UNIT: &str = "/etc/systemd/system/zeronat.service";
@@ -32,6 +32,9 @@ pub struct Outcome {
     // The literal start command that was run, with an edit hint. None for dry-run
     // (nothing was actually run).
     pub ran: Option<String>,
+    // Command to open the interactive admin console. None when there is no fixed
+    // control address to point at (a DHT client).
+    pub console: Option<String>,
 }
 
 /// Drives the install. Every external command goes through `run` so the UI can
@@ -147,6 +150,24 @@ fn mode_str(cfg: &Config) -> &'static str {
     }
 }
 
+/// Command to open the interactive admin console for this node. The console
+/// connects to a server's control port: local on a server box, the dialed server
+/// for a fixed-address client. A DHT client has no fixed control address to point
+/// at, so there is no one-line console command (run it on the server instead).
+fn console_cmd(cfg: &Config) -> Option<String> {
+    let target = match cfg.mode {
+        Mode::Server => format!("127.0.0.1:{}", cfg.control),
+        Mode::Client if cfg.use_dht => return None,
+        Mode::Client => client_addr(cfg),
+    };
+    Some(match cfg.method {
+        // The image is FROM scratch with the binary at /zeronat (not on PATH), and
+        // the container already holds ZERONAT_SECRET from its env file.
+        Method::Docker => format!("docker exec -it zeronat /zeronat admin --server {target}"),
+        Method::Systemd => format!("zeronat admin --server {target} --secret {}", cfg.secret),
+    })
+}
+
 /// The intro line and the single-line command to run on the *other* machine,
 /// mirroring the shell installer. One line so it is easy to copy and paste.
 fn peer_steps(cfg: &Config) -> (String, String) {
@@ -241,7 +262,6 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
         format!("ZERONAT_SECRET={}\n", cfg.secret)
     };
     place(r, env.as_bytes(), "0600", ENV_FILE)?;
-    let _ = r.run(true, "rm", &["-f", "/etc/zeronat/.env"]);
 
     let (manage, ran) = match cfg.method {
         Method::Docker => install_docker(cfg, &sub, r)?,
@@ -255,6 +275,7 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
         peer_intro,
         peer_cmd,
         ran: Some(ran),
+        console: console_cmd(cfg),
     })
 }
 
@@ -280,7 +301,7 @@ fn dry_run(cfg: &Config, _sub: &str, r: &mut dyn Runner) -> Result<Outcome, Stri
             };
             dstep(r, "would fetch the compose file");
             dstep(r, "would pull the image and start via compose");
-            format!("{prog} ... logs -f")
+            format!("cd {ETC_DIR} && {prog} logs -f    # status: {prog} ps")
         }
         Method::Docker => {
             dstep(r, "would pull the image and start the container");
@@ -301,6 +322,7 @@ fn dry_run(cfg: &Config, _sub: &str, r: &mut dyn Runner) -> Result<Outcome, Stri
         peer_intro,
         peer_cmd,
         ran: None,
+        console: console_cmd(cfg),
     })
 }
 
@@ -325,17 +347,13 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(String
         if dc.is_empty() {
             return Err("docker compose not available".into());
         }
+        // compose auto-loads .env from the project directory (the compose file's
+        // own dir), so -f is the only flag needed and the command works from any
+        // cwd; --env-file and --project-directory would be redundant.
         let base: Vec<String> = dc[1..]
             .iter()
             .cloned()
-            .chain([
-                "--env-file".into(),
-                ENV_FILE.into(),
-                "-f".into(),
-                COMPOSE_FILE.into(),
-                "--project-directory".into(),
-                ETC_DIR.into(),
-            ])
+            .chain(["-f".into(), COMPOSE_FILE.into()])
             .collect();
 
         r.step("pulling image".into());
@@ -347,14 +365,9 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(String
             .chain(base.iter().map(|s| s.as_str()))
             .collect();
         let ran = format!("{} up -d    # edit {ENV_FILE} to change ports/secret", view.join(" "));
-        Ok((
-            format!(
-                "{} logs -f    # status: {} ps",
-                view.join(" "),
-                view.join(" ")
-            ),
-            ran,
-        ))
+        let dcj = dc.join(" ");
+        let manage = format!("cd {ETC_DIR} && {dcj} logs -f    # status: {dcj} ps");
+        Ok((manage, ran))
     } else {
         r.step("pulling image".into());
         let out = r.run(true, "docker", &["pull", IMAGE])?;
@@ -472,11 +485,49 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{check_forwards, peer_steps, subcmd};
-    use crate::ui::{Config, Kind, Mode};
+    use super::{check_forwards, console_cmd, peer_steps, subcmd};
+    use crate::ui::{Config, Kind, Method, Mode};
 
     fn cfg() -> Config {
         Config::new(false, false, None)
+    }
+
+    #[test]
+    fn console_server_targets_localhost() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.control = "2222".into();
+        c.method = Method::Docker;
+        assert_eq!(
+            console_cmd(&c).unwrap(),
+            "docker exec -it zeronat /zeronat admin --server 127.0.0.1:2222"
+        );
+        c.method = Method::Systemd;
+        c.secret = "sek".into();
+        assert_eq!(
+            console_cmd(&c).unwrap(),
+            "zeronat admin --server 127.0.0.1:2222 --secret sek"
+        );
+    }
+
+    #[test]
+    fn console_client_targets_the_server() {
+        let mut c = cfg();
+        c.mode = Mode::Client;
+        c.server_addr = "vps.example:9000".into();
+        c.method = Method::Docker;
+        assert_eq!(
+            console_cmd(&c).unwrap(),
+            "docker exec -it zeronat /zeronat admin --server vps.example:9000"
+        );
+    }
+
+    #[test]
+    fn console_none_for_dht_client() {
+        let mut c = cfg();
+        c.mode = Mode::Client;
+        c.use_dht = true;
+        assert!(console_cmd(&c).is_none());
     }
 
     #[test]

@@ -4,5 +4,5 @@ services:
     container_name: zeronat
     network_mode: host
     restart: unless-stopped
-    env_file: zeronat.env
+    env_file: .env
     command: ${ZERONAT_ARGS}

@@ -293,6 +293,9 @@ fn render_outcome(o: &Outcome, color: bool) -> String {
         s.push_str(&format!("  {dim}Ran:{reset}\n    {ran}\n\n"));
     }
     s.push_str(&format!("  {dim}manage it with{reset}\n    {}\n\n", o.manage));
+    if let Some(console) = &o.console {
+        s.push_str(&format!("  {dim}open the console{reset}\n    {}\n\n", console));
+    }
     s.push_str(&format!("  {accent}{}{reset}\n\n", o.peer_intro));
     s.push_str(&format!("    {bold}{}{reset}\n\n", o.peer_cmd));
     s
@@ -347,9 +350,15 @@ fn progress_view(
     if let Status::Done(o) = status {
         body.push(frame::blank(w));
         let mut m = Line::new();
-        m.add(MUTED, "  manage  ");
+        m.add(MUTED, "  manage   ");
         m.add(PLAIN, &o.manage);
         body.push(frame::row(w, m));
+        if let Some(console) = &o.console {
+            let mut c = Line::new();
+            c.add(MUTED, "  console  ");
+            c.add(PLAIN, console);
+            body.push(frame::row(w, c));
+        }
     }
 
     let area = h.saturating_sub(5);

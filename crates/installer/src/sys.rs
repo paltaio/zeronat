@@ -136,16 +136,14 @@ pub fn pub_ip() -> String {
 
 /// A secret already on disk, so a re-run does not rotate it and break clients.
 pub fn existing_secret() -> Option<String> {
-    for f in ["/etc/zeronat/.env", "/etc/zeronat/zeronat.env"] {
-        if let Ok(out) = run(true, "cat", &[f]) {
-            if out.status.success() {
-                for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    if let Some(v) = line.strip_prefix("ZERONAT_SECRET=") {
-                        if !v.is_empty() {
-                            return Some(v.to_string());
-                        }
-                    }
-                }
+    let out = run(true, "cat", &["/etc/zeronat/.env"]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(v) = line.strip_prefix("ZERONAT_SECRET=") {
+            if !v.is_empty() {
+                return Some(v.to_string());
             }
         }
     }
