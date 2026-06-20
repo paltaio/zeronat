@@ -274,14 +274,19 @@ fi
 # --- write env --------------------------------------------------------------
 run mkdir -p "$ETC_DIR"
 if [ "$METHOD" = docker ] && [ "$DEPLOY" = compose ]; then
-  # compose reads .env from the project dir for ${ZERONAT_*} and as the container env_file
+  # One env file for every method: compose interpolates ${ZERONAT_*} from it via
+  # --env-file and injects it into the container via env_file; the run/systemd
+  # paths read the same file. ZERONAT_ARGS is only consumed by compose.
   { printf 'ZERONAT_SECRET=%s\n' "$SECRET"; printf 'ZERONAT_ARGS=%s\n' "$SUBCMD"; } \
-    | run tee "$ETC_DIR/.env" >/dev/null
-  run chmod 600 "$ETC_DIR/.env"
+    | run tee "$ENV_FILE" >/dev/null
+  run chmod 600 "$ENV_FILE"
 else
   printf 'ZERONAT_SECRET=%s\n' "$SECRET" | run tee "$ENV_FILE" >/dev/null
   run chmod 600 "$ENV_FILE"
 fi
+# Older compose installs kept the secret in a separate .env; drop it so a single
+# zeronat.env is the only env file regardless of how the box was first set up.
+[ -f "$ETC_DIR/.env" ] && run rm -f "$ETC_DIR/.env"
 
 # --- install ----------------------------------------------------------------
 RAN=""
@@ -297,8 +302,8 @@ if [ "$METHOD" = docker ]; then
     [ "$KIND" = bridge ] && COMPOSE_SRC="compose.bridge.yml"
     _c=$(curl -fsSL "$RAW_BASE/$COMPOSE_SRC") || err "could not fetch $COMPOSE_SRC"
     printf '%s\n' "$_c" | run tee "$COMPOSE_FILE" >/dev/null
-    DCF="$DC -f $COMPOSE_FILE --project-directory $ETC_DIR"
-    RAN="$DCF up -d   # edit $ETC_DIR/.env to change ports/secret"
+    DCF="$DC --env-file $ENV_FILE -f $COMPOSE_FILE --project-directory $ETC_DIR"
+    RAN="$DCF up -d   # edit $ENV_FILE to change ports/secret"
     # shellcheck disable=SC2086
     run $DCF pull
     # shellcheck disable=SC2086
