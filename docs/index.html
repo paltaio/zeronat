@@ -115,11 +115,9 @@
 
     <section id="install">
       <h2>Install</h2>
-      <p>On the public host (interactive, or pass flags):</p>
-<pre><code>curl -fsSL https://paltaio.github.io/zeronat/install.sh | sh -s -- --server</code></pre>
-      <p>It picks Docker or a systemd service, generates the secret, asks which ports to forward, and prints
-      the matching command to run on the machine behind CG-NAT. Run <code>install.sh --help</code> for all
-      options.</p>
+<pre><code>curl -fsSL https://paltaio.github.io/zeronat/get.sh | sh</code></pre>
+      <p>Picks Docker or a systemd service, generates the secret, asks which ports to forward, and prints the
+      matching command to run on the machine behind CG-NAT.</p>
 <pre><code>docker pull ghcr.io/paltaio/zeronat</code></pre>
     </section>
 

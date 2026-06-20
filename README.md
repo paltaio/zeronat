@@ -9,10 +9,10 @@ The server runs on the public host. The client runs behind NAT, dials out, and h
 ## Install
 
 ```bash
-curl -fsSL https://paltaio.github.io/zeronat/install.sh | sh -s -- --server
+curl -fsSL https://paltaio.github.io/zeronat/get.sh | sh
 ```
 
-Picks Docker or a systemd service, generates the secret, asks which ports to forward, and prints the command to run behind CG-NAT. `install.sh --help` for the rest.
+Picks Docker or a systemd service, generates the secret, asks which ports to forward, and prints the command to run behind CG-NAT.
 
 ## Usage
 
