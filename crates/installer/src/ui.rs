@@ -7,17 +7,17 @@ use zntui::style::{Color, Line, Style, ACCENT, BAD, GOOD, MUTED, PLAIN, WARN};
 
 const BOLD: Style = Style::fg(Color::Default).bold();
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
     Server,
     Client,
 }
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Method {
     Docker,
     Systemd,
 }
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Deploy {
     Compose,
     Run,
@@ -58,8 +58,12 @@ pub struct Config {
     pub kind: Kind,
     pub ports: String,
     pub tap: String,
+    pub bridge: String,
+    pub tap_mtu: String,
     pub control: String,
     pub use_dht: bool,
+    pub announce_ip: String,
+    pub announce_port: String,
     pub server_addr: String,
     pub secret: String,
     pub secret_mode: SecretMode,
@@ -81,8 +85,12 @@ impl Config {
             kind: Kind::Ports,
             ports: String::new(),
             tap: "zn0".to_string(),
+            bridge: String::new(),
+            tap_mtu: String::new(),
             control: "2222".to_string(),
             use_dht: false,
+            announce_ip: String::new(),
+            announce_port: String::new(),
             server_addr: String::new(),
             secret: String::new(),
             secret_mode: if existing_secret.is_some() {

@@ -5,7 +5,6 @@ on:
     branches: [main]
     paths:
       - "docs/index.html"
-      - "install.sh"
       - "get.sh"
       - "crates/installer/**"
       - "crates/tui/**"
@@ -85,7 +84,6 @@ jobs:
         run: |
           mkdir -p _site
           cp docs/index.html _site/index.html
-          cp install.sh _site/install.sh
           cp get.sh _site/get.sh
           for d in artifacts/installer-*; do
             cp "$d"/zeronat-installer-* _site/

@@ -2,14 +2,16 @@
 //! zeronat (server or client) with no flags to remember. Driven over /dev/tty so
 //! it works under `curl ... | sh`.
 
+mod args;
 mod install;
 mod sys;
 mod term;
 mod ui;
 
+use args::Host;
 use install::{Lvl, Outcome};
 use term::{Renderer, Tty};
-use ui::{App, Config};
+use ui::App;
 use zntui::frame;
 use zntui::style::{Color, Line, Style, ACCENT, BAD, GOOD, MUTED, PLAIN};
 
@@ -74,24 +76,78 @@ impl install::Runner for LiveRunner<'_> {
     }
 }
 
-fn real_main() -> i32 {
-    // --dry-run previews the steps and makes no changes (and needs no root).
-    let dry = std::env::args()
-        .skip(1)
-        .any(|a| a == "--dry-run" || a == "-n");
+const USAGE: &str = "\
+zeronat installer
 
-    // Pre-flight on the normal terminal, before the alt screen: cache sudo creds
-    // and probe the host so the wizard reflects what is actually available.
+  curl -fsSL https://paltaio.github.io/zeronat/get.sh | sh -s -- [options]
+
+  --server | --client       side to install on this machine
+  --method docker|systemd   install method (default: docker if present, else systemd)
+  --deploy compose|run      (docker only) compose file or plain docker run
+  --ports \"443/tcp 80/tcp 51820/udp\"
+  --control PORT            tunnel control port (default 2222)
+  --secret SECRET           shared secret (default: generated)
+  --server-addr HOST[:PORT] (client only) where the server is reachable
+  --dht                     find the server over the DHT (dynamic IP, no fixed address)
+  --announce-ip IP          (server, with --dht) public IPv4 to announce
+  --announce-port PORT      (server, with --dht) public port to announce
+  --tap NAME                L2 bridge instead of ports: relay raw Ethernet/PPPoE (Linux)
+  --bridge NAME             (with --tap) enslave the TAP to this existing bridge
+  --tap-mtu N               (with --tap) TAP MTU (default 1400)
+  -y, --yes                 no prompts; fail if a required value is missing
+  -n, --dry-run             preview the steps without making changes
+  -h, --help
+
+With no options it runs the interactive wizard. --ports and --tap are mutually exclusive.";
+
+fn real_main() -> i32 {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let parsed = match args::parse(&argv) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    if parsed.help {
+        println!("{USAGE}");
+        return 0;
+    }
+
+    let dry = parsed.dry;
+    // Headless when -y is passed or there is no terminal to drive the wizard.
+    let headless = parsed.headless || Tty::open().is_err();
+
+    // Pre-flight on the normal terminal, before any alt screen: cache sudo creds
+    // and probe the host so config reflects what is actually available.
     if !dry {
         if let Err(e) = sys::ensure_privilege() {
-            eprintln!("zeronat installer: {e}");
+            eprintln!("error: {e}");
             return 1;
         }
     }
     let have_docker = sys::have("docker");
     let have_compose = have_docker && sys::have_compose();
-    let existing = if dry { None } else { sys::existing_secret() };
-    let cfg = Config::new(have_docker, have_compose, existing);
+    // Read the on-disk secret even in dry-run so the preview shows the secret a
+    // real run would reuse, not a freshly generated one.
+    let existing = sys::existing_secret();
+    let host = Host {
+        have_docker,
+        have_compose,
+        existing_secret: existing,
+    };
+
+    if headless {
+        return run_headless(&parsed, &host, dry);
+    }
+
+    let cfg = match args::build(&parsed, &host, headless) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
 
     let mut tty = match Tty::open() {
         Ok(t) => t,
@@ -159,7 +215,7 @@ fn real_main() -> i32 {
     // Persist the outcome on the normal screen so it survives the alt screen.
     match result {
         Ok(o) => {
-            print_outcome(&mut tty, &o);
+            let _ = tty.write_all(render_outcome(&o, true).as_bytes());
             0
         }
         Err(e) => {
@@ -170,30 +226,76 @@ fn real_main() -> i32 {
     }
 }
 
+/// Non-interactive install: build and validate the config from flags, then run
+/// it printing plain lines (no raw mode, alt screen, or spinner). Steps and info
+/// go to stderr; the copy-pasteable outcome goes to stdout.
+fn run_headless(parsed: &args::Parsed, host: &Host, dry: bool) -> i32 {
+    let cfg = match args::build(parsed, host, true) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let mut runner = PlainRunner;
+    match install::execute(&cfg, dry, &mut runner) {
+        Ok(o) => {
+            print!("{}", render_outcome(&o, false));
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
+struct PlainRunner;
+
+impl install::Runner for PlainRunner {
+    fn step(&mut self, desc: String) {
+        eprintln!("  {desc}");
+    }
+
+    fn info(&mut self, msg: String) {
+        eprintln!("    {msg}");
+    }
+
+    fn run(
+        &mut self,
+        privileged: bool,
+        program: &str,
+        args: &[&str],
+    ) -> Result<std::process::Output, String> {
+        sys::run(privileged, program, args)
+    }
+}
+
 enum Status<'a> {
     Working,
     Done(&'a Outcome),
     Failed(&'a str),
 }
 
-/// Print the result to the normal terminal after the alt screen closes, so it
-/// stays in the scrollback. The peer command is one line and indented on its
-/// own, so a copy-paste picks up exactly the command.
-fn print_outcome(tty: &mut Tty, o: &Outcome) {
-    let (green, accent, dim, bold, reset) =
-        ("\x1b[92m", "\x1b[96;1m", "\x1b[90m", "\x1b[1m", "\x1b[0m");
+/// Format the install result for the normal screen: the wizard writes it to the
+/// tty after the alt screen closes, the headless path prints it to stdout. The
+/// peer command sits alone on an indented line so a copy-paste grabs exactly it.
+/// `color` adds ANSI styling for an interactive terminal.
+fn render_outcome(o: &Outcome, color: bool) -> String {
+    let (green, accent, dim, bold, reset, check) = if color {
+        ("\x1b[92m", "\x1b[96;1m", "\x1b[90m", "\x1b[1m", "\x1b[0m", "✓ ")
+    } else {
+        ("", "", "", "", "", "")
+    };
     let mut s = String::new();
-    s.push_str(&format!(
-        "\n  {green}✓{reset} {bold}{}{reset}\n\n",
-        o.headline
-    ));
-    s.push_str(&format!(
-        "  {dim}manage it with{reset}\n    {}\n\n",
-        o.manage
-    ));
+    s.push_str(&format!("\n  {green}{check}{reset}{bold}{}{reset}\n\n", o.headline));
+    if let Some(ran) = &o.ran {
+        s.push_str(&format!("  {dim}Ran:{reset}\n    {ran}\n\n"));
+    }
+    s.push_str(&format!("  {dim}manage it with{reset}\n    {}\n\n", o.manage));
     s.push_str(&format!("  {accent}{}{reset}\n\n", o.peer_intro));
     s.push_str(&format!("    {bold}{}{reset}\n\n", o.peer_cmd));
-    let _ = tty.write_all(s.as_bytes());
+    s
 }
 
 fn progress_view(

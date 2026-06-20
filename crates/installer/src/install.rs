@@ -8,7 +8,7 @@ use crate::sys::{self, errtext, ok};
 use crate::ui::{Config, Deploy, Kind, Method, Mode};
 
 // Shown to the user, so it uses the friendly Pages URL.
-const INSTALL_URL: &str = "https://paltaio.github.io/zeronat/install.sh";
+const INSTALL_URL: &str = "https://paltaio.github.io/zeronat/get.sh";
 // Internal fetches (compose templates) hit the repo directly to stay current.
 const RAW_BASE: &str = "https://raw.githubusercontent.com/paltaio/zeronat/main";
 const RELEASE_BASE: &str = "https://github.com/paltaio/zeronat/releases/latest/download";
@@ -29,6 +29,9 @@ pub struct Outcome {
     pub headline: String,
     pub peer_intro: String,
     pub peer_cmd: String,
+    // The literal start command that was run, with an edit hint. None for dry-run
+    // (nothing was actually run).
+    pub ran: Option<String>,
 }
 
 /// Drives the install. Every external command goes through `run` so the UI can
@@ -75,7 +78,16 @@ fn place(r: &mut dyn Runner, content: &[u8], mode: &str, dest: &str) -> Result<(
 
 fn zn_args(cfg: &Config) -> String {
     match cfg.kind {
-        Kind::Bridge => format!(" --tap {}", cfg.tap),
+        Kind::Bridge => {
+            let mut s = format!(" --tap {}", cfg.tap);
+            if !cfg.bridge.is_empty() {
+                s.push_str(&format!(" --bridge {}", cfg.bridge));
+            }
+            if !cfg.tap_mtu.is_empty() {
+                s.push_str(&format!(" --tap-mtu {}", cfg.tap_mtu));
+            }
+            s
+        }
         Kind::Ports => cfg
             .ports
             .split_whitespace()
@@ -107,6 +119,12 @@ pub fn subcmd(cfg: &Config) -> String {
             let mut s = format!("server --control {}{a}", cfg.control);
             if cfg.use_dht {
                 s.push_str(" --server dht");
+                if !cfg.announce_ip.is_empty() {
+                    s.push_str(&format!(" --announce-ip {}", cfg.announce_ip));
+                }
+                if !cfg.announce_port.is_empty() {
+                    s.push_str(&format!(" --announce-port {}", cfg.announce_port));
+                }
             }
             s
         }
@@ -137,13 +155,13 @@ fn peer_steps(cfg: &Config) -> (String, String) {
         Mode::Server => {
             let cmd = if cfg.use_dht {
                 format!(
-                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --dht --secret {} {fwd}",
+                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --dht --secret {} {fwd} -y",
                     cfg.secret
                 )
             } else {
                 let host = sys::pub_ip();
                 format!(
-                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --server-addr {host}:{} --secret {} {fwd}",
+                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --server-addr {host}:{} --secret {} {fwd} -y",
                     cfg.control, cfg.secret
                 )
             };
@@ -166,7 +184,7 @@ fn peer_steps(cfg: &Config) -> (String, String) {
                 format!("--control {ctrl}")
             };
             let cmd = format!(
-                "curl -fsSL {INSTALL_URL} | sh -s -- --server {disc} --secret {} {fwd}",
+                "curl -fsSL {INSTALL_URL} | sh -s -- --server {disc} --secret {} {fwd} -y",
                 cfg.secret
             );
             (
@@ -177,7 +195,34 @@ fn peer_steps(cfg: &Config) -> (String, String) {
     }
 }
 
+/// Last-line guard before any command is built: the validated paths (headless
+/// `valid_ports`, interactive checklist) already enforce this, so reaching here
+/// with a forwarding-less config means a path bypassed validation. Catch it
+/// rather than silently starting a server/client that forwards nothing.
+fn check_forwards(cfg: &Config) -> Result<(), String> {
+    match cfg.kind {
+        Kind::Bridge => {
+            if cfg.tap.trim().is_empty() {
+                return Err("no TAP device name given".into());
+            }
+        }
+        Kind::Ports => {
+            for tok in cfg.ports.split_whitespace() {
+                let proto = tok.split_once('/').map(|(_, p)| p).unwrap_or("");
+                if proto != "tcp" && proto != "udp" {
+                    return Err(format!("bad protocol in '{tok}' (use tcp or udp)"));
+                }
+            }
+            if cfg.ports.split_whitespace().next().is_none() {
+                return Err("no ports given".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, String> {
+    check_forwards(cfg)?;
     let sub = subcmd(cfg);
     if dry {
         return dry_run(cfg, &sub, r);
@@ -198,7 +243,7 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
     place(r, env.as_bytes(), "0600", ENV_FILE)?;
     let _ = r.run(true, "rm", &["-f", "/etc/zeronat/.env"]);
 
-    let manage = match cfg.method {
+    let (manage, ran) = match cfg.method {
         Method::Docker => install_docker(cfg, &sub, r)?,
         Method::Systemd => install_systemd(cfg, &sub, r)?,
     };
@@ -209,6 +254,7 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
         headline: format!("zeronat {} is running", mode_str(cfg)),
         peer_intro,
         peer_cmd,
+        ran: Some(ran),
     })
 }
 
@@ -254,10 +300,11 @@ fn dry_run(cfg: &Config, _sub: &str, r: &mut dyn Runner) -> Result<Outcome, Stri
         headline: format!("zeronat {} ready (dry run)", mode_str(cfg)),
         peer_intro,
         peer_cmd,
+        ran: None,
     })
 }
 
-fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<String, String> {
+fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(String, String), String> {
     let _ = r.run(true, "docker", &["rm", "-f", "zeronat"]);
 
     if cfg.deploy == Deploy::Compose {
@@ -299,10 +346,14 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<String,
         let view: Vec<&str> = std::iter::once(dc[0].as_str())
             .chain(base.iter().map(|s| s.as_str()))
             .collect();
-        Ok(format!(
-            "{} logs -f    # status: {} ps",
-            view.join(" "),
-            view.join(" ")
+        let ran = format!("{} up -d    # edit {ENV_FILE} to change ports/secret", view.join(" "));
+        Ok((
+            format!(
+                "{} logs -f    # status: {} ps",
+                view.join(" "),
+                view.join(" ")
+            ),
+            ran,
         ))
     } else {
         r.step("pulling image".into());
@@ -336,7 +387,14 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<String,
         if !ok(&out) {
             return Err(format!("docker run: {}", errtext(&out)));
         }
-        Ok("docker logs -f zeronat    # status: docker ps".into())
+        let ran = format!(
+            "docker {}    # edit {ENV_FILE} to change ports/secret",
+            args.join(" ")
+        );
+        Ok((
+            "docker logs -f zeronat    # status: docker ps".into(),
+            ran,
+        ))
     }
 }
 
@@ -357,7 +415,7 @@ fn compose(r: &mut dyn Runner, prog: &str, base: &[String], verb: &str) -> Resul
     }
 }
 
-fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<String, String> {
+fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(String, String), String> {
     let target = sys::arch_target()?;
     r.info(format!("target {target}"));
     let url = format!("{RELEASE_BASE}/zeronat-{target}");
@@ -405,16 +463,44 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<String
     if !ok(&out) {
         return Err(format!("enable: {}", errtext(&out)));
     }
-    Ok("systemctl status zeronat    # logs: journalctl -u zeronat -f".into())
+    let ran = format!("systemctl enable --now zeronat    # edit {ENV_FILE} and {UNIT} to change ports/secret");
+    Ok((
+        "systemctl status zeronat    # logs: journalctl -u zeronat -f".into(),
+        ran,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{peer_steps, subcmd};
+    use super::{check_forwards, peer_steps, subcmd};
     use crate::ui::{Config, Kind, Mode};
 
     fn cfg() -> Config {
         Config::new(false, false, None)
+    }
+
+    #[test]
+    fn check_forwards_rejects_empty_ports() {
+        let mut c = cfg();
+        c.kind = Kind::Ports;
+        c.ports = "  ".into();
+        assert!(check_forwards(&c).is_err());
+    }
+
+    #[test]
+    fn check_forwards_rejects_empty_tap() {
+        let mut c = cfg();
+        c.kind = Kind::Bridge;
+        c.tap = "".into();
+        assert!(check_forwards(&c).is_err());
+    }
+
+    #[test]
+    fn check_forwards_accepts_valid_ports() {
+        let mut c = cfg();
+        c.kind = Kind::Ports;
+        c.ports = "443/tcp 80/udp".into();
+        assert!(check_forwards(&c).is_ok());
     }
 
     #[test]
@@ -488,5 +574,45 @@ mod tests {
         c.kind = Kind::Bridge;
         c.tap = "zn0".into();
         assert_eq!(subcmd(&c), "server --control 2222 --tap zn0");
+    }
+
+    #[test]
+    fn bridge_with_bridge_and_mtu() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.kind = Kind::Bridge;
+        c.tap = "zn0".into();
+        c.bridge = "br0".into();
+        c.tap_mtu = "1400".into();
+        assert_eq!(
+            subcmd(&c),
+            "server --control 2222 --tap zn0 --bridge br0 --tap-mtu 1400"
+        );
+    }
+
+    #[test]
+    fn server_dht_announce() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.use_dht = true;
+        c.ports = "443/tcp".into();
+        c.announce_ip = "203.0.113.1".into();
+        c.announce_port = "9000".into();
+        assert_eq!(
+            subcmd(&c),
+            "server --control 2222 --tcp 443 --server dht --announce-ip 203.0.113.1 --announce-port 9000"
+        );
+    }
+
+    #[test]
+    fn peer_cmd_uses_get_sh_and_headless() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.use_dht = true;
+        c.ports = "443/tcp".into();
+        c.secret = "deadbeef".into();
+        let (_, cmd) = peer_steps(&c);
+        assert!(cmd.contains("get.sh"), "{cmd}");
+        assert!(cmd.ends_with(" -y"), "{cmd}");
     }
 }
