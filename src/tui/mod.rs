@@ -1,15 +1,15 @@
-//! A small terminal-UI toolkit and the admin console built on it.
+//! The admin console and the stdio terminal shim that drives it.
 //!
-//! The toolkit is intentionally thin: raw-mode terminal control, a key reader,
-//! ANSI styling, box-drawing, and a frame renderer that diffs rows so a steady
-//! screen emits nothing. `console` is its first consumer, a live view of one
-//! server with inline control over its routes and listeners.
+//! Styling, box-drawing, and key parsing come from the shared `zntui` crate; the
+//! pieces here are zeronat-specific: raw-mode control of stdio, an async key
+//! reader, a frame renderer, and `console`, a live view of one server with
+//! inline control over its routes and listeners.
+
+pub use zntui::{frame, style};
 
 mod console;
-mod frame;
 mod input;
 mod render;
-mod style;
 mod term;
 
 pub use console::run;

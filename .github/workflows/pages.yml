@@ -6,6 +6,9 @@ on:
     paths:
       - "docs/index.html"
       - "install.sh"
+      - "get.sh"
+      - "crates/installer/**"
+      - "crates/tui/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -19,7 +22,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  installers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - arm-unknown-linux-musleabihf
+          - mips-unknown-linux-gnu
+          - mipsel-unknown-linux-gnu
+          - mips64-unknown-linux-gnuabi64
+          - mips64el-unknown-linux-gnuabi64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build installer
+        env:
+          RUSTFLAGS: '-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort -Cforce-unwind-tables=no'
+        run: |
+          cross build --release --locked \
+            -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
+            --target ${{ matrix.target }} -p zeronat-installer
+
+      - name: Stage installer
+        run: install -D "target/${{ matrix.target }}/release/zeronat-installer" "out/zeronat-installer-${{ matrix.target }}"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.target }}
+          path: out/zeronat-installer-${{ matrix.target }}
+          if-no-files-found: error
+
   deploy:
+    needs: installers
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -27,11 +76,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: installer-*
+
       - name: Stage site
         run: |
           mkdir -p _site
           cp docs/index.html _site/index.html
           cp install.sh _site/install.sh
+          cp get.sh _site/get.sh
+          for d in artifacts/installer-*; do
+            cp "$d"/zeronat-installer-* _site/
+          done
           touch _site/.nojekyll
 
       - uses: actions/upload-pages-artifact@v3

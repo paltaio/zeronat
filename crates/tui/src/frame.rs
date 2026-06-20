@@ -1,7 +1,7 @@
 //! Box-drawing helpers. Every function returns a finished row string of exactly
 //! `width` columns, so a screen is just a `Vec<String>` the renderer can diff.
 
-use super::style::{Line, ACCENT, MUTED, PLAIN};
+use crate::style::{Line, ACCENT, MUTED, PLAIN};
 
 /// Top border carrying a left title group and a right status group, joined by a
 /// run of dashes: `┌─ left ──────── right ─┐`. The groups are trimmed to fit so

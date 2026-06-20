@@ -1,0 +1,16 @@
+[package]
+name = "zeronat-installer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "zeronat-installer"
+path = "src/main.rs"
+
+[dependencies]
+zntui = { path = "../tui" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

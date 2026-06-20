@@ -575,4 +575,17 @@ dependencies = [
  "snow",
  "tokio",
  "x25519-dalek",
+ "zntui",
 ]
+
+[[package]]
+name = "zeronat-installer"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "zntui",
+]
+
+[[package]]
+name = "zntui"
+version = "0.1.0"

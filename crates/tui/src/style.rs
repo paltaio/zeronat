@@ -37,7 +37,6 @@ impl Color {
 pub struct Style {
     pub fg: Color,
     pub bold: bool,
-    pub dim: bool,
     pub reverse: bool,
 }
 
@@ -46,7 +45,6 @@ impl Style {
         Style {
             fg,
             bold: false,
-            dim: false,
             reverse: false,
         }
     }
@@ -73,9 +71,6 @@ impl Style {
         let mut codes: Vec<u8> = Vec::new();
         if self.bold {
             codes.push(1);
-        }
-        if self.dim {
-            codes.push(2);
         }
         if self.reverse {
             codes.push(7);
