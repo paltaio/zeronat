@@ -20,6 +20,7 @@ const SIOCSIFNETMASK: u64 = 0x891c;
 const SIOCGIFFLAGS: u64 = 0x8913;
 const SIOCSIFFLAGS: u64 = 0x8914;
 const SIOCSIFMTU: u64 = 0x8922;
+const SIOCGIFMTU: u64 = 0x8921;
 const SIOCGIFINDEX: u64 = 0x8933;
 const SIOCBRADDIF: u64 = 0x89a2;
 
@@ -69,6 +70,9 @@ impl IfReq {
     fn set_mtu(&mut self, mtu: i32) {
         unsafe { std::ptr::write_unaligned(self.ifru.as_mut_ptr() as *mut i32, mtu) }
     }
+    fn get_mtu(&self) -> i32 {
+        unsafe { std::ptr::read_unaligned(self.ifru.as_ptr() as *const i32) }
+    }
     fn set_ifindex(&mut self, idx: i32) {
         unsafe { std::ptr::write_unaligned(self.ifru.as_mut_ptr() as *mut i32, idx) }
     }
@@ -101,6 +105,12 @@ fn set_mtu_ioctl(sock: RawFd, name: &str, mtu: usize) -> Result<()> {
     ioctl_ifr(sock, SIOCSIFMTU, &mut ifr, &format!("SIOCSIFMTU {name}"))
 }
 
+fn get_mtu_ioctl(sock: RawFd, name: &str) -> Result<i32> {
+    let mut ifr = IfReq::new(name)?;
+    ioctl_ifr(sock, SIOCGIFMTU, &mut ifr, &format!("SIOCGIFMTU {name}"))?;
+    Ok(ifr.get_mtu())
+}
+
 /// Bring the interface up and mark it running.
 fn bring_up(sock: RawFd, name: &str) -> Result<()> {
     let mut ifr = IfReq::new(name)?;
@@ -127,6 +137,11 @@ fn configure_inner(sock: RawFd, name: &str, mtu: usize, bridge: Option<&str>) ->
     bring_up(sock, name)?;
 
     if let Some(br) = bridge {
+        // Enslaving a smaller-MTU TAP makes the kernel drop the bridge to the
+        // minimum member MTU, even when the bridge MTU was set explicitly. Capture
+        // the bridge MTU and restore it after the enslave so the host's own traffic
+        // on the bridge keeps its full MTU (the smaller TAP port stays at its MTU).
+        let br_mtu = get_mtu_ioctl(sock, br).ok();
         let mut ifr = IfReq::new(name)?;
         ioctl_ifr(sock, SIOCGIFINDEX, &mut ifr, &format!("SIOCGIFINDEX {name}"))?;
         let idx = ifr.get_ifindex();
@@ -138,6 +153,9 @@ fn configure_inner(sock: RawFd, name: &str, mtu: usize, bridge: Option<&str>) ->
             &mut brifr,
             &format!("SIOCBRADDIF {br} <- {name}"),
         )?;
+        if let Some(m) = br_mtu {
+            let _ = set_mtu_ioctl(sock, br, m as usize);
+        }
     }
     Ok(())
 }
@@ -347,6 +365,8 @@ mod tests {
         assert_eq!(ifr.get_flags(), IFF_TAP | IFF_NO_PI);
         ifr.set_ifindex(42);
         assert_eq!(ifr.get_ifindex(), 42);
+        ifr.set_mtu(1400);
+        assert_eq!(ifr.get_mtu(), 1400);
     }
 
     #[test]

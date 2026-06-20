@@ -233,6 +233,11 @@ pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
       sets the MTU (default 1400). Linux only. Needs <code>CAP_NET_ADMIN</code>: root,
       <code>setcap cap_net_admin+ep zeronat</code>, or Docker
       <code>--cap-add NET_ADMIN --device /dev/net/tun</code> (plus <code>--device /dev/ppp</code> for pppd).</p>
+      <p>The installer can build that bridge for you on netplan or systemd-networkd hosts: pass
+      <code>--bridge-nic &lt;iface&gt;</code> (or pick the interface in the wizard) and it creates the bridge,
+      enslaves the NIC, and persists the change so it survives reboot. On a single-NIC server, where the
+      uplink itself must join the bridge, it moves that interface's address onto the bridge and waits for you
+      to confirm you still have access, reverting automatically within ~30s if you do not.</p>
     </section>
 
     <section id="dht">

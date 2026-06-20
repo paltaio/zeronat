@@ -4,8 +4,12 @@
 
 use std::process::Output;
 
+use crate::bridge;
 use crate::sys::{self, errtext, ok};
 use crate::ui::{Config, Deploy, Kind, Method, Mode};
+
+/// Seconds the operator has to confirm a risky bridge before it auto-reverts.
+const BRIDGE_TIMEOUT: u32 = 30;
 
 // Shown to the user, so it uses the friendly Pages URL.
 const INSTALL_URL: &str = "https://paltaio.github.io/zeronat/get.sh";
@@ -43,6 +47,10 @@ pub trait Runner {
     fn step(&mut self, desc: String);
     fn info(&mut self, msg: String);
     fn run(&mut self, privileged: bool, program: &str, args: &[&str]) -> Result<Output, String>;
+    /// Ask the operator to confirm within `secs`, used to keep a risky bridge.
+    /// Interactive runners read a key with a countdown; headless runners verify
+    /// connectivity instead. Returns true to keep, false to let it revert.
+    fn confirm(&mut self, prompt: &str, secs: u32) -> bool;
 }
 
 /// Write `content` to `dest` with `mode` as root: stage a temp file and let the
@@ -271,6 +279,10 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
     };
     place(r, env.as_bytes(), "0600", ENV_FILE)?;
 
+    // Build the host bridge before starting zeronat, so the TAP has a bridge to
+    // join. A no-op unless this is a server in bridge mode asked to create one.
+    setup_bridge(cfg, r)?;
+
     let (manage, ran) = match cfg.method {
         Method::Docker => install_docker(cfg, &sub, r)?,
         Method::Systemd => install_systemd(cfg, &sub, r)?,
@@ -287,6 +299,131 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
     })
 }
 
+/// Create the host bridge and enslave the chosen NIC, persisting it through the
+/// host's network manager. When the NIC carries the operator's connectivity the
+/// apply runs under a detached watchdog that reverts unless confirmed in time.
+/// A no-op unless this is a server in bridge mode with `bridge_create`.
+fn setup_bridge(cfg: &Config, r: &mut dyn Runner) -> Result<(), String> {
+    if !(cfg.mode == Mode::Server && cfg.kind == Kind::Bridge && cfg.bridge_create) {
+        return Ok(());
+    }
+    if !sys::have("ip") {
+        return Err("the `ip` command (iproute2) is required to create a bridge".into());
+    }
+    let nics = bridge::list_nics();
+    let nic = nics
+        .iter()
+        .find(|n| n.name == cfg.bridge_nic)
+        .cloned()
+        .ok_or_else(|| format!("NIC '{}' not found", cfg.bridge_nic))?;
+    if nic.wifi {
+        return Err(format!("{} is wireless; bridge a wired NIC instead", nic.name));
+    }
+    if nic.enslaved {
+        // A re-run after a successful bridge: the NIC is already a member. If it is
+        // already our bridge, the step is done; otherwise it belongs to something else.
+        if verify_bridge(&cfg.bridge, &nic.name, r).is_ok() {
+            return Ok(());
+        }
+        return Err(format!("{} is already enslaved to another bridge/bond", nic.name));
+    }
+    let mgr = bridge::detect_manager();
+    if matches!(mgr, bridge::Mgr::Unsupported(_)) {
+        return Err(bridge::manual_snippet(&cfg.bridge, &nic));
+    }
+    let dns = bridge::nameservers();
+
+    if !nic.risky() {
+        // A spare NIC with no addressing cannot strand the operator: apply and
+        // persist with no rollback window.
+        r.step(format!("creating bridge {} on {}", cfg.bridge, nic.name));
+        let script = bridge::apply_script(&cfg.bridge, &nic, mgr, &dns, None);
+        place(r, script.as_bytes(), "0755", bridge::APPLY_PATH)?;
+        let out = r.run(true, "sh", &[bridge::APPLY_PATH])?;
+        if !ok(&out) {
+            return Err(format!("bridge setup failed: {}", errtext(&out)));
+        }
+        return verify_bridge(&cfg.bridge, &nic.name, r);
+    }
+
+    // Risky: the NIC carries the operator's connectivity. Persisting via netplan's
+    // authoritative-file takeover renames every existing netplan file aside, so
+    // refuse a multi-NIC host where that would drop another interface's config.
+    if mgr == bridge::Mgr::Netplan && nics.iter().filter(|n| n.has_ip()).count() > 1 {
+        return Err(format!(
+            "this host has more than one active interface; auto-bridging the uplink is \
+             only supported on a single-NIC host.\n{}",
+            bridge::manual_snippet(&cfg.bridge, &nic)
+        ));
+    }
+    // systemd owns the revert timer, so it must be present.
+    if !bridge::have_systemd_run() {
+        return Err(format!(
+            "systemd-run is required to safely bridge the uplink NIC.\n{}",
+            bridge::manual_snippet(&cfg.bridge, &nic)
+        ));
+    }
+
+    r.step(format!(
+        "bridging {} into {} (auto-reverts in ~{BRIDGE_TIMEOUT}s if you lose access)",
+        nic.name, cfg.bridge
+    ));
+    // The apply script arms the systemd revert timer as its first action. The
+    // timer's clock starts at surgery time, but the operator's countdown only
+    // starts after the apply returns, so the margin must cover a slow apply (e.g.
+    // a contended `netplan generate`) plus the full confirm window. The normal
+    // keep/decline paths cancel or trigger the timer explicitly; this deadline is
+    // only the backstop for the operator-vanished case.
+    let apply = bridge::apply_script(&cfg.bridge, &nic, mgr, &dns, Some(BRIDGE_TIMEOUT + 60));
+    let undo = bridge::undo_script(&cfg.bridge, &nic, mgr);
+    place(r, apply.as_bytes(), "0755", bridge::APPLY_PATH)?;
+    place(r, undo.as_bytes(), "0755", bridge::UNDO_PATH)?;
+
+    let undo_timer = format!("{}.timer", bridge::UNDO_UNIT);
+
+    // Run the apply. It arms the timer first, so even if this is interrupted the
+    // box still reverts.
+    let out = r.run(true, "sh", &[bridge::APPLY_PATH])?;
+    if !ok(&out) {
+        let undone = matches!(r.run(true, "sh", &[bridge::UNDO_PATH]), Ok(o) if o.status.success());
+        if undone {
+            let _ = r.run(true, "systemctl", &["stop", &undo_timer]);
+        }
+        return Err(format!("bridge apply failed: {}", errtext(&out)));
+    }
+
+    let keep = r.confirm(
+        &format!("Bridge live on {}. Confirm you still have access", nic.name),
+        BRIDGE_TIMEOUT,
+    );
+    if keep {
+        let _ = r.run(true, "systemctl", &["stop", &undo_timer]);
+        verify_bridge(&cfg.bridge, &nic.name, r)?;
+        r.info("bridge kept and persisted".into());
+        Ok(())
+    } else {
+        // Revert synchronously so the box is actually restored before we report it;
+        // the systemd timer was only the backstop for our own death. Leave it armed
+        // if the synchronous undo did not succeed.
+        let undone = matches!(r.run(true, "sh", &[bridge::UNDO_PATH]), Ok(o) if o.status.success());
+        if undone {
+            let _ = r.run(true, "systemctl", &["stop", &undo_timer]);
+        }
+        Err("no confirmation; the bridge was reverted".into())
+    }
+}
+
+/// Confirm the NIC ended up enslaved to the bridge after an apply.
+fn verify_bridge(bridge: &str, nic: &str, r: &mut dyn Runner) -> Result<(), String> {
+    let out = r.run(false, "ip", &["-o", "link", "show", "master", bridge])?;
+    let listed = String::from_utf8_lossy(&out.stdout);
+    let enslaved = listed.contains(&format!(" {nic}:")) || listed.contains(&format!(" {nic}@"));
+    if !ok(&out) || !enslaved {
+        return Err(format!("{nic} is not enslaved to {bridge} after apply"));
+    }
+    Ok(())
+}
+
 /// Preview the steps without touching the system. Used by --dry-run and for
 /// safe demos; the progress screen looks the same as a real install.
 // The `sleep` is a deliberate no-op that paces the preview through the real
@@ -299,6 +436,12 @@ fn dstep(r: &mut dyn Runner, desc: &str) {
 fn dry_run(cfg: &Config, _sub: &str, r: &mut dyn Runner) -> Result<Outcome, String> {
     r.info("dry run: no changes will be made".into());
     dstep(r, &format!("would prepare {ETC_DIR} and write {ENV_FILE}"));
+    if cfg.mode == Mode::Server && cfg.kind == Kind::Bridge && cfg.bridge_create {
+        dstep(
+            r,
+            &format!("would create bridge {} on {}", cfg.bridge, cfg.bridge_nic),
+        );
+    }
     let manage = match cfg.method {
         Method::Docker if cfg.deploy == Deploy::Compose => {
             let dc = sys::compose_argv();

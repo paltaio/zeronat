@@ -60,6 +60,15 @@ pub struct Config {
     pub ports: String,
     pub tap: String,
     pub bridge: String,
+    /// Physical NIC the installer should enslave into the bridge. Empty means an
+    /// existing bridge is reused (or none).
+    pub bridge_nic: String,
+    /// Build the host bridge (and enslave `bridge_nic`) instead of assuming one.
+    pub bridge_create: bool,
+    /// Candidate physical NICs and the one carrying this SSH session, probed for
+    /// the bridge-NIC prompt.
+    pub nics: Vec<String>,
+    pub ssh_nic: String,
     pub tap_mtu: String,
     pub control: String,
     pub use_dht: bool,
@@ -90,6 +99,10 @@ impl Config {
             ports: String::new(),
             tap: "zn0".to_string(),
             bridge: String::new(),
+            bridge_nic: String::new(),
+            bridge_create: false,
+            nics: Vec::new(),
+            ssh_nic: String::new(),
             tap_mtu: String::new(),
             control: "2222".to_string(),
             use_dht: false,
@@ -119,6 +132,8 @@ enum Step {
     Kind,
     Ports,
     Tap,
+    BridgeNic,
+    BridgeName,
     SshExclude,
     Discovery,
     ServerAddr,
@@ -169,7 +184,12 @@ impl App {
     fn is_input(step: Step) -> bool {
         matches!(
             step,
-            Step::Tap | Step::ServerAddr | Step::Control | Step::SecretEntry
+            Step::Tap
+                | Step::BridgeNic
+                | Step::BridgeName
+                | Step::ServerAddr
+                | Step::Control
+                | Step::SecretEntry
         )
     }
 
@@ -187,6 +207,10 @@ impl App {
                 Kind::All if self.cfg.mode == Mode::Server => Step::SshExclude,
                 Kind::All => Step::Discovery,
             },
+            // Only a server bridges into a host NIC; a client just runs on the TAP.
+            Step::Tap if self.cfg.mode == Mode::Server => Step::BridgeNic,
+            Step::BridgeNic if self.cfg.bridge_nic.trim().is_empty() => Step::BridgeName,
+            Step::BridgeNic | Step::BridgeName => Step::Discovery,
             Step::Ports | Step::Tap | Step::SshExclude => Step::Discovery,
             Step::Discovery => match self.cfg.mode {
                 Mode::Server => Step::Control,
@@ -214,6 +238,8 @@ impl App {
         } else if App::is_input(step) {
             self.input = match step {
                 Step::Tap => self.cfg.tap.clone(),
+                Step::BridgeNic => self.cfg.bridge_nic.clone(),
+                Step::BridgeName => self.cfg.bridge.clone(),
                 Step::ServerAddr => self.cfg.server_addr.clone(),
                 Step::Control => self.cfg.control.clone(),
                 _ => String::new(),
@@ -488,6 +514,20 @@ impl App {
                 }
                 self.cfg.tap = v;
             }
+            Step::BridgeNic => {
+                if v.is_empty() {
+                    self.cfg.bridge_nic.clear();
+                    self.cfg.bridge_create = false;
+                } else {
+                    self.cfg.bridge_nic = v;
+                    self.cfg.bridge_create = true;
+                    if self.cfg.bridge.trim().is_empty() {
+                        self.cfg.bridge = "br-zeronat".to_string();
+                    }
+                }
+            }
+            // Empty is allowed: a standalone TAP with no host bridge.
+            Step::BridgeName => self.cfg.bridge = v,
             Step::ServerAddr => {
                 if v.is_empty() {
                     self.error = Some("enter the server address".into());
@@ -695,6 +735,8 @@ impl App {
             Step::Kind => "What should the tunnel carry?",
             Step::Ports => "Ports to forward",
             Step::Tap => "TAP device name",
+            Step::BridgeNic => "Physical NIC to bridge",
+            Step::BridgeName => "Existing bridge name",
             Step::SshExclude => "Forward every port?",
             Step::Discovery => match self.cfg.mode {
                 Mode::Server => "How will clients reach this server?",
@@ -786,13 +828,25 @@ impl App {
         body.push(zntui::frame::row(w, hint));
     }
 
-    fn input_hint(&self) -> &'static str {
+    fn input_hint(&self) -> String {
         match self.step {
-            Step::Tap => "Linux only; created and bridged for raw Ethernet/PPPoE",
-            Step::ServerAddr => "HOST or HOST:PORT (default port 2222)",
-            Step::Control => "the UDP/TCP port the tunnel control runs on",
-            Step::SecretEntry => "must match the secret on the other side",
-            _ => "",
+            Step::Tap => "Linux only; the TAP relays raw Ethernet/PPPoE".into(),
+            Step::BridgeNic => {
+                let mut h = if self.cfg.nics.is_empty() {
+                    "NIC to enslave; blank to use an existing bridge".to_string()
+                } else {
+                    format!("detected: {}", self.cfg.nics.join(", "))
+                };
+                if !self.cfg.ssh_nic.is_empty() {
+                    h.push_str(&format!("  ({} carries this SSH session)", self.cfg.ssh_nic));
+                }
+                h
+            }
+            Step::BridgeName => "the TAP is enslaved to this existing bridge".into(),
+            Step::ServerAddr => "HOST or HOST:PORT (default port 2222)".into(),
+            Step::Control => "the UDP/TCP port the tunnel control runs on".into(),
+            Step::SecretEntry => "must match the secret on the other side".into(),
+            _ => String::new(),
         }
     }
 
@@ -821,7 +875,18 @@ impl App {
         );
         match self.cfg.kind {
             Kind::Ports => add("ports", self.cfg.ports.clone(), PLAIN),
-            Kind::Bridge => add("bridge", self.cfg.tap.clone(), PLAIN),
+            Kind::Bridge => {
+                add("tap", self.cfg.tap.clone(), PLAIN);
+                if self.cfg.bridge_create {
+                    add(
+                        "bridge",
+                        format!("{} (create on {})", self.cfg.bridge, self.cfg.bridge_nic),
+                        WARN,
+                    );
+                } else if !self.cfg.bridge.trim().is_empty() {
+                    add("bridge", self.cfg.bridge.clone(), PLAIN);
+                }
+            }
             Kind::All => {
                 add("forward", "all traffic".into(), PLAIN);
                 if self.cfg.mode == Mode::Server {

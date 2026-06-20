@@ -3,6 +3,7 @@
 //! it works under `curl ... | sh`.
 
 mod args;
+mod bridge;
 mod install;
 mod sys;
 mod term;
@@ -13,7 +14,8 @@ use install::{Lvl, Outcome};
 use term::{Renderer, Tty};
 use ui::App;
 use zntui::frame;
-use zntui::style::{Color, Line, Style, ACCENT, BAD, GOOD, MUTED, PLAIN};
+use zntui::key::Key;
+use zntui::style::{Color, Line, Style, ACCENT, BAD, GOOD, MUTED, PLAIN, WARN};
 
 const BOLD: Style = Style::fg(Color::Default).bold();
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -74,6 +76,72 @@ impl install::Runner for LiveRunner<'_> {
             .join()
             .unwrap_or_else(|_| Err("command thread panicked".into()))
     }
+
+    fn confirm(&mut self, prompt: &str, secs: u32) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            let remaining = secs.saturating_sub(start.elapsed().as_secs() as u32);
+            let (w, h) = self.tty.size();
+            let view = confirm_view(prompt, remaining, w as usize, h as usize);
+            let _ = self.renderer.draw(self.tty, view, w, h);
+            if remaining == 0 {
+                return false;
+            }
+            // A short poll keeps the countdown ticking; a tty error (the session
+            // dropping mid-window) just keeps counting down to the revert.
+            match self.tty.poll_key(400) {
+                Ok(Some(Key::Enter | Key::Char('y') | Key::Char('Y'))) => return true,
+                Ok(Some(
+                    Key::Esc | Key::Char('n') | Key::Char('N') | Key::Char('q') | Key::CtrlC,
+                )) => return false,
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The countdown screen shown while waiting for the operator to confirm a risky
+/// bridge stayed connected.
+fn confirm_view(prompt: &str, remaining: u32, w: usize, h: usize) -> Vec<String> {
+    if w < 30 || h < 12 {
+        return vec![" ".repeat(w); h];
+    }
+    let mut left = Line::new();
+    left.add(ACCENT, "zeronat");
+    left.add(MUTED, " installer");
+    let mut right = Line::new();
+    right.add(MUTED, "bridge");
+    let mut lines = vec![frame::top(w, left, right)];
+
+    let mut body: Vec<String> = vec![frame::blank(w)];
+    let mut title = Line::new();
+    title.add(BOLD, "  Confirm network bridge");
+    body.push(frame::row(w, title));
+    body.push(frame::blank(w));
+    let mut p = Line::new();
+    p.add(PLAIN, &format!("  {prompt}"));
+    body.push(frame::row(w, p));
+    body.push(frame::blank(w));
+    let mut c = Line::new();
+    c.add(WARN, &format!("  reverting in {remaining}s unless you confirm"));
+    body.push(frame::row(w, c));
+
+    let area = h.saturating_sub(5);
+    body.truncate(area);
+    while body.len() < area {
+        body.push(frame::blank(w));
+    }
+    lines.extend(body);
+
+    lines.push(frame::divider(w));
+    let mut hint = Line::new();
+    hint.add(ACCENT, "⏎");
+    hint.add(MUTED, " keep   ");
+    hint.add(ACCENT, "esc");
+    hint.add(MUTED, " revert");
+    lines.push(frame::row(w, hint));
+    lines.push(frame::bottom(w));
+    lines
 }
 
 const USAGE: &str = "\
@@ -94,6 +162,7 @@ zeronat installer
   --announce-port PORT      (server, with --dht) public port to announce
   --tap NAME                L2 bridge instead of ports: relay raw Ethernet/PPPoE (Linux)
   --bridge NAME             (with --tap) enslave the TAP to this existing bridge
+  --bridge-nic NIC          (server --tap) build the bridge and enslave this NIC
   --tap-mtu N               (with --tap) TAP MTU (default 1400)
   -y, --yes                 no prompts; fail if a required value is missing
   -n, --dry-run             preview the steps without making changes
@@ -143,13 +212,21 @@ fn real_main() -> i32 {
         return run_headless(&parsed, &host, dry);
     }
 
-    let cfg = match args::build(&parsed, &host, headless) {
+    let mut cfg = match args::build(&parsed, &host, headless) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
             return 1;
         }
     };
+    // Probe NICs so the bridge step can list them and flag the SSH interface.
+    let nics = bridge::list_nics();
+    cfg.ssh_nic = nics
+        .iter()
+        .find(|n| n.is_ssh)
+        .map(|n| n.name.clone())
+        .unwrap_or_default();
+    cfg.nics = nics.into_iter().map(|n| n.name).collect();
 
     let mut tty = match Tty::open() {
         Ok(t) => t,
@@ -270,6 +347,13 @@ impl install::Runner for PlainRunner {
         args: &[&str],
     ) -> Result<std::process::Output, String> {
         sys::run(privileged, program, args)
+    }
+
+    fn confirm(&mut self, _prompt: &str, secs: u32) -> bool {
+        // No operator to press a key; keep the bridge only if the box stays
+        // reachable through it.
+        eprintln!("    verifying connectivity over the new bridge...");
+        bridge::probe_connectivity(secs)
     }
 }
 

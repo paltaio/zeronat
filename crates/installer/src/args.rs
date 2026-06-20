@@ -24,6 +24,7 @@ pub struct Parsed {
     pub announce_port: Option<String>,
     pub tap: Option<String>,
     pub bridge: Option<String>,
+    pub bridge_nic: Option<String>,
     pub tap_mtu: Option<String>,
     pub all: bool,
     pub headless: bool,
@@ -65,6 +66,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             "--announce-port" => p.announce_port = Some(take(&mut i, a)?),
             "--tap" => p.tap = Some(take(&mut i, a)?),
             "--bridge" => p.bridge = Some(take(&mut i, a)?),
+            "--bridge-nic" => p.bridge_nic = Some(take(&mut i, a)?),
             "--tap-mtu" => p.tap_mtu = Some(take(&mut i, a)?),
             "--all" => p.all = true,
             "-y" | "--yes" => p.headless = true,
@@ -181,6 +183,18 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
     }
     if let Some(b) = &p.bridge {
         cfg.bridge = b.clone();
+    }
+    // --bridge-nic asks the installer to build the host bridge (and enslave the
+    // NIC) itself, rather than assuming an existing bridge.
+    if let Some(n) = &p.bridge_nic {
+        cfg.bridge_nic = n.clone();
+        cfg.bridge_create = true;
+        if cfg.bridge.trim().is_empty() {
+            cfg.bridge = "br-zeronat".to_string();
+        }
+    }
+    if cfg.bridge_create && (cfg.mode != Mode::Server || cfg.kind != Kind::Bridge) {
+        return Err("--bridge-nic applies to a server in --tap bridge mode".into());
     }
     if let Some(m) = &p.tap_mtu {
         cfg.tap_mtu = m.clone();

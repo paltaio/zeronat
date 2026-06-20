@@ -112,6 +112,42 @@ impl Tty {
             }
         }
     }
+
+    /// Like `next_key` but waits at most `timeout_ms`. Returns `Ok(None)` on
+    /// timeout so a caller can drive a countdown. An error (e.g. the tty closing
+    /// when an SSH session drops) propagates so the caller can stop waiting.
+    pub fn poll_key(&mut self, timeout_ms: i32) -> io::Result<Option<Key>> {
+        loop {
+            if self.bpos < self.buf.len() {
+                let (key, adv) = parse(&self.buf[self.bpos..]);
+                self.bpos += adv.max(1);
+                if let Some(k) = key {
+                    return Ok(Some(k));
+                }
+                continue;
+            }
+            let mut pfd = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if r < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if r == 0 {
+                return Ok(None);
+            }
+            let mut tmp = [0u8; 64];
+            let n = self.file.read(&mut tmp)?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "tty closed"));
+            }
+            self.buf.clear();
+            self.buf.extend_from_slice(&tmp[..n]);
+            self.bpos = 0;
+        }
+    }
 }
 
 /// Flicker-free renderer: keeps the previous frame and rewrites only the rows
