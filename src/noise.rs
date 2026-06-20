@@ -20,6 +20,14 @@ pub type Noise = (NoiseReader, NoiseWriter);
 type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
 type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
+/// A bidirectional stream erased to a single trait object. The handshake
+/// interleaves reads and writes on one stream, so it needs a combined trait;
+/// erasing here lets the handshake state machine compile once instead of once
+/// per concrete stream type (TcpStream, KcpStream, ...).
+trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
+type BoxStream = Box<dyn IoStream>;
+
 /// Derive the 32-byte pre-shared key from the user's passphrase.
 pub fn derive_psk(secret: &str) -> [u8; 32] {
     let mut h = Blake2s256::new();
@@ -179,10 +187,7 @@ struct Keys {
 }
 
 /// Run the NNpsk0 initiator handshake to completion over `stream`.
-async fn run_initiator<S>(stream: &mut S, psk: &[u8; 32], payload1: &[u8]) -> Result<Keys>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+async fn run_initiator(stream: &mut BoxStream, psk: &[u8; 32], payload1: &[u8]) -> Result<Keys> {
     let mut ss = SymmetricState::new();
     ss.mix_hash(&[]); // MixHash(prologue) with the empty prologue.
 
@@ -221,10 +226,7 @@ where
 
 /// Run the NNpsk0 responder handshake; returns the keys and the decrypted
 /// payload from message 1.
-async fn run_responder<S>(stream: &mut S, psk: &[u8; 32]) -> Result<(Keys, Vec<u8>)>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+async fn run_responder(stream: &mut BoxStream, psk: &[u8; 32]) -> Result<(Keys, Vec<u8>)> {
     let mut ss = SymmetricState::new();
     ss.mix_hash(&[]); // MixHash(prologue) with the empty prologue.
 
@@ -265,26 +267,25 @@ where
     ))
 }
 
-pub async fn client_handshake<S>(mut stream: S, psk: &[u8; 32]) -> Result<Noise>
+pub async fn client_handshake<S>(stream: S, psk: &[u8; 32]) -> Result<Noise>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let mut stream: BoxStream = Box::new(stream);
     let keys = run_initiator(&mut stream, psk, &[]).await?;
     Ok(finish(stream, keys))
 }
 
-pub async fn server_handshake<S>(mut stream: S, psk: &[u8; 32]) -> Result<Noise>
+pub async fn server_handshake<S>(stream: S, psk: &[u8; 32]) -> Result<Noise>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let mut stream: BoxStream = Box::new(stream);
     let (keys, _payload) = run_responder(&mut stream, psk).await?;
     Ok(finish(stream, keys))
 }
 
-fn finish<S>(stream: S, keys: Keys) -> Noise
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+fn finish(stream: BoxStream, keys: Keys) -> Noise {
     let (rh, wh) = tokio::io::split(stream);
     (
         NoiseReader {
@@ -437,13 +438,14 @@ impl StatelessNoise {
 /// Initiator handshake that converts straight to a stateless transport.
 /// The 8-byte `id` rides in the (PSK-encrypted) first handshake message payload.
 pub async fn client_handshake_stateless<S>(
-    mut stream: S,
+    stream: S,
     psk: &[u8; 32],
     id: u64,
 ) -> Result<StatelessNoise>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let mut stream: BoxStream = Box::new(stream);
     let keys = run_initiator(&mut stream, psk, &id.to_be_bytes()).await?;
     Ok(StatelessNoise {
         send_key: keys.send_key,
@@ -454,12 +456,13 @@ where
 
 /// Responder handshake; returns the peer's `id` and the stateless transport.
 pub async fn server_handshake_stateless<S>(
-    mut stream: S,
+    stream: S,
     psk: &[u8; 32],
 ) -> Result<(u64, StatelessNoise)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let mut stream: BoxStream = Box::new(stream);
     let (keys, payload) = run_responder(&mut stream, psk).await?;
     if payload.len() < 8 {
         return Err("missing stream id in handshake payload".into());

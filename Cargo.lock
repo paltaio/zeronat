@@ -571,6 +571,7 @@ dependencies = [
  "kcp",
  "libc",
  "sha1",
+ "sha2",
  "snow",
  "tokio",
  "x25519-dalek",

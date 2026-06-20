@@ -21,7 +21,7 @@ fn machine_suffix() -> String {
     if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
         let id = id.trim();
         if id.len() >= 4 {
-            return id[id.len() - 4..].to_lowercase();
+            return id[id.len() - 4..].to_ascii_lowercase();
         }
     }
     let mut h = Blake2s256::new();
@@ -46,7 +46,7 @@ fn short_hostname() -> String {
         .unwrap_or_else(|| "node".to_string());
 
     let normalized: String = raw
-        .to_lowercase()
+        .to_ascii_lowercase()
         .split('.')
         .next()
         .unwrap_or("")
