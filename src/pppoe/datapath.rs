@@ -184,9 +184,17 @@ pub struct PppoeDatapath<'a> {
     /// True once an Echo-Request has been sent and its interval has not yet been
     /// scored. Keeps the first interval (before any request) from being counted.
     echo_outstanding: bool,
+    /// Set when any inbound session frame from the AC arrives; cleared each scored
+    /// interval. Liveness keys on this, not only matching echo-replies: a link
+    /// passing traffic or receiving the AC's own keepalives is alive even when the
+    /// AC never answers our Echo-Requests (pppd leaves LCP-echo off by default for
+    /// exactly that reason). Only total AC silence over the window declares a death.
+    inbound_seen: bool,
     /// Set when liveness fails, an inbound PADT for our session arrives, or the
     /// PPP FSM drops below Opened after the link came up. The shell redials.
     link_down: bool,
+    /// Why `link_down` was set (`echo-timeout`, `padt`, `lcp-closed`), for the log.
+    link_down_reason: Option<&'static str>,
     // Construction inputs retained so `reset` can rebuild the inner FSMs for an
     // in-session redial without re-borrowing from `new`. The credentials are
     // borrowed for `'a`, the lifetime the datapath already carries.
@@ -244,7 +252,9 @@ impl<'a> PppoeDatapath<'a> {
             echo_ticks: 0,
             echo_misses: 0,
             echo_outstanding: false,
+            inbound_seen: false,
             link_down: false,
+            link_down_reason: None,
             username,
             password,
             service_name,
@@ -273,6 +283,12 @@ impl<'a> PppoeDatapath<'a> {
     /// Our locally-administered client MAC for this session.
     pub fn our_mac(&self) -> MacAddr {
         self.our_mac
+    }
+
+    /// Why the link last went down (`echo-timeout`, `padt`, `lcp-closed`), for the
+    /// shell's redial log. `unknown` before any link-down.
+    pub fn link_down_reason(&self) -> &'static str {
+        self.link_down_reason.unwrap_or("unknown")
     }
 
     /// Kick discovery: emit the first PADI into the outbound queue. Call once
@@ -315,7 +331,9 @@ impl<'a> PppoeDatapath<'a> {
         self.echo_ticks = 0;
         self.echo_misses = 0;
         self.echo_outstanding = false;
+        self.inbound_seen = false;
         self.link_down = false;
+        self.link_down_reason = None;
 
         self.start();
         Ok(())
@@ -382,10 +400,13 @@ impl<'a> PppoeDatapath<'a> {
     /// Established and not already down.
     ///
     /// The first Echo-Request goes out on the Established edge. Each subsequent
-    /// interval is scored exactly once: a single take-and-clear of the reply flag
-    /// per interval, counting a miss only for an interval in which a request was
-    /// outstanding. After ECHO_DEAD_THRESHOLD consecutive missed intervals the
-    /// link is declared down. A PPP-side drop below LCP-Opened is also a down.
+    /// interval is scored exactly once: the interval counts as alive if the AC
+    /// answered our echo OR sent any session frame (`inbound_seen`); both flags are
+    /// take-and-cleared once per interval. This keys liveness on AC activity rather
+    /// than only on matching echo-replies, because some BRAS deployments do not
+    /// answer LCP echoes yet keep the link up. Only ECHO_DEAD_THRESHOLD consecutive
+    /// intervals of total AC silence declare the link down. A PPP-side drop below
+    /// LCP-Opened is also a down.
     fn tick_liveness(&mut self) {
         if self.established.is_none() || self.link_down {
             return;
@@ -397,15 +418,19 @@ impl<'a> PppoeDatapath<'a> {
         // RFC 1661 reopen, not a teardown: leave the link up and let it resettle.
         if self.ppp.lcp_closed() {
             self.link_down = true;
+            self.link_down_reason = Some("lcp-closed");
             return;
         }
 
-        // First echo on the Established edge: send immediately, start the timer.
+        // First echo on the Established edge: send immediately, start the timer, and
+        // clear any inbound/reply seen during negotiation so the window starts clean.
         if !self.echo_outstanding {
             self.ppp.send_echo_request();
             self.drain_ppp_out();
             self.echo_outstanding = true;
             self.echo_ticks = 0;
+            self.inbound_seen = false;
+            let _ = self.ppp.take_echo_reply_seen();
             return;
         }
 
@@ -414,15 +439,19 @@ impl<'a> PppoeDatapath<'a> {
             return;
         }
 
-        // Interval boundary: score the just-closed interval with one take.
+        // Interval boundary: the link is alive if the AC answered our echo OR sent
+        // any session frame this interval. Take-and-clear both flags exactly once.
         self.echo_ticks = 0;
-        if self.ppp.take_echo_reply_seen() {
+        let reply = self.ppp.take_echo_reply_seen();
+        let inbound = core::mem::take(&mut self.inbound_seen);
+        if reply || inbound {
             self.echo_misses = 0;
         } else {
             self.echo_misses += 1;
         }
         if self.echo_misses >= ECHO_DEAD_THRESHOLD {
             self.link_down = true;
+            self.link_down_reason = Some("echo-timeout");
             return;
         }
         // Send the next request to open the next interval.
@@ -480,6 +509,8 @@ impl<'a> PppoeDatapath<'a> {
         if header.session_id != session.session_id {
             return; // a session frame for another client on the segment
         }
+        // A valid session frame for us is proof the AC is alive: it drives liveness.
+        self.inbound_seen = true;
         // `ppp_start..ppp_end` was validated against the PPPoE LENGTH, so indexing
         // it cannot fault.
         let payload = &frame[header.ppp_start..header.ppp_end];
@@ -503,6 +534,7 @@ impl<'a> PppoeDatapath<'a> {
         // it must not redial.
         if self.established.is_some() && !self.link_down && self.ppp.lcp_closed() {
             self.link_down = true;
+            self.link_down_reason = Some("lcp-closed");
         }
     }
 
@@ -520,6 +552,7 @@ impl<'a> PppoeDatapath<'a> {
             Action::Failed => {
                 if self.established.is_some() || self.session.is_some() {
                     self.link_down = true;
+                    self.link_down_reason = Some("padt");
                 } else {
                     self.dead = true;
                 }
@@ -627,7 +660,9 @@ mod tests {
             echo_ticks: 0,
             echo_misses: 0,
             echo_outstanding: false,
+            inbound_seen: false,
             link_down: false,
+            link_down_reason: None,
             username: USER,
             password: SECRET,
             service_name: vec![],
@@ -895,39 +930,36 @@ mod tests {
     }
 
     #[test]
-    fn loopback_echo_reply_does_not_keep_link_alive() {
-        // A reply carrying OUR own Magic-Number means the link is looped back, not a
-        // live peer (RFC 1661 section 5.8), so it must not reset the liveness
-        // counter: the link still declares down after the dead window even though a
-        // reply arrives every interval.
+    fn any_inbound_frame_keeps_link_alive_without_echo_replies() {
+        // Liveness resets on ANY inbound session frame from the AC, not only on a
+        // matching echo-reply. Here every tick delivers a loopback echo-reply (our
+        // own magic), which does NOT set the echo-reply-seen flag yet still counts
+        // as AC activity, so the link stays up past the dead window. This is the
+        // case the live NE40-BRAS hit: it does not answer our echoes but the link is
+        // alive, and pppd likewise leaves LCP-echo teardown off by default.
         let mut dp = fixed_dp();
         drive_to_established(&mut dp);
         let _ = drain_frames(&mut dp);
 
-        let mut down = false;
         for _ in 0..(ECHO_DEAD_THRESHOLD * ECHO_INTERVAL_TICKS + ECHO_INTERVAL_TICKS) {
             let phase = dp.on_tick();
-            if find_echo(&drain_frames(&mut dp)).is_some() {
-                dp.on_l2_frame(&from_ac(&echo_reply(MAGIC))); // our magic = loopback
-                let _ = drain_frames(&mut dp);
-            }
-            if matches!(phase, DpPhase::LinkDown) {
-                down = true;
-                break;
-            }
+            let _ = drain_frames(&mut dp);
+            dp.on_l2_frame(&from_ac(&echo_reply(MAGIC))); // inbound activity, not a reply
+            assert!(matches!(phase, DpPhase::Established(_)));
         }
-        assert!(down, "loopback echo-replies must not keep the link alive");
+        assert!(matches!(dp.phase(), DpPhase::Established(_)));
     }
 
     #[test]
-    fn missed_replies_declare_link_down() {
+    fn total_ac_silence_declares_link_down() {
         let mut dp = fixed_dp();
         drive_to_established(&mut dp);
         let _ = drain_frames(&mut dp);
 
-        // Edge echo + ECHO_DEAD_THRESHOLD unanswered intervals. The threshold is
-        // hit at exactly THRESHOLD*INTERVAL ticks past the edge; not before.
-        dp.on_tick(); // edge: first echo
+        // Edge echo + ECHO_DEAD_THRESHOLD intervals of TOTAL AC silence (no reply,
+        // no inbound frame). The threshold is hit at exactly THRESHOLD*INTERVAL ticks
+        // past the edge; not before.
+        dp.on_tick(); // edge: first echo, window starts clean
         let _ = drain_frames(&mut dp);
         let mut ticks = 0u32;
         loop {
@@ -944,6 +976,7 @@ mod tests {
             );
         }
         assert_eq!(ticks, ECHO_DEAD_THRESHOLD * ECHO_INTERVAL_TICKS);
+        assert_eq!(dp.link_down_reason(), "echo-timeout");
     }
 
     #[test]

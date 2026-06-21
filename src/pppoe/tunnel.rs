@@ -152,9 +152,10 @@ fn redial_in_place(
     dp: &mut PppoeDatapath<'_>,
     tun: Option<Arc<TapDevice>>,
 ) -> crate::Result<Option<Arc<TapDevice>>> {
+    let reason = dp.link_down_reason(); // captured before reset() clears it
     drop(tun); // close zppp0
+    crate::elog!("pppoe: link down ({reason}), re-dialing");
     dp.reset()?;
-    crate::elog!("pppoe: link down, re-dialing");
     Ok(None)
 }
 
