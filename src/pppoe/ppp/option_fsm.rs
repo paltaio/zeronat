@@ -239,6 +239,18 @@ impl<P: Protocol> OptionFsm<P> {
         })
     }
 
+    /// Build an outbound Echo-Request carrying a 4-byte Magic-Number body
+    /// (RFC 1661 section 5.8). Only meaningful for LCP; the driver guards the call
+    /// site so it is never built for IPCP. `id` is caller-sequenced (the engine
+    /// sequences it so the FSM stays deterministic for tests); `magic` is our
+    /// local Magic-Number. The owned body makes the returned packet `'static`.
+    pub(super) fn send_echo_request(&mut self, id: u8, magic: u32) -> Packet<'static> {
+        Packet {
+            proto: self.proto.protocol(),
+            payload: Payload::PPP(Code::EchoReq, id, PPPPayload::Owned(magic.to_be_bytes().to_vec())),
+        }
+    }
+
     /// Answer an unknown PPP protocol with an LCP Protocol-Reject (RFC 1661).
     pub fn send_protocol_reject<'a>(&mut self, pkt: &'a mut [u8]) -> Packet<'a> {
         Packet {

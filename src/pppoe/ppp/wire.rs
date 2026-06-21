@@ -138,6 +138,10 @@ impl<'a> Payload<'a> {
 
 pub enum PPPPayload<'a> {
     Raw(&'a mut [u8]),
+    /// An owned control body that does not borrow the receive buffer, used for a
+    /// frame WE originate (the LCP Echo-Request Magic-Number). Carrying its own
+    /// bytes lets the emitter return a `'static` packet without a backing buffer.
+    Owned(Vec<u8>),
     PAP(&'a [u8], &'a [u8]),
     Options(Options),
 }
@@ -146,6 +150,7 @@ impl<'a> PPPPayload<'a> {
     pub fn buffer_len(&self) -> usize {
         match self {
             Self::Raw(data) => data.len(),
+            Self::Owned(data) => data.len(),
             Self::PAP(user, pass) => 1 + user.len() + 1 + pass.len(),
             Self::Options(options) => options.buffer_len(),
         }
@@ -154,6 +159,7 @@ impl<'a> PPPPayload<'a> {
     pub fn emit(&self, buffer: &mut [u8]) {
         match self {
             Self::Raw(data) => buffer.copy_from_slice(data),
+            Self::Owned(data) => buffer.copy_from_slice(data),
             Self::PAP(user, pass) => {
                 buffer[0] = user.len() as u8;
                 buffer[1..][..user.len()].copy_from_slice(user);

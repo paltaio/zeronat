@@ -77,6 +77,25 @@ fn maybe_bring_up_zppp0(
     Ok(Some(dev))
 }
 
+/// React to a LinkDown phase: close zppp0 (its address came from the now-dead
+/// IPCP lease) and reset the datapath to Discovery in place. The select loop
+/// keeps running; discovery re-runs over the same channel and zppp0 reopens on
+/// the next Established edge with the (possibly new) address.
+///
+/// zppp0 removal relies on the shell being the sole `Arc<TapDevice>` holder, so
+/// `drop` closes the last fd and the kernel removes the non-persistent TUN. The
+/// caller drains the fresh PADI right after this returns. Errors only if the new
+/// PPP session cannot be built (system RNG failure), which tears down the tunnel.
+fn redial_in_place(
+    dp: &mut PppoeDatapath<'_>,
+    tun: Option<Arc<TapDevice>>,
+) -> crate::Result<Option<Arc<TapDevice>>> {
+    drop(tun); // close zppp0
+    dp.reset()?;
+    eprintln!("pppoe: link down, re-dialing");
+    Ok(None)
+}
+
 /// Drain every queued outbound L2 frame to the unreliable datagram channel.
 async fn flush_to_dgram(dp: &mut PppoeDatapath<'_>, tx: &DgramTx) -> crate::Result<()> {
     while let Some(frame) = dp.poll_transmit_frame() {
@@ -146,10 +165,17 @@ pub async fn run_dgram(
                     last_in = Instant::now();
                     let phase = dp.on_l2_frame(&d);
                     flush_to_dgram(&mut dp, &tx).await?;
+                    // Bring-up first: a no-op on any non-Established phase, so it is
+                    // safe to call before the LinkDown handler that closes zppp0.
                     tun = maybe_bring_up_zppp0(tun, phase, &cfg)?;
                     drain_inbound_to_tun(&mut dp, &tun).await?;
-                    if matches!(phase, DpPhase::Dead) {
-                        break Err("pppoe discovery failed".into());
+                    match phase {
+                        DpPhase::Dead => break Err("pppoe discovery failed".into()),
+                        DpPhase::LinkDown => {
+                            tun = redial_in_place(&mut dp, tun)?;
+                            flush_to_dgram(&mut dp, &tx).await?; // drain the fresh PADI
+                        }
+                        _ => {}
                     }
                 }
                 None => break Ok(()),
@@ -165,8 +191,13 @@ pub async fn run_dgram(
                 let phase = dp.on_tick();
                 flush_to_dgram(&mut dp, &tx).await?;
                 tun = maybe_bring_up_zppp0(tun, phase, &cfg)?;
-                if matches!(phase, DpPhase::Dead) {
-                    break Err("pppoe discovery failed".into());
+                match phase {
+                    DpPhase::Dead => break Err("pppoe discovery failed".into()),
+                    DpPhase::LinkDown => {
+                        tun = redial_in_place(&mut dp, tun)?;
+                        flush_to_dgram(&mut dp, &tx).await?;
+                    }
+                    _ => {}
                 }
             }
 
@@ -219,10 +250,17 @@ pub async fn run_stream(
                     }
                     let phase = dp.on_l2_frame(&d);
                     flush_to_stream(&mut dp, &mut nw).await?;
+                    // Bring-up first: a no-op on any non-Established phase, so it is
+                    // safe to call before the LinkDown handler that closes zppp0.
                     tun = maybe_bring_up_zppp0(tun, phase, &cfg)?;
                     drain_inbound_to_tun(&mut dp, &tun).await?;
-                    if matches!(phase, DpPhase::Dead) {
-                        break Err("pppoe discovery failed".into());
+                    match phase {
+                        DpPhase::Dead => break Err("pppoe discovery failed".into()),
+                        DpPhase::LinkDown => {
+                            tun = redial_in_place(&mut dp, tun)?;
+                            flush_to_stream(&mut dp, &mut nw).await?; // drain the fresh PADI
+                        }
+                        _ => {}
                     }
                 }
                 Err(_) => break Ok(()),
@@ -238,8 +276,13 @@ pub async fn run_stream(
                 let phase = dp.on_tick();
                 flush_to_stream(&mut dp, &mut nw).await?;
                 tun = maybe_bring_up_zppp0(tun, phase, &cfg)?;
-                if matches!(phase, DpPhase::Dead) {
-                    break Err("pppoe discovery failed".into());
+                match phase {
+                    DpPhase::Dead => break Err("pppoe discovery failed".into()),
+                    DpPhase::LinkDown => {
+                        tun = redial_in_place(&mut dp, tun)?;
+                        flush_to_stream(&mut dp, &mut nw).await?;
+                    }
+                    _ => {}
                 }
             }
 

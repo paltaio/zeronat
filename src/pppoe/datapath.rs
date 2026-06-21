@@ -8,9 +8,8 @@
 //! drained with `poll_inbound_ip`. The async shell (`super::tunnel`) owns the real
 //! channel and the TUN and pumps this core.
 //!
-//! The L2 backend (the tunnel channel, or a future raw `AF_PACKET` bare client)
-//! is interchangeable precisely because this core touches no socket:
-//! a different shell can reuse `PppoeDatapath` verbatim and route the drained
+//! Because this core touches no socket, the L2 backend is interchangeable: a
+//! different shell can reuse `PppoeDatapath` verbatim and route the drained
 //! frames to a different channel.
 //!
 //! Every inbound parse goes through the bounds-checked typed-error decoders in
@@ -28,6 +27,16 @@ const PPP_PROTO_IPV4: [u8; 2] = [0x00, 0x21];
 /// PPPoE-over-tunnel overhead the inner PPP MTU must leave room for: the 6-byte
 /// PPPoE session header plus the 2-byte PPP Protocol field.
 pub const PPPOE_OVERHEAD: u16 = 8;
+
+/// LCP Echo-Request cadence, in `on_tick` ticks, once the link is Established.
+/// The shell drives `on_tick` once a second, so this probes every 25s, on the
+/// same timescale the tunnel transport already keepalives, without flooding.
+const ECHO_INTERVAL_TICKS: u32 = 25;
+
+/// Consecutive unanswered Echo-Request intervals that declare the link dead.
+/// With ECHO_INTERVAL_TICKS this is a ~75s liveness window: above a single lost
+/// echo or a brief peer pause, well under a stuck-forever link.
+const ECHO_DEAD_THRESHOLD: u32 = 3;
 
 /// Effective IP MTU / advertised LCP MRU for a PPPoE link riding a tunnel whose L2
 /// MTU is `tunnel_tap_mtu`. The inner PPP payload is capped by the tunnel MTU
@@ -50,7 +59,13 @@ pub enum DpPhase {
     Ppp,
     /// IPCP up; the negotiated IP config is ready, zppp0 can come up / is up.
     Established(engine::Established),
-    /// Discovery failed permanently (retries exhausted or PADT).
+    /// The link was Established and then died (echo timeout, inbound PADT, or the
+    /// PPP FSM dropping below Opened). The shell tears down zppp0 and redials in
+    /// place. Distinct from `Dead`, which is a permanent discovery failure that
+    /// bounces the whole tunnel.
+    LinkDown,
+    /// Discovery failed permanently (retries exhausted or PADT before the link
+    /// ever came up).
     Dead,
 }
 
@@ -76,6 +91,27 @@ pub struct PppoeDatapath<'a> {
     inbound_ip: Vec<Vec<u8>>,
     /// True once discovery has permanently failed.
     dead: bool,
+    /// Ticks since the last Echo-Request, counted only while Established.
+    echo_ticks: u32,
+    /// Consecutive Echo-Request intervals with no matching reply observed.
+    echo_misses: u32,
+    /// True once an Echo-Request has been sent and its interval has not yet been
+    /// scored. Keeps the first interval (before any request) from being counted.
+    echo_outstanding: bool,
+    /// Set when liveness fails, an inbound PADT for our session arrives, or the
+    /// PPP FSM drops below Opened after the link came up. The shell redials.
+    link_down: bool,
+    // Construction inputs retained so `reset` can rebuild the inner FSMs for an
+    // in-session redial without re-borrowing from `new`. The credentials are
+    // borrowed for `'a`, the lifetime the datapath already carries.
+    username: &'a [u8],
+    password: &'a [u8],
+    service_name: Vec<u8>,
+    host_uniq: Option<Vec<u8>>,
+    mru: u16,
+    retransmit_ticks: u32,
+    max_attempts: u32,
+    request_dns: bool,
 }
 
 impl<'a> PppoeDatapath<'a> {
@@ -92,17 +128,20 @@ impl<'a> PppoeDatapath<'a> {
         max_attempts: u32,
     ) -> super::Result<Self> {
         let our_mac = MacAddr::random_local()?;
-        let mut host_uniq = [0u8; 4];
-        getrandom::getrandom(&mut host_uniq).map_err(|_| super::Error::Rng)?;
+        let mut hu = [0u8; 4];
+        getrandom::getrandom(&mut hu).map_err(|_| super::Error::Rng)?;
+        let host_uniq = Some(hu.to_vec());
         let discovery = Discovery::new(
             our_mac,
-            service_name,
-            Some(host_uniq.to_vec()),
+            service_name.clone(),
+            host_uniq.clone(),
             retransmit_ticks,
             max_attempts,
         );
+        let request_dns = false;
         let mut cfg = PppConfig::with_random_magic(username, password)?;
         cfg.mru = mru;
+        cfg.request_dns = request_dns;
         let ppp = PppSession::new(cfg)?;
         Ok(Self {
             our_mac,
@@ -113,6 +152,18 @@ impl<'a> PppoeDatapath<'a> {
             out: Vec::new(),
             inbound_ip: Vec::new(),
             dead: false,
+            echo_ticks: 0,
+            echo_misses: 0,
+            echo_outstanding: false,
+            link_down: false,
+            username,
+            password,
+            service_name,
+            host_uniq,
+            mru,
+            retransmit_ticks,
+            max_attempts,
+            request_dns,
         })
     }
 
@@ -126,6 +177,45 @@ impl<'a> PppoeDatapath<'a> {
     pub fn start(&mut self) {
         let action = self.discovery.start();
         self.apply_discovery_action(action);
+    }
+
+    /// Tear down the current session and return to Discovery for an in-session
+    /// redial: same source MAC, Service-Name, and Host-Uniq selector, but a fresh
+    /// discovery (new PADI -> new session id) and a fresh PPP session with a new
+    /// Magic-Number. Called by the shell after it observes LinkDown and closes
+    /// zppp0. Re-emits the first PADI, so the caller drains `poll_transmit_frame`
+    /// right after.
+    ///
+    /// No PADT is sent to the AC: the old session is already dead and a fresh PADI
+    /// starts a new one the BRAS treats independently.
+    ///
+    /// Errors only if the system RNG fails while drawing the new Magic-Number,
+    /// which on Linux is effectively impossible; the shell then tears down the
+    /// tunnel and the reconnect loop redials from scratch.
+    pub fn reset(&mut self) -> super::Result<()> {
+        self.discovery = Discovery::new(
+            self.our_mac,
+            self.service_name.clone(),
+            self.host_uniq.clone(),
+            self.retransmit_ticks,
+            self.max_attempts,
+        );
+        let mut cfg = PppConfig::with_random_magic(self.username, self.password)?;
+        cfg.mru = self.mru;
+        cfg.request_dns = self.request_dns;
+        self.ppp = PppSession::new(cfg)?;
+
+        self.session = None;
+        self.established = None;
+        self.out.clear();
+        self.inbound_ip.clear();
+        self.echo_ticks = 0;
+        self.echo_misses = 0;
+        self.echo_outstanding = false;
+        self.link_down = false;
+
+        self.start();
+        Ok(())
     }
 
     /// Feed one inbound raw Ethernet frame from the L2 channel and return the
@@ -176,7 +266,60 @@ impl<'a> PppoeDatapath<'a> {
         self.apply_discovery_action(action);
         self.ppp.poll();
         self.drain_ppp_out();
+        self.tick_liveness();
         self.phase()
+    }
+
+    /// Run the LCP-echo liveness cycle for one tick. A no-op unless the link is
+    /// Established and not already down.
+    ///
+    /// The first Echo-Request goes out on the Established edge. Each subsequent
+    /// interval is scored exactly once: a single take-and-clear of the reply flag
+    /// per interval, counting a miss only for an interval in which a request was
+    /// outstanding. After ECHO_DEAD_THRESHOLD consecutive missed intervals the
+    /// link is declared down. A PPP-side drop below LCP-Opened is also a down.
+    fn tick_liveness(&mut self) {
+        if self.established.is_none() || self.link_down {
+            return;
+        }
+
+        // A previously-Opened link whose LCP reached Closed (inbound Terminate, or
+        // a local close) is a PPP-side down. A transient sub-Opened dip while an
+        // inbound Configure-Request renegotiates (ReqSent/AckSent/AckReceived) is a
+        // RFC 1661 reopen, not a teardown: leave the link up and let it resettle.
+        if self.ppp.lcp_closed() {
+            self.link_down = true;
+            return;
+        }
+
+        // First echo on the Established edge: send immediately, start the timer.
+        if !self.echo_outstanding {
+            self.ppp.send_echo_request();
+            self.drain_ppp_out();
+            self.echo_outstanding = true;
+            self.echo_ticks = 0;
+            return;
+        }
+
+        self.echo_ticks += 1;
+        if self.echo_ticks < ECHO_INTERVAL_TICKS {
+            return;
+        }
+
+        // Interval boundary: score the just-closed interval with one take.
+        self.echo_ticks = 0;
+        if self.ppp.take_echo_reply_seen() {
+            self.echo_misses = 0;
+        } else {
+            self.echo_misses += 1;
+        }
+        if self.echo_misses >= ECHO_DEAD_THRESHOLD {
+            self.link_down = true;
+            return;
+        }
+        // Send the next request to open the next interval.
+        self.ppp.send_echo_request();
+        self.drain_ppp_out();
     }
 
     /// Drain the next outbound raw Ethernet frame for the L2 channel, or `None`.
@@ -201,6 +344,9 @@ impl<'a> PppoeDatapath<'a> {
     pub fn phase(&self) -> DpPhase {
         if self.dead {
             return DpPhase::Dead;
+        }
+        if self.link_down {
+            return DpPhase::LinkDown;
         }
         if let Some(est) = self.established {
             return DpPhase::Established(est);
@@ -235,6 +381,14 @@ impl<'a> PppoeDatapath<'a> {
         }
         self.drain_ppp_out();
         self.refresh_established();
+        // An inbound Terminate that drives LCP to Closed after the link came up is a
+        // link-down. Catch it on the frame rather than waiting a tick. An inbound
+        // Configure-Request that reopens negotiation (RFC 1661 RcR in Opened) dips
+        // below Opened but stays sub-Closed; that is renegotiation, not teardown, so
+        // it must not redial.
+        if self.established.is_some() && !self.link_down && self.ppp.lcp_closed() {
+            self.link_down = true;
+        }
     }
 
     /// Act on a discovery `Action`: queue frames to send, latch the session and
@@ -244,7 +398,17 @@ impl<'a> PppoeDatapath<'a> {
             Action::Send(bytes) => self.out.push(bytes),
             Action::Idle => {}
             Action::Established(est) => self.on_discovery_established(est),
-            Action::Failed => self.dead = true,
+            // A discovery failure once a session has latched (inbound PADT for our
+            // session, or a post-Established failure) is a recoverable link-down:
+            // the shell redials in place. Before any session latches it stays a
+            // hard discovery death that bounces the tunnel.
+            Action::Failed => {
+                if self.established.is_some() || self.session.is_some() {
+                    self.link_down = true;
+                } else {
+                    self.dead = true;
+                }
+            }
         }
     }
 
@@ -342,6 +506,18 @@ mod tests {
             out: Vec::new(),
             inbound_ip: Vec::new(),
             dead: false,
+            echo_ticks: 0,
+            echo_misses: 0,
+            echo_outstanding: false,
+            link_down: false,
+            username: USER,
+            password: SECRET,
+            service_name: vec![],
+            host_uniq: Some(HU.to_vec()),
+            mru: MRU,
+            retransmit_ticks: 3,
+            max_attempts: 5,
+            request_dns: false,
         }
     }
 
@@ -524,6 +700,318 @@ mod tests {
         assert_eq!(effective_mtu(1492, 8), 0);
     }
 
+    // ---- LCP-echo liveness + in-session redial ----
+
+    /// An LCP Echo-Reply PPP payload echoing `magic` (as the AC would send it).
+    fn echo_reply(magic: u32) -> Vec<u8> {
+        let mut p = vec![0xc0, 0x21, 0x0a, 0x01];
+        p.extend_from_slice(&8u16.to_be_bytes());
+        p.extend_from_slice(&magic.to_be_bytes());
+        p
+    }
+
+    /// A PADT discovery frame as the AC sends it to us: src=AC, dst=OUR, our id.
+    fn padt_from_ac(session_id: u16) -> Vec<u8> {
+        let mut f = Vec::new();
+        crate::pppoe::session::put_eth_header(&mut f, OUR, AC, ETHERTYPE_DISCOVERY);
+        f.push(crate::pppoe::VER_TYPE);
+        f.push(crate::pppoe::discovery::CODE_PADT);
+        f.extend_from_slice(&session_id.to_be_bytes());
+        f.extend_from_slice(&0u16.to_be_bytes());
+        f
+    }
+
+    /// Find the single emitted LCP Echo-Request among drained frames and return
+    /// its PPP payload, or `None` if none is present.
+    fn find_echo(frames: &[Vec<u8>]) -> Option<Vec<u8>> {
+        for f in frames {
+            if let Ok(h) = parse_session_frame(f) {
+                let ppp = &f[h.ppp_start..h.ppp_end];
+                if ppp.len() >= 4 && ppp[0..2] == [0xc0, 0x21] && ppp[2] == 0x09 {
+                    return Some(ppp.to_vec());
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn echo_emitted_on_interval() {
+        let mut dp = fixed_dp();
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+
+        // The first echo goes out on the Established edge (first on_tick).
+        dp.on_tick();
+        let first = find_echo(&drain_frames(&mut dp)).expect("first echo on the edge");
+        assert_eq!(u16::from_be_bytes([first[4], first[5]]), 0x0008);
+        assert_eq!(&first[6..10], &MAGIC.to_be_bytes());
+
+        // No echo on the intervening ticks; the next one only at the boundary.
+        for _ in 0..(ECHO_INTERVAL_TICKS - 1) {
+            dp.on_tick();
+            assert!(find_echo(&drain_frames(&mut dp)).is_none());
+        }
+        dp.on_tick();
+        assert!(find_echo(&drain_frames(&mut dp)).is_some());
+    }
+
+    #[test]
+    fn echo_reply_keeps_link_alive() {
+        let mut dp = fixed_dp();
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+
+        // Drive well past the dead window, answering every echo with a reply.
+        for _ in 0..(ECHO_DEAD_THRESHOLD * ECHO_INTERVAL_TICKS + ECHO_INTERVAL_TICKS) {
+            let phase = dp.on_tick();
+            if find_echo(&drain_frames(&mut dp)).is_some() {
+                dp.on_l2_frame(&from_ac(&echo_reply(MAGIC)));
+                let _ = drain_frames(&mut dp);
+            }
+            assert!(matches!(phase, DpPhase::Established(_)));
+        }
+        assert_eq!(dp.echo_misses, 0);
+        assert!(matches!(dp.phase(), DpPhase::Established(_)));
+    }
+
+    #[test]
+    fn missed_replies_declare_link_down() {
+        let mut dp = fixed_dp();
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+
+        // Edge echo + ECHO_DEAD_THRESHOLD unanswered intervals. The threshold is
+        // hit at exactly THRESHOLD*INTERVAL ticks past the edge; not before.
+        dp.on_tick(); // edge: first echo
+        let _ = drain_frames(&mut dp);
+        let mut ticks = 0u32;
+        loop {
+            let phase = dp.on_tick();
+            let _ = drain_frames(&mut dp);
+            ticks += 1;
+            if matches!(phase, DpPhase::LinkDown) {
+                break;
+            }
+            assert!(matches!(phase, DpPhase::Established(_)));
+            assert!(
+                ticks < ECHO_DEAD_THRESHOLD * ECHO_INTERVAL_TICKS,
+                "link should have gone down by now"
+            );
+        }
+        assert_eq!(ticks, ECHO_DEAD_THRESHOLD * ECHO_INTERVAL_TICKS);
+    }
+
+    #[test]
+    fn inbound_padt_after_established_is_link_down() {
+        let mut dp = fixed_dp();
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+        assert_eq!(dp.on_l2_frame(&padt_from_ac(SESSION_ID)), DpPhase::LinkDown);
+    }
+
+    #[test]
+    fn discovery_padt_before_established_is_dead() {
+        // No session latched yet (still in Discovery): a PADT is a hard death.
+        let mut dp = discovery_phase();
+        // The discovery FSM only honors a PADT from its chosen AC, so feed a PADO
+        // first to latch the AC without latching a session, then PADT.
+        dp.on_l2_frame(PADO); // -> PadrSent, ac_mac latched, no session yet
+        let _ = drain_frames(&mut dp);
+        assert!(matches!(dp.phase(), DpPhase::Discovery));
+        assert_eq!(dp.on_l2_frame(&padt_from_ac(0)), DpPhase::Dead);
+    }
+
+    #[test]
+    fn ppp_phase_padt_is_link_down() {
+        // Session latched (PADS seen) but PPP not yet Established: a PADT redials
+        // in-session because the session id is dead.
+        let mut dp = ppp_phase();
+        assert!(matches!(dp.phase(), DpPhase::Ppp));
+        assert_eq!(dp.on_l2_frame(&padt_from_ac(SESSION_ID)), DpPhase::LinkDown);
+    }
+
+    #[test]
+    fn link_down_terminate_req() {
+        let mut dp = fixed_dp();
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+        // Inbound LCP TerminateReq drops LCP below Opened -> link-down on the frame.
+        let phase = dp.on_l2_frame(&from_ac(&lcp(0x05, 0x07, &[])));
+        assert_eq!(phase, DpPhase::LinkDown);
+    }
+
+    #[test]
+    fn inbound_lcp_confreq_after_established_keeps_link_up() {
+        // RFC 1661 section 4.2 RcR in Opened: an inbound Configure-Request reopens
+        // negotiation, transiting LCP through AckSent/ReqSent (sub-Opened) before it
+        // resettles to Opened. That transient dip must not be misread as link death.
+        let mut dp = fixed_dp();
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+
+        // Peer reopens with a Magic-Number-only Configure-Request; we Ack it and
+        // emit our own Configure-Request (LCP -> AckSent, sub-Opened).
+        let reneg_opts = [0x05, 0x06, 0xab, 0xcd, 0xef, 0x01];
+        let phase = dp.on_l2_frame(&from_ac(&lcp(0x01, 0x42, &reneg_opts)));
+        assert_eq!(phase, DpPhase::Established(*dp.established.as_ref().unwrap()));
+        assert!(!dp.link_down, "renegotiation must not declare link-down");
+
+        // A tick mid-renegotiation must not redial either: LCP is sub-Opened but
+        // not Closed.
+        assert!(matches!(dp.on_tick(), DpPhase::Established(_)));
+        assert!(!dp.link_down);
+
+        // Find our reopened Configure-Request and let the peer Ack it; LCP -> Opened.
+        let our_req = {
+            let mut req = None;
+            for f in drain_frames(&mut dp) {
+                if let Ok(h) = parse_session_frame(&f) {
+                    let ppp = &f[h.ppp_start..h.ppp_end];
+                    if ppp.len() >= 4 && ppp[0..2] == [0xc0, 0x21] && ppp[2] == 0x01 {
+                        req = Some(ppp.to_vec());
+                    }
+                }
+            }
+            req.expect("our reopened LCP Configure-Request")
+        };
+        let phase = dp.on_l2_frame(&from_ac(&lcp(0x02, our_req[3], &our_req[6..])));
+        assert!(matches!(phase, DpPhase::Established(_)));
+        assert!(dp.ppp.lcp_opened(), "LCP resettles to Opened after reopen");
+
+        // The link still echoes after the reopen: an Echo-Request goes out at the
+        // next interval boundary and a reply keeps it alive.
+        let _ = drain_frames(&mut dp);
+        let mut echoed = false;
+        for _ in 0..=ECHO_INTERVAL_TICKS {
+            assert!(matches!(dp.on_tick(), DpPhase::Established(_)));
+            if find_echo(&drain_frames(&mut dp)).is_some() {
+                echoed = true;
+                dp.on_l2_frame(&from_ac(&echo_reply(MAGIC)));
+                let _ = drain_frames(&mut dp);
+                break;
+            }
+        }
+        assert!(echoed, "echo cycle resumes after the reopen");
+        assert!(matches!(dp.phase(), DpPhase::Established(_)));
+    }
+
+    #[test]
+    fn reset_returns_to_discovery_and_reestablishes() {
+        let mut dp = fixed_dp();
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+
+        dp.reset().expect("reset");
+        assert_eq!(dp.phase(), DpPhase::Discovery);
+        assert!(dp.established.is_none());
+        // Exactly one outbound PADI was re-emitted.
+        let frames = drain_frames(&mut dp);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][14], 0x11);
+        assert_eq!(frames[0][15], 0x09); // PADI
+
+        // Re-drive to Established with a different session id and confirm outbound
+        // session frames address the new id.
+        re_drive_to_established(&mut dp, 0x1234);
+        let _ = drain_frames(&mut dp);
+        dp.on_tun_ip(&[0x45, 0x00, 0x00, 0x14]);
+        let frames = drain_frames(&mut dp);
+        let h = parse_session_frame(&frames[0]).expect("session frame");
+        assert_eq!(h.session_id, 0x1234);
+        assert!(matches!(dp.phase(), DpPhase::Established(_)));
+    }
+
+    #[test]
+    fn reset_twice_reestablishes_each_time() {
+        let mut dp = fixed_dp();
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+
+        dp.reset().expect("reset 1");
+        assert_eq!(dp.phase(), DpPhase::Discovery);
+        let _ = drain_frames(&mut dp);
+        re_drive_to_established(&mut dp, 0x1111);
+        assert!(matches!(dp.phase(), DpPhase::Established(_)));
+        let _ = drain_frames(&mut dp);
+
+        dp.reset().expect("reset 2");
+        assert_eq!(dp.phase(), DpPhase::Discovery);
+        let _ = drain_frames(&mut dp);
+        re_drive_to_established(&mut dp, 0x2222);
+        assert!(matches!(dp.phase(), DpPhase::Established(_)));
+    }
+
+    #[test]
+    fn reset_rebuilds_ppp_session() {
+        // reset rebuilds the PPP session: the liveness counters and the
+        // outstanding-echo latch are cleared, so the post-reset link starts a
+        // fresh echo cycle rather than carrying pre-reset state.
+        let mut dp = fixed_dp();
+        drive_to_established(&mut dp);
+        dp.on_tick(); // sends the first echo, sets echo_outstanding
+        assert!(dp.echo_outstanding);
+        let _ = drain_frames(&mut dp);
+
+        dp.reset().expect("reset");
+        assert!(!dp.echo_outstanding);
+        assert_eq!(dp.echo_misses, 0);
+        assert_eq!(dp.echo_ticks, 0);
+    }
+
+    /// Re-drive a post-reset datapath from Discovery to Established, assigning
+    /// `session_id` in the synthetic PADS. Mirrors `drive_to_established` but with
+    /// a caller-chosen session id so a reset's fresh id can be asserted.
+    fn re_drive_to_established(dp: &mut PppoeDatapath, session_id: u16) {
+        // PADO -> PADR.
+        assert_eq!(dp.on_l2_frame(PADO), DpPhase::Discovery);
+        let _ = drain_frames(dp);
+        // PADS with the chosen session id -> Ppp.
+        let mut pads = PADS.to_vec();
+        pads[16..18].copy_from_slice(&session_id.to_be_bytes());
+        assert_eq!(dp.on_l2_frame(&pads), DpPhase::Ppp);
+        let our_lcp_req = {
+            let frames = drain_frames(dp);
+            let h = parse_session_frame(&frames[0]).expect("lcp req");
+            frames[0][h.ppp_start..h.ppp_end].to_vec()
+        };
+        let lcp_id = our_lcp_req[3];
+
+        // Session frames now address `session_id`, so the AC's frames to us carry it.
+        let from = |ppp: &[u8]| build_session_frame(OUR, AC, session_id, ppp);
+
+        let peer_opts = [
+            0x01, 0x04, 0x05, 0xd4, 0x03, 0x05, 0xc2, 0x23, 0x05, 0x05, 0x06, 0xf6, 0xb2, 0xf2,
+            0xce,
+        ];
+        dp.on_l2_frame(&from(&lcp(0x01, 1, &peer_opts)));
+        let _ = drain_frames(dp);
+        dp.on_l2_frame(&from(&lcp(0x02, lcp_id, &our_lcp_req[6..])));
+        let _ = drain_frames(dp);
+        dp.on_l2_frame(&from(&chap_challenge(1, &CHALLENGE, b"NE40-BRAS")));
+        let _ = drain_frames(dp);
+        dp.on_l2_frame(&from(&chap_result(3, 1)));
+        let our_ipcp_req = {
+            let frames = drain_frames(dp);
+            let h = parse_session_frame(&frames[0]).expect("ipcp req");
+            frames[0][h.ppp_start..h.ppp_end].to_vec()
+        };
+        let ipcp_id = our_ipcp_req[3];
+        let peer_ip = [0x03, 0x06, 0xba, 0x6b, 0x60, 0x01];
+        dp.on_l2_frame(&from(&ipcp(0x01, 1, &peer_ip)));
+        let _ = drain_frames(dp);
+        let our_ip = [0x03, 0x06, 0xba, 0x6b, 0x74, 0x10];
+        dp.on_l2_frame(&from(&ipcp(0x03, ipcp_id, &our_ip)));
+        let our_ipcp_req2 = {
+            let frames = drain_frames(dp);
+            let h = parse_session_frame(&frames[0]).expect("ipcp req2");
+            frames[0][h.ppp_start..h.ppp_end].to_vec()
+        };
+        let ipcp_id2 = our_ipcp_req2[3];
+        let phase = dp.on_l2_frame(&from(&ipcp(0x02, ipcp_id2, &our_ip)));
+        assert!(matches!(phase, DpPhase::Established(_)));
+    }
+
     // De-panic gate for the inbound L2 demux. The sub-decoders are already fuzzed
     // in discovery.rs/engine.rs; this proves the demux glue adds no panic site.
     #[test]
@@ -539,6 +1027,11 @@ mod tests {
             session_seed.clone(),
             from_ac(&[0x00, 0x21, 0x45]),         // session frame with a short IP
             from_ac(&lcp(0x01, 1, &[0x01, 0x04])),
+            from_ac(&echo_reply(MAGIC)),          // well-formed echo-reply (liveness peek)
+            from_ac(&[0xc0, 0x21, 0x0a, 0x01, 0x00, 0x06]), // echo-reply, truncated body
+            from_ac(&[0xc0, 0x21, 0x0a, 0x01, 0xff, 0xff, 0x06, 0xc2]), // echo-reply len overrun
+            from_ac(&[0xc0, 0x21, 0x0a, 0x01, 0x00, 0x00]), // echo-reply, zero-length body
+            from_ac(&[0xc0, 0x21, 0x05, 0x07, 0x00, 0x04]), // LCP TerminateReq
         ];
         // 0x8864 with a LENGTH overrun.
         let mut overrun = session_seed.clone();

@@ -97,6 +97,8 @@ pub struct PppSession<'a> {
     ppp: PPP<'a>,
     /// Outbound raw PPP payloads (2-byte proto + body), FIFO.
     out: Vec<Vec<u8>>,
+    /// Wrapping identifier sequenced into each originated LCP Echo-Request.
+    echo_id: u8,
 }
 
 impl<'a> PppSession<'a> {
@@ -115,6 +117,7 @@ impl<'a> PppSession<'a> {
         Ok(Self {
             ppp,
             out: Vec::new(),
+            echo_id: 0,
         })
     }
 
@@ -198,6 +201,41 @@ impl<'a> PppSession<'a> {
             dns: ipv4.dns_servers,
             mru: status.mru,
         })
+    }
+
+    /// Queue an LCP Echo-Request if LCP is Opened. The identifier is sequenced
+    /// here (wrapping) so the FSM stays deterministic for tests. Returns `true`
+    /// if one was queued, `false` (no-op) if LCP is not Opened.
+    pub fn send_echo_request(&mut self) -> bool {
+        self.echo_id = self.echo_id.wrapping_add(1);
+        match self.ppp.lcp_echo_request(self.echo_id) {
+            Some(frame) => {
+                self.out.push(serialize(frame));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Take-and-clear the liveness flag: `true` if a matching Echo-Reply arrived
+    /// since the last call.
+    pub fn take_echo_reply_seen(&mut self) -> bool {
+        self.ppp.take_echo_reply_seen()
+    }
+
+    /// True once LCP is Opened (the link is up enough to echo). Stays true across
+    /// Auth/Network/Open and goes false during an inbound renegotiation or a
+    /// teardown.
+    pub fn lcp_opened(&self) -> bool {
+        self.ppp.lcp_opened()
+    }
+
+    /// True when LCP has reached Closed: a peer TerminateReq in Opened or a local
+    /// close. This is the authoritative gate for link-down detection. A transient
+    /// drop below Opened during an inbound Configure-Request renegotiation does not
+    /// set this, so a RFC 1661 reopen is not misread as link death.
+    pub fn lcp_closed(&self) -> bool {
+        self.ppp.lcp_closed()
     }
 
     fn drive_poll(&mut self) {
@@ -485,6 +523,12 @@ mod tests {
             vec![0xc0, 0x21, 0x09, 0x01, 0x00, 0x03],  // EchoReq, length 3 (< 4-byte header)
             vec![0xc0, 0x21, 0x05, 0x01, 0x00, 0x00],  // TerminateReq, length field 0
             vec![0xc0, 0x21, 0x05, 0x01, 0x00, 0x02],  // TerminateReq, length 2 (< header)
+            // EchoReply variants exercising the inbound liveness pre-dispatch peek.
+            vec![0xc0, 0x21, 0x0a, 0x01, 0x00, 0x08, 0x06, 0xc2, 0x7d, 0x42], // well-formed, our magic
+            vec![0xc0, 0x21, 0x0a, 0x01, 0x00, 0x08, 0xde, 0xad, 0xbe, 0xef], // well-formed, wrong magic
+            vec![0xc0, 0x21, 0x0a, 0x01, 0x00, 0x06],  // EchoReply, body truncated (no magic)
+            vec![0xc0, 0x21, 0x0a, 0x01, 0xff, 0xff, 0x06, 0xc2, 0x7d, 0x42], // length overrun
+            vec![0xc0, 0x21, 0x0a, 0x01, 0x00, 0x00],  // EchoReply, length field 0 (empty body)
             chap_challenge(1, &[0xaa; 2], b"x"),       // value-size will be 2 here (well-formed)
             // CHAP Challenge with value-size overrunning the packet.
             vec![0xc2, 0x23, 0x01, 0x01, 0x00, 0x09, 0xff, 0xaa, 0xbb],
@@ -581,5 +625,76 @@ mod tests {
             FeedOutcome::Ip(payload) => assert_eq!(payload, &ip[2..]),
             other => panic!("expected Ip, got {other:?}"),
         }
+    }
+
+    /// Build an LCP Echo-Reply (code 10) carrying a 4-byte Magic-Number body.
+    fn echo_reply(id: u8, magic: u32) -> Vec<u8> {
+        let mut p = vec![0xc0, 0x21, Code::EchoReply as u8, id];
+        p.extend_from_slice(&8u16.to_be_bytes()); // length = 4 header + 4 magic
+        p.extend_from_slice(&magic.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn echo_request_emitted_when_open() {
+        let mut s = established_session();
+        let _ = drain(&mut s);
+        assert!(s.send_echo_request());
+        let out = drain(&mut s);
+        assert_eq!(out.len(), 1);
+        let req = &out[0];
+        assert_eq!(proto_of(req), ProtocolType::LCP);
+        assert_eq!(code_of(req), Code::EchoReq);
+        // Length field = 8 (4-byte header + 4-byte magic), body = our magic BE.
+        assert_eq!(u16::from_be_bytes([req[4], req[5]]), 0x0008);
+        assert_eq!(&req[6..10], &MAGIC.to_be_bytes());
+        assert_eq!(req.len(), 10);
+    }
+
+    #[test]
+    fn echo_request_noop_before_open() {
+        let mut s = fresh_open(); // LCP in ReqSent, not Opened
+        assert!(!s.send_echo_request());
+        assert!(drain(&mut s).is_empty());
+    }
+
+    #[test]
+    fn echo_reply_refreshes_liveness() {
+        let mut s = established_session();
+        let _ = drain(&mut s);
+        s.feed(&echo_reply(7, MAGIC));
+        assert!(s.take_echo_reply_seen());
+        // Take-and-clear: a second read is false.
+        assert!(!s.take_echo_reply_seen());
+    }
+
+    #[test]
+    fn echo_reply_wrong_magic_ignored() {
+        let mut s = established_session();
+        let _ = drain(&mut s);
+        s.feed(&echo_reply(1, MAGIC ^ 0xffff_ffff));
+        assert!(!s.take_echo_reply_seen());
+    }
+
+    #[test]
+    fn echo_reply_id_independent() {
+        // A reply whose id differs from any request id but whose magic matches is
+        // proof of liveness: matching is by magic, not by id.
+        let mut s = established_session();
+        let _ = drain(&mut s);
+        s.send_echo_request(); // echo_id is now 1
+        let _ = drain(&mut s);
+        s.feed(&echo_reply(0x99, MAGIC));
+        assert!(s.take_echo_reply_seen());
+    }
+
+    #[test]
+    fn lcp_opened_tracks_state() {
+        let s = fresh_open();
+        assert!(!s.lcp_opened());
+        let s = lcp_opened_session();
+        assert!(s.lcp_opened());
+        let s = established_session();
+        assert!(s.lcp_opened());
     }
 }

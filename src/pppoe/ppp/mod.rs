@@ -31,7 +31,7 @@ use self::ipv4cp::IPv4CP;
 use self::lcp::{AuthType, LCP};
 use self::option_fsm::{OptionFsm, State};
 use self::pap::{State as PapState, PAP};
-use self::wire::{Packet, ProtocolType};
+use self::wire::{Code, Packet, ProtocolType};
 use crate::pppoe::auth::Chap;
 
 pub use self::ipv4cp::Ipv4Status;
@@ -110,6 +110,9 @@ pub struct PPP<'a> {
     pub pap: PAP<'a>,
     pub chap: Chap,
     pub ipv4cp: OptionFsm<IPv4CP>,
+    /// Set when an inbound LCP Echo-Reply carrying our Magic-Number is observed.
+    /// The datapath's liveness timer take-and-clears it to count missed replies.
+    echo_reply_seen: bool,
 }
 
 impl<'a> PPP<'a> {
@@ -125,12 +128,65 @@ impl<'a> PPP<'a> {
             chap: Chap::new(),
             ipv4cp: OptionFsm::new(IPv4CP::new()),
             config,
+            echo_reply_seen: false,
         }
     }
 
     /// Request DNS1/DNS2 in our IPCP ConfReq (pppd's `usepeerdns`).
     pub fn set_request_dns(&mut self, on: bool) {
         self.ipv4cp.proto_mut().set_request_dns(on);
+    }
+
+    /// True once LCP has reached the Opened state, the only state on which an
+    /// Echo-Request is valid.
+    pub fn lcp_opened(&self) -> bool {
+        self.lcp.state() == State::Opened
+    }
+
+    /// True when LCP is in the Closed state. This is teardown (a peer
+    /// TerminateReq in Opened, or a local close), distinct from a transient
+    /// sub-Opened dip during an inbound renegotiation, which sits in
+    /// ReqSent/AckSent/AckReceived. The link-down detector keys on this so a
+    /// RFC 1661 reopen (Configure-Request in Opened) is not misread as link death.
+    pub fn lcp_closed(&self) -> bool {
+        self.lcp.state() == State::Closed
+    }
+
+    /// Build an LCP Echo-Request once LCP is Opened, else `None`. `id` is
+    /// caller-sequenced. The body is our local Magic-Number; the peer echoes it
+    /// verbatim in the reply, which `is_matching_echo_reply` matches.
+    pub fn lcp_echo_request(&mut self, id: u8) -> Option<OutFrame<'static>> {
+        if self.lcp.state() != State::Opened {
+            return None;
+        }
+        let magic = self.lcp.proto().magic_local;
+        Some(OutFrame::Packet(self.lcp.send_echo_request(id, magic)))
+    }
+
+    /// Take-and-clear the "an Echo-Reply for our magic arrived" flag.
+    pub fn take_echo_reply_seen(&mut self) -> bool {
+        core::mem::take(&mut self.echo_reply_seen)
+    }
+
+    /// True iff `pkt` is a well-formed LCP Echo-Reply whose 4-byte body matches
+    /// our Magic-Number. Untrusted input: every read is bounds-checked, never
+    /// panics. RFC 1661 section 5.8 has the reply echo the requester's (our)
+    /// Magic-Number, so a match confirms the peer answered our request.
+    fn is_matching_echo_reply(pkt: &[u8], our_magic: u32) -> bool {
+        // 2 proto + 1 code + 1 id + 2 length + 4 magic = 10 bytes minimum; the
+        // body past the 2-byte proto must hold at least the 4-byte control header
+        // plus the 4-byte Magic-Number.
+        let body = match pkt.get(2..) {
+            Some(b) if b.len() >= 8 => b,
+            _ => return false,
+        };
+        if Code::from(body[0]) != Code::EchoReply {
+            return false;
+        }
+        match body.get(4..8) {
+            Some(m) => u32::from_be_bytes([m[0], m[1], m[2], m[3]]) == our_magic,
+            None => false,
+        }
     }
 
     pub fn status(&self) -> Status {
@@ -175,6 +231,12 @@ impl<'a> PPP<'a> {
 
         match ProtocolType::from(proto) {
             ProtocolType::LCP => {
+                // An Echo-Reply reaches `handle` only via its catch-all no-op arm,
+                // so the FSM never surfaces it. Peek for one carrying our magic
+                // before delegating, to drive the liveness timer.
+                if Self::is_matching_echo_reply(pkt, self.lcp.proto().magic_local) {
+                    self.echo_reply_seen = true;
+                }
                 self.lcp.handle(pkt, |p| tx(p.into()));
                 Ok(RxOutcome::Consumed)
             }
