@@ -18,13 +18,16 @@ pub const KCP_MTU: usize = 1350;
 /// an already-open stream conv.
 pub const SETUP_CONV_BIT: u32 = 0x8000_0000;
 
-/// Fixed conv id for the L2 bridge setup conv over UDP. Uses `SETUP_CONV_BIT`
-/// with zero low bits; auto-allocated stream convs start at 1 and UDP-forward
-/// setup convs derive from ids that also start at 1, so this value never
-/// collides with either.
+/// Fixed conv id tagging a connection as the L2 bridge setup conv over UDP. Uses
+/// `SETUP_CONV_BIT` with zero low bits; auto-allocated stream convs start at 1 and
+/// UDP-forward setup convs derive from ids that also start at 1, so this value
+/// never collides with either. It is a per-connection role marker: the server
+/// attaches each client carrying it to its own switch port.
 pub const BRIDGE_CONV: u32 = SETUP_CONV_BIT;
 
-/// Reserved stream id marking the L2 bridge data stream over the TCP fallback.
+/// Reserved stream id tagging a connection as the L2 bridge data stream over the
+/// TCP fallback. A per-connection role marker: each client using it gets its own
+/// switch port on the server.
 pub const BRIDGE_ID: u64 = u64::MAX;
 
 const SOCKET_SEND_CAP: usize = 1024;
@@ -223,7 +226,7 @@ impl AsyncWrite for KcpStream {
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 type ConvMap = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
@@ -246,6 +249,18 @@ impl Drop for ConvGuard {
     }
 }
 
+/// Released when an attached bridge ends, clearing the session's bridge-attached
+/// flag so a later reconnect within the same session can attach again.
+pub struct BridgeGuard {
+    attached: Arc<AtomicBool>,
+}
+
+impl Drop for BridgeGuard {
+    fn drop(&mut self) {
+        self.attached.store(false, Ordering::Release);
+    }
+}
+
 /// Shared per-(socket,peer) multiplexing state.
 pub struct Session {
     send_tx: mpsc::Sender<Vec<u8>>,
@@ -255,6 +270,10 @@ pub struct Session {
     // Count of live conv drivers + dgram receivers; reaches zero when the session
     // carries nothing, letting the control listener reclaim it.
     live: Arc<AtomicUsize>,
+    // Set while this session has one live bridge port. One bridge per session is
+    // expected; a second concurrent attach is refused so two switch ports never
+    // learn and ping-pong the same client's MAC.
+    bridge_attached: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -354,6 +373,24 @@ impl Session {
     pub fn send_tx(&self) -> mpsc::Sender<Vec<u8>> {
         self.send_tx.clone()
     }
+
+    /// Claim this session's single bridge slot. Returns `Some(guard)` for the
+    /// first attach and `None` while a bridge is already live, so a second
+    /// concurrent bridge attach in the same session is refused. The guard clears
+    /// the slot on drop, so a later reconnect within the session can attach again.
+    pub fn try_attach_bridge(&self) -> Option<BridgeGuard> {
+        match self.bridge_attached.compare_exchange(
+            false,
+            true,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Some(BridgeGuard {
+                attached: self.bridge_attached.clone(),
+            }),
+            Err(_) => None,
+        }
+    }
 }
 
 /// What the RX router yields when a peer opens a new conv.
@@ -373,6 +410,7 @@ pub fn session(socket: Arc<UdpSocket>, peer: SocketAddr, first_conv: u32) -> Arc
         dgrams: Arc::new(Mutex::new(HashMap::new())),
         next_conv: Mutex::new(first_conv),
         live: Arc::new(AtomicUsize::new(0)),
+        bridge_attached: Arc::new(AtomicBool::new(false)),
     })
 }
 

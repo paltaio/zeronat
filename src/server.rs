@@ -128,24 +128,12 @@ pub(crate) struct Server {
     /// Serializes config writes so two concurrent admin sessions never interleave
     /// a save.
     save_lock: tokio::sync::Mutex<()>,
+    /// Software learning switch between the one server device and its client
+    /// port(s). Built once in `run()` when a `--tap`/`--tun` device is opened;
+    /// absent on a runtime-only node with no device. A `--tap` switch gives each
+    /// client its own port; a `--tun` switch serves one client.
     #[cfg(target_os = "linux")]
-    tap: Option<Arc<TapDevice>>,
-    #[cfg(target_os = "linux")]
-    bridge_cancel: Mutex<Option<Arc<Notify>>>,
-}
-
-#[cfg(target_os = "linux")]
-impl Server {
-    /// Take ownership of the bridge: cancel any previously running bridge relay
-    /// and return the cancel handle for the new one. The TAP is point-to-point,
-    /// so the newest bridge wins and the old relay stops touching the device.
-    fn supersede_bridge(&self) -> Arc<Notify> {
-        let cancel = Arc::new(Notify::new());
-        if let Some(prev) = self.bridge_cancel.lock().unwrap().replace(cancel.clone()) {
-            prev.notify_one();
-        }
-        cancel
-    }
+    switch: Option<Arc<bridge::TapSwitch>>,
 }
 
 impl Server {
@@ -278,8 +266,11 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
     // `_` binding would drop it immediately.
     #[cfg(target_os = "linux")]
     let mut _nat_guard: Option<netfilter::NatGuard> = None;
+    // Carries the opened device with whether it is L2 (TAP/Ethernet) or L3 (TUN).
+    // The switch needs that distinction: an L2 device MAC-learns across many
+    // ports, an L3 device serves exactly one client.
     #[cfg(target_os = "linux")]
-    let tap = if let Some(st) = &tun {
+    let tap: Option<(Arc<TapDevice>, bool)> = if let Some(st) = &tun {
         let dev = Arc::new(TapDevice::open_tun(&st.device)?);
         let plan = netfilter::NatPlan {
             iface: st.device.name.clone(),
@@ -314,9 +305,9 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
             }
             netfilter::Outcome::Degraded(msg) => eprint!("{msg}"),
         }
-        Some(dev)
+        Some((dev, false))
     } else if let Some(cfg) = &tap {
-        Some(Arc::new(TapDevice::open(cfg)?))
+        Some((Arc::new(TapDevice::open(cfg)?), true))
     } else {
         None
     };
@@ -324,6 +315,12 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
     if tap.is_some() || tun.is_some() {
         return Err("L2/L3 tunnel modes (--tap/--tun) are only supported on Linux".into());
     }
+
+    // Wrap the one opened device in the software switch so its client port(s)
+    // share it; the switch owns the device and spawns the sole reader. Built once
+    // here, carrying the L2/L3 distinction so a TUN switch admits one client.
+    #[cfg(target_os = "linux")]
+    let switch = tap.map(|(dev, is_l2)| bridge::TapSwitch::new(dev, is_l2));
 
     let bind_ip = bind;
 
@@ -372,9 +369,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         file_control,
         save_lock: tokio::sync::Mutex::new(()),
         #[cfg(target_os = "linux")]
-        tap,
-        #[cfg(target_os = "linux")]
-        bridge_cancel: Mutex::new(None),
+        switch,
     });
 
     // A configured forwarded port that is already in use must not kill the server:
@@ -547,9 +542,11 @@ pub(crate) async fn serve_stream(
         Msg::Data { id } => {
             #[cfg(target_os = "linux")]
             if id == BRIDGE_ID {
-                if let Some(tap) = srv.tap.clone() {
-                    let cancel = srv.supersede_bridge();
-                    bridge::tap_stream(tap, r, w, cancel).await;
+                if let Some(switch) = srv.switch.clone() {
+                    match switch.add_port() {
+                        Ok(handle) => bridge::switch_port_stream(handle, r, w).await,
+                        Err(e) => crate::elog!("rejecting bridge stream: {e}"),
+                    }
                 }
                 return Ok(());
             }
@@ -1184,20 +1181,34 @@ fn take_udp_pending(srv: &Server, id: u64) -> Option<UdpPending> {
     srv.udp_pending.lock().unwrap().remove(&id)
 }
 
-/// Run the L2 bridge over the UDP datagram channel against the server's TAP. The
-/// bridge setup conv carries the fixed `BRIDGE_CONV`, also used as the datagram tag.
+/// Attach a client's UDP bridge conv to the software switch. The bridge setup conv
+/// carries the fixed `BRIDGE_CONV` (also the datagram tag); each client gets its
+/// own switch port, so multiple clients share the one TAP. The idle reaper inside
+/// the relay (plus the session's `register_dgram` guard) reclaims a silent port.
 #[cfg(target_os = "linux")]
 async fn accept_bridge(srv: Arc<Server>, sess: Arc<Session>, conv: u32, noise: StatelessNoise) {
-    let Some(tap) = srv.tap.clone() else {
+    let Some(switch) = srv.switch.clone() else {
         return;
     };
-    let cancel = srv.supersede_bridge();
+    // One bridge port per session. A second concurrent bridge attach in the same
+    // session is anomalous; refuse it so two ports never learn and ping-pong the
+    // same client's MAC. The guard releases on every exit path below.
+    let Some(_bridge_guard) = sess.try_attach_bridge() else {
+        return;
+    };
+    let handle = match switch.add_port() {
+        Ok(h) => h,
+        Err(e) => {
+            crate::elog!("rejecting bridge conv: {e}");
+            return;
+        }
+    };
     let noise = Arc::new(noise);
     // `_guard` keeps the session counted live for the whole bridge.
     let (inbound, _guard) = sess.register_dgram(conv);
     let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
     let rx = DgramRx::new(inbound, noise);
-    bridge::tap_dgram(tap, rx, tx, cancel).await;
+    bridge::switch_port_dgram(handle, rx, tx).await;
 }
 
 #[cfg(test)]
@@ -1281,9 +1292,7 @@ mod tests {
             file_control: None,
             save_lock: tokio::sync::Mutex::new(()),
             #[cfg(target_os = "linux")]
-            tap: None,
-            #[cfg(target_os = "linux")]
-            bridge_cancel: Mutex::new(None),
+            switch: None,
         })
     }
 

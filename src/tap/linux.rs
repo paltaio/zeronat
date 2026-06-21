@@ -289,6 +289,36 @@ impl TapDevice {
         })
     }
 
+    /// Build a device backed by one end of a non-blocking `socketpair` for tests
+    /// that need a real `read_frame`/`write_frame`-capable device without a kernel
+    /// TAP or root. `read_frame` blocks until the peer end is written; `write_frame`
+    /// succeeds into the socket buffer. The peer fd is returned so the test can
+    /// inject inbound frames and drain egress.
+    #[cfg(test)]
+    pub(crate) fn socketpair_for_test(mtu: usize) -> Result<(Self, RawFd)> {
+        let mut fds = [0 as RawFd; 2];
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_NONBLOCK,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        match Self::from_raw(fds[0], mtu) {
+            Ok(dev) => Ok((dev, fds[1])),
+            // `from_raw` owns `fds[0]` (its Drop closes it); close the peer so a
+            // device-build failure does not leak the other half.
+            Err(e) => {
+                unsafe { libc::close(fds[1]) };
+                Err(e)
+            }
+        }
+    }
+
     pub async fn read_frame(&self) -> Result<Vec<u8>> {
         loop {
             let mut guard = self.fd.readable().await?;
