@@ -33,11 +33,18 @@ impl<'a> PppConfig<'a> {
     pub fn with_random_magic(username: &'a [u8], password: &'a [u8]) -> Result<Self> {
         let mut b = [0u8; 4];
         getrandom::getrandom(&mut b).map_err(|_| Error::Rng)?;
+        // A zero Magic-Number means "no magic" in RFC 1661 and would defeat the
+        // liveness loopback guard (a peer that omits its magic replies with zero,
+        // which must not read as our own magic). Force a nonzero value.
+        let magic = match u32::from_be_bytes(b) {
+            0 => 1,
+            m => m,
+        };
         Ok(Self {
             username,
             password,
             mru: DEFAULT_MRU,
-            magic: u32::from_be_bytes(b),
+            magic,
             request_dns: false,
         })
     }
@@ -270,6 +277,9 @@ mod tests {
     // Deterministic to match the captured ConfReq option bytes.
     const MRU: u16 = 1392;
     const MAGIC: u32 = 0x06c27d42;
+    /// The peer's Magic-Number, distinct from ours. A real LCP Echo-Reply carries
+    /// the replier's magic, so a peer reply differs from our local magic.
+    const PEER_MAGIC: u32 = 0x5ea17b03;
 
     const CHALLENGE: [u8; 16] = [
         0x1a, 0x88, 0x05, 0x28, 0x03, 0x05, 0x07, 0x22, 0xcd, 0x6c, 0x29, 0xed, 0x93, 0xd9, 0x4a,
@@ -659,32 +669,66 @@ mod tests {
     }
 
     #[test]
+    fn echo_request_answered_with_our_magic() {
+        // An inbound Echo-Request carries the peer's magic; our Echo-Reply must
+        // carry OUR magic (RFC 1661 section 5.8), not echo the peer's back, or a
+        // peer doing loopback detection sees its own magic and drops the reply.
+        let mut s = established_session();
+        let _ = drain(&mut s);
+        let mut req = vec![0xc0, 0x21, Code::EchoReq as u8, 0x42];
+        req.extend_from_slice(&8u16.to_be_bytes());
+        req.extend_from_slice(&PEER_MAGIC.to_be_bytes());
+        s.feed(&req);
+        let out = drain(&mut s);
+        let reply = out
+            .iter()
+            .find(|f| proto_of(f) == ProtocolType::LCP && code_of(f) == Code::EchoReply)
+            .expect("an LCP Echo-Reply");
+        assert_eq!(reply[3], 0x42, "reply keeps the request id");
+        assert_eq!(&reply[6..10], &MAGIC.to_be_bytes(), "reply carries our magic");
+    }
+
+    #[test]
     fn echo_reply_refreshes_liveness() {
         let mut s = established_session();
         let _ = drain(&mut s);
-        s.feed(&echo_reply(7, MAGIC));
+        // A reply carrying the peer's magic (not ours) is proof the peer answered.
+        s.feed(&echo_reply(7, PEER_MAGIC));
         assert!(s.take_echo_reply_seen());
         // Take-and-clear: a second read is false.
         assert!(!s.take_echo_reply_seen());
     }
 
     #[test]
-    fn echo_reply_wrong_magic_ignored() {
+    fn echo_reply_own_magic_is_loopback_ignored() {
+        // RFC 1661 section 5.8: a reply carrying OUR own Magic-Number means the link
+        // is looped back, not a live peer, so it does not count as liveness.
         let mut s = established_session();
         let _ = drain(&mut s);
-        s.feed(&echo_reply(1, MAGIC ^ 0xffff_ffff));
+        s.feed(&echo_reply(1, MAGIC));
         assert!(!s.take_echo_reply_seen());
     }
 
     #[test]
     fn echo_reply_id_independent() {
-        // A reply whose id differs from any request id but whose magic matches is
-        // proof of liveness: matching is by magic, not by id.
+        // A peer reply (its magic, not ours) proves liveness regardless of id:
+        // liveness keys on the magic differing from ours, not on the id.
         let mut s = established_session();
         let _ = drain(&mut s);
         s.send_echo_request(); // echo_id is now 1
         let _ = drain(&mut s);
-        s.feed(&echo_reply(0x99, MAGIC));
+        s.feed(&echo_reply(0x99, PEER_MAGIC));
+        assert!(s.take_echo_reply_seen());
+    }
+
+    #[test]
+    fn echo_reply_with_zero_magic_is_liveness() {
+        // A peer that did not negotiate a Magic-Number replies with magic 0. Our
+        // magic is always nonzero (see PppConfig::with_random_magic), so a zero
+        // reply differs from ours and counts as a live peer rather than a loopback.
+        let mut s = established_session();
+        let _ = drain(&mut s);
+        s.feed(&echo_reply(5, 0));
         assert!(s.take_echo_reply_seen());
     }
 

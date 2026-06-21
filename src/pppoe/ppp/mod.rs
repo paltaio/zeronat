@@ -110,8 +110,10 @@ pub struct PPP<'a> {
     pub pap: PAP<'a>,
     pub chap: Chap,
     pub ipv4cp: OptionFsm<IPv4CP>,
-    /// Set when an inbound LCP Echo-Reply carrying our Magic-Number is observed.
-    /// The datapath's liveness timer take-and-clears it to count missed replies.
+    /// Set when an inbound LCP Echo-Reply from the peer is observed (its
+    /// Magic-Number differs from ours; a reply carrying our own magic is a
+    /// loopback and is ignored). The datapath's liveness timer take-and-clears it
+    /// to count missed replies.
     echo_reply_seen: bool,
 }
 
@@ -153,8 +155,9 @@ impl<'a> PPP<'a> {
     }
 
     /// Build an LCP Echo-Request once LCP is Opened, else `None`. `id` is
-    /// caller-sequenced. The body is our local Magic-Number; the peer echoes it
-    /// verbatim in the reply, which `is_matching_echo_reply` matches.
+    /// caller-sequenced. The body is our local Magic-Number; the peer answers with
+    /// an Echo-Reply carrying its OWN magic (RFC 1661 section 5.8), which
+    /// `is_peer_echo_reply` accepts as liveness because it differs from ours.
     pub fn lcp_echo_request(&mut self, id: u8) -> Option<OutFrame<'static>> {
         if self.lcp.state() != State::Opened {
             return None;
@@ -163,16 +166,19 @@ impl<'a> PPP<'a> {
         Some(OutFrame::Packet(self.lcp.send_echo_request(id, magic)))
     }
 
-    /// Take-and-clear the "an Echo-Reply for our magic arrived" flag.
+    /// Take-and-clear the "a peer Echo-Reply arrived" liveness flag.
     pub fn take_echo_reply_seen(&mut self) -> bool {
         core::mem::take(&mut self.echo_reply_seen)
     }
 
-    /// True iff `pkt` is a well-formed LCP Echo-Reply whose 4-byte body matches
-    /// our Magic-Number. Untrusted input: every read is bounds-checked, never
-    /// panics. RFC 1661 section 5.8 has the reply echo the requester's (our)
-    /// Magic-Number, so a match confirms the peer answered our request.
-    fn is_matching_echo_reply(pkt: &[u8], our_magic: u32) -> bool {
+    /// True iff `pkt` is a well-formed LCP Echo-Reply from the peer, i.e. proof the
+    /// peer answered our Echo-Request. Untrusted input: every read is bounds-checked,
+    /// never panics. RFC 1661 section 5.8 has each side stamp its OWN Magic-Number
+    /// into the frames it transmits, so a genuine peer reply carries the peer's
+    /// magic, which differs from ours; a reply carrying our own Magic-Number means
+    /// the link is looped back, which is not liveness. Hence liveness is any
+    /// Echo-Reply whose magic differs from our local Magic-Number.
+    fn is_peer_echo_reply(pkt: &[u8], our_magic: u32) -> bool {
         // 2 proto + 1 code + 1 id + 2 length + 4 magic = 10 bytes minimum; the
         // body past the 2-byte proto must hold at least the 4-byte control header
         // plus the 4-byte Magic-Number.
@@ -184,7 +190,7 @@ impl<'a> PPP<'a> {
             return false;
         }
         match body.get(4..8) {
-            Some(m) => u32::from_be_bytes([m[0], m[1], m[2], m[3]]) == our_magic,
+            Some(m) => u32::from_be_bytes([m[0], m[1], m[2], m[3]]) != our_magic,
             None => false,
         }
     }
@@ -232,9 +238,9 @@ impl<'a> PPP<'a> {
         match ProtocolType::from(proto) {
             ProtocolType::LCP => {
                 // An Echo-Reply reaches `handle` only via its catch-all no-op arm,
-                // so the FSM never surfaces it. Peek for one carrying our magic
-                // before delegating, to drive the liveness timer.
-                if Self::is_matching_echo_reply(pkt, self.lcp.proto().magic_local) {
+                // so the FSM never surfaces it. Peek for a peer reply before
+                // delegating, to drive the liveness timer.
+                if Self::is_peer_echo_reply(pkt, self.lcp.proto().magic_local) {
                     self.echo_reply_seen = true;
                 }
                 self.lcp.handle(pkt, |p| tx(p.into()));

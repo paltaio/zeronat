@@ -145,6 +145,10 @@ impl Protocol for LCP {
         }
     }
 
+    fn echo_reply_magic(&self) -> core::option::Option<u32> {
+        Some(self.magic_local)
+    }
+
     fn own_options(&mut self, mut f: impl FnMut(u8, &[u8])) {
         if !self.mru_rej {
             f(Option::Mru as u8, &self.mru_local.to_be_bytes());

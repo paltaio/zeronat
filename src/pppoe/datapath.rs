@@ -467,6 +467,9 @@ mod tests {
     const SECRET: &[u8] = b"tchile";
     const MRU: u16 = 1392;
     const MAGIC: u32 = 0x06c27d42;
+    /// The AC's Magic-Number, distinct from ours. A real LCP Echo-Reply carries the
+    /// peer's magic; only a reply whose magic differs from ours counts as liveness.
+    const PEER_MAGIC: u32 = 0x5ea17b03;
 
     const CHALLENGE: [u8; 16] = [
         0x1a, 0x88, 0x05, 0x28, 0x03, 0x05, 0x07, 0x22, 0xcd, 0x6c, 0x29, 0xed, 0x93, 0xd9, 0x4a,
@@ -766,13 +769,38 @@ mod tests {
         for _ in 0..(ECHO_DEAD_THRESHOLD * ECHO_INTERVAL_TICKS + ECHO_INTERVAL_TICKS) {
             let phase = dp.on_tick();
             if find_echo(&drain_frames(&mut dp)).is_some() {
-                dp.on_l2_frame(&from_ac(&echo_reply(MAGIC)));
+                dp.on_l2_frame(&from_ac(&echo_reply(PEER_MAGIC)));
                 let _ = drain_frames(&mut dp);
             }
             assert!(matches!(phase, DpPhase::Established(_)));
         }
         assert_eq!(dp.echo_misses, 0);
         assert!(matches!(dp.phase(), DpPhase::Established(_)));
+    }
+
+    #[test]
+    fn loopback_echo_reply_does_not_keep_link_alive() {
+        // A reply carrying OUR own Magic-Number means the link is looped back, not a
+        // live peer (RFC 1661 section 5.8), so it must not reset the liveness
+        // counter: the link still declares down after the dead window even though a
+        // reply arrives every interval.
+        let mut dp = fixed_dp();
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+
+        let mut down = false;
+        for _ in 0..(ECHO_DEAD_THRESHOLD * ECHO_INTERVAL_TICKS + ECHO_INTERVAL_TICKS) {
+            let phase = dp.on_tick();
+            if find_echo(&drain_frames(&mut dp)).is_some() {
+                dp.on_l2_frame(&from_ac(&echo_reply(MAGIC))); // our magic = loopback
+                let _ = drain_frames(&mut dp);
+            }
+            if matches!(phase, DpPhase::LinkDown) {
+                down = true;
+                break;
+            }
+        }
+        assert!(down, "loopback echo-replies must not keep the link alive");
     }
 
     #[test]
@@ -887,7 +915,7 @@ mod tests {
             assert!(matches!(dp.on_tick(), DpPhase::Established(_)));
             if find_echo(&drain_frames(&mut dp)).is_some() {
                 echoed = true;
-                dp.on_l2_frame(&from_ac(&echo_reply(MAGIC)));
+                dp.on_l2_frame(&from_ac(&echo_reply(PEER_MAGIC)));
                 let _ = drain_frames(&mut dp);
                 break;
             }
@@ -1027,7 +1055,7 @@ mod tests {
             session_seed.clone(),
             from_ac(&[0x00, 0x21, 0x45]),         // session frame with a short IP
             from_ac(&lcp(0x01, 1, &[0x01, 0x04])),
-            from_ac(&echo_reply(MAGIC)),          // well-formed echo-reply (liveness peek)
+            from_ac(&echo_reply(PEER_MAGIC)),          // well-formed echo-reply (liveness peek)
             from_ac(&[0xc0, 0x21, 0x0a, 0x01, 0x00, 0x06]), // echo-reply, truncated body
             from_ac(&[0xc0, 0x21, 0x0a, 0x01, 0xff, 0xff, 0x06, 0xc2]), // echo-reply len overrun
             from_ac(&[0xc0, 0x21, 0x0a, 0x01, 0x00, 0x00]), // echo-reply, zero-length body

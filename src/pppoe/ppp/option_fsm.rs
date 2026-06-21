@@ -28,6 +28,14 @@ pub trait Protocol {
 
     fn peer_options_start(&mut self);
     fn peer_option_received<'a>(&mut self, code: u8, data: &'a [u8]) -> Verdict<'a>;
+
+    /// The Magic-Number to stamp into an Echo-Reply this protocol originates. LCP
+    /// returns its local magic (RFC 1661: each side sends its own magic, so the
+    /// reply must not echo the requester's back); protocols without a magic leave
+    /// the inbound bytes unchanged.
+    fn echo_reply_magic(&self) -> Option<u32> {
+        None
+    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -231,8 +239,17 @@ impl<P: Protocol> OptionFsm<P> {
         // `handle` enforces a 4-byte minimum control length, so the body past the
         // 2-byte proto is non-empty; the element guard is defense-in-depth to keep
         // this site index-panic-free even if a future caller changes that invariant.
+        let magic = self.proto.echo_reply_magic();
         let body = pkt.get_mut(2..)?;
         *body.first_mut()? = Code::EchoReply as u8;
+        // The inbound request holds the peer's Magic-Number; stamp ours over it so
+        // the peer does not read its own magic back and treat the link as looped
+        // (RFC 1661 section 5.8). Body layout: code, id, 2-byte length, 4-byte magic.
+        if let Some(m) = magic {
+            if let Some(slot) = body.get_mut(4..8) {
+                slot.copy_from_slice(&m.to_be_bytes());
+            }
+        }
         Some(Packet {
             proto: self.proto.protocol(),
             payload: Payload::Raw(body),
