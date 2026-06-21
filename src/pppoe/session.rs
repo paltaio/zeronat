@@ -52,7 +52,7 @@ pub fn parse_eth_header(frame: &[u8]) -> Result<(EthHeader, usize)> {
 /// A decoded 0x8864 session frame: the assigned session id plus the byte range
 /// of the PPP payload within the original frame.
 ///
-/// P1 does NOT parse PPP. `ppp_start..ppp_end` indexes the caller's frame
+/// This does NOT parse PPP. `ppp_start..ppp_end` indexes the caller's frame
 /// slice; the caller reads the PPP payload there. The range is already
 /// validated against the PPPoE LENGTH field, so indexing it cannot fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,7 +127,7 @@ mod tests {
     const OUR: MacAddr = MacAddr([0xfe, 0xee, 0x13, 0xac, 0xc4, 0x74]);
     const AC: MacAddr = MacAddr([0x70, 0x7b, 0xe8, 0x74, 0x22, 0x17]);
 
-    // Section 3.5: 0x8864 session header with an empty PPP payload (20 bytes).
+    // 0x8864 session header with an empty PPP payload (20 bytes).
     const SESSION_HDR: &[u8] = &[
         0xfe, 0xee, 0x13, 0xac, 0xc4, 0x74, 0x70, 0x7b, 0xe8, 0x74, 0x22, 0x17, 0x88, 0x64, 0x11,
         0x00, 0x5e, 0x61, 0x00, 0x00,

@@ -6,7 +6,10 @@
 //! indexing that can fault on attacker-chosen lengths: bounds are checked and
 //! every TAG_LENGTH is validated against the bytes that remain.
 
+pub mod auth;
 pub mod discovery;
+pub mod engine;
+pub mod ppp;
 pub mod session;
 
 use std::fmt;
@@ -87,8 +90,12 @@ pub enum Error {
     LengthOverrun,
     /// A TAG_LENGTH ran past the end of the discovery payload.
     TagOverrun,
-    /// System RNG failed while generating a local MAC.
+    /// System RNG failed while generating a local MAC or LCP Magic-Number.
     Rng,
+    /// A PPP credential exceeds 255 bytes (the PAP/CHAP length fields are 1 byte).
+    CredentialTooLong,
+    /// A PPP operation was attempted from a phase that does not allow it.
+    InvalidState,
 }
 
 impl fmt::Display for Error {
@@ -101,6 +108,8 @@ impl fmt::Display for Error {
             Error::LengthOverrun => write!(f, "PPPoE length exceeds frame bytes"),
             Error::TagOverrun => write!(f, "tag length exceeds payload bytes"),
             Error::Rng => write!(f, "system rng failed"),
+            Error::CredentialTooLong => write!(f, "ppp credential exceeds 255 bytes"),
+            Error::InvalidState => write!(f, "ppp operation invalid in current phase"),
         }
     }
 }
