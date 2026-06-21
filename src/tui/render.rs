@@ -36,7 +36,7 @@ impl Renderer {
         }
 
         for (i, line) in lines.iter().enumerate() {
-            let changed = self.prev.get(i).map_or(true, |p| p != line);
+            let changed = self.prev.get(i) != Some(line);
             if changed {
                 out.push_str(&format!("\x1b[{};1H\x1b[2K", i + 1));
                 out.push_str(line);

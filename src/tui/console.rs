@@ -203,10 +203,8 @@ impl App {
         match k {
             Key::Char('q') => return Flow::Quit,
             Key::Up | Key::Char('k') => self.sel = self.sel.saturating_sub(1),
-            Key::Down | Key::Char('j') => {
-                if self.sel + 1 < self.item_count() {
-                    self.sel += 1;
-                }
+            Key::Down | Key::Char('j') if self.sel + 1 < self.item_count() => {
+                self.sel += 1;
             }
             Key::Char('r') => self.refresh().await,
             Key::Char('a') => {
@@ -254,28 +252,24 @@ impl App {
                     };
                 }
             }
-            Key::Char('c') => {
-                if self.sel < routes.len() {
-                    let r = &routes[self.sel];
-                    let req = Msg::ClearRoute {
-                        bind_ip: r.bind_ip,
-                        proto: r.proto,
-                        port: r.port,
-                    };
-                    self.apply(req, format!("cleared route {}:{}", proto_name(r.proto), r.port))
-                        .await;
-                }
+            Key::Char('c') if self.sel < routes.len() => {
+                let r = &routes[self.sel];
+                let req = Msg::ClearRoute {
+                    bind_ip: r.bind_ip,
+                    proto: r.proto,
+                    port: r.port,
+                };
+                self.apply(req, format!("cleared route {}:{}", proto_name(r.proto), r.port))
+                    .await;
             }
-            Key::Char('d') => {
-                if self.sel >= routes.len() {
-                    if let Some(l) = listeners.get(self.sel - routes.len()) {
-                        self.overlay = Overlay::Confirm {
-                            prompt: format!("remove listener {} :{} ?", proto_name(l.proto), l.port),
-                            bind: l.bind_ip,
-                            proto: l.proto,
-                            port: l.port,
-                        };
-                    }
+            Key::Char('d') if self.sel >= routes.len() => {
+                if let Some(l) = listeners.get(self.sel - routes.len()) {
+                    self.overlay = Overlay::Confirm {
+                        prompt: format!("remove listener {} :{} ?", proto_name(l.proto), l.port),
+                        bind: l.bind_ip,
+                        proto: l.proto,
+                        port: l.port,
+                    };
                 }
             }
             _ => {}
@@ -610,10 +604,10 @@ impl App {
                 if start > 0 {
                     p.push(frame::row(w, muted_line(&format!("  ↑ {start} more"))));
                 }
-                for i in start..end {
+                for (i, opt) in options.iter().enumerate().take(end).skip(start) {
                     let mut l = Line::new();
                     caret(&mut l, i == *sel);
-                    match &options[i] {
+                    match opt {
                         PickOption::Client(id) => l.add(if i == *sel { BOLD } else { PLAIN }, &sanitize(id)),
                         PickOption::Clear => l.add(WARN, "(clear route)"),
                     };
