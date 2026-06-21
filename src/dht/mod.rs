@@ -172,7 +172,7 @@ pub async fn announce_loop(secret: &str, announce_ip: Option<Ipv4Addr>, port: u1
     loop {
         let delay = match publish(&id, announce_ip, port).await {
             Ok((ip, stored)) => {
-                eprintln!("dht: announced {ip}:{port} to {stored} nodes");
+                crate::elog!("dht: announced {ip}:{port} to {stored} nodes");
                 if stored > 0 {
                     warm = true;
                 }
@@ -183,7 +183,7 @@ pub async fn announce_loop(secret: &str, announce_ip: Option<Ipv4Addr>, port: u1
                 }
             }
             Err(e) => {
-                eprintln!("dht: announce failed: {e}");
+                crate::elog!("dht: announce failed: {e}");
                 if warm {
                     REPUBLISH_INTERVAL
                 } else {

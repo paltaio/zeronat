@@ -298,14 +298,14 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
                 } else {
                     format!(" + {} excluded", st.except.len())
                 };
-                eprintln!(
+                crate::elog!(
                     "tun {}: forwarding all ports (except control{extra}) to {} via {}",
                     st.device.name,
                     st.client_ip,
                     g.backend_name(),
                 );
                 if control_port != 22 && !st.except.contains(&22) {
-                    eprintln!(
+                    crate::elog!(
                         "warning: port 22 (SSH) now routes to the client; pass --except 22 to keep \
                          administering this server over SSH"
                     );
@@ -390,31 +390,31 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         )
         .await
         {
-            eprintln!("{e}");
+            crate::elog!("{e}");
         }
     }
 
     let bind = bind_ip.to_string();
     let (udp_control, l) = bind_control_sockets(&bind, control_port).await?;
-    eprintln!("udp control listening on {bind}:{control_port}");
+    crate::elog!("udp control listening on {bind}:{control_port}");
     {
         let srv = srv.clone();
         let udp_control = udp_control.clone();
         tokio::spawn(async move {
             if let Err(e) = udp_control_listener(srv, udp_control).await {
-                eprintln!("udp control listener stopped: {e}");
+                crate::elog!("udp control listener stopped: {e}");
             }
         });
     }
 
-    eprintln!("control listening on {bind}:{control_port}");
+    crate::elog!("control listening on {bind}:{control_port}");
     loop {
         // A transient accept error (EMFILE, ECONNABORTED, ...) must not kill the
         // control loop or the process; log it, back off briefly, and keep serving.
         let (sock, peer) = match l.accept().await {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("control accept error: {e}");
+                crate::elog!("control accept error: {e}");
                 tokio::time::sleep(ACCEPT_BACKOFF).await;
                 continue;
             }
@@ -422,7 +422,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         let srv = srv.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_incoming(srv, sock).await {
-                eprintln!("connection from {peer} ended: {e}");
+                crate::elog!("connection from {peer} ended: {e}");
             }
         });
     }
@@ -476,9 +476,9 @@ pub(crate) async fn serve_stream(
                 )
             };
             if superseded.is_some() {
-                eprintln!("client {client_id} reconnected, superseding previous session");
+                crate::elog!("client {client_id} reconnected, superseding previous session");
             }
-            eprintln!("client {client_id} connected");
+            crate::elog!("client {client_id} connected");
             let mut w = w;
             let writer = tokio::spawn(async move {
                 while let Some(bytes) = rx.recv().await {
@@ -512,7 +512,7 @@ pub(crate) async fn serve_stream(
                 }
             }
             writer.abort();
-            eprintln!("client {client_id} disconnected");
+            crate::elog!("client {client_id} disconnected");
             Ok(())
         }
         Msg::AdminHello { version, mode } => {
@@ -521,13 +521,13 @@ pub(crate) async fn serve_stream(
             }
             match mode {
                 0 => {
-                    eprintln!("admin connected (snapshot)");
+                    crate::elog!("admin connected (snapshot)");
                     let mut w = w;
                     w.send(&Msg::Snapshot(srv.snapshot()).encode()).await?;
                     Ok(())
                 }
                 1 => {
-                    eprintln!("admin connected (mutate)");
+                    crate::elog!("admin connected (mutate)");
                     // Same guard as the first role frame: an admin that says it
                     // will mutate but never sends the request must not park here.
                     let bytes = match timeout(CONTROL_TIMEOUT, r.recv()).await {
@@ -536,7 +536,7 @@ pub(crate) async fn serve_stream(
                     };
                     let req = Msg::decode(&bytes)?;
                     let (ok, msg) = apply_mutation(&srv, req).await;
-                    eprintln!("admin mutation: ok={ok} {msg}");
+                    crate::elog!("admin mutation: ok={ok} {msg}");
                     let mut w = w;
                     w.send(&Msg::MutationResult { ok, msg }.encode()).await?;
                     Ok(())
@@ -831,7 +831,7 @@ async fn spawn_listener(
             });
         }
     }
-    eprintln!("listener added: {bind_ip} {} {port}", proto_name(proto));
+    crate::elog!("listener added: {bind_ip} {} {port}", proto_name(proto));
     Ok(())
 }
 
@@ -848,7 +848,7 @@ fn remove_listener(srv: &Server, key: RouteKey) -> Result<()> {
                 bridge.abort();
             }
             let (bind_ip, proto, port) = key;
-            eprintln!("listener removed: {bind_ip} {} {port}", proto_name(proto));
+            crate::elog!("listener removed: {bind_ip} {} {port}", proto_name(proto));
             Ok(())
         }
         None => {
@@ -877,7 +877,7 @@ async fn tcp_listener(
                 // Keep the forwarded port alive across transient accept errors so
                 // fd pressure does not silently and permanently kill this listener.
                 Err(e) => {
-                    eprintln!("tcp listener {bind_ip}:{port} accept error: {e}");
+                    crate::elog!("tcp listener {bind_ip}:{port} accept error: {e}");
                     tokio::time::sleep(ACCEPT_BACKOFF).await;
                     continue;
                 }
@@ -930,7 +930,7 @@ async fn udp_listener(
             r = socket.recv_from(&mut buf) => match r {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("udp listener {bind_ip}:{port} recv error: {e}");
+                    crate::elog!("udp listener {bind_ip}:{port} recv error: {e}");
                     tokio::time::sleep(ACCEPT_BACKOFF).await;
                     continue;
                 }
@@ -1062,7 +1062,7 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
             r = socket.recv_from(&mut buf) => match r {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("udp control recv error: {e}");
+                    crate::elog!("udp control recv error: {e}");
                     tokio::time::sleep(ACCEPT_BACKOFF).await;
                     continue;
                 }

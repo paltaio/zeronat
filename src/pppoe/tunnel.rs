@@ -81,7 +81,7 @@ fn maybe_bring_up_zppp0(
         .ac_name
         .map(|n| String::from_utf8_lossy(n).into_owned())
         .unwrap_or_else(|| "any".to_string());
-    eprintln!(
+    crate::elog!(
         "pppoe: zppp0 up ip {}/32 peer {} mtu {} dns {:?}/{:?} ac {}; for a manual test: ip route add {} dev {}",
         est.local_ip,
         est.peer_ip,
@@ -132,7 +132,7 @@ fn strand_watchdog(
     }
     *guard = None;
     *stranded = true;
-    eprintln!(
+    crate::elog!(
         "pppoe: control link silent for {}s; auto-reverted host routing, zppp0 still up",
         PPPOE_STRAND_REVERT.as_secs()
     );
@@ -154,7 +154,7 @@ fn redial_in_place(
 ) -> crate::Result<Option<Arc<TapDevice>>> {
     drop(tun); // close zppp0
     dp.reset()?;
-    eprintln!("pppoe: link down, re-dialing");
+    crate::elog!("pppoe: link down, re-dialing");
     Ok(None)
 }
 

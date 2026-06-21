@@ -210,9 +210,9 @@ impl Discovery {
                 if let Some(addr) = crate::dht::read_cache(id) {
                     return Ok(addr.to_string());
                 }
-                eprintln!("resolving server address via dht...");
+                crate::elog!("resolving server address via dht...");
                 let addr = crate::dht::resolve(id).await?;
-                eprintln!("dht: resolved server to {addr}");
+                crate::elog!("dht: resolved server to {addr}");
                 crate::dht::write_cache(id, addr);
                 Ok(addr.to_string())
             }
@@ -284,11 +284,11 @@ pub async fn run(
             }
             Err(e) => match &last_addr {
                 Some(a) => {
-                    eprintln!("server discovery failed: {e}; keeping last known server {a}");
+                    crate::elog!("server discovery failed: {e}; keeping last known server {a}");
                     a.clone()
                 }
                 None => {
-                    eprintln!("server discovery failed: {e}");
+                    crate::elog!("server discovery failed: {e}");
                     sleep(backoff.delay()).await;
                     backoff.fail();
                     continue;
@@ -325,7 +325,7 @@ pub async fn run(
             );
         }
         if let Err(e) = result {
-            eprintln!("connection lost: {e}");
+            crate::elog!("connection lost: {e}");
             // Only a failure to establish against the cached address invalidates
             // it; a long-lived session dying from a transient blip keeps the cache
             // so the redial stays off the DHT. If the IP truly moved, the next
@@ -377,7 +377,7 @@ async fn bridge_session(
             }
             // A short-lived bridge_udp returns Err with the handshake never even
             // reached on some paths; treat any UDP failure here as a flap signal.
-            eprintln!("udp transport unavailable ({e}); falling back to tcp");
+            crate::elog!("udp transport unavailable ({e}); falling back to tcp");
             let (result, tcp_established) = bridge_tcp(client, tap).await;
             (
                 result,
@@ -426,7 +426,7 @@ async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop, Arc<
                         return;
                     }
                     Err(e) => {
-                        eprintln!("udp recv error: {e}");
+                        crate::elog!("udp recv error: {e}");
                         sleep(RECV_ERROR_BACKOFF).await;
                     }
                 }
@@ -459,7 +459,7 @@ async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bo
         Ok(Err(e)) => return (Err(e), false),
         Err(_) => return (Err("udp handshake timed out".into()), false),
     };
-    eprintln!("bridge connected to {} over udp", client.server);
+    crate::elog!("bridge connected to {} over udp", client.server);
 
     let noise = Arc::new(noise);
     let (inbound, _guard) = sess.register_dgram(BRIDGE_CONV);
@@ -483,7 +483,7 @@ async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bo
     if let Err(e) = nw.send(&Msg::Data { id: BRIDGE_ID }.encode()).await {
         return (Err(e), true);
     }
-    eprintln!("bridge connected to {} over tcp", client.server);
+    crate::elog!("bridge connected to {} over tcp", client.server);
     bridge::tap_stream(tap, nr, nw, Arc::new(Notify::new())).await;
     (Ok(()), true)
 }
@@ -526,7 +526,7 @@ async fn pppoe_session(
             if mode == Transport::Udp {
                 return (Err(e), UdpOutcome::Skipped, established);
             }
-            eprintln!("udp transport unavailable ({e}); falling back to tcp");
+            crate::elog!("udp transport unavailable ({e}); falling back to tcp");
             let (result, tcp_established) = pppoe_tcp(client, pp).await;
             (
                 result,
@@ -617,7 +617,7 @@ async fn pppoe_udp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>,
         Ok(Err(e)) => return (Err(e), false),
         Err(_) => return (Err("udp handshake timed out".into()), false),
     };
-    eprintln!("pppoe connected to {} over udp", client.server);
+    crate::elog!("pppoe connected to {} over udp", client.server);
 
     let noise = Arc::new(noise);
     let (inbound, _guard) = sess.register_dgram(BRIDGE_CONV);
@@ -645,7 +645,7 @@ async fn pppoe_tcp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>,
     if let Err(e) = nw.send(&Msg::Data { id: BRIDGE_ID }.encode()).await {
         return (Err(e), true);
     }
-    eprintln!("pppoe connected to {} over tcp", client.server);
+    crate::elog!("pppoe connected to {} over tcp", client.server);
     // Pin the IP the tunnel actually connected to (handles a hostname --server).
     let server_ip = peer.and_then(peer_v4);
     let result =
@@ -684,7 +684,7 @@ async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome,
     let (link, r, w, started) = if probe_udp {
         match udp_session(client.clone()).await {
             Ok((sess, pump, cancel, (r, w))) => {
-                eprintln!("connected to {} over udp", client.server);
+                crate::elog!("connected to {} over udp", client.server);
                 (Link::Udp(sess, pump, cancel), r, w, Some(Instant::now()))
             }
             Err(e) => {
@@ -694,7 +694,7 @@ async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome,
                 }
                 // A failed UDP connect is itself a flap signal for the cooldown,
                 // independent of how the TCP fallback session fares afterwards.
-                eprintln!("udp transport unavailable ({e}); falling back to tcp");
+                crate::elog!("udp transport unavailable ({e}); falling back to tcp");
                 match tcp_control(client.clone()).await {
                     Ok((r, w)) => {
                         return (
@@ -758,7 +758,7 @@ async fn connect_and_handshake(
 async fn tcp_control(client: Arc<Client>) -> Result<crate::noise::Noise> {
     let (noise, _peer) =
         connect_and_handshake(&client.server, &client.psk, OPEN_HANDSHAKE_TIMEOUT).await?;
-    eprintln!("connected to {}", client.server);
+    crate::elog!("connected to {}", client.server);
     Ok(noise)
 }
 
@@ -841,7 +841,7 @@ async fn control_loop(
                 forwards.retain(|h| !h.is_finished());
                 forwards.push(tokio::spawn(async move {
                     if let Err(e) = handle_open(client, link, proto, port, id).await {
-                        eprintln!("stream {id} ({proto:?} :{port}) failed: {e}");
+                        crate::elog!("stream {id} ({proto:?} :{port}) failed: {e}");
                     }
                 }));
             }

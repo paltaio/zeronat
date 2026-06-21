@@ -144,6 +144,24 @@ fn build_tap(name: Option<String>, mtu: usize, bridge: Option<String>) -> Option
     name.map(|name| TapConfig { name, mtu, bridge })
 }
 
+/// `"on"`/`"off"` for a boolean flag in the startup banner.
+fn onoff(b: bool) -> &'static str {
+    if b {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+/// Short label for the transport mode in the startup banner.
+fn transport_label(t: client::Transport) -> &'static str {
+    match t {
+        client::Transport::Auto => "auto",
+        client::Transport::Udp => "udp",
+        client::Transport::Tcp => "tcp",
+    }
+}
+
 /// Parse a forward spec into (public_port, "host:port" target).
 fn parse_forward(spec: &str) -> Result<(u16, String)> {
     let parts: Vec<&str> = spec.split(':').collect();
@@ -731,6 +749,13 @@ async fn run(cmd: Cmd) -> Result<()> {
                 ip: announce_ip,
                 port: announce_port,
             });
+            zeronat::elog!(
+                "zeronat {} server: bind={bind_ip} control={control_port} tap={} tun={} dht={}",
+                env!("CARGO_PKG_VERSION"),
+                onoff(tap.is_some()),
+                onoff(tun.is_some()),
+                onoff(dht.is_some())
+            );
             server::run(server::ServerSettings {
                 bind: bind_ip,
                 control_port,
@@ -877,6 +902,18 @@ async fn run(cmd: Cmd) -> Result<()> {
                     )
                 }
             };
+            let v = env!("CARGO_PKG_VERSION");
+            let tl = transport_label(transport);
+            match &pppoe {
+                Some(pp) => zeronat::elog!(
+                    "zeronat {v} client: pppoe server={server} transport={tl} tun={} mtu={} default-route={} mss-clamp={} dns={}",
+                    pp.tun_name, pp.effective_mtu, onoff(pp.default_route), onoff(pp.clamp_mss.is_some()), onoff(pp.request_dns)
+                ),
+                None => zeronat::elog!(
+                    "zeronat {v} client: server={server} transport={tl} tcp-forwards={} udp-forwards={} tap={} tun={}",
+                    tcp.len(), udp.len(), onoff(tap.is_some()), onoff(tun.is_some())
+                ),
+            }
             client::run(server, secret, tcp, udp, transport, tap, tun, pppoe, id_prefix).await
         }
         Cmd::Admin {

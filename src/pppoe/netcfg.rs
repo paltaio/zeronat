@@ -227,10 +227,10 @@ pub fn apply(
                         {
                             state.server_pin = Some(ip);
                         } else {
-                            eprintln!("pppoe: server-pin route for {ip} failed; continuing");
+                            crate::elog!("pppoe: server-pin route for {ip} failed; continuing");
                         }
                     }
-                    None => eprintln!(
+                    None => crate::elog!(
                         "pppoe: server-pin skipped (tunnel reached over IPv6); a v4 default swap cannot strand it"
                     ),
                 }
@@ -248,16 +248,16 @@ pub fn apply(
                             captured.metric,
                         );
                         state.default_added = true;
-                        eprintln!(
+                        crate::elog!(
                             "pppoe: default route via {tun_name} (was via {} dev {})",
                             captured.gateway, captured.iface
                         );
                     }
-                    Err(e) => eprintln!("pppoe: could not add default via {tun_name} ({e}); host routing unchanged"),
+                    Err(e) => crate::elog!("pppoe: could not add default via {tun_name} ({e}); host routing unchanged"),
                 }
                 state.captured = Some(captured);
             }
-            None => eprintln!("pppoe: no original default route found; default-route swap skipped"),
+            None => crate::elog!("pppoe: no original default route found; default-route swap skipped"),
         }
     }
 
@@ -282,10 +282,10 @@ fn read_default_route(tun_name: &str) -> Option<CapturedDefault> {
 fn apply_dns(dns: &[Option<Ipv4Addr>; 2], state: &mut AppliedState) {
     let servers: Vec<Ipv4Addr> = dns.iter().flatten().copied().collect();
     if servers.is_empty() {
-        eprintln!("pppoe: --pppoe-dns set but the peer provided no DNS servers");
+        crate::elog!("pppoe: --pppoe-dns set but the peer provided no DNS servers");
         return;
     }
-    eprintln!("pppoe: dns servers {servers:?}");
+    crate::elog!("pppoe: dns servers {servers:?}");
     let rendered = render_resolv_conf(dns);
     let backup = std::fs::read(RESOLV_CONF).ok();
     match std::fs::write(RESOLV_CONF, rendered.as_bytes()) {
@@ -293,7 +293,7 @@ fn apply_dns(dns: &[Option<Ipv4Addr>; 2], state: &mut AppliedState) {
             state.resolv_written = true;
             state.resolv_backup = backup;
         }
-        Err(e) => eprintln!("pppoe: could not write {RESOLV_CONF} ({e}); apply DNS on the host"),
+        Err(e) => crate::elog!("pppoe: could not write {RESOLV_CONF} ({e}); apply DNS on the host"),
     }
 }
 
