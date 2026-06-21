@@ -199,6 +199,16 @@ pub async fn announce_loop(secret: &str, announce_ip: Option<Ipv4Addr>, port: u1
 }
 
 pub(super) fn cache_dir() -> Option<PathBuf> {
+    // A service manager that provisions a persistent, writable state directory wins:
+    // systemd exports STATE_DIRECTORY when the unit declares `StateDirectory=`. A
+    // daemon runs with no HOME/XDG_CACHE_HOME, so without this the cache silently has
+    // nowhere to live and every reconnect re-resolves. The value may be a
+    // colon-separated list; take the first entry.
+    if let Ok(x) = std::env::var("STATE_DIRECTORY") {
+        if let Some(first) = x.split(':').find(|s| !s.is_empty()) {
+            return Some(PathBuf::from(first));
+        }
+    }
     if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
         if !x.is_empty() {
             return Some(PathBuf::from(x));

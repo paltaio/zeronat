@@ -611,6 +611,7 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(Strin
          Wants=network-online.target\n\n\
          [Service]\n\
          EnvironmentFile={ENV_FILE}\n\
+         StateDirectory=zeronat\n\
          ExecStart={BIN_PATH} {sub}\n\
          Restart=always\n\
          RestartSec=3\n\n\

@@ -241,16 +241,29 @@ pub async fn run(
 
     let mut udp_health = UdpHealth::default();
     let mut backoff = Backoff::default();
+    // Last address we successfully resolved to. A transient DHT gap (the server
+    // republishes on an interval) must not knock a working client offline, so an
+    // empty or failed lookup falls back to this until the DHT yields a new value.
+    let mut last_addr: Option<String> = None;
 
     loop {
         let addr = match discovery.resolve().await {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("server discovery failed: {e}");
-                sleep(backoff.delay()).await;
-                backoff.fail();
-                continue;
+            Ok(a) => {
+                last_addr = Some(a.clone());
+                a
             }
+            Err(e) => match &last_addr {
+                Some(a) => {
+                    eprintln!("server discovery failed: {e}; keeping last known server {a}");
+                    a.clone()
+                }
+                None => {
+                    eprintln!("server discovery failed: {e}");
+                    sleep(backoff.delay()).await;
+                    backoff.fail();
+                    continue;
+                }
+            },
         };
         let client = Arc::new(Client {
             server: addr,
