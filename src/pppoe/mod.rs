@@ -7,10 +7,14 @@
 //! every TAG_LENGTH is validated against the bytes that remain.
 
 pub mod auth;
+pub mod cli;
+pub mod datapath;
 pub mod discovery;
 pub mod engine;
 pub mod ppp;
 pub mod session;
+#[cfg(target_os = "linux")]
+pub mod tunnel;
 
 use std::fmt;
 
@@ -96,6 +100,13 @@ pub enum Error {
     CredentialTooLong,
     /// A PPP operation was attempted from a phase that does not allow it.
     InvalidState,
+    /// No PPPoE username was provided via flag or environment.
+    MissingUsername,
+    /// No PPPoE password was provided via file, environment, or flag.
+    MissingPassword,
+    /// The tunnel L2 MTU is too small to carry a usable PPP link. `tunnel` is the
+    /// configured tunnel MTU; `min` is the smallest tunnel MTU that would work.
+    TunnelMtuTooSmall { tunnel: u16, min: u16 },
 }
 
 impl fmt::Display for Error {
@@ -110,6 +121,17 @@ impl fmt::Display for Error {
             Error::Rng => write!(f, "system rng failed"),
             Error::CredentialTooLong => write!(f, "ppp credential exceeds 255 bytes"),
             Error::InvalidState => write!(f, "ppp operation invalid in current phase"),
+            Error::MissingUsername => {
+                write!(f, "--pppoe requires --pppoe-user or ZERONAT_PPPOE_USER")
+            }
+            Error::MissingPassword => write!(
+                f,
+                "--pppoe requires --pppoe-pass-file, ZERONAT_PPPOE_PASS, or --pppoe-pass"
+            ),
+            Error::TunnelMtuTooSmall { tunnel, min } => write!(
+                f,
+                "tunnel MTU {tunnel} too small for PPPoE: needs at least {min}"
+            ),
         }
     }
 }

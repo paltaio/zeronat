@@ -116,6 +116,21 @@ pub enum Transport {
     Tcp,
 }
 
+/// Resolved `--pppoe` configuration. Owns the credential bytes for the whole
+/// reconnect-loop lifetime; the per-attempt `PppoeDatapath` borrows them.
+#[derive(Clone)]
+pub struct PppoeRunConfig {
+    pub username: Vec<u8>,
+    pub password: Vec<u8>,
+    /// PPPoE Service-Name selector (empty = any).
+    pub service_name: Vec<u8>,
+    /// Preferred AC name. Stored and logged; PADO filtering is not yet active.
+    pub ac_name: Option<Vec<u8>>,
+    pub tun_name: String,
+    /// Effective MTU/MRU (`min(--pppoe-mtu, tunnel MTU - 8)`, floored).
+    pub effective_mtu: u16,
+}
+
 /// What an Auto-mode connection attempt did with UDP, so the reconnect loop can
 /// update its cooldown memory. `Skipped` means the attempt never touched UDP
 /// (forced TCP, or cooldown active), so it leaves the memory unchanged.
@@ -217,6 +232,7 @@ pub async fn run(
     transport: Transport,
     tap: Option<TapConfig>,
     tun: Option<TunConfig>,
+    pppoe: Option<PppoeRunConfig>,
     id_prefix: Option<String>,
 ) -> Result<()> {
     let psk = crate::noise::derive_psk(&secret);
@@ -238,6 +254,14 @@ pub async fn run(
     if tap.is_some() || tun.is_some() {
         return Err("L2/L3 tunnel modes (--tap/--tun) are only supported on Linux".into());
     }
+    #[cfg(not(target_os = "linux"))]
+    if pppoe.is_some() {
+        return Err("--pppoe is only supported on Linux".into());
+    }
+
+    // Held for the loop's lifetime: the per-attempt datapath borrows these
+    // credential bytes across the await, so the config must outlive every attempt.
+    let pppoe = pppoe.map(Arc::new);
 
     let mut udp_health = UdpHealth::default();
     let mut backoff = Backoff::default();
@@ -276,10 +300,14 @@ pub async fn run(
         // Auto only: skip the UDP probe while a flap cooldown is active. Forced
         // Udp/Tcp ignore `try_udp` and keep their fixed path.
         let try_udp = transport != Transport::Auto || choose_udp(&udp_health, Instant::now());
+        // The (Some(tap), Some(pppoe)) case is impossible: the run() exclusion
+        // check rejects --pppoe with --tap/--tun before the loop. Match tap first
+        // so the precedence is deterministic without an unreachable! arm.
         #[cfg(target_os = "linux")]
-        let (result, outcome, established) = match &tap {
-            Some(tap) => bridge_session(client.clone(), tap.clone(), try_udp).await,
-            None => session(client.clone(), try_udp).await,
+        let (result, outcome, established) = match (&tap, &pppoe) {
+            (Some(tap), _) => bridge_session(client.clone(), tap.clone(), try_udp).await,
+            (None, Some(pp)) => pppoe_session(client.clone(), pp.clone(), try_udp).await,
+            (None, None) => session(client.clone(), try_udp).await,
         };
         #[cfg(not(target_os = "linux"))]
         let (result, outcome, established) = session(client.clone(), try_udp).await;
@@ -452,6 +480,135 @@ async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bo
     eprintln!("bridge connected to {} over tcp", client.server);
     bridge::tap_stream(tap, nr, nw, Arc::new(Notify::new())).await;
     (Ok(()), true)
+}
+
+/// Discovery resend budget for the in-process PPPoE client, expressed in
+/// `NEGO_TICK` (1s) units: resend PADI/PADR after 3s of no progress, up to 5
+/// attempts before declaring the line dead.
+#[cfg(target_os = "linux")]
+const PPPOE_RETRANSMIT_TICKS: u32 = 3;
+#[cfg(target_os = "linux")]
+const PPPOE_MAX_ATTEMPTS: u32 = 5;
+
+/// Bring up the in-process PPPoE client: UDP first for Auto/Udp, TCP otherwise or
+/// as fallback. Mirrors `bridge_session`'s reconnect contract; the only structural
+/// delta is that `pppoe_udp`/`pppoe_tcp` return the datapath's `Result<()>` (a TUN
+/// open failure or discovery death) instead of always `Ok(())`.
+#[cfg(target_os = "linux")]
+async fn pppoe_session(
+    client: Arc<Client>,
+    pp: Arc<PppoeRunConfig>,
+    try_udp: bool,
+) -> (Result<()>, UdpOutcome, bool) {
+    let mode = client.transport;
+    if mode == Transport::Tcp || (mode == Transport::Auto && !try_udp) {
+        let (result, established) = pppoe_tcp(client, pp).await;
+        return (result, UdpOutcome::Skipped, established);
+    }
+    let started = Instant::now();
+    match pppoe_udp(client.clone(), pp.clone()).await {
+        (Ok(()), established) => {
+            let healthy = started.elapsed() >= UDP_MIN_HEALTHY;
+            let outcome = if healthy {
+                UdpOutcome::Healthy
+            } else {
+                UdpOutcome::Unhealthy
+            };
+            (Ok(()), outcome, established)
+        }
+        (Err(e), established) => {
+            if mode == Transport::Udp {
+                return (Err(e), UdpOutcome::Skipped, established);
+            }
+            eprintln!("udp transport unavailable ({e}); falling back to tcp");
+            let (result, tcp_established) = pppoe_tcp(client, pp).await;
+            (
+                result,
+                UdpOutcome::Unhealthy,
+                established || tcp_established,
+            )
+        }
+    }
+}
+
+/// Build a `PppoeDatapath` borrowing `pp`'s credential bytes. The caller holds
+/// `pp` (an `Arc`) across the whole datapath run, so the borrow stays valid.
+#[cfg(target_os = "linux")]
+fn build_datapath(pp: &PppoeRunConfig) -> Result<crate::pppoe::datapath::PppoeDatapath<'_>> {
+    crate::pppoe::datapath::PppoeDatapath::new(
+        &pp.username,
+        &pp.password,
+        pp.service_name.clone(),
+        pp.effective_mtu,
+        PPPOE_RETRANSMIT_TICKS,
+        PPPOE_MAX_ATTEMPTS,
+    )
+    .map_err(|e| -> crate::Error { e.into() })
+}
+
+#[cfg(target_os = "linux")]
+fn bringup(pp: &PppoeRunConfig) -> crate::pppoe::tunnel::ZpppBringup<'_> {
+    crate::pppoe::tunnel::ZpppBringup {
+        tun_name: &pp.tun_name,
+        mtu: pp.effective_mtu,
+        ac_name: pp.ac_name.as_deref(),
+    }
+}
+
+/// In-process PPPoE over the UDP transport: PPPoE frames ride the unreliable
+/// datagram channel. The bool is whether the handshake established before the
+/// datapath ran or failed.
+#[cfg(target_os = "linux")]
+async fn pppoe_udp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>, bool) {
+    let dp = match build_datapath(&pp) {
+        Ok(dp) => dp,
+        Err(e) => return (Err(e), false),
+    };
+    let (sess, _pump, cancel) = match udp_connect(&client).await {
+        Ok(v) => v,
+        Err(e) => return (Err(e), false),
+    };
+    let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
+    let noise = match tokio_timeout(
+        UDP_HANDSHAKE_TIMEOUT,
+        client_handshake_stateless(stream, &client.psk, BRIDGE_ID),
+    )
+    .await
+    {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return (Err(e), false),
+        Err(_) => return (Err("udp handshake timed out".into()), false),
+    };
+    eprintln!("pppoe connected to {} over udp", client.server);
+
+    let noise = Arc::new(noise);
+    let (inbound, _guard) = sess.register_dgram(BRIDGE_CONV);
+    let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
+    let rx = DgramRx::new(inbound, noise);
+    let result = crate::pppoe::tunnel::run_dgram(dp, bringup(&pp), rx, tx, cancel).await;
+    (result, true)
+}
+
+/// In-process PPPoE over the TCP fallback: PPPoE frames ride a reliable Noise
+/// stream. The bool is whether the handshake established before the datapath ran.
+#[cfg(target_os = "linux")]
+async fn pppoe_tcp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>, bool) {
+    let dp = match build_datapath(&pp) {
+        Ok(dp) => dp,
+        Err(e) => return (Err(e), false),
+    };
+    let (nr, mut nw) =
+        match connect_and_handshake(&client.server, &client.psk, OPEN_HANDSHAKE_TIMEOUT).await {
+            Ok(v) => v,
+            Err(e) => return (Err(e), false),
+        };
+    if let Err(e) = nw.send(&Msg::Data { id: BRIDGE_ID }.encode()).await {
+        return (Err(e), true);
+    }
+    eprintln!("pppoe connected to {} over tcp", client.server);
+    let result = crate::pppoe::tunnel::run_stream(dp, bringup(&pp), nr, nw, Arc::new(Notify::new()))
+        .await;
+    (result, true)
 }
 
 /// Establish the control channel over UDP/KCP. Returns the session and the

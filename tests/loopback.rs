@@ -154,6 +154,7 @@ fn start_tunnel(transport: zeronat::client::Transport) -> Tunnel {
         transport,
         None,
         None,
+        None,
         Some("rpi".into()),
     ));
 
@@ -388,6 +389,7 @@ async fn multi_client_route_switch() {
             zeronat::client::Transport::Tcp,
             None,
             None,
+            None,
             Some("rpi-1".into()),
         ));
         tokio::spawn(zeronat::client::run(
@@ -396,6 +398,7 @@ async fn multi_client_route_switch() {
             vec![(public_tcp, format!("127.0.0.1:{target2}"))],
             vec![],
             zeronat::client::Transport::Tcp,
+            None,
             None,
             None,
             Some("rpi-2".into()),
@@ -633,6 +636,7 @@ async fn reconnect_same_id_supersede() {
             zeronat::client::Transport::Tcp,
             None,
             None,
+            None,
             Some("dup".into()),
         ));
         tokio::spawn(zeronat::client::run(
@@ -641,6 +645,7 @@ async fn reconnect_same_id_supersede() {
             vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
             vec![],
             zeronat::client::Transport::Tcp,
+            None,
             None,
             None,
             Some("dup".into()),
@@ -710,6 +715,7 @@ async fn config_autosave_persists_route() {
             vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
             vec![],
             zeronat::client::Transport::Tcp,
+            None,
             None,
             None,
             Some("rpi".into()),
@@ -797,6 +803,7 @@ async fn cli_listener_remove_refused() {
             zeronat::client::Transport::Tcp,
             None,
             None,
+            None,
             Some("rpi".into()),
         ));
         wait_clients(control, 1).await;
@@ -848,6 +855,7 @@ async fn runtime_node_does_not_persist() {
             vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
             vec![],
             zeronat::client::Transport::Tcp,
+            None,
             None,
             None,
             Some("rpi".into()),

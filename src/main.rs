@@ -53,6 +53,18 @@ client options:
   --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
   --tap-mtu <N>       TAP/TUN MTU (default: 1400; alias --tun-mtu)
   --bridge <NAME>     Enslave the TAP to this existing bridge
+  --pppoe             In-process PPPoE client (Linux only): dial an ISP PPPoE
+                      line over the tunnel and expose it as a TUN (zppp0)
+  --pppoe-user <U>    PPPoE username (or env ZERONAT_PPPOE_USER)
+  --pppoe-pass-file <P> File (mode 600) holding the PPPoE password (preferred)
+  --pppoe-pass <P>    PPPoE password inline; visible in ps/argv, prefer
+                      --pppoe-pass-file or ZERONAT_PPPOE_PASS
+  --pppoe-service <NAME> PPPoE Service-Name to request (default: any)
+  --pppoe-ac <NAME>   Preferred Access Concentrator name (accepted; AC-name
+                      filtering not yet active)
+  --pppoe-tun <NAME>  TUN device name (default: zppp0)
+  --pppoe-mtu <N>     Requested PPP MTU/MRU (default: 1492; capped to tunnel
+                      MTU minus 8)
 
 admin options:
   (no command)        Open the interactive console on a terminal; prints a
@@ -92,6 +104,14 @@ enum Cmd {
         tap: Option<TapConfig>,
         tun: bool,
         mtu: usize,
+        pppoe: bool,
+        pppoe_user: Option<String>,
+        pppoe_pass: Option<String>,
+        pppoe_pass_file: Option<std::path::PathBuf>,
+        pppoe_service: Option<String>,
+        pppoe_ac: Option<String>,
+        pppoe_tun: String,
+        pppoe_mtu: usize,
     },
     Admin {
         server: String,
@@ -318,6 +338,14 @@ fn parse_args() -> Result<Cmd> {
         let mut tap_mtu: usize = DEFAULT_TAP_MTU;
         let mut bridge: Option<String> = None;
         let mut tun = false;
+        let mut pppoe = false;
+        let mut pppoe_user: Option<String> = None;
+        let mut pppoe_pass: Option<String> = None;
+        let mut pppoe_pass_file: Option<std::path::PathBuf> = None;
+        let mut pppoe_service: Option<String> = None;
+        let mut pppoe_ac: Option<String> = None;
+        let mut pppoe_tun = "zppp0".to_string();
+        let mut pppoe_mtu: usize = 1492;
 
         while let Some(flag) = iter.next() {
             match flag.as_str() {
@@ -360,6 +388,34 @@ fn parse_args() -> Result<Cmd> {
                 "--bridge" => {
                     bridge = Some(iter.next().ok_or("--bridge requires a value")?);
                 }
+                "--pppoe" => {
+                    pppoe = true;
+                }
+                "--pppoe-user" => {
+                    pppoe_user = Some(iter.next().ok_or("--pppoe-user requires a value")?);
+                }
+                "--pppoe-pass" => {
+                    pppoe_pass = Some(iter.next().ok_or("--pppoe-pass requires a value")?);
+                }
+                "--pppoe-pass-file" => {
+                    pppoe_pass_file =
+                        Some(iter.next().ok_or("--pppoe-pass-file requires a value")?.into());
+                }
+                "--pppoe-service" => {
+                    pppoe_service = Some(iter.next().ok_or("--pppoe-service requires a value")?);
+                }
+                "--pppoe-ac" => {
+                    pppoe_ac = Some(iter.next().ok_or("--pppoe-ac requires a value")?);
+                }
+                "--pppoe-tun" => {
+                    pppoe_tun = iter.next().ok_or("--pppoe-tun requires a value")?;
+                }
+                "--pppoe-mtu" => {
+                    let v = iter.next().ok_or("--pppoe-mtu requires a value")?;
+                    pppoe_mtu = v.parse().map_err(|_| -> zeronat::Error {
+                        format!("--pppoe-mtu must be a positive integer, got '{v}'").into()
+                    })?;
+                }
                 other => {
                     eprintln!("error: unknown flag '{other}'");
                     std::process::exit(1);
@@ -387,6 +443,14 @@ fn parse_args() -> Result<Cmd> {
             tun,
             mtu: tap_mtu,
             tap,
+            pppoe,
+            pppoe_user,
+            pppoe_pass,
+            pppoe_pass_file,
+            pppoe_service,
+            pppoe_ac,
+            pppoe_tun,
+            pppoe_mtu,
         })
     } else {
         // admin
@@ -675,7 +739,24 @@ async fn run(cmd: Cmd) -> Result<()> {
             tap,
             tun,
             mtu,
+            pppoe,
+            pppoe_user,
+            pppoe_pass,
+            pppoe_pass_file,
+            pppoe_service,
+            pppoe_ac,
+            pppoe_tun,
+            pppoe_mtu,
         } => {
+            use zeronat::pppoe::cli;
+            // --pppoe owns the L2 channel; reject the device/forward flags it
+            // conflicts with. --transport is orthogonal and stays valid.
+            cli::validate_pppoe_exclusions(
+                pppoe,
+                tap.is_some(),
+                tun,
+                !tcp.is_empty() || !udp.is_empty(),
+            )?;
             if tun {
                 if tap.is_some() {
                     return Err("--tun cannot be combined with --tap".into());
@@ -687,9 +768,55 @@ async fn run(cmd: Cmd) -> Result<()> {
             if tap.is_some() && (!tcp.is_empty() || !udp.is_empty()) {
                 return Err("--tap cannot be combined with --tcp/--udp forwards".into());
             }
-            if !tun && tap.is_none() && tcp.is_empty() && udp.is_empty() {
-                return Err("nothing to do: pass --tun, --tap, or at least one --tcp/--udp".into());
+            if !pppoe && !tun && tap.is_none() && tcp.is_empty() && udp.is_empty() {
+                return Err(
+                    "nothing to do: pass --pppoe, --tun, --tap, or at least one --tcp/--udp".into(),
+                );
             }
+
+            // Resolve the PPPoE config: credentials (file > env > flag) and the
+            // effective MTU (capped to the tunnel MTU minus 8, floored). The
+            // password file is read here so the precedence helper stays pure.
+            let pppoe = if pppoe {
+                let user = cli::resolve_username(
+                    pppoe_user,
+                    std::env::var("ZERONAT_PPPOE_USER").ok(),
+                )?;
+                let pass_file = match &pppoe_pass_file {
+                    Some(path) => Some(std::fs::read(path).map_err(|e| -> zeronat::Error {
+                        format!("reading --pppoe-pass-file {}: {e}", path.display()).into()
+                    })?),
+                    None => None,
+                };
+                let pass = cli::resolve_password(
+                    pass_file,
+                    std::env::var("ZERONAT_PPPOE_PASS").ok(),
+                    pppoe_pass,
+                )?;
+                let pppoe_mtu_u16: u16 = pppoe_mtu.try_into().map_err(|_| -> zeronat::Error {
+                    format!("--pppoe-mtu {pppoe_mtu} exceeds the 65535 MTU limit").into()
+                })?;
+                let tap_mtu_u16: u16 = mtu.try_into().map_err(|_| -> zeronat::Error {
+                    format!("--tap-mtu {mtu} exceeds the 65535 MTU limit").into()
+                })?;
+                let resolved = cli::resolve_effective_mtu(pppoe_mtu_u16, tap_mtu_u16)?;
+                if resolved.capped {
+                    eprintln!(
+                        "pppoe: requested MTU {pppoe_mtu} exceeds what the tunnel carries; using {}",
+                        resolved.effective
+                    );
+                }
+                Some(client::PppoeRunConfig {
+                    username: user,
+                    password: pass,
+                    service_name: pppoe_service.map(String::into_bytes).unwrap_or_default(),
+                    ac_name: pppoe_ac.map(String::into_bytes),
+                    tun_name: pppoe_tun,
+                    effective_mtu: resolved.effective,
+                })
+            } else {
+                None
+            };
             let tun = if tun {
                 let (_subnet, _server_ip, client_ip) = tun_addrs(&secret);
                 Some(zeronat::tap::TunConfig {
@@ -719,7 +846,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                     )
                 }
             };
-            client::run(server, secret, tcp, udp, transport, tap, tun, id_prefix).await
+            client::run(server, secret, tcp, udp, transport, tap, tun, pppoe, id_prefix).await
         }
         Cmd::Admin {
             server,
