@@ -65,6 +65,12 @@ client options:
   --pppoe-tun <NAME>  TUN device name (default: zppp0)
   --pppoe-mtu <N>     Requested PPP MTU/MRU (default: 1492; capped to tunnel
                       MTU minus 8)
+  --pppoe-default-route  Route all traffic out zppp0 except the tunnel to the
+                      server; brings on the TCP MSS clamp; reverts on exit
+  --pppoe-no-mss-clamp   Opt out of the MSS clamp that rides with
+                      --pppoe-default-route
+  --pppoe-dns         Apply IPCP-provided DNS to /etc/resolv.conf (fragile under
+                      Docker; the servers are also logged)
 
 admin options:
   (no command)        Open the interactive console on a terminal; prints a
@@ -112,6 +118,9 @@ enum Cmd {
         pppoe_ac: Option<String>,
         pppoe_tun: String,
         pppoe_mtu: usize,
+        pppoe_default_route: bool,
+        pppoe_no_mss_clamp: bool,
+        pppoe_dns: bool,
     },
     Admin {
         server: String,
@@ -346,6 +355,9 @@ fn parse_args() -> Result<Cmd> {
         let mut pppoe_ac: Option<String> = None;
         let mut pppoe_tun = "zppp0".to_string();
         let mut pppoe_mtu: usize = 1492;
+        let mut pppoe_default_route = false;
+        let mut pppoe_no_mss_clamp = false;
+        let mut pppoe_dns = false;
 
         while let Some(flag) = iter.next() {
             match flag.as_str() {
@@ -416,6 +428,9 @@ fn parse_args() -> Result<Cmd> {
                         format!("--pppoe-mtu must be a positive integer, got '{v}'").into()
                     })?;
                 }
+                "--pppoe-default-route" => pppoe_default_route = true,
+                "--pppoe-no-mss-clamp" => pppoe_no_mss_clamp = true,
+                "--pppoe-dns" => pppoe_dns = true,
                 other => {
                     eprintln!("error: unknown flag '{other}'");
                     std::process::exit(1);
@@ -451,6 +466,9 @@ fn parse_args() -> Result<Cmd> {
             pppoe_ac,
             pppoe_tun,
             pppoe_mtu,
+            pppoe_default_route,
+            pppoe_no_mss_clamp,
+            pppoe_dns,
         })
     } else {
         // admin
@@ -747,6 +765,9 @@ async fn run(cmd: Cmd) -> Result<()> {
             pppoe_ac,
             pppoe_tun,
             pppoe_mtu,
+            pppoe_default_route,
+            pppoe_no_mss_clamp,
+            pppoe_dns,
         } => {
             use zeronat::pppoe::cli;
             // --pppoe owns the L2 channel; reject the device/forward flags it
@@ -757,6 +778,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 tun,
                 !tcp.is_empty() || !udp.is_empty(),
             )?;
+            cli::validate_pppoe_netcfg(pppoe, pppoe_default_route, pppoe_no_mss_clamp, pppoe_dns)?;
             if tun {
                 if tap.is_some() {
                     return Err("--tun cannot be combined with --tap".into());
@@ -813,6 +835,15 @@ async fn run(cmd: Cmd) -> Result<()> {
                     ac_name: pppoe_ac.map(String::into_bytes),
                     tun_name: pppoe_tun,
                     effective_mtu: resolved.effective,
+                    default_route: pppoe_default_route,
+                    // The MSS clamp rides with --pppoe-default-route unless opted out;
+                    // value is the effective IP MTU minus the IPv4+TCP headers.
+                    clamp_mss: if pppoe_default_route && !pppoe_no_mss_clamp {
+                        Some(resolved.effective.saturating_sub(40).max(536))
+                    } else {
+                        None
+                    },
+                    request_dns: pppoe_dns,
                 })
             } else {
                 None

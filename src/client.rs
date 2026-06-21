@@ -129,6 +129,12 @@ pub struct PppoeRunConfig {
     pub tun_name: String,
     /// Effective MTU/MRU (`min(--pppoe-mtu, tunnel MTU - 8)`, floored).
     pub effective_mtu: u16,
+    /// Replace the host default route with zppp0 and pin the tunnel to the WAN.
+    pub default_route: bool,
+    /// MSS to clamp forwarded SYNs to, or `None` to leave forwarded packets alone.
+    pub clamp_mss: Option<u16>,
+    /// Request the IPCP DNS servers and apply them to `/etc/resolv.conf`.
+    pub request_dns: bool,
 }
 
 /// What an Auto-mode connection attempt did with UDP, so the reconnect loop can
@@ -469,7 +475,7 @@ async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bo
 /// is whether the handshake established before the bridge ran or failed.
 #[cfg(target_os = "linux")]
 async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bool) {
-    let (nr, mut nw) =
+    let ((nr, mut nw), _peer) =
         match connect_and_handshake(&client.server, &client.psk, OPEN_HANDSHAKE_TIMEOUT).await {
             Ok(v) => v,
             Err(e) => return (Err(e), false),
@@ -535,7 +541,7 @@ async fn pppoe_session(
 /// `pp` (an `Arc`) across the whole datapath run, so the borrow stays valid.
 #[cfg(target_os = "linux")]
 fn build_datapath(pp: &PppoeRunConfig) -> Result<crate::pppoe::datapath::PppoeDatapath<'_>> {
-    crate::pppoe::datapath::PppoeDatapath::new(
+    let mut dp = crate::pppoe::datapath::PppoeDatapath::new(
         &pp.username,
         &pp.password,
         pp.service_name.clone(),
@@ -543,15 +549,47 @@ fn build_datapath(pp: &PppoeRunConfig) -> Result<crate::pppoe::datapath::PppoeDa
         PPPOE_RETRANSMIT_TICKS,
         PPPOE_MAX_ATTEMPTS,
     )
-    .map_err(|e| -> crate::Error { e.into() })
+    .map_err(|e| -> crate::Error { e.into() })?;
+    if let Some(c) = pp.clamp_mss {
+        dp.set_clamp_mss(c);
+    }
+    dp.set_request_dns(pp.request_dns);
+    Ok(dp)
+}
+
+/// The IPv4 half of a socket address, or `None` for IPv6. Used to target the
+/// PPPoE WAN pin; an IPv6-reached control link cannot be stranded by a v4
+/// default-route swap, so `None` correctly skips the pin there.
+#[cfg(target_os = "linux")]
+fn peer_v4(addr: SocketAddr) -> Option<std::net::Ipv4Addr> {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(_) => None,
+    }
+}
+
+/// The server's IPv4 address parsed from a literal `host:port`. Valid for the UDP
+/// path, where `--server` is already a resolved `ip:port`; the TCP path uses the
+/// connected `peer_addr` instead so a hostname `--server` is still pinned.
+#[cfg(target_os = "linux")]
+fn server_v4(server: &str) -> Option<std::net::Ipv4Addr> {
+    server.parse::<SocketAddr>().ok().and_then(peer_v4)
 }
 
 #[cfg(target_os = "linux")]
-fn bringup(pp: &PppoeRunConfig) -> crate::pppoe::tunnel::ZpppBringup<'_> {
+fn bringup<'a>(
+    server_ip: Option<std::net::Ipv4Addr>,
+    pp: &'a PppoeRunConfig,
+) -> crate::pppoe::tunnel::ZpppBringup<'a> {
     crate::pppoe::tunnel::ZpppBringup {
         tun_name: &pp.tun_name,
         mtu: pp.effective_mtu,
         ac_name: pp.ac_name.as_deref(),
+        netcfg: crate::pppoe::netcfg::NetCfgOpts {
+            default_route: pp.default_route,
+            dns: pp.request_dns,
+        },
+        server_ip,
     }
 }
 
@@ -585,7 +623,9 @@ async fn pppoe_udp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>,
     let (inbound, _guard) = sess.register_dgram(BRIDGE_CONV);
     let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
     let rx = DgramRx::new(inbound, noise);
-    let result = crate::pppoe::tunnel::run_dgram(dp, bringup(&pp), rx, tx, cancel).await;
+    // UDP requires a literal ip:port, so the configured server is the real peer.
+    let server_ip = server_v4(&client.server);
+    let result = crate::pppoe::tunnel::run_dgram(dp, bringup(server_ip, &pp), rx, tx, cancel).await;
     (result, true)
 }
 
@@ -597,7 +637,7 @@ async fn pppoe_tcp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>,
         Ok(dp) => dp,
         Err(e) => return (Err(e), false),
     };
-    let (nr, mut nw) =
+    let ((nr, mut nw), peer) =
         match connect_and_handshake(&client.server, &client.psk, OPEN_HANDSHAKE_TIMEOUT).await {
             Ok(v) => v,
             Err(e) => return (Err(e), false),
@@ -606,8 +646,11 @@ async fn pppoe_tcp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>,
         return (Err(e), true);
     }
     eprintln!("pppoe connected to {} over tcp", client.server);
-    let result = crate::pppoe::tunnel::run_stream(dp, bringup(&pp), nr, nw, Arc::new(Notify::new()))
-        .await;
+    // Pin the IP the tunnel actually connected to (handles a hostname --server).
+    let server_ip = peer.and_then(peer_v4);
+    let result =
+        crate::pppoe::tunnel::run_stream(dp, bringup(server_ip, &pp), nr, nw, Arc::new(Notify::new()))
+            .await;
     (result, true)
 }
 
@@ -683,23 +726,29 @@ async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome,
     (result, outcome, true)
 }
 
-/// Dial `addr`, disable Nagle, and run the Noise handshake, bounding the whole
-/// connect-plus-handshake under `timeout`. A path that black-holes mid-handshake
-/// (msg1 ACKed but msg2 never arrives on a NAT remap, WAN re-dial, or silent
-/// firewall drop) would otherwise park on the kernel read for the retransmit
-/// window (~15 min, or forever with keepalive off); the timeout turns that into
-/// an Err so the caller can back off and redial in seconds.
+/// Dial `addr`, disable Nagle, run the Noise handshake, and report the connected
+/// peer address, bounding the whole connect-plus-handshake under `timeout`.
+///
+/// A path that black-holes mid-handshake (msg1 ACKed but msg2 never arrives on a
+/// NAT remap, WAN re-dial, or silent firewall drop) would otherwise park on the
+/// kernel read for the retransmit window (~15 min, or forever with keepalive off);
+/// the timeout turns that into an Err so the caller can back off and redial in
+/// seconds. The peer is the IP the socket actually reached (after DNS resolution of
+/// a hostname `--server`), which is what the PPPoE WAN pin must target; a re-parse
+/// of the config string misses the hostname case.
 async fn connect_and_handshake(
     addr: &str,
     psk: &[u8; 32],
     timeout: Duration,
-) -> Result<crate::noise::Noise> {
+) -> Result<(crate::noise::Noise, Option<SocketAddr>)> {
     tokio_timeout(timeout, async {
         let sock = TcpStream::connect(addr)
             .await
             .map_err(|e| -> crate::Error { format!("connecting to {addr}: {e}").into() })?;
         sock.set_nodelay(true).ok();
-        client_handshake(sock, psk).await
+        let peer = sock.peer_addr().ok();
+        let noise = client_handshake(sock, psk).await?;
+        Ok((noise, peer))
     })
     .await
     .map_err(|_| -> crate::Error { format!("tcp handshake to {addr} timed out").into() })?
@@ -707,7 +756,8 @@ async fn connect_and_handshake(
 
 /// Dial the TCP control connection and run the Noise handshake.
 async fn tcp_control(client: Arc<Client>) -> Result<crate::noise::Noise> {
-    let noise = connect_and_handshake(&client.server, &client.psk, OPEN_HANDSHAKE_TIMEOUT).await?;
+    let (noise, _peer) =
+        connect_and_handshake(&client.server, &client.psk, OPEN_HANDSHAKE_TIMEOUT).await?;
     eprintln!("connected to {}", client.server);
     Ok(noise)
 }

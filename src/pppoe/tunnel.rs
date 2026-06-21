@@ -11,6 +11,7 @@
 //! Before Established there is no address and no TUN; the zppp0 read arm stays
 //! disabled until the bring-up edge.
 
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,12 +22,25 @@ use crate::bridge::UDP_IDLE;
 use crate::dgram::{DgramRx, DgramTx, Frame};
 use crate::noise::{NoiseReader, NoiseWriter};
 use crate::pppoe::datapath::{DpPhase, PppoeDatapath};
+use crate::pppoe::engine::Established;
+use crate::pppoe::netcfg::{self, NetCfgGuard, NetCfgOpts};
 use crate::tap::{TapDevice, TunConfig};
 
 /// Fast tick that drives discovery PADI/PADR retransmit and PPP phase advance.
 /// PPPoE/PPP restart timers are seconds-scale, far below the idle window, so the
 /// FSM is stepped on this cadence rather than the slow keepalive tick.
 const NEGO_TICK: Duration = Duration::from_secs(1);
+
+/// After the default route is swapped to zppp0, if no inbound tunnel frame arrives
+/// for this long the control link is treated as stranded and the host-network
+/// helpers are reverted (keeping zppp0 and the process up). Must stay below
+/// `UDP_IDLE` (120s) so the revert precedes the idle reap. It keys on raw tunnel
+/// inbound silence, refreshed by the BRAS's LCP echo-replies (~25s) on a healthy
+/// link; the only other refresh is the 60s tunnel keepalive. So 45s sits above the
+/// echo cadence (a healthy link never trips) but below the ~75s PPP echo-dead
+/// window, intentionally falling back to the original WAN before PPP itself gives
+/// up when the zppp0 path goes quiet.
+const PPPOE_STRAND_REVERT: Duration = Duration::from_secs(45);
 
 /// Carried into `run_*`: the zppp0 name and the effective MTU/MRU (used both for
 /// the TUN MTU and, already, for the LCP MRU baked into the datapath).
@@ -35,6 +49,10 @@ pub struct ZpppBringup<'a> {
     pub mtu: u16,
     /// Stored-only AC-name selector (logged, not yet used for PADO filtering).
     pub ac_name: Option<&'a [u8]>,
+    /// Which host-network helpers to apply once the link is Established.
+    pub netcfg: NetCfgOpts,
+    /// Resolved IPv4 server address for the WAN pin, or `None` to skip it.
+    pub server_ip: Option<Ipv4Addr>,
 }
 
 /// Bring up zppp0 once PPP reports Established. Opens the TUN with the IPCP
@@ -44,13 +62,13 @@ fn maybe_bring_up_zppp0(
     tun: Option<Arc<TapDevice>>,
     phase: DpPhase,
     cfg: &ZpppBringup<'_>,
-) -> crate::Result<Option<Arc<TapDevice>>> {
+) -> crate::Result<(Option<Arc<TapDevice>>, Option<Established>)> {
     if tun.is_some() {
-        return Ok(tun); // already up
+        return Ok((tun, None)); // already up; no fresh edge
     }
     let est = match phase {
         DpPhase::Established(est) => est,
-        _ => return Ok(None),
+        _ => return Ok((None, None)),
     };
     let tun_cfg = TunConfig {
         name: cfg.tun_name.to_string(),
@@ -74,7 +92,51 @@ fn maybe_bring_up_zppp0(
         est.peer_ip,
         cfg.tun_name,
     );
-    Ok(Some(dev))
+    Ok((Some(dev), Some(est)))
+}
+
+/// On a fresh Established edge, apply the opt-in host-network helpers for the new
+/// lease. A no-op when no host flags are set. Clears the strand latch so the
+/// watchdog re-arms for the new default route. The LinkDown path already reverts
+/// any prior guard before a re-Established edge can occur, so the `None` reset here
+/// is defensive (it would revert a stale guard only if a future change left one).
+fn apply_netcfg_edge(
+    guard: &mut Option<NetCfgGuard>,
+    stranded: &mut bool,
+    est_edge: Option<Established>,
+    cfg: &ZpppBringup<'_>,
+) {
+    let Some(est) = est_edge else { return };
+    if !cfg.netcfg.any() {
+        return;
+    }
+    *guard = None; // defensive: the LinkDown path already reverted any prior guard
+    *guard = Some(netcfg::apply(cfg.netcfg, cfg.server_ip, &est, cfg.tun_name));
+    *stranded = false;
+}
+
+/// Revert the host-network helpers if the control link has been silent for longer
+/// than `PPPOE_STRAND_REVERT` since the default route was swapped. Keeps zppp0 and
+/// the process up; the swap is not re-applied until a real redial proves recovery
+/// (a fresh Established edge clears the latch). Returns whether it just reverted.
+fn strand_watchdog(
+    guard: &mut Option<NetCfgGuard>,
+    stranded: &mut bool,
+    last_in: Instant,
+) -> bool {
+    if *stranded || !guard.as_ref().is_some_and(|g| g.default_applied()) {
+        return false;
+    }
+    if last_in.elapsed() < PPPOE_STRAND_REVERT {
+        return false;
+    }
+    *guard = None;
+    *stranded = true;
+    eprintln!(
+        "pppoe: control link silent for {}s; auto-reverted host routing, zppp0 still up",
+        PPPOE_STRAND_REVERT.as_secs()
+    );
+    true
 }
 
 /// React to a LinkDown phase: close zppp0 (its address came from the now-dead
@@ -143,6 +205,8 @@ pub async fn run_dgram(
     nego.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_in = Instant::now();
     let mut tun: Option<Arc<TapDevice>> = None;
+    let mut netcfg: Option<NetCfgGuard> = None;
+    let mut stranded = false;
 
     dp.start();
     flush_to_dgram(&mut dp, &tx).await?;
@@ -167,11 +231,15 @@ pub async fn run_dgram(
                     flush_to_dgram(&mut dp, &tx).await?;
                     // Bring-up first: a no-op on any non-Established phase, so it is
                     // safe to call before the LinkDown handler that closes zppp0.
-                    tun = maybe_bring_up_zppp0(tun, phase, &cfg)?;
+                    let (t, est_edge) = maybe_bring_up_zppp0(tun, phase, &cfg)?;
+                    tun = t;
+                    apply_netcfg_edge(&mut netcfg, &mut stranded, est_edge, &cfg);
                     drain_inbound_to_tun(&mut dp, &tun).await?;
                     match phase {
                         DpPhase::Dead => break Err("pppoe discovery failed".into()),
                         DpPhase::LinkDown => {
+                            netcfg = None; // revert host routing before zppp0 goes away
+                            stranded = false;
                             tun = redial_in_place(&mut dp, tun)?;
                             flush_to_dgram(&mut dp, &tx).await?; // drain the fresh PADI
                         }
@@ -190,15 +258,20 @@ pub async fn run_dgram(
             _ = nego.tick() => {
                 let phase = dp.on_tick();
                 flush_to_dgram(&mut dp, &tx).await?;
-                tun = maybe_bring_up_zppp0(tun, phase, &cfg)?;
+                let (t, est_edge) = maybe_bring_up_zppp0(tun, phase, &cfg)?;
+                tun = t;
+                apply_netcfg_edge(&mut netcfg, &mut stranded, est_edge, &cfg);
                 match phase {
                     DpPhase::Dead => break Err("pppoe discovery failed".into()),
                     DpPhase::LinkDown => {
+                        netcfg = None;
+                        stranded = false;
                         tun = redial_in_place(&mut dp, tun)?;
                         flush_to_dgram(&mut dp, &tx).await?;
                     }
                     _ => {}
                 }
+                strand_watchdog(&mut netcfg, &mut stranded, last_in);
             }
 
             _ = keepalive.tick() => {
@@ -227,6 +300,8 @@ pub async fn run_stream(
     nego.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_in = Instant::now();
     let mut tun: Option<Arc<TapDevice>> = None;
+    let mut netcfg: Option<NetCfgGuard> = None;
+    let mut stranded = false;
 
     dp.start();
     flush_to_stream(&mut dp, &mut nw).await?;
@@ -252,11 +327,15 @@ pub async fn run_stream(
                     flush_to_stream(&mut dp, &mut nw).await?;
                     // Bring-up first: a no-op on any non-Established phase, so it is
                     // safe to call before the LinkDown handler that closes zppp0.
-                    tun = maybe_bring_up_zppp0(tun, phase, &cfg)?;
+                    let (t, est_edge) = maybe_bring_up_zppp0(tun, phase, &cfg)?;
+                    tun = t;
+                    apply_netcfg_edge(&mut netcfg, &mut stranded, est_edge, &cfg);
                     drain_inbound_to_tun(&mut dp, &tun).await?;
                     match phase {
                         DpPhase::Dead => break Err("pppoe discovery failed".into()),
                         DpPhase::LinkDown => {
+                            netcfg = None; // revert host routing before zppp0 goes away
+                            stranded = false;
                             tun = redial_in_place(&mut dp, tun)?;
                             flush_to_stream(&mut dp, &mut nw).await?; // drain the fresh PADI
                         }
@@ -275,15 +354,20 @@ pub async fn run_stream(
             _ = nego.tick() => {
                 let phase = dp.on_tick();
                 flush_to_stream(&mut dp, &mut nw).await?;
-                tun = maybe_bring_up_zppp0(tun, phase, &cfg)?;
+                let (t, est_edge) = maybe_bring_up_zppp0(tun, phase, &cfg)?;
+                tun = t;
+                apply_netcfg_edge(&mut netcfg, &mut stranded, est_edge, &cfg);
                 match phase {
                     DpPhase::Dead => break Err("pppoe discovery failed".into()),
                     DpPhase::LinkDown => {
+                        netcfg = None;
+                        stranded = false;
                         tun = redial_in_place(&mut dp, tun)?;
                         flush_to_stream(&mut dp, &mut nw).await?;
                     }
                     _ => {}
                 }
+                strand_watchdog(&mut netcfg, &mut stranded, last_in);
             }
 
             _ = keepalive.tick() => {

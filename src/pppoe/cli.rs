@@ -102,6 +102,32 @@ pub fn validate_pppoe_exclusions(
     Ok(())
 }
 
+/// Reject invalid `--pppoe-*` host-network flag combinations. The three host flags
+/// configure the `--pppoe` link, so each requires `--pppoe`; opting out of the MSS
+/// clamp only makes sense alongside the default-route swap that brings it on.
+pub fn validate_pppoe_netcfg(
+    pppoe: bool,
+    default_route: bool,
+    no_mss_clamp: bool,
+    dns: bool,
+) -> crate::Result<()> {
+    if !pppoe {
+        if default_route {
+            return Err("--pppoe-default-route requires --pppoe".into());
+        }
+        if no_mss_clamp {
+            return Err("--pppoe-no-mss-clamp requires --pppoe".into());
+        }
+        if dns {
+            return Err("--pppoe-dns requires --pppoe".into());
+        }
+    }
+    if no_mss_clamp && !default_route {
+        return Err("--pppoe-no-mss-clamp requires --pppoe-default-route".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +225,20 @@ mod tests {
         assert!(validate_pppoe_exclusions(true, false, false, true).is_err());
         // Not --pppoe: never errors regardless of the other flags.
         assert!(validate_pppoe_exclusions(false, true, true, true).is_ok());
+    }
+
+    #[test]
+    fn netcfg_flag_validation() {
+        // All host flags require --pppoe.
+        assert!(validate_pppoe_netcfg(false, true, false, false).is_err());
+        assert!(validate_pppoe_netcfg(false, false, true, false).is_err());
+        assert!(validate_pppoe_netcfg(false, false, false, true).is_err());
+        // --pppoe-no-mss-clamp requires --pppoe-default-route.
+        assert!(validate_pppoe_netcfg(true, false, true, false).is_err());
+        // Valid combinations.
+        assert!(validate_pppoe_netcfg(true, true, false, false).is_ok());
+        assert!(validate_pppoe_netcfg(true, true, true, false).is_ok()); // opt out of the clamp
+        assert!(validate_pppoe_netcfg(true, false, false, true).is_ok()); // dns is independent
+        assert!(validate_pppoe_netcfg(true, false, false, false).is_ok()); // plain --pppoe
     }
 }

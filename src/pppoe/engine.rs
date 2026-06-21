@@ -128,6 +128,11 @@ impl<'a> PppSession<'a> {
         })
     }
 
+    /// Toggle whether IPCP requests the peer's DNS servers on the next negotiation.
+    pub fn set_request_dns(&mut self, on: bool) {
+        self.ppp.set_request_dns(on);
+    }
+
     /// Kick the FSM: LCP starts opening. Call once after construction, then drain
     /// the initial LCP Configure-Request with `poll_transmit`.
     pub fn open(&mut self) -> Result<()> {

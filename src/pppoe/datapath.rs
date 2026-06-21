@@ -50,6 +50,92 @@ pub fn effective_mtu(pppoe_mtu: u16, tunnel_tap_mtu: u16) -> u16 {
     pppoe_mtu.min(tunnel_tap_mtu.saturating_sub(PPPOE_OVERHEAD))
 }
 
+/// Clamp the TCP MSS option of a forwarded IPv4 SYN down to `clamp`, returning
+/// whether the packet was rewritten. Pure and panic-free on untrusted input: every
+/// read is bounds-checked (the release profile is panic=abort). Only IPv4 TCP SYN
+/// or SYN+ACK segments whose MSS option exceeds `clamp` are touched; everything
+/// else is left byte-identical. The change is folded into the TCP checksum
+/// incrementally (RFC 1624) so the segment stays valid without a full recompute.
+///
+/// This matters only for FORWARDED traffic over the sub-1500 link; a kernel that
+/// originates a SYN locally already emits a correct MSS, so the clamp is inert
+/// there (the MSS is already <= the link and the rewrite is skipped).
+fn clamp_tcp_mss(pkt: &mut [u8], clamp: u16) -> bool {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        return false; // too short for an IPv4 header, or not IPv4
+    }
+    let ihl = (pkt[0] & 0x0f) as usize * 4;
+    if ihl < 20 || pkt.len() < ihl + 20 {
+        return false; // header malformed, or no room for the fixed TCP header
+    }
+    if pkt[9] != 6 {
+        return false; // not TCP
+    }
+    // A non-first fragment (low 13 bits of bytes 6..8) carries no TCP header.
+    if u16::from_be_bytes([pkt[6], pkt[7]]) & 0x1fff != 0 {
+        return false;
+    }
+    let tcp = &mut pkt[ihl..]; // len >= 20 from the ihl + 20 check
+    if tcp[13] & 0x02 == 0 {
+        return false; // SYN bit clear: not a SYN/SYN+ACK
+    }
+    let data_off = (tcp[12] >> 4) as usize * 4;
+    if data_off < 20 || data_off > tcp.len() {
+        return false; // options region does not fit
+    }
+    let mut i = 20;
+    while i < data_off {
+        let kind = tcp[i];
+        if kind == 0 {
+            break; // End of Option List
+        }
+        if kind == 1 {
+            i += 1; // No-Operation, single byte
+            continue;
+        }
+        if i + 1 >= data_off {
+            break; // length byte would run past the options region
+        }
+        let len = tcp[i + 1] as usize;
+        if len < 2 || i + len > data_off {
+            break; // malformed option length; stop walking
+        }
+        if kind == 2 && len == 4 {
+            let cur = u16::from_be_bytes([tcp[i + 2], tcp[i + 3]]);
+            if cur <= clamp {
+                return false; // already within the path; leave byte-identical
+            }
+            tcp[i + 2] = (clamp >> 8) as u8;
+            tcp[i + 3] = (clamp & 0xff) as u8;
+            fold_tcp_checksum(tcp, cur, clamp);
+            return true;
+        }
+        i += len;
+    }
+    false
+}
+
+/// One's-complement 16-bit add (end-around carry), used for the incremental
+/// checksum update.
+fn ones_complement_add(a: u16, b: u16) -> u16 {
+    let s = a as u32 + b as u32;
+    ((s & 0xffff) + (s >> 16)) as u16
+}
+
+/// Update the TCP checksum at `tcp[16..18]` after a 16-bit field changed from `old`
+/// to `new`, per RFC 1624 Eqn 3: `HC' = ~(~HC + ~old + new)`. The incremental form
+/// can produce 0x0000 where a full recompute gives 0xFFFF, but only when `new` is 0;
+/// both are valid TCP checksums, and the clamp value is always >= 536, so that edge
+/// never arises here.
+fn fold_tcp_checksum(tcp: &mut [u8], old: u16, new: u16) {
+    let hc = u16::from_be_bytes([tcp[16], tcp[17]]);
+    let mut acc = ones_complement_add(!hc, !old);
+    acc = ones_complement_add(acc, new);
+    let hc_new = !acc;
+    tcp[16] = (hc_new >> 8) as u8;
+    tcp[17] = (hc_new & 0xff) as u8;
+}
+
 /// Phase the shell observes to decide when to open zppp0 and start pumping it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DpPhase {
@@ -112,6 +198,9 @@ pub struct PppoeDatapath<'a> {
     retransmit_ticks: u32,
     max_attempts: u32,
     request_dns: bool,
+    /// When set, the TCP MSS to clamp forwarded SYNs to (in both directions). `None`
+    /// leaves forwarded packets untouched. Survives `reset` like the other inputs.
+    clamp_mss: Option<u16>,
 }
 
 impl<'a> PppoeDatapath<'a> {
@@ -164,7 +253,21 @@ impl<'a> PppoeDatapath<'a> {
             retransmit_ticks,
             max_attempts,
             request_dns,
+            clamp_mss: None,
         })
+    }
+
+    /// Enable forwarded-TCP MSS clamping to `clamp` (in both directions). Set by the
+    /// shell when `--pppoe-default-route` is on without `--pppoe-no-mss-clamp`.
+    pub fn set_clamp_mss(&mut self, clamp: u16) {
+        self.clamp_mss = Some(clamp);
+    }
+
+    /// Request the IPCP DNS options on (re)negotiation. Flips the default-off
+    /// `request_dns`; takes effect on the current session and survives `reset`.
+    pub fn set_request_dns(&mut self, on: bool) {
+        self.request_dns = on;
+        self.ppp.set_request_dns(on);
     }
 
     /// Our locally-administered client MAC for this session.
@@ -252,6 +355,11 @@ impl<'a> PppoeDatapath<'a> {
         let mut payload = Vec::with_capacity(PPP_PROTO_IPV4.len() + ip.len());
         payload.extend_from_slice(&PPP_PROTO_IPV4);
         payload.extend_from_slice(ip);
+        // Egress zppp0 -> BRAS: clamp the forwarded SYN's MSS in place on the IP
+        // bytes (after the 2-byte PPP protocol field) before framing.
+        if let Some(c) = self.clamp_mss {
+            clamp_tcp_mss(&mut payload[PPP_PROTO_IPV4.len()..], c);
+        }
         let frame = build_session_frame(session.ac_mac, self.our_mac, session.session_id, &payload);
         self.out.push(frame);
     }
@@ -376,7 +484,14 @@ impl<'a> PppoeDatapath<'a> {
         // it cannot fault.
         let payload = &frame[header.ppp_start..header.ppp_end];
         match self.ppp.feed(payload) {
-            FeedOutcome::Ip(ip) => self.inbound_ip.push(ip),
+            // Ingress BRAS -> zppp0: clamp the forwarded SYN's MSS before it is
+            // written to the TUN and forwarded on by the kernel.
+            FeedOutcome::Ip(mut ip) => {
+                if let Some(c) = self.clamp_mss {
+                    clamp_tcp_mss(&mut ip, c);
+                }
+                self.inbound_ip.push(ip);
+            }
             FeedOutcome::Consumed | FeedOutcome::Truncated => {}
         }
         self.drain_ppp_out();
@@ -520,6 +635,7 @@ mod tests {
             mru: MRU,
             retransmit_ticks: 3,
             max_attempts: 5,
+            clamp_mss: None,
             request_dns: false,
         }
     }
@@ -1125,5 +1241,216 @@ mod tests {
         drive_to_established(&mut dp);
         let _ = drain_frames(&mut dp);
         dp
+    }
+
+    // --- forwarded-TCP MSS clamp ---
+
+    /// One's-complement 16-bit sum complement (Internet checksum) over `words`.
+    fn ones16(words: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i + 1 < words.len() {
+            sum += u16::from_be_bytes([words[i], words[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < words.len() {
+            sum += (words[i] as u32) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Full TCP checksum over the IPv4 pseudo-header + segment, for verifying that
+    /// the incremental update matches a from-scratch recompute.
+    fn tcp_cksum(ip: &[u8]) -> u16 {
+        let ihl = (ip[0] & 0x0f) as usize * 4;
+        let tcp = &ip[ihl..];
+        let mut p = Vec::new();
+        p.extend_from_slice(&ip[12..20]); // src + dst
+        p.push(0);
+        p.push(6); // TCP
+        p.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+        p.extend_from_slice(tcp);
+        ones16(&p)
+    }
+
+    fn mss_opt(v: u16) -> Vec<u8> {
+        vec![2, 4, (v >> 8) as u8, (v & 0xff) as u8]
+    }
+
+    /// Build an IPv4/TCP packet (ihl 5) with `flags` and the given TCP `opts`
+    /// (zero-padded to a 4-byte boundary) and a valid TCP checksum.
+    fn tcp_pkt(flags: u8, opts: &[u8]) -> Vec<u8> {
+        let mut topts = opts.to_vec();
+        while !topts.len().is_multiple_of(4) {
+            topts.push(0);
+        }
+        let tcp_len = 20 + topts.len();
+        let total = 20 + tcp_len;
+        let mut p = vec![0u8; total];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = 6;
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        {
+            let tcp = &mut p[20..];
+            tcp[0..2].copy_from_slice(&40000u16.to_be_bytes());
+            tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+            tcp[12] = ((tcp_len / 4) as u8) << 4;
+            tcp[13] = flags;
+            tcp[14..16].copy_from_slice(&64240u16.to_be_bytes());
+            tcp[20..20 + topts.len()].copy_from_slice(&topts);
+        }
+        let ck = tcp_cksum(&p);
+        p[36..38].copy_from_slice(&ck.to_be_bytes()); // tcp checksum at ip[20+16..]
+        p
+    }
+
+    /// Read the 2-byte MSS value from a packet whose first TCP option is the MSS.
+    fn read_mss(ip: &[u8]) -> u16 {
+        u16::from_be_bytes([ip[42], ip[43]])
+    }
+
+    #[test]
+    fn clamp_lowers_mss_and_keeps_checksum_valid() {
+        let mut p = tcp_pkt(0x02, &mss_opt(1460));
+        assert!(clamp_tcp_mss(&mut p, 1352));
+        assert_eq!(read_mss(&p), 1352);
+        // The incremental checksum update must equal a full recompute over the
+        // segment (recompute with the stored field zeroed, compare to stored).
+        let stored = u16::from_be_bytes([p[36], p[37]]);
+        let mut q = p.clone();
+        q[36] = 0;
+        q[37] = 0;
+        assert_eq!(tcp_cksum(&q), stored);
+    }
+
+    #[test]
+    fn clamp_idempotent_when_already_small() {
+        let mut p = tcp_pkt(0x02, &mss_opt(1000));
+        let before = p.clone();
+        assert!(!clamp_tcp_mss(&mut p, 1352));
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn clamp_second_pass_is_noop() {
+        let mut p = tcp_pkt(0x02, &mss_opt(1460));
+        assert!(clamp_tcp_mss(&mut p, 1352));
+        let after = p.clone();
+        assert!(!clamp_tcp_mss(&mut p, 1352));
+        assert_eq!(p, after);
+    }
+
+    #[test]
+    fn clamp_syn_ack_clamped_pure_ack_untouched() {
+        let mut sa = tcp_pkt(0x12, &mss_opt(1460)); // SYN+ACK
+        assert!(clamp_tcp_mss(&mut sa, 1352));
+        assert_eq!(read_mss(&sa), 1352);
+        let mut ack = tcp_pkt(0x10, &mss_opt(1460)); // pure ACK
+        let before = ack.clone();
+        assert!(!clamp_tcp_mss(&mut ack, 1352));
+        assert_eq!(ack, before);
+    }
+
+    #[test]
+    fn clamp_skips_syn_without_mss_option() {
+        let mut p = tcp_pkt(0x02, &[1, 1, 3, 3, 7, 0]); // NOP,NOP,WScale,pad
+        let before = p.clone();
+        assert!(!clamp_tcp_mss(&mut p, 1352));
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn clamp_skips_non_tcp_and_ipv6() {
+        let mut udp = tcp_pkt(0x02, &mss_opt(1460));
+        udp[9] = 17; // UDP
+        let before = udp.clone();
+        assert!(!clamp_tcp_mss(&mut udp, 1352));
+        assert_eq!(udp, before);
+        let mut v6 = vec![0x60u8; 60]; // version nibble 6
+        let before6 = v6.clone();
+        assert!(!clamp_tcp_mss(&mut v6, 1352));
+        assert_eq!(v6, before6);
+    }
+
+    #[test]
+    fn clamp_skips_fragments_and_truncated() {
+        let mut frag = tcp_pkt(0x02, &mss_opt(1460));
+        frag[6] = 0x00;
+        frag[7] = 0x01; // non-zero fragment offset
+        let before = frag.clone();
+        assert!(!clamp_tcp_mss(&mut frag, 1352));
+        assert_eq!(frag, before);
+        assert!(!clamp_tcp_mss(&mut [0x45u8; 10], 1352)); // < IP header
+        assert!(!clamp_tcp_mss(&mut [0x45u8; 30], 1352)); // ihl 20 but no room for TCP
+    }
+
+    #[test]
+    fn clamp_handles_malformed_options_without_panic() {
+        // MSS-kind option whose length overruns the options region.
+        let mut p = tcp_pkt(0x02, &[2, 0xff, 0x05, 0xb4]);
+        let before = p.clone();
+        assert!(!clamp_tcp_mss(&mut p, 1352));
+        assert_eq!(p, before);
+        // MSS kind with a non-4 length is not treated as a clampable MSS.
+        let mut q = tcp_pkt(0x02, &[2, 3, 0x05, 0xb4]);
+        let beforeq = q.clone();
+        assert!(!clamp_tcp_mss(&mut q, 1352));
+        assert_eq!(q, beforeq);
+    }
+
+    #[test]
+    fn clamp_mss_survives_reset() {
+        let mut dp = fixed_dp();
+        dp.set_clamp_mss(1352);
+        assert_eq!(dp.clamp_mss, Some(1352));
+        dp.reset().unwrap();
+        assert_eq!(dp.clamp_mss, Some(1352), "clamp persists across an in-session redial");
+    }
+
+    #[test]
+    fn clamp_applied_to_egress_syn_in_on_tun_ip() {
+        let mut dp = fixed_dp();
+        dp.set_clamp_mss(1352);
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+        dp.on_tun_ip(&tcp_pkt(0x02, &mss_opt(1460)));
+        let ppp = one_ppp_out(&drain_frames(&mut dp));
+        assert_eq!(&ppp[0..2], &[0x00, 0x21]); // IPv4-over-PPP
+        assert_eq!(read_mss(&ppp[2..]), 1352);
+    }
+
+    #[test]
+    fn no_clamp_leaves_egress_syn_untouched() {
+        let mut dp = fixed_dp(); // clamp_mss is None
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+        dp.on_tun_ip(&tcp_pkt(0x02, &mss_opt(1460)));
+        let ppp = one_ppp_out(&drain_frames(&mut dp));
+        assert_eq!(read_mss(&ppp[2..]), 1460);
+    }
+
+    #[test]
+    fn fuzz_clamp_tcp_mss_never_panics() {
+        let mut state: u64 = 0xdead_beef_cafe_babe;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for _ in 0..4000 {
+            let len = (next() % 96) as usize;
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                buf.push((next() & 0xff) as u8);
+            }
+            let _ = clamp_tcp_mss(&mut buf, 1352);
+        }
     }
 }
