@@ -13,6 +13,7 @@ pub mod kcp;
 #[cfg(target_os = "linux")]
 pub mod netfilter;
 pub mod noise;
+pub mod pppoe;
 pub mod proto;
 pub mod server;
 pub mod tap;
