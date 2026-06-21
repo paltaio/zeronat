@@ -3,8 +3,6 @@ use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-#[cfg(target_os = "linux")]
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
@@ -70,8 +68,9 @@ impl LocalWrite for OwnedWriteHalf {
 /// empty keepalive probes) and the up half emits a probe once the link has been
 /// quiet for half the window; a live peer answers and refreshes the mark, so the
 /// independent watchdog reaps only on a true black hole (no inbound frame for the
-/// whole window). The mark is in whole seconds: 32-bit targets (mips) have no
-/// AtomicU64 and second resolution is ample for a 120s window.
+/// whole window). The mark is an AtomicU32 in whole seconds: 32-bit targets
+/// (mips) have no 64-bit atomics and second resolution is ample for a 120s
+/// window.
 async fn stream_relay<R, W, C>(
     mut local_r: R,
     mut local_w: W,
@@ -352,9 +351,9 @@ pub struct TapSwitch {
     /// `true` for an L2 (TAP/Ethernet) device that supports MAC learning across
     /// many ports; `false` for an L3 (TUN) device, which serves one client only.
     is_l2: bool,
-    ports: Mutex<HashMap<u64, SwitchPort>>,
-    macs: Mutex<HashMap<[u8; 6], (u64, Instant)>>,
-    next_port: AtomicU64,
+    ports: Mutex<HashMap<u32, SwitchPort>>,
+    macs: Mutex<HashMap<[u8; 6], (u32, Instant)>>,
+    next_port: AtomicU32,
 }
 
 /// Parse an Ethernet frame's destination and source MAC. `None` for a buffer too
@@ -392,7 +391,7 @@ impl TapSwitch {
             is_l2,
             ports: Mutex::new(HashMap::new()),
             macs: Mutex::new(HashMap::new()),
-            next_port: AtomicU64::new(0),
+            next_port: AtomicU32::new(0),
         });
         let reader = sw.clone();
         tokio::spawn(async move { reader.tap_read_loop().await });
@@ -409,7 +408,7 @@ impl TapSwitch {
             is_l2,
             ports: Mutex::new(HashMap::new()),
             macs: Mutex::new(HashMap::new()),
-            next_port: AtomicU64::new(0),
+            next_port: AtomicU32::new(0),
         })
     }
 
@@ -486,7 +485,7 @@ impl TapSwitch {
     /// eviction; a `Full` target drops this frame (one slow client never stalls
     /// the others or the single TAP reader).
     fn flood(&self, frame: Vec<u8>) {
-        let targets: Vec<(u64, mpsc::Sender<Vec<u8>>)> = self
+        let targets: Vec<(u32, mpsc::Sender<Vec<u8>>)> = self
             .ports
             .lock()
             .unwrap()
@@ -506,7 +505,7 @@ impl TapSwitch {
 
     /// Remove a port and purge every MAC it owned. Idempotent: a port already gone
     /// (e.g. dropped by its `SwitchHandle`) leaves the maps untouched.
-    fn evict_port(&self, port_id: u64) {
+    fn evict_port(&self, port_id: u32) {
         self.ports.lock().unwrap().remove(&port_id);
         self.macs.lock().unwrap().retain(|_, &mut (p, _)| p != port_id);
     }
@@ -515,7 +514,7 @@ impl TapSwitch {
     /// station). Honors `MAX_MACS_PER_SWITCH`: at the cap, an existing MAC still
     /// updates (its port and timestamp move) but a new MAC is refused, so one
     /// client cannot exhaust the table.
-    fn learn(&self, src: [u8; 6], port: u64) {
+    fn learn(&self, src: [u8; 6], port: u32) {
         if is_group_or_zero(&src) {
             return;
         }
@@ -535,7 +534,7 @@ impl TapSwitch {
     /// Concurrent writes from N port relays are safe: the device is opened
     /// `IFF_NO_PI`, so one `write()` carries exactly one whole frame and the kernel
     /// serializes writes on the fd atomically per frame.
-    async fn learn_and_write_egress(&self, frame: &[u8], port: u64) -> crate::Result<()> {
+    async fn learn_and_write_egress(&self, frame: &[u8], port: u32) -> crate::Result<()> {
         if let Some((_, src)) = dst_src(frame) {
             self.learn(src, port);
         }
@@ -584,7 +583,7 @@ impl TapSwitch {
 #[cfg(target_os = "linux")]
 pub struct SwitchHandle {
     switch: Arc<TapSwitch>,
-    port_id: u64,
+    port_id: u32,
     out_rx: Option<mpsc::Receiver<Vec<u8>>>,
     cancel: Arc<Notify>,
 }
@@ -665,7 +664,7 @@ struct PortRead(mpsc::Receiver<Vec<u8>>);
 #[cfg(target_os = "linux")]
 struct PortWrite {
     switch: Arc<TapSwitch>,
-    port_id: u64,
+    port_id: u32,
 }
 
 #[cfg(target_os = "linux")]
