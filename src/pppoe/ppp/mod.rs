@@ -154,12 +154,18 @@ impl<'a> PPP<'a> {
         self.lcp.state() == State::Closed
     }
 
-    /// Build an LCP Echo-Request once LCP is Opened, else `None`. `id` is
+    /// Build an LCP Echo-Request once the link is up, else `None`. `id` is
     /// caller-sequenced. The body is our local Magic-Number; the peer answers with
     /// an Echo-Reply carrying its OWN magic (RFC 1661 section 5.8), which
     /// `is_peer_echo_reply` accepts as liveness because it differs from ours.
+    ///
+    /// "Up" is Opened plus the post-Open sub-`Opened` dip an inbound
+    /// Configure-Request renegotiation causes (RFC 1661 RcR in Opened), so our
+    /// keepalive keeps firing across a BRAS re-confirm instead of stalling until
+    /// the link is declared dead. Pre-Open bring-up and teardown (Closed) yield
+    /// `None`.
     pub fn lcp_echo_request(&mut self, id: u8) -> Option<OutFrame<'static>> {
-        if self.lcp.state() != State::Opened {
+        if !self.lcp.link_up() {
             return None;
         }
         let magic = self.lcp.proto().magic_local;

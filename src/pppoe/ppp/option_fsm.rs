@@ -50,6 +50,12 @@ pub enum State {
 pub struct OptionFsm<P> {
     id: u8,
     state: State,
+    /// Latched once the FSM first reaches `Opened`, cleared only on `close()`.
+    /// Distinguishes a sub-`Opened` state during initial bring-up (no peer link
+    /// yet) from the transient dip an RFC 1661 RcR-in-Opened renegotiation causes
+    /// after the link is up. Echo handling keys on this so a BRAS that re-confirms
+    /// LCP after Open does not silence our keepalive.
+    up_seen: bool,
     proto: P,
 }
 
@@ -58,12 +64,22 @@ impl<P: Protocol> OptionFsm<P> {
         Self {
             id: 1,
             state: State::Closed,
+            up_seen: false,
             proto,
         }
     }
 
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// True once the FSM has reached `Opened` and has not since been `close()`d.
+    /// The link is usable for Echo keepalive even when an inbound Configure-Request
+    /// has dipped it into a sub-`Opened` renegotiation state (RFC 1661 RcR in
+    /// Opened): the peer expects Echo-Reply for the whole life of the session, and
+    /// we keep originating our own Echo-Request across the dip.
+    pub fn link_up(&self) -> bool {
+        self.up_seen && self.state != State::Closed
     }
 
     pub fn proto(&self) -> &P {
@@ -88,7 +104,15 @@ impl<P: Protocol> OptionFsm<P> {
     }
 
     pub fn close(&mut self) {
+        self.enter_closed();
+    }
+
+    /// The single path into `State::Closed`. Clearing `up_seen` here keeps the
+    /// `link_up()` latch from surviving a teardown into a later Closed->ReqSent
+    /// re-open, where a stale `up_seen` would report the link up during bring-up.
+    fn enter_closed(&mut self) {
         self.state = State::Closed;
+        self.up_seen = false;
     }
 
     pub fn handle(&mut self, pkt: &mut [u8], mut tx: impl FnMut(Packet<'_>)) {
@@ -116,8 +140,9 @@ impl<P: Protocol> OptionFsm<P> {
         let pkt = &mut pkt[..len + 2];
 
         match (code, self.state) {
-            // reply EchoReq on state Opened, ignore in all other states (including Closed!)
-            (Code::EchoReq, State::Opened) => {
+            // Answer Echo-Request whenever the link is up (see `link_up`): Opened
+            // plus the post-Open RcR dip, not pre-Open bring-up or teardown.
+            (Code::EchoReq, _) if self.link_up() => {
                 if let Some(resp) = self.send_echo_response(pkt) {
                     tx(resp)
                 }
@@ -145,7 +170,10 @@ impl<P: Protocol> OptionFsm<P> {
                     // Closed); kept as a no-op so the RX path has no panic site.
                     (_, State::Closed) => {}
                     (true, State::ReqSent) => self.state = State::AckSent,
-                    (true, State::AckReceived) => self.state = State::Opened,
+                    (true, State::AckReceived) => {
+                        self.state = State::Opened;
+                        self.up_seen = true;
+                    }
                     (true, State::AckSent) => self.state = State::AckSent,
                     (true, State::Opened) => {
                         tx(self.send_configure_request());
@@ -161,7 +189,10 @@ impl<P: Protocol> OptionFsm<P> {
             }
 
             (Code::ConfigureAck, State::ReqSent) => self.state = State::AckReceived,
-            (Code::ConfigureAck, State::AckSent) => self.state = State::Opened,
+            (Code::ConfigureAck, State::AckSent) => {
+                self.state = State::Opened;
+                self.up_seen = true;
+            }
             (Code::ConfigureAck, State::AckReceived) | (Code::ConfigureAck, State::Opened) => {
                 self.state = State::ReqSent;
                 tx(self.send_configure_request())
@@ -192,7 +223,7 @@ impl<P: Protocol> OptionFsm<P> {
                 tx(self.send_configure_request())
             }
             (Code::TerminateReq, State::Opened) => {
-                self.state = State::Closed;
+                self.enter_closed();
                 tx(self.send_terminate_ack(id))
             }
             (Code::TerminateReq, State::ReqSent)

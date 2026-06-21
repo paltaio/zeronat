@@ -1074,6 +1074,57 @@ mod tests {
     }
 
     #[test]
+    fn answers_bras_echo_and_survives_stuck_reneg() {
+        // Live NE40-BRAS failure: after Open the BRAS sends an LCP Configure-Request
+        // (RcR in Opened) but never Acks our reciprocal request, so LCP sits in
+        // AckSent (sub-Opened) for the rest of the session. The BRAS then probes
+        // with an Echo-Request every interval and drops the session after a few
+        // unanswered probes. We must answer each one and keep the link up.
+        let mut dp = fixed_dp();
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+
+        // BRAS reopens; we Ack and re-request, the BRAS stays silent. LCP is now
+        // sub-Opened but not Closed.
+        let reneg_opts = [0x05, 0x06, 0xab, 0xcd, 0xef, 0x01];
+        let phase = dp.on_l2_frame(&from_ac(&lcp(0x01, 0x42, &reneg_opts)));
+        assert_eq!(phase, DpPhase::Established(*dp.established.as_ref().unwrap()));
+        assert!(!dp.ppp.lcp_opened(), "renegotiation dips LCP below Opened");
+        assert!(!dp.ppp.lcp_closed(), "renegotiation is not a teardown");
+        let _ = drain_frames(&mut dp);
+
+        // An inbound BRAS Echo-Request mid-reneg is answered with our magic.
+        let mut echo_req = vec![0xc0, 0x21, 0x09, 0x10];
+        echo_req.extend_from_slice(&8u16.to_be_bytes());
+        echo_req.extend_from_slice(&PEER_MAGIC.to_be_bytes());
+        let phase = dp.on_l2_frame(&from_ac(&echo_req));
+        assert!(matches!(phase, DpPhase::Established(_)));
+        let frames = drain_frames(&mut dp);
+        let reply = frames
+            .iter()
+            .filter_map(|f| parse_session_frame(f).ok().map(|h| (f, h)))
+            .map(|(f, h)| f[h.ppp_start..h.ppp_end].to_vec())
+            .find(|p| p.len() >= 6 && p[0..2] == [0xc0, 0x21] && p[2] == 0x0a)
+            .expect("an Echo-Reply to the BRAS probe while sub-Opened");
+        assert_eq!(reply[3], 0x10, "reply keeps the request id");
+        assert_eq!(&reply[6..10], &MAGIC.to_be_bytes(), "reply carries our magic");
+
+        // Our own keepalive keeps firing across the stuck reneg: it goes out every
+        // interval and the BRAS answering keeps the link alive for several windows.
+        for _ in 0..(ECHO_DEAD_THRESHOLD * ECHO_INTERVAL_TICKS + ECHO_INTERVAL_TICKS) {
+            let phase = dp.on_tick();
+            assert!(matches!(phase, DpPhase::Established(_)), "link stays up");
+            if let Some(echo) = find_echo(&drain_frames(&mut dp)) {
+                assert_eq!(&echo[6..10], &MAGIC.to_be_bytes());
+                dp.on_l2_frame(&from_ac(&echo_reply(PEER_MAGIC)));
+                let _ = drain_frames(&mut dp);
+            }
+        }
+        assert!(!dp.link_down, "answered echoes keep the link up");
+        assert!(matches!(dp.phase(), DpPhase::Established(_)));
+    }
+
+    #[test]
     fn reset_returns_to_discovery_and_reestablishes() {
         let mut dp = fixed_dp();
         drive_to_established(&mut dp);

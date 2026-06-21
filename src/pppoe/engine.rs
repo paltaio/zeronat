@@ -215,9 +215,10 @@ impl<'a> PppSession<'a> {
         })
     }
 
-    /// Queue an LCP Echo-Request if LCP is Opened. The identifier is sequenced
-    /// here (wrapping) so the FSM stays deterministic for tests. Returns `true`
-    /// if one was queued, `false` (no-op) if LCP is not Opened.
+    /// Queue an LCP Echo-Request if the link is up (Opened, or the sub-`Opened`
+    /// dip of a post-Open Configure-Request renegotiation). The identifier is
+    /// sequenced here (wrapping) so the FSM stays deterministic for tests. Returns
+    /// `true` if one was queued, `false` (no-op) if the link is not up.
     pub fn send_echo_request(&mut self) -> bool {
         self.echo_id = self.echo_id.wrapping_add(1);
         match self.ppp.lcp_echo_request(self.echo_id) {
@@ -745,5 +746,78 @@ mod tests {
         assert!(s.lcp_opened());
         let s = established_session();
         assert!(s.lcp_opened());
+    }
+
+    /// Drive an established session, then feed a BRAS-style inbound LCP
+    /// Configure-Request (RFC 1661 RcR in Opened) that we Ack but the peer never
+    /// Acks back, leaving LCP in a sub-`Opened` renegotiation state. Returns the
+    /// session and the peer's Configure-Request id.
+    fn established_then_reneg() -> PppSession<'static> {
+        let mut s = established_session();
+        let _ = drain(&mut s);
+        assert!(s.lcp_opened());
+        // BRAS reopens LCP with a Magic-Number-only Configure-Request. We Ack it
+        // and re-send our own Configure-Request; LCP dips to AckSent (sub-Opened).
+        let reneg = [0x05, 0x06, 0xab, 0xcd, 0xef, 0x01];
+        s.feed(&lcp(Code::ConfigureReq, 0x42, &reneg));
+        let _ = drain(&mut s);
+        assert!(!s.lcp_opened(), "renegotiation dips LCP below Opened");
+        assert!(!s.lcp_closed(), "renegotiation is not a teardown");
+        s
+    }
+
+    #[test]
+    fn echo_request_answered_during_post_open_reneg() {
+        // The live failure: after Open the BRAS sends a Configure-Request, dipping
+        // LCP to AckSent, then keeps sending Echo-Requests every 30s. We must keep
+        // replying for the whole life of the session, not only in strict Opened.
+        let mut s = established_then_reneg();
+        let mut req = vec![0xc0, 0x21, Code::EchoReq as u8, 0x10];
+        req.extend_from_slice(&8u16.to_be_bytes());
+        req.extend_from_slice(&PEER_MAGIC.to_be_bytes());
+        s.feed(&req);
+        let out = drain(&mut s);
+        let reply = out
+            .iter()
+            .find(|f| proto_of(f) == ProtocolType::LCP && code_of(f) == Code::EchoReply)
+            .expect("an Echo-Reply while sub-Opened after a post-Open reneg");
+        assert_eq!(reply[3], 0x10, "reply keeps the request id");
+        assert_eq!(&reply[6..10], &MAGIC.to_be_bytes(), "reply carries our magic");
+    }
+
+    #[test]
+    fn echo_request_originated_during_post_open_reneg() {
+        // Our own keepalive must keep firing across the post-Open renegotiation dip,
+        // not stall until the BRAS declares the link dead.
+        let mut s = established_then_reneg();
+        for _ in 0..3 {
+            assert!(s.send_echo_request(), "echo originates while sub-Opened");
+            let out = drain(&mut s);
+            let req = out
+                .iter()
+                .find(|f| proto_of(f) == ProtocolType::LCP && code_of(f) == Code::EchoReq)
+                .expect("an outbound Echo-Request");
+            assert_eq!(&req[6..10], &MAGIC.to_be_bytes(), "echo carries our magic");
+        }
+    }
+
+    #[test]
+    fn echo_not_answered_or_originated_before_first_open() {
+        // The sub-`Opened` states are reachable during initial bring-up too, before
+        // the link has ever opened. There is no live peer to keep alive yet, so we
+        // neither answer nor originate echoes there.
+        let mut s = fresh_open(); // LCP in ReqSent, never reached Opened
+        assert!(!s.lcp_opened());
+        assert!(!s.send_echo_request(), "no echo before the link first opens");
+        let mut req = vec![0xc0, 0x21, Code::EchoReq as u8, 0x10];
+        req.extend_from_slice(&8u16.to_be_bytes());
+        req.extend_from_slice(&PEER_MAGIC.to_be_bytes());
+        s.feed(&req);
+        let out = drain(&mut s);
+        assert!(
+            !out.iter()
+                .any(|f| proto_of(f) == ProtocolType::LCP && code_of(f) == Code::EchoReply),
+            "no Echo-Reply before the link first opens"
+        );
     }
 }
