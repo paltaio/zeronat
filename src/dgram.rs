@@ -12,12 +12,19 @@ use crate::noise::StatelessNoise;
 /// run the same zeronat build, so this inner framing needs no negotiation.
 const KIND_DATA: u8 = 0x00;
 const KIND_KEEPALIVE: u8 = 0x01;
+/// Carries a bridge client's label, sent once after a UDP bridge attaches. A
+/// control frame on the datagram channel; it never reaches the forwarding path.
+const KIND_NAME: u8 = 0x02;
 
-/// A decrypted datagram frame: either an inner datagram to forward or a
-/// keepalive that only refreshes the receiver's idle window.
+/// Longest accepted label, a guard against a crafted oversized name frame.
+const MAX_NAME_LEN: usize = 256;
+
+/// A decrypted datagram frame: an inner datagram to forward, a keepalive that only
+/// refreshes the receiver's idle window, or a one-shot bridge client label.
 pub enum Frame {
     Data(Vec<u8>),
     Keepalive,
+    Name(String),
 }
 
 /// Sends UDP-forward datagrams over the shared socket as `0x03` frames.
@@ -47,6 +54,15 @@ impl DgramTx {
     /// the receiver beyond refreshing its idle window.
     pub async fn probe(&self) -> Result<()> {
         self.frame(&[KIND_KEEPALIVE])
+    }
+
+    /// Announce this bridge client's label. Best-effort and one-shot; a server
+    /// that does not understand the kind simply drops it.
+    pub async fn send_name(&self, name: &str) -> Result<()> {
+        let mut plaintext = Vec::with_capacity(1 + name.len());
+        plaintext.push(KIND_NAME);
+        plaintext.extend_from_slice(name.as_bytes());
+        self.frame(&plaintext)
     }
 
     fn frame(&self, plaintext: &[u8]) -> Result<()> {
@@ -82,6 +98,15 @@ impl DgramRx {
                 Ok(pt) => match pt.split_first() {
                     Some((&KIND_DATA, rest)) => return Some(Frame::Data(rest.to_vec())),
                     Some((&KIND_KEEPALIVE, _)) => return Some(Frame::Keepalive),
+                    Some((&KIND_NAME, rest)) => {
+                        if rest.len() > MAX_NAME_LEN {
+                            continue; // oversized label: drop, keep going
+                        }
+                        match String::from_utf8(rest.to_vec()) {
+                            Ok(name) => return Some(Frame::Name(name)),
+                            Err(_) => continue, // non-utf8 label: drop, keep going
+                        }
+                    }
                     _ => continue, // empty or unknown kind: drop, keep going
                 },
                 Err(_) => continue, // drop undecryptable datagrams, keep going

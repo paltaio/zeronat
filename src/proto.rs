@@ -47,6 +47,27 @@ pub struct RouteEntry {
     pub source: Source,
 }
 
+/// An L2 bridge client attached to the server's software switch, as reported in a
+/// `Snapshot`. These attach over the data channel (not as routed forward clients),
+/// so the fleet view sources them from the switch rather than the client registry.
+/// `label` is the client's id when it announced one (`named` true) or a fallback
+/// (peer address, else `bridge-<port>`). `transport` is 1 = tcp, 2 = udp. Counters
+/// and `peer` are observed server-side; the bridge's negotiated WAN IP is not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeEntry {
+    pub label: String,
+    pub named: bool,
+    pub transport: u8,
+    pub peer: String,
+    pub macs: Vec<[u8; 6]>,
+    pub rx_bytes: u64,
+    pub rx_frames: u64,
+    pub tx_bytes: u64,
+    pub tx_frames: u64,
+    pub uptime_secs: u32,
+    pub idle_secs: u32,
+}
+
 /// A point-in-time view of one server's topology, returned to admin on request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotBody {
@@ -55,6 +76,7 @@ pub struct SnapshotBody {
     pub listeners: Vec<Listener>,
     pub clients: Vec<ClientEntry>,
     pub routes: Vec<RouteEntry>,
+    pub bridge_clients: Vec<BridgeEntry>,
 }
 
 /// Messages exchanged over the encrypted Noise channels.
@@ -76,6 +98,10 @@ pub enum Msg {
     },
     Data {
         id: u64,
+        /// Client label when this `Data` opens a bridge attach; `None` for a
+        /// forward-data stream, which carries no label. A bridge attach sends the
+        /// client's id so the server's fleet view can name the port.
+        name: Option<String>,
     },
     Pong,
     ClientHello {
@@ -194,6 +220,85 @@ fn take_ip(b: &[u8], at: &mut usize) -> Result<Ipv4Addr> {
     Ok(ip)
 }
 
+/// Decode the bridge-client trailer that follows the routes in a snapshot: a u16
+/// count followed by that many entries. Every multi-byte read is length-guarded
+/// first, the count is u16-bounded, and the list is grown without preallocating
+/// from the untrusted count, so a malformed or truncated body errors rather than
+/// panicking or over-allocating. The caller still rejects any bytes left over.
+fn decode_bridge_clients(b: &[u8], at: &mut usize) -> Result<Vec<BridgeEntry>> {
+    if *at + 2 > b.len() {
+        return Err("truncated bridge count".into());
+    }
+    let count = u16::from_be_bytes([b[*at], b[*at + 1]]) as usize;
+    *at += 2;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let label = take_str(b, at)?;
+        if *at >= b.len() {
+            return Err("truncated bridge named flag".into());
+        }
+        let named = match b[*at] {
+            0 => false,
+            1 => true,
+            n => return Err(format!("unknown bridge named byte {n}").into()),
+        };
+        *at += 1;
+        if *at >= b.len() {
+            return Err("truncated bridge transport".into());
+        }
+        let transport = b[*at];
+        *at += 1;
+        if transport != 1 && transport != 2 {
+            return Err(format!("unknown transport byte {transport}").into());
+        }
+        let peer = take_str(b, at)?;
+        if *at + 2 > b.len() {
+            return Err("truncated bridge mac count".into());
+        }
+        let mac_count = u16::from_be_bytes([b[*at], b[*at + 1]]) as usize;
+        *at += 2;
+        let mut macs = Vec::new();
+        for _ in 0..mac_count {
+            if *at + 6 > b.len() {
+                return Err("truncated bridge mac".into());
+            }
+            let mut m = [0u8; 6];
+            m.copy_from_slice(&b[*at..*at + 6]);
+            *at += 6;
+            macs.push(m);
+        }
+        if *at + 40 > b.len() {
+            return Err("truncated bridge counters".into());
+        }
+        let rx_bytes = u64::from_be_bytes(b[*at..*at + 8].try_into().unwrap());
+        *at += 8;
+        let rx_frames = u64::from_be_bytes(b[*at..*at + 8].try_into().unwrap());
+        *at += 8;
+        let tx_bytes = u64::from_be_bytes(b[*at..*at + 8].try_into().unwrap());
+        *at += 8;
+        let tx_frames = u64::from_be_bytes(b[*at..*at + 8].try_into().unwrap());
+        *at += 8;
+        let uptime_secs = u32::from_be_bytes(b[*at..*at + 4].try_into().unwrap());
+        *at += 4;
+        let idle_secs = u32::from_be_bytes(b[*at..*at + 4].try_into().unwrap());
+        *at += 4;
+        out.push(BridgeEntry {
+            label,
+            named,
+            transport,
+            peer,
+            macs,
+            rx_bytes,
+            rx_frames,
+            tx_bytes,
+            tx_frames,
+            uptime_secs,
+            idle_secs,
+        });
+    }
+    Ok(out)
+}
+
 impl Msg {
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -206,10 +311,13 @@ impl Msg {
                 b.extend_from_slice(&id.to_be_bytes());
                 b
             }
-            Msg::Data { id } => {
+            Msg::Data { id, name } => {
                 let mut b = Vec::with_capacity(9);
                 b.push(3);
                 b.extend_from_slice(&id.to_be_bytes());
+                if let Some(name) = name {
+                    put_str(&mut b, name);
+                }
                 b
             }
             Msg::Pong => vec![4],
@@ -251,6 +359,27 @@ impl Msg {
                     put_str(&mut b, &route.client_id);
                     b.push(route.state);
                     b.push(source_byte(route.source));
+                }
+                // Bridge-client trailer: a u16 count then that many entries (the
+                // count is 0 when no bridge clients are attached).
+                debug_assert!(snap.bridge_clients.len() <= u16::MAX as usize);
+                b.extend_from_slice(&(snap.bridge_clients.len() as u16).to_be_bytes());
+                for e in &snap.bridge_clients {
+                    put_str(&mut b, &e.label);
+                    b.push(u8::from(e.named));
+                    b.push(e.transport);
+                    put_str(&mut b, &e.peer);
+                    debug_assert!(e.macs.len() <= u16::MAX as usize);
+                    b.extend_from_slice(&(e.macs.len() as u16).to_be_bytes());
+                    for m in &e.macs {
+                        b.extend_from_slice(m);
+                    }
+                    b.extend_from_slice(&e.rx_bytes.to_be_bytes());
+                    b.extend_from_slice(&e.rx_frames.to_be_bytes());
+                    b.extend_from_slice(&e.tx_bytes.to_be_bytes());
+                    b.extend_from_slice(&e.tx_frames.to_be_bytes());
+                    b.extend_from_slice(&e.uptime_secs.to_be_bytes());
+                    b.extend_from_slice(&e.idle_secs.to_be_bytes());
                 }
                 b
             }
@@ -323,9 +452,19 @@ impl Msg {
                 let id = u64::from_be_bytes(b[4..12].try_into().unwrap());
                 Ok(Msg::Open { proto, port, id })
             }
-            Some(3) if b.len() == 9 => {
+            Some(3) if b.len() >= 9 => {
                 let id = u64::from_be_bytes(b[1..9].try_into().unwrap());
-                Ok(Msg::Data { id })
+                let name = if b.len() == 9 {
+                    None
+                } else {
+                    let mut at = 9;
+                    let name = take_str(b, &mut at)?;
+                    if at != b.len() {
+                        return Err("trailing bytes in data".into());
+                    }
+                    Some(name)
+                };
+                Ok(Msg::Data { id, name })
             }
             Some(4) => Ok(Msg::Pong),
             Some(5) => {
@@ -427,6 +566,7 @@ impl Msg {
                         source,
                     });
                 }
+                let bridge_clients = decode_bridge_clients(b, &mut at)?;
                 if at != b.len() {
                     return Err("trailing bytes in snapshot".into());
                 }
@@ -436,6 +576,7 @@ impl Msg {
                     listeners,
                     clients,
                     routes,
+                    bridge_clients,
                 }))
             }
             Some(8) if b.len() == 8 => {
@@ -608,6 +749,34 @@ mod tests {
                     source: Source::Cli,
                 },
             ],
+            bridge_clients: vec![
+                BridgeEntry {
+                    label: "rpi-3-ef56".into(),
+                    named: true,
+                    transport: 1,
+                    peer: "203.0.113.5:51820".into(),
+                    macs: vec![[0x02, 0, 0, 0, 0, 1], [0x02, 0, 0, 0, 0, 2]],
+                    rx_bytes: 18_874_368,
+                    rx_frames: 24_010,
+                    tx_bytes: 9_437_184,
+                    tx_frames: 19_004,
+                    uptime_secs: 252,
+                    idle_secs: 0,
+                },
+                BridgeEntry {
+                    label: "bridge-7".into(),
+                    named: false,
+                    transport: 2,
+                    peer: String::new(),
+                    macs: Vec::new(),
+                    rx_bytes: 0,
+                    rx_frames: 0,
+                    tx_bytes: 0,
+                    tx_frames: 0,
+                    uptime_secs: 2,
+                    idle_secs: 2,
+                },
+            ],
         };
         match roundtrip(&Msg::Snapshot(body.clone())) {
             Msg::Snapshot(decoded) => assert_eq!(decoded, body),
@@ -615,16 +784,129 @@ mod tests {
         }
 
         let empty = SnapshotBody {
-            version: 1,
+            version: 2,
             server_id: "srv".into(),
             listeners: Vec::new(),
             clients: Vec::new(),
             routes: Vec::new(),
+            bridge_clients: Vec::new(),
         };
         match roundtrip(&Msg::Snapshot(empty.clone())) {
             Msg::Snapshot(decoded) => assert_eq!(decoded, empty),
             other => panic!("expected snapshot, got {other:?}"),
         }
+    }
+
+    /// The bridge trailer is mandatory: a snapshot whose bytes end at the routes
+    /// (no trailer) is malformed and must error, not decode to an empty fleet.
+    #[test]
+    fn snapshot_missing_trailer_errors() {
+        let body = SnapshotBody {
+            version: 1,
+            server_id: "srv".into(),
+            listeners: Vec::new(),
+            clients: Vec::new(),
+            routes: Vec::new(),
+            bridge_clients: Vec::new(),
+        };
+        let mut bytes = Msg::Snapshot(body).encode();
+        assert_eq!(&bytes[bytes.len() - 2..], &[0, 0]);
+        bytes.truncate(bytes.len() - 2);
+        assert!(Msg::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn data_carries_optional_name() {
+        // A forward-data frame carries no label: 9 bytes, decodes to None.
+        let bare = Msg::Data { id: 7, name: None };
+        let enc = bare.encode();
+        assert_eq!(enc.len(), 9);
+        match Msg::decode(&enc) {
+            Ok(Msg::Data { id, name }) => {
+                assert_eq!(id, 7);
+                assert!(name.is_none());
+            }
+            other => panic!("expected data, got {other:?}"),
+        }
+        // A named frame roundtrips.
+        let named = Msg::Data {
+            id: u64::MAX,
+            name: Some("br-1a2b".into()),
+        };
+        match roundtrip(&named) {
+            Msg::Data { id, name } => {
+                assert_eq!(id, u64::MAX);
+                assert_eq!(name.as_deref(), Some("br-1a2b"));
+            }
+            other => panic!("expected data, got {other:?}"),
+        }
+        // A truncated name length prefix and trailing junk after a valid name both
+        // error rather than panic.
+        assert!(Msg::decode(&[3, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        let mut bad = Msg::Data {
+            id: 1,
+            name: Some("x".into()),
+        }
+        .encode();
+        bad.push(0xAA);
+        assert!(Msg::decode(&bad).is_err());
+    }
+
+    /// Every malformed bridge trailer must error, never panic (panic=abort).
+    #[test]
+    fn snapshot_bridge_trailer_rejects_malformed() {
+        let entry = BridgeEntry {
+            label: "a".into(),
+            named: true,
+            transport: 1,
+            peer: "p".into(),
+            macs: vec![[1, 2, 3, 4, 5, 6]],
+            rx_bytes: 1,
+            rx_frames: 1,
+            tx_bytes: 1,
+            tx_frames: 1,
+            uptime_secs: 1,
+            idle_secs: 0,
+        };
+        let mk = |bridge: Vec<BridgeEntry>| {
+            Msg::Snapshot(SnapshotBody {
+                version: 2,
+                server_id: "s".into(),
+                listeners: Vec::new(),
+                clients: Vec::new(),
+                routes: Vec::new(),
+                bridge_clients: bridge,
+            })
+        };
+        let good = mk(vec![entry]).encode();
+        // The trailer's bridge-count begins right after the routes: the same body
+        // with an empty fleet ends with that 2-byte zero count.
+        let trailer_at = mk(Vec::new()).encode().len() - 2;
+
+        // Truncating anywhere inside the populated trailer (past the count
+        // boundary) must error, never panic.
+        for cut in trailer_at + 1..good.len() {
+            assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
+        }
+        // Trailing junk after a valid v2 body is rejected.
+        let mut junk = good.clone();
+        junk.push(0x00);
+        assert!(Msg::decode(&junk).is_err());
+        // A bridge count larger than the remaining bytes errors, not over-reads.
+        let mut big = good.clone();
+        big[trailer_at] = 0xff;
+        big[trailer_at + 1] = 0xff;
+        assert!(Msg::decode(&big).is_err());
+        // The transport byte sits after the count, the label (2-byte len + "a"),
+        // and the 1-byte named flag. A value outside {1,2} errors.
+        let transport_at = trailer_at + 2 + 3 + 1;
+        let mut bad_transport = good.clone();
+        bad_transport[transport_at] = 9;
+        assert!(Msg::decode(&bad_transport).is_err());
+        // The named flag (only 0 or 1) is the byte just before transport.
+        let mut bad_named = good.clone();
+        bad_named[transport_at - 1] = 2;
+        assert!(Msg::decode(&bad_named).is_err());
     }
 
     #[test]
@@ -762,17 +1044,18 @@ mod tests {
                 transport: 1,
             }],
             routes: Vec::new(),
+            bridge_clients: Vec::new(),
         })
         .encode();
-        // The last byte is the empty-routes count low byte; back up to the
-        // transport byte (which precedes the two route-count bytes) and corrupt it.
+        // The trailing four bytes are the zero route count then the zero bridge
+        // count; back up past them to the client transport byte and corrupt it.
         let n = snap.len();
-        snap[n - 3] = 3;
+        snap[n - 5] = 3;
         assert!(Msg::decode(&snap).is_err());
 
         // tag-7 with a bad listener source byte (5). A single listener and no
-        // clients/routes puts the listener source byte before the two zero
-        // counts (client + route), i.e. five bytes from the end.
+        // clients/routes puts the listener source byte before the three zero
+        // counts (client + route + bridge), i.e. seven bytes from the end.
         let mut snap = Msg::Snapshot(SnapshotBody {
             version: 1,
             server_id: "0".into(),
@@ -784,15 +1067,16 @@ mod tests {
             }],
             clients: Vec::new(),
             routes: Vec::new(),
+            bridge_clients: Vec::new(),
         })
         .encode();
         let n = snap.len();
-        snap[n - 5] = 5;
+        snap[n - 7] = 5;
         assert!(Msg::decode(&snap).is_err());
 
         // tag-7 with a bad route source byte (7). A single route and no
-        // clients/listeners puts the route source byte at the very end, after the
-        // route state byte.
+        // clients/listeners puts the route source byte just before the two zero
+        // bridge-count bytes, i.e. three bytes from the end.
         let mut snap = Msg::Snapshot(SnapshotBody {
             version: 1,
             server_id: "0".into(),
@@ -806,10 +1090,11 @@ mod tests {
                 state: 0,
                 source: Source::File,
             }],
+            bridge_clients: Vec::new(),
         })
         .encode();
         let n = snap.len();
-        snap[n - 1] = 7;
+        snap[n - 3] = 7;
         assert!(Msg::decode(&snap).is_err());
     }
 
@@ -834,11 +1119,17 @@ mod tests {
             other => panic!("expected open, got {other:?}"),
         }
 
-        let data = Msg::Data { id: 42 };
+        let data = Msg::Data {
+            id: 42,
+            name: None,
+        };
         let bytes = data.encode();
         assert_eq!(bytes.len(), 9);
         match Msg::decode(&bytes).unwrap() {
-            Msg::Data { id } => assert_eq!(id, 42),
+            Msg::Data { id, name } => {
+                assert_eq!(id, 42);
+                assert!(name.is_none());
+            }
             other => panic!("expected data, got {other:?}"),
         }
 

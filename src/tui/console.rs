@@ -9,7 +9,9 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use crate::admin;
-use crate::proto::{proto_name, ClientEntry, Listener, Msg, Proto, RouteEntry, Source, SnapshotBody};
+use crate::proto::{
+    proto_name, BridgeEntry, ClientEntry, Listener, Msg, Proto, RouteEntry, Source, SnapshotBody,
+};
 use crate::Result;
 
 use super::input::{self, Key};
@@ -139,6 +141,16 @@ impl App {
     fn clients(&self) -> Vec<ClientEntry> {
         let mut v = self.snap.as_ref().map(|s| s.clients.clone()).unwrap_or_default();
         v.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+        v
+    }
+
+    fn bridge(&self) -> Vec<BridgeEntry> {
+        let mut v = self
+            .snap
+            .as_ref()
+            .map(|s| s.bridge_clients.clone())
+            .unwrap_or_default();
+        v.sort_by(|a, b| a.label.cmp(&b.label));
         v
     }
 
@@ -443,6 +455,7 @@ impl App {
         let routes = self.routes();
         let listeners = self.listeners();
         let clients = self.clients();
+        let bridge = self.bridge();
 
         let mut lines: Vec<String> = Vec::with_capacity(h);
         lines.push(frame::top(w, self.header_left(), self.status_seg()));
@@ -467,6 +480,14 @@ impl App {
         content.push(frame::blank(w));
         content.push(frame::row(w, section_head("CLIENTS", clients.len())));
         content.push(frame::row(w, clients_row(&clients)));
+        content.push(frame::blank(w));
+        content.push(frame::row(w, section_head("BRIDGE", bridge.len())));
+        if bridge.is_empty() {
+            content.push(frame::row(w, muted_line("  (none connected)")));
+        }
+        for e in &bridge {
+            content.push(frame::row(w, bridge_row(e)));
+        }
 
         // Reserve the last four rows: divider, toast, hints, bottom border.
         let area = h.saturating_sub(5);
@@ -704,6 +725,39 @@ fn clients_row(clients: &[ClientEntry]) -> Line {
         }
         l.add(ACCENT, &sanitize(&c.client_id));
     }
+    l
+}
+
+fn bridge_row(e: &BridgeEntry) -> Line {
+    let mut l = Line::new();
+    l.add(PLAIN, "  ");
+    l.add(ACCENT, &sanitize(&e.label));
+    if !e.named {
+        l.add(MUTED, " (anon)");
+    }
+    let proto = crate::admin::transport_name(e.transport);
+    let peer = if e.peer.is_empty() {
+        "-".to_string()
+    } else {
+        sanitize(&e.peer)
+    };
+    let rx = format!(
+        "{} / {}",
+        crate::admin::human_bytes(e.rx_bytes),
+        crate::admin::human_count(e.rx_frames)
+    );
+    let tx = format!(
+        "{} / {}",
+        crate::admin::human_bytes(e.tx_bytes),
+        crate::admin::human_count(e.tx_frames)
+    );
+    let tail = format!(
+        " · {proto} · {peer} · {} macs · {rx}/{tx} · up {} · idle {}",
+        e.macs.len(),
+        crate::admin::fmt_dur(e.uptime_secs),
+        crate::admin::fmt_dur(e.idle_secs),
+    );
+    l.add(MUTED, &tail);
     l
 }
 

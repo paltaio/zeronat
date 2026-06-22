@@ -465,9 +465,11 @@ async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bo
     let (inbound, _guard) = sess.register_dgram(BRIDGE_CONV);
     let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
     let rx = DgramRx::new(inbound, noise);
+    // Announce this client's label so the server's fleet view names the port.
+    let _ = tx.send_name(&client.client_id).await;
     // `cancel` fires only when the RX pump sees the peer vanish (server restart),
     // tearing the bridge down at once instead of stalling until the next reconnect.
-    bridge::tap_dgram(tap, rx, tx, cancel).await;
+    bridge::tap_dgram(tap, rx, tx, cancel, &client.client_id).await;
     (Ok(()), true)
 }
 
@@ -480,7 +482,16 @@ async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bo
             Ok(v) => v,
             Err(e) => return (Err(e), false),
         };
-    if let Err(e) = nw.send(&Msg::Data { id: BRIDGE_ID }.encode()).await {
+    if let Err(e) = nw
+        .send(
+            &Msg::Data {
+                id: BRIDGE_ID,
+                name: Some(client.client_id.clone()),
+            }
+            .encode(),
+        )
+        .await
+    {
         return (Err(e), true);
     }
     crate::elog!("bridge connected to {} over tcp", client.server);
@@ -623,9 +634,13 @@ async fn pppoe_udp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>,
     let (inbound, _guard) = sess.register_dgram(BRIDGE_CONV);
     let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
     let rx = DgramRx::new(inbound, noise);
+    // Announce this client's label so the server's fleet view names the port.
+    let _ = tx.send_name(&client.client_id).await;
     // UDP requires a literal ip:port, so the configured server is the real peer.
     let server_ip = server_v4(&client.server);
-    let result = crate::pppoe::tunnel::run_dgram(dp, bringup(server_ip, &pp), rx, tx, cancel).await;
+    let result =
+        crate::pppoe::tunnel::run_dgram(dp, bringup(server_ip, &pp), rx, tx, cancel, &client.client_id)
+            .await;
     (result, true)
 }
 
@@ -642,7 +657,16 @@ async fn pppoe_tcp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>,
             Ok(v) => v,
             Err(e) => return (Err(e), false),
         };
-    if let Err(e) = nw.send(&Msg::Data { id: BRIDGE_ID }.encode()).await {
+    if let Err(e) = nw
+        .send(
+            &Msg::Data {
+                id: BRIDGE_ID,
+                name: Some(client.client_id.clone()),
+            }
+            .encode(),
+        )
+        .await
+    {
         return (Err(e), true);
     }
     crate::elog!("pppoe connected to {} over tcp", client.server);
@@ -887,7 +911,7 @@ async fn handle_open(
             })
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
-            nw.send(&Msg::Data { id }.encode()).await?;
+            nw.send(&Msg::Data { id, name: None }.encode()).await?;
             let local = TcpStream::connect(&target)
                 .await
                 .map_err(|e| -> crate::Error {
@@ -903,7 +927,7 @@ async fn handle_open(
             })
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
-            nw.send(&Msg::Data { id }.encode()).await?;
+            nw.send(&Msg::Data { id, name: None }.encode()).await?;
             let local = UdpSocket::bind("0.0.0.0:0").await?;
             local.connect(&target).await.map_err(|e| -> crate::Error {
                 format!("connecting to local {target}: {e}").into()
@@ -919,7 +943,7 @@ async fn handle_open(
             )
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
-            nw.send(&Msg::Data { id }.encode()).await?;
+            nw.send(&Msg::Data { id, name: None }.encode()).await?;
             let local = TcpStream::connect(&target)
                 .await
                 .map_err(|e| -> crate::Error {

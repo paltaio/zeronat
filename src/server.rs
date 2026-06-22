@@ -19,6 +19,8 @@ use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 #[cfg(target_os = "linux")]
 use crate::netfilter;
 use crate::noise::{server_handshake, server_handshake_stateless, Noise, StatelessNoise};
+#[cfg(target_os = "linux")]
+use crate::proto::BridgeEntry;
 use crate::proto::{
     proto_name, ClientEntry, Listener, Msg, Proto, RouteEntry, SnapshotBody, Source,
 };
@@ -70,6 +72,14 @@ const UDP_DATA_TTL: Duration = Duration::from_secs(180);
 pub enum ActiveTransport {
     Tcp,
     Udp,
+}
+
+/// Wire byte for an observed transport in a snapshot or switch port: 1 = tcp, 2 = udp.
+fn transport_byte(t: ActiveTransport) -> u8 {
+    match t {
+        ActiveTransport::Tcp => 1,
+        ActiveTransport::Udp => 2,
+    }
 }
 
 /// A public listener keyed by its bind IP, protocol, and port. The same tuple
@@ -416,14 +426,14 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         };
         let srv = srv.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_incoming(srv, sock).await {
+            if let Err(e) = handle_incoming(srv, sock, peer).await {
                 crate::elog!("connection from {peer} ended: {e}");
             }
         });
     }
 }
 
-async fn handle_incoming(srv: Arc<Server>, sock: TcpStream) -> Result<()> {
+async fn handle_incoming(srv: Arc<Server>, sock: TcpStream, peer: SocketAddr) -> Result<()> {
     sock.set_nodelay(true).ok();
     let (r, w) = {
         let _permit = srv.handshakes.clone().acquire_owned().await?;
@@ -432,7 +442,7 @@ async fn handle_incoming(srv: Arc<Server>, sock: TcpStream) -> Result<()> {
             Err(_) => return Err("handshake timed out".into()),
         }
     };
-    serve_stream(srv, r, w, ActiveTransport::Tcp).await
+    serve_stream(srv, r, w, ActiveTransport::Tcp, Some(peer)).await
 }
 
 /// Dispatch a freshly handshaked stream (control, admin, or data),
@@ -442,6 +452,7 @@ pub(crate) async fn serve_stream(
     mut r: crate::noise::NoiseReader,
     w: crate::noise::NoiseWriter,
     transport: ActiveTransport,
+    peer: Option<SocketAddr>,
 ) -> Result<()> {
     // Guard the first role frame: a peer can finish the handshake then never send
     // its role, parking this task and its fd forever (half-death, NAT rebind,
@@ -539,17 +550,26 @@ pub(crate) async fn serve_stream(
                 other => Err(format!("unsupported admin mode {other}").into()),
             }
         }
-        Msg::Data { id } => {
+        Msg::Data { id, name } => {
             #[cfg(target_os = "linux")]
             if id == BRIDGE_ID {
                 if let Some(switch) = srv.switch.clone() {
-                    match switch.add_port() {
-                        Ok(handle) => bridge::switch_port_stream(handle, r, w).await,
+                    match switch.add_port(transport_byte(transport), peer) {
+                        Ok(handle) => {
+                            if let Some(name) = name.as_deref().filter(|n| !n.is_empty()) {
+                                handle.set_name(name);
+                            }
+                            bridge::switch_port_stream(handle, r, w).await
+                        }
                         Err(e) => crate::elog!("rejecting bridge stream: {e}"),
                     }
                 }
                 return Ok(());
             }
+            // The bridge name and peer address are only consumed by the
+            // linux-only switch above.
+            #[cfg(not(target_os = "linux"))]
+            let _ = (&name, &peer);
             if let Some(tx) = srv.pending.lock().unwrap().remove(&id) {
                 let _ = tx.send((r, w));
             }
@@ -571,10 +591,7 @@ impl Server {
                 .iter()
                 .map(|(id, h)| ClientEntry {
                     client_id: id.clone(),
-                    transport: match h.transport {
-                        ActiveTransport::Tcp => 1,
-                        ActiveTransport::Udp => 2,
-                    },
+                    transport: transport_byte(h.transport),
                 })
                 .collect();
             (connected, clients)
@@ -611,12 +628,50 @@ impl Server {
                 source: route.source,
             })
             .collect();
+        // L2 bridge clients attach to the switch, not the forward client registry,
+        // so the fleet view reads them from the switch's port table. The switch is
+        // linux-only; other platforms report no bridge clients.
+        #[cfg(target_os = "linux")]
+        let bridge_clients = self
+            .switch
+            .as_ref()
+            .map(|sw| {
+                sw.ports_snapshot()
+                    .into_iter()
+                    .map(|p| {
+                        let named = p.name.as_ref().is_some_and(|s| !s.is_empty());
+                        let label = p.name.filter(|s| !s.is_empty()).unwrap_or_else(|| match p.peer
+                        {
+                            Some(a) => a.to_string(),
+                            None => format!("bridge-{}", p.port_id),
+                        });
+                        BridgeEntry {
+                            label,
+                            named,
+                            transport: p.transport,
+                            peer: p.peer.map(|a| a.to_string()).unwrap_or_default(),
+                            macs: p.macs,
+                            rx_bytes: p.rx_bytes,
+                            rx_frames: p.rx_frames,
+                            tx_bytes: p.tx_bytes,
+                            tx_frames: p.tx_frames,
+                            uptime_secs: p.uptime_secs,
+                            idle_secs: p.idle_secs,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        #[cfg(not(target_os = "linux"))]
+        let bridge_clients = Vec::new();
+
         SnapshotBody {
             version: crate::identity::PROTO_VERSION,
             server_id: self.server_id.clone(),
             listeners,
             clients,
             routes,
+            bridge_clients,
         }
     }
 
@@ -1116,7 +1171,7 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
                         timeout(HANDSHAKE_TIMEOUT, server_handshake(stream, &psk)).await;
                     drop(permit);
                     if let Ok(Ok((r, w))) = handshake {
-                        let _ = serve_stream(srv, r, w, ActiveTransport::Udp).await;
+                        let _ = serve_stream(srv, r, w, ActiveTransport::Udp, Some(src)).await;
                     }
                 });
             }
@@ -1134,7 +1189,7 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
                     if let Ok(Ok((id, noise))) = handshake {
                         #[cfg(target_os = "linux")]
                         if conv == BRIDGE_CONV {
-                            accept_bridge(srv, sess2, conv, noise).await;
+                            accept_bridge(srv, sess2, conv, noise, src).await;
                         } else {
                             accept_udp_forward(srv, sess2, conv, id, noise).await;
                         }
@@ -1186,7 +1241,13 @@ fn take_udp_pending(srv: &Server, id: u64) -> Option<UdpPending> {
 /// own switch port, so multiple clients share the one TAP. The idle reaper inside
 /// the relay (plus the session's `register_dgram` guard) reclaims a silent port.
 #[cfg(target_os = "linux")]
-async fn accept_bridge(srv: Arc<Server>, sess: Arc<Session>, conv: u32, noise: StatelessNoise) {
+async fn accept_bridge(
+    srv: Arc<Server>,
+    sess: Arc<Session>,
+    conv: u32,
+    noise: StatelessNoise,
+    src: SocketAddr,
+) {
     let Some(switch) = srv.switch.clone() else {
         return;
     };
@@ -1196,7 +1257,7 @@ async fn accept_bridge(srv: Arc<Server>, sess: Arc<Session>, conv: u32, noise: S
     let Some(_bridge_guard) = sess.try_attach_bridge() else {
         return;
     };
-    let handle = match switch.add_port() {
+    let handle = match switch.add_port(2, Some(src)) {
         Ok(h) => h,
         Err(e) => {
             crate::elog!("rejecting bridge conv: {e}");
@@ -1319,7 +1380,7 @@ mod tests {
         let (r, w) = crate::noise::server_handshake(server_io, &srv.psk)
             .await
             .expect("server handshake");
-        let res = serve_stream(srv, r, w, ActiveTransport::Tcp).await;
+        let res = serve_stream(srv, r, w, ActiveTransport::Tcp, None).await;
         assert!(
             res.is_err(),
             "silent role frame must time out and release the task"
@@ -1352,7 +1413,7 @@ mod tests {
         let (r, w) = crate::noise::server_handshake(server_io, &srv.psk)
             .await
             .expect("server handshake");
-        let res = serve_stream(srv, r, w, ActiveTransport::Tcp).await;
+        let res = serve_stream(srv, r, w, ActiveTransport::Tcp, None).await;
         assert!(
             res.is_err(),
             "silent admin request must time out and release the task"

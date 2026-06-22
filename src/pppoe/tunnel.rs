@@ -198,6 +198,7 @@ pub async fn run_dgram(
     mut rx: DgramRx,
     tx: DgramTx,
     cancel: Arc<Notify>,
+    name: &str,
 ) -> crate::Result<()> {
     let half = UDP_IDLE / 2;
     let mut keepalive = interval_at(Instant::now() + half, half);
@@ -226,6 +227,8 @@ pub async fn run_dgram(
 
             m = rx.recv() => match m {
                 Some(Frame::Keepalive) => last_in = Instant::now(),
+                // A name frame is server-bound only; never reaches this datapath.
+                Some(Frame::Name(_)) => last_in = Instant::now(),
                 Some(Frame::Data(d)) => {
                     last_in = Instant::now();
                     let phase = dp.on_l2_frame(&d);
@@ -279,6 +282,9 @@ pub async fn run_dgram(
                 if last_in.elapsed() >= UDP_IDLE {
                     break Ok(());
                 }
+                // Re-announce the name so a lost attach frame self-heals; the
+                // server applies it idempotently on every receipt.
+                tx.send_name(name).await.ok();
                 tx.probe().await.ok();
             }
         }

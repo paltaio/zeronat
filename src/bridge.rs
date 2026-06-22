@@ -8,6 +8,26 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+// Per-port traffic counters use the widest atomic the target supports: a 64-bit
+// atomic where one exists, falling back to 32-bit on targets (mips) that lack it.
+// The counters are display-only, so a 32-bit wrap on those targets is harmless.
+#[cfg(all(target_os = "linux", target_has_atomic = "64"))]
+use std::sync::atomic::AtomicU64 as AtomicCounter;
+#[cfg(all(target_os = "linux", not(target_has_atomic = "64")))]
+use std::sync::atomic::AtomicU32 as AtomicCounter;
+
+// Widen a counter load to the wire's u64. On a 64-bit-atomic target the value is
+// already u64; on a 32-bit-atomic target the loaded u32 is widened here so the
+// snapshot stays target-independent.
+#[cfg(all(target_os = "linux", target_has_atomic = "64"))]
+fn widen_counter(v: u64) -> u64 {
+    v
+}
+#[cfg(all(target_os = "linux", not(target_has_atomic = "64")))]
+fn widen_counter(v: u32) -> u64 {
+    u64::from(v)
+}
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
@@ -259,7 +279,13 @@ impl LocalWrite for TapWrite {
 /// self-heals if the mapping silently expires: with no inbound frame for the
 /// whole window the relay reaps and the reconnect loop redials.
 #[cfg(target_os = "linux")]
-pub async fn tap_dgram(tap: Arc<TapDevice>, mut rx: DgramRx, tx: DgramTx, cancel: Arc<Notify>) {
+pub async fn tap_dgram(
+    tap: Arc<TapDevice>,
+    mut rx: DgramRx,
+    tx: DgramTx,
+    cancel: Arc<Notify>,
+    name: &str,
+) {
     let half = UDP_IDLE / 2;
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -276,12 +302,22 @@ pub async fn tap_dgram(tap: Arc<TapDevice>, mut rx: DgramRx, tx: DgramTx, cancel
                     last_in = Instant::now();
                     match f {
                         Frame::Keepalive => true,
+                        // A name frame is server-bound only; ignore it here.
+                        Frame::Name(_) => true,
                         Frame::Data(d) => tap.write_frame(&d).await.is_ok(),
                     }
                 }
                 None => false,
             },
-            _ = tick.tick() => last_in.elapsed() < UDP_IDLE && tx.probe().await.is_ok(),
+            _ = tick.tick() => {
+                let live = last_in.elapsed() < UDP_IDLE;
+                if live {
+                    // Re-announce the name so a lost attach frame self-heals; the
+                    // server applies it idempotently on every receipt.
+                    tx.send_name(name).await.ok();
+                }
+                live && tx.probe().await.is_ok()
+            }
         };
         if !alive {
             break;
@@ -324,13 +360,90 @@ const MAX_MACS_PER_SWITCH: usize = 4096;
 #[cfg(target_os = "linux")]
 const SWITCH_PORT_CAP: usize = 256;
 
+/// Cap on the learned MACs reported per port in the admin fleet view. Bounds a
+/// bridge-client row's width; routing still uses the full per-switch MAC table.
+#[cfg(target_os = "linux")]
+const MAX_DISPLAY_MACS: usize = 16;
+
+/// Live traffic counters for one switch port, shared by `Arc` so a port's relay
+/// bumps them with a single atomic add per frame and never touches the `ports`
+/// lock on the datapath. `last_activity` is whole seconds since `created`, the
+/// same low-resolution mark idiom the relays use for idleness.
+#[cfg(target_os = "linux")]
+struct PortStats {
+    rx_bytes: AtomicCounter,
+    rx_frames: AtomicCounter,
+    tx_bytes: AtomicCounter,
+    tx_frames: AtomicCounter,
+    last_activity: AtomicU32,
+    created: Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl PortStats {
+    fn new() -> Arc<PortStats> {
+        Arc::new(PortStats {
+            rx_bytes: AtomicCounter::new(0),
+            rx_frames: AtomicCounter::new(0),
+            tx_bytes: AtomicCounter::new(0),
+            tx_frames: AtomicCounter::new(0),
+            last_activity: AtomicU32::new(0),
+            created: Instant::now(),
+        })
+    }
+
+    /// Record one egress frame (client -> server): a single atomic add per field.
+    fn note_rx(&self, len: usize) {
+        self.rx_bytes.fetch_add(len as _, Ordering::Relaxed);
+        self.rx_frames.fetch_add(1, Ordering::Relaxed);
+        self.touch();
+    }
+
+    /// Record one inbound frame (server -> client).
+    fn note_tx(&self, len: usize) {
+        self.tx_bytes.fetch_add(len as _, Ordering::Relaxed);
+        self.tx_frames.fetch_add(1, Ordering::Relaxed);
+        self.touch();
+    }
+
+    fn touch(&self) {
+        self.last_activity
+            .store(self.created.elapsed().as_secs().min(u32::MAX as u64) as u32, Ordering::Relaxed);
+    }
+}
+
 /// One attached client on the software switch: a bounded sender that carries
-/// inbound (TAP -> client) frames toward that client's relay, plus the cancel
-/// that relay waits on so an evicted/closed port tears its relay down at once.
+/// inbound (TAP -> client) frames toward that client's relay, the cancel that
+/// relay waits on so an evicted/closed port tears its relay down at once, and the
+/// metadata and counters the fleet view reports.
 #[cfg(target_os = "linux")]
 struct SwitchPort {
     out: mpsc::Sender<Vec<u8>>,
     cancel: Arc<Notify>,
+    stats: Arc<PortStats>,
+    /// Client-announced label, set once if the client sends one; `None` leaves the
+    /// fleet view to fall back to the peer address or the port id.
+    name: Mutex<Option<String>>,
+    /// Observed control transport: 1 = tcp, 2 = udp.
+    transport: u8,
+    peer: Option<SocketAddr>,
+}
+
+/// A point-in-time copy of one switch port for the admin fleet view. Plain owned
+/// data so `bridge.rs` carries no dependency on the wire `BridgeEntry`.
+#[cfg(target_os = "linux")]
+pub struct BridgePortInfo {
+    pub port_id: u32,
+    pub name: Option<String>,
+    pub transport: u8,
+    pub peer: Option<SocketAddr>,
+    pub macs: Vec<[u8; 6]>,
+    pub rx_bytes: u64,
+    pub rx_frames: u64,
+    pub tx_bytes: u64,
+    pub tx_frames: u64,
+    pub uptime_secs: u32,
+    pub idle_secs: u32,
 }
 
 /// In-process learning switch between the one server-side device and N attached
@@ -550,10 +663,15 @@ impl TapSwitch {
     /// without disturbing the established one. The cap check and the insert happen
     /// together under the `ports` lock so two simultaneous attaches cannot both
     /// pass it.
-    pub fn add_port(self: &Arc<Self>) -> crate::Result<SwitchHandle> {
+    pub fn add_port(
+        self: &Arc<Self>,
+        transport: u8,
+        peer: Option<SocketAddr>,
+    ) -> crate::Result<SwitchHandle> {
         let port_id = self.next_port.fetch_add(1, Ordering::Relaxed);
         let (out_tx, out_rx) = mpsc::channel(SWITCH_PORT_CAP);
         let cancel = Arc::new(Notify::new());
+        let stats = PortStats::new();
         {
             let mut ports = self.ports.lock().unwrap();
             if !self.is_l2 && !ports.is_empty() {
@@ -564,6 +682,10 @@ impl TapSwitch {
                 SwitchPort {
                     out: out_tx,
                     cancel: cancel.clone(),
+                    stats: stats.clone(),
+                    name: Mutex::new(None),
+                    transport,
+                    peer,
                 },
             );
         }
@@ -572,7 +694,70 @@ impl TapSwitch {
             port_id,
             out_rx: Some(out_rx),
             cancel,
+            stats,
         })
+    }
+
+    /// Record the label a client announced for its port. Sanitizes to printable
+    /// characters and caps the length, so a crafted name cannot inject terminal
+    /// control sequences or grow without bound; an empty name leaves the port
+    /// unnamed so the fleet view keeps its address/port fallback.
+    fn set_port_name(&self, port_id: u32, name: &str) {
+        let clean: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+        if clean.is_empty() {
+            return;
+        }
+        if let Some(port) = self.ports.lock().unwrap().get(&port_id) {
+            *port.name.lock().unwrap() = Some(clean);
+        }
+    }
+
+    /// The source MACs learned behind `port_id`, capped for display. Locks only the
+    /// MAC table, so it never nests with the `ports` lock.
+    fn macs_for(&self, port_id: u32) -> Vec<[u8; 6]> {
+        self.macs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, &(p, _))| p == port_id)
+            .map(|(mac, _)| *mac)
+            .take(MAX_DISPLAY_MACS)
+            .collect()
+    }
+
+    /// A point-in-time view of every attached port for the admin fleet report.
+    /// Copies each port's fields out under the `ports` lock, releases it, then reads
+    /// the MAC table, so a port's MAC scan never runs while the `ports` lock is held.
+    pub fn ports_snapshot(&self) -> Vec<BridgePortInfo> {
+        let rows: Vec<BridgePortInfo> = {
+            let ports = self.ports.lock().unwrap();
+            ports
+                .iter()
+                .map(|(&port_id, p)| {
+                    let uptime = p.stats.created.elapsed().as_secs().min(u32::MAX as u64) as u32;
+                    let last = p.stats.last_activity.load(Ordering::Relaxed);
+                    BridgePortInfo {
+                        port_id,
+                        name: p.name.lock().unwrap().clone(),
+                        transport: p.transport,
+                        peer: p.peer,
+                        macs: Vec::new(),
+                        rx_bytes: widen_counter(p.stats.rx_bytes.load(Ordering::Relaxed)),
+                        rx_frames: widen_counter(p.stats.rx_frames.load(Ordering::Relaxed)),
+                        tx_bytes: widen_counter(p.stats.tx_bytes.load(Ordering::Relaxed)),
+                        tx_frames: widen_counter(p.stats.tx_frames.load(Ordering::Relaxed)),
+                        uptime_secs: uptime,
+                        idle_secs: uptime.saturating_sub(last),
+                    }
+                })
+                .collect()
+        };
+        rows.into_iter()
+            .map(|mut r| {
+                r.macs = self.macs_for(r.port_id);
+                r
+            })
+            .collect()
     }
 }
 
@@ -586,6 +771,17 @@ pub struct SwitchHandle {
     port_id: u32,
     out_rx: Option<mpsc::Receiver<Vec<u8>>>,
     cancel: Arc<Notify>,
+    stats: Arc<PortStats>,
+}
+
+#[cfg(target_os = "linux")]
+impl SwitchHandle {
+    /// Record a client-announced label for this port. Used by the stream (TCP)
+    /// bridge, which carries the name in its first frame; the datagram bridge sets
+    /// it from an in-band name frame instead.
+    pub fn set_name(&self, name: &str) {
+        self.switch.set_port_name(self.port_id, name);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -606,6 +802,7 @@ pub async fn switch_port_dgram(mut handle: SwitchHandle, mut rx: DgramRx, tx: Dg
     let mut out_rx = handle.out_rx.take().expect("switch port out_rx");
     let switch = handle.switch.clone();
     let port_id = handle.port_id;
+    let stats = handle.stats.clone();
     let half = UDP_IDLE / 2;
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -618,13 +815,23 @@ pub async fn switch_port_dgram(mut handle: SwitchHandle, mut rx: DgramRx, tx: Dg
                     last_in = Instant::now();
                     match f {
                         Frame::Keepalive => true,
-                        Frame::Data(d) => switch.learn_and_write_egress(&d, port_id).await.is_ok(),
+                        Frame::Name(n) => {
+                            switch.set_port_name(port_id, &n);
+                            true
+                        }
+                        Frame::Data(d) => {
+                            stats.note_rx(d.len());
+                            switch.learn_and_write_egress(&d, port_id).await.is_ok()
+                        }
                     }
                 }
                 None => false,
             },
             f = out_rx.recv() => match f {
-                Some(f) => tx.send(&f).await.is_ok(),
+                Some(f) => {
+                    stats.note_tx(f.len());
+                    tx.send(&f).await.is_ok()
+                }
                 None => false,
             },
             _ = tick.tick() => last_in.elapsed() < UDP_IDLE && tx.probe().await.is_ok(),
@@ -644,10 +851,14 @@ pub async fn switch_port_dgram(mut handle: SwitchHandle, mut rx: DgramRx, tx: Dg
 #[cfg(target_os = "linux")]
 pub async fn switch_port_stream(mut handle: SwitchHandle, nr: NoiseReader, nw: NoiseWriter) {
     let out_rx = handle.out_rx.take().expect("switch port out_rx");
-    let local_r = PortRead(out_rx);
+    let local_r = PortRead {
+        rx: out_rx,
+        stats: handle.stats.clone(),
+    };
     let local_w = PortWrite {
         switch: handle.switch.clone(),
         port_id: handle.port_id,
+        stats: handle.stats.clone(),
     };
     let port_cancel = handle.cancel.clone();
     let stop = async move { port_cancel.notified().await };
@@ -658,24 +869,34 @@ pub async fn switch_port_stream(mut handle: SwitchHandle, nr: NoiseReader, nw: N
 /// inbound frame (TAP -> client). A closed channel is the empty-Vec EOF sentinel,
 /// which a switch frame never collides with (a TAP frame is never empty).
 #[cfg(target_os = "linux")]
-struct PortRead(mpsc::Receiver<Vec<u8>>);
+struct PortRead {
+    rx: mpsc::Receiver<Vec<u8>>,
+    stats: Arc<PortStats>,
+}
 /// `stream_relay` local-write half for a switch port: an egress frame (client ->
 /// BRAS) learns its source MAC onto this port, then writes to the shared TAP.
 #[cfg(target_os = "linux")]
 struct PortWrite {
     switch: Arc<TapSwitch>,
     port_id: u32,
+    stats: Arc<PortStats>,
 }
 
 #[cfg(target_os = "linux")]
 impl LocalRead for PortRead {
     async fn read(&mut self) -> crate::Result<Vec<u8>> {
-        Ok(self.0.recv().await.unwrap_or_default())
+        let frame = self.rx.recv().await.unwrap_or_default();
+        // An empty frame is the channel-closed EOF sentinel, not real traffic.
+        if !frame.is_empty() {
+            self.stats.note_tx(frame.len());
+        }
+        Ok(frame)
     }
 }
 #[cfg(target_os = "linux")]
 impl LocalWrite for PortWrite {
     async fn write(&mut self, buf: &[u8]) -> crate::Result<()> {
+        self.stats.note_rx(buf.len());
         self.switch.learn_and_write_egress(buf, self.port_id).await
     }
 }
@@ -694,6 +915,7 @@ pub async fn udp_client_stateless(local: UdpSocket, mut rx: DgramRx, tx: DgramTx
                     last_in = Instant::now();
                     match f {
                         Frame::Keepalive => true,
+                        Frame::Name(_) => true,
                         Frame::Data(d) => local.send(&d).await.is_ok(),
                     }
                 }
@@ -734,6 +956,7 @@ pub async fn udp_server_stateless(
                     last_in = Instant::now();
                     match f {
                         Frame::Keepalive => true,
+                        Frame::Name(_) => true,
                         Frame::Data(d) => socket.send_to(&d, src).await.is_ok(),
                     }
                 }
@@ -903,8 +1126,8 @@ mod switch_tests {
     #[tokio::test]
     async fn learn_then_unicast_delivers_to_owner() {
         let (sw, _g) = test_switch();
-        let mut a = sw.add_port().unwrap();
-        let mut b = sw.add_port().unwrap();
+        let mut a = sw.add_port(1, None).unwrap();
+        let mut b = sw.add_port(1, None).unwrap();
         // M1 lives behind port a.
         sw.learn(M1, a.port_id);
 
@@ -919,8 +1142,8 @@ mod switch_tests {
     #[tokio::test]
     async fn broadcast_floods_all_ports() {
         let (sw, _g) = test_switch();
-        let mut a = sw.add_port().unwrap();
-        let mut b = sw.add_port().unwrap();
+        let mut a = sw.add_port(1, None).unwrap();
+        let mut b = sw.add_port(1, None).unwrap();
         let f = frame(BCAST, M1, b"b");
         sw.forward_inbound(BCAST, f.clone());
         assert_eq!(a.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
@@ -931,8 +1154,8 @@ mod switch_tests {
     #[tokio::test]
     async fn unknown_unicast_floods() {
         let (sw, _g) = test_switch();
-        let mut a = sw.add_port().unwrap();
-        let mut b = sw.add_port().unwrap();
+        let mut a = sw.add_port(1, None).unwrap();
+        let mut b = sw.add_port(1, None).unwrap();
         let f = frame(M1, M2, b"u");
         sw.forward_inbound(M1, f.clone());
         assert_eq!(a.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
@@ -943,8 +1166,8 @@ mod switch_tests {
     #[tokio::test]
     async fn multicast_floods() {
         let (sw, _g) = test_switch();
-        let mut a = sw.add_port().unwrap();
-        let mut b = sw.add_port().unwrap();
+        let mut a = sw.add_port(1, None).unwrap();
+        let mut b = sw.add_port(1, None).unwrap();
         let f = frame(MCAST, M1, b"m");
         sw.forward_inbound(MCAST, f.clone());
         assert_eq!(a.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
@@ -958,7 +1181,7 @@ mod switch_tests {
     async fn single_port_fast_path() {
         let (dev, peer) = crate::tap::TapDevice::socketpair_for_test(1500).unwrap();
         let sw = TapSwitch::new(Arc::new(dev), true);
-        let mut p = sw.add_port().unwrap();
+        let mut p = sw.add_port(1, None).unwrap();
 
         // A raw L3-ish buffer shorter than an Ethernet header; the fast path must
         // forward it without parsing.
@@ -984,8 +1207,8 @@ mod switch_tests {
     #[tokio::test]
     async fn relearn_on_reconnect() {
         let (sw, _g) = test_switch();
-        let mut a = sw.add_port().unwrap();
-        let mut b = sw.add_port().unwrap();
+        let mut a = sw.add_port(1, None).unwrap();
+        let mut b = sw.add_port(1, None).unwrap();
         sw.learn(M1, a.port_id);
         sw.learn(M1, b.port_id); // M1 moved to port b
 
@@ -1000,9 +1223,9 @@ mod switch_tests {
     #[tokio::test]
     async fn handle_drop_evicts_port_and_macs() {
         let (sw, _g) = test_switch();
-        let a = sw.add_port().unwrap();
+        let a = sw.add_port(1, None).unwrap();
         let a_id = a.port_id;
-        let mut b = sw.add_port().unwrap();
+        let mut b = sw.add_port(1, None).unwrap();
         sw.learn(M1, a_id);
         assert!(sw.macs.lock().unwrap().contains_key(&M1));
 
@@ -1016,12 +1239,95 @@ mod switch_tests {
         assert_eq!(b.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
     }
 
+    // add_port records its transport and peer; ports_snapshot reports them with
+    // zeroed counters and no learned MACs.
+    #[tokio::test]
+    async fn ports_snapshot_reports_metadata() {
+        let (sw, _g) = test_switch();
+        let peer: std::net::SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        let _a = sw.add_port(2, Some(peer)).unwrap();
+        let snap = sw.ports_snapshot();
+        assert_eq!(snap.len(), 1);
+        let p = &snap[0];
+        assert_eq!(p.transport, 2);
+        assert_eq!(p.peer, Some(peer));
+        assert!(p.name.is_none());
+        assert_eq!(
+            (p.rx_bytes, p.rx_frames, p.tx_bytes, p.tx_frames),
+            (0, 0, 0, 0)
+        );
+        assert!(p.macs.is_empty());
+    }
+
+    // Counters bumped on a port's stats (as the relays do per frame) surface in the
+    // snapshot, and a dropped handle removes the port from it.
+    #[tokio::test]
+    async fn ports_snapshot_reports_counters_and_eviction() {
+        let (sw, _g) = test_switch();
+        let a = sw.add_port(1, None).unwrap();
+        a.stats.note_rx(100);
+        a.stats.note_rx(40);
+        a.stats.note_tx(10);
+        let p = sw
+            .ports_snapshot()
+            .into_iter()
+            .find(|p| p.port_id == a.port_id)
+            .expect("port present");
+        assert_eq!((p.rx_bytes, p.rx_frames), (140, 2));
+        assert_eq!((p.tx_bytes, p.tx_frames), (10, 1));
+
+        let id = a.port_id;
+        drop(a);
+        assert!(sw.ports_snapshot().iter().all(|p| p.port_id != id));
+    }
+
+    // A client-announced name shows in the snapshot with control characters
+    // stripped and the length capped; an empty name never clears an existing one.
+    #[tokio::test]
+    async fn set_port_name_sanitizes_and_caps() {
+        let (sw, _g) = test_switch();
+        let a = sw.add_port(1, None).unwrap();
+        sw.set_port_name(a.port_id, "rpi\x07-1a2b");
+        let name = |sw: &Arc<TapSwitch>, id| {
+            sw.ports_snapshot()
+                .into_iter()
+                .find(|p| p.port_id == id)
+                .and_then(|p| p.name)
+        };
+        assert_eq!(name(&sw, a.port_id).as_deref(), Some("rpi-1a2b"));
+        // An empty name leaves the prior name in place.
+        sw.set_port_name(a.port_id, "");
+        assert_eq!(name(&sw, a.port_id).as_deref(), Some("rpi-1a2b"));
+        // An over-long name is capped at 64 characters.
+        let b = sw.add_port(1, None).unwrap();
+        sw.set_port_name(b.port_id, &"x".repeat(200));
+        assert_eq!(name(&sw, b.port_id).map(|s| s.chars().count()), Some(64));
+    }
+
+    // macs_for and the snapshot report only the MACs learned behind that port.
+    #[tokio::test]
+    async fn macs_for_isolates_ports() {
+        let (sw, _g) = test_switch();
+        let a = sw.add_port(1, None).unwrap();
+        let b = sw.add_port(1, None).unwrap();
+        sw.learn(M1, a.port_id);
+        sw.learn(M2, b.port_id);
+        assert_eq!(sw.macs_for(a.port_id), vec![M1]);
+        assert_eq!(sw.macs_for(b.port_id), vec![M2]);
+        let p = sw
+            .ports_snapshot()
+            .into_iter()
+            .find(|p| p.port_id == a.port_id)
+            .expect("port present");
+        assert_eq!(p.macs, vec![M1]);
+    }
+
     // Learning stops growing the table at MAX_MACS_PER_SWITCH, but entries already
     // present still update (their port can still move).
     #[tokio::test]
     async fn mac_table_cap() {
         let (sw, _g) = test_switch();
-        let p = sw.add_port().unwrap();
+        let p = sw.add_port(1, None).unwrap();
 
         for i in 0..MAX_MACS_PER_SWITCH as u32 {
             let b = i.to_be_bytes();
@@ -1046,9 +1352,9 @@ mod switch_tests {
     #[tokio::test]
     async fn closed_port_does_not_block_others() {
         let (sw, _g) = test_switch();
-        let dead = sw.add_port().unwrap();
+        let dead = sw.add_port(1, None).unwrap();
         let dead_id = dead.port_id;
-        let mut live = sw.add_port().unwrap();
+        let mut live = sw.add_port(1, None).unwrap();
         // Close the dead port's receiver without going through Drop (model a relay
         // that stopped draining and dropped its rx).
         let mut dead = dead;
@@ -1071,14 +1377,14 @@ mod switch_tests {
         let _g = TapFdGuard(peer);
         let tun = TapSwitch::new_without_reader(Arc::new(dev), false);
 
-        let first = tun.add_port().expect("first tun port attaches");
-        assert!(tun.add_port().is_err(), "second tun port must be refused");
+        let first = tun.add_port(1, None).expect("first tun port attaches");
+        assert!(tun.add_port(1, None).is_err(), "second tun port must be refused");
         drop(first);
-        let _reattach = tun.add_port().expect("a freed tun slot accepts a reconnect");
+        let _reattach = tun.add_port(1, None).expect("a freed tun slot accepts a reconnect");
 
         let (sw, _g2) = test_switch(); // is_l2 = true
         let _ports: Vec<_> = (0..8)
-            .map(|_| sw.add_port().expect("an l2 switch admits many ports"))
+            .map(|_| sw.add_port(1, None).expect("an l2 switch admits many ports"))
             .collect();
         assert_eq!(sw.ports.lock().unwrap().len(), 8);
     }
