@@ -240,8 +240,17 @@ fn real_main() -> i32 {
         return 1;
     }
 
+    // Offer an in-place upgrade as the first step when an existing install is a
+    // version behind. Skipped in dry-run, which previews a fresh install and has
+    // no cached privilege for the docker probe.
+    let upgrade = if dry {
+        None
+    } else {
+        upgrade_offer(&sys::installed(), sys::latest_version().as_deref())
+    };
+
     let mut renderer = Renderer::new();
-    let mut app = App::new(cfg);
+    let mut app = App::new(cfg, upgrade);
 
     let aborted = loop {
         let (w, h) = tty.size();
@@ -266,6 +275,8 @@ fn real_main() -> i32 {
 
     // Execute, animating a progress screen as each step runs.
     let cfg = app.cfg.clone();
+    let do_upgrade = app.do_upgrade;
+    let offer = app.upgrade_offer().cloned();
     let (result, log) = {
         let mut runner = LiveRunner {
             tty: &mut tty,
@@ -273,7 +284,10 @@ fn real_main() -> i32 {
             log: Vec::new(),
             spin: 0,
         };
-        let result = install::execute(&cfg, dry, &mut runner);
+        let result = match (do_upgrade, &offer) {
+            (true, Some(o)) => install::upgrade(o, &mut runner),
+            _ => install::execute(&cfg, dry, &mut runner),
+        };
         (result, runner.log)
     };
 
@@ -303,6 +317,32 @@ fn real_main() -> i32 {
             1
         }
     }
+}
+
+/// Build the upgrade offer from the detected install and the latest release: a
+/// deployment is included only when a newer version exists. None when nothing is
+/// behind (or the latest version could not be determined).
+fn upgrade_offer(installed: &sys::Installed, latest: Option<&str>) -> Option<ui::UpgradeOffer> {
+    let latest = latest?;
+    let systemd = installed
+        .systemd
+        .as_ref()
+        .filter(|c| sys::version_newer(latest, c))
+        .cloned();
+    let docker = installed
+        .docker
+        .as_ref()
+        .filter(|c| sys::version_newer(latest, c))
+        .cloned();
+    if systemd.is_none() && docker.is_none() {
+        return None;
+    }
+    Some(ui::UpgradeOffer {
+        latest: latest.to_string(),
+        systemd,
+        docker,
+        compose: installed.compose,
+    })
 }
 
 /// Non-interactive install: build and validate the config from flags, then run
@@ -375,15 +415,17 @@ fn render_outcome(o: &Outcome, color: bool) -> String {
     };
     let mut s = String::new();
     s.push_str(&format!("\n  {green}{check}{reset}{bold}{}{reset}\n\n", o.headline));
-    if let Some(ran) = &o.ran {
-        s.push_str(&format!("  {dim}Ran:{reset}\n    {ran}\n\n"));
+    for c in &o.cmds {
+        s.push_str(&format!("  {dim}{}{reset}\n    {}\n\n", c.label, c.cmd));
     }
-    s.push_str(&format!("  {dim}manage it with{reset}\n    {}\n\n", o.manage));
-    if let Some(console) = &o.console {
-        s.push_str(&format!("  {dim}open the console{reset}\n    {}\n\n", console));
+    if let Some(note) = &o.note {
+        s.push_str(&format!("  {dim}{note}{reset}\n\n"));
     }
-    s.push_str(&format!("  {accent}{}{reset}\n\n", o.peer_intro));
-    s.push_str(&format!("    {bold}{}{reset}\n\n", o.peer_cmd));
+    // An upgrade has no peer command; only a fresh install prints one.
+    if !o.peer_cmd.is_empty() {
+        s.push_str(&format!("  {accent}{}{reset}\n\n", o.peer_intro));
+        s.push_str(&format!("    {bold}{}{reset}\n\n", o.peer_cmd));
+    }
     s
 }
 
@@ -435,15 +477,16 @@ fn progress_view(
 
     if let Status::Done(o) = status {
         body.push(frame::blank(w));
-        let mut m = Line::new();
-        m.add(MUTED, "  manage   ");
-        m.add(PLAIN, &o.manage);
-        body.push(frame::row(w, m));
-        if let Some(console) = &o.console {
-            let mut c = Line::new();
-            c.add(MUTED, "  console  ");
-            c.add(PLAIN, console);
-            body.push(frame::row(w, c));
+        for c in &o.cmds {
+            let mut l = Line::new();
+            l.add(MUTED, &format!("  {:<8} ", c.label));
+            l.add(PLAIN, &c.cmd);
+            body.push(frame::row(w, l));
+        }
+        if let Some(note) = &o.note {
+            let mut l = Line::new();
+            l.add(MUTED, &format!("  {note}"));
+            body.push(frame::row(w, l));
         }
     }
 

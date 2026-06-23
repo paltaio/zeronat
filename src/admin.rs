@@ -2,6 +2,26 @@ use crate::proto::{proto_name, Msg, SnapshotBody, Source};
 use crate::Result;
 use tokio::net::TcpStream;
 
+/// Where the installer writes the deployment env file. `admin` reads its
+/// `ZERONAT_SECRET` as the final fallback when neither `--secret` nor the
+/// environment supplies one.
+const ENV_FILE: &str = "/etc/zeronat/.env";
+
+/// Best-effort read of the installer env file's shared secret.
+pub fn secret_from_env_file() -> Option<String> {
+    parse_env_secret(&std::fs::read_to_string(ENV_FILE).ok()?)
+}
+
+/// Pull `ZERONAT_SECRET` out of an env-file body (`KEY=VALUE` lines).
+fn parse_env_secret(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        line.strip_prefix("ZERONAT_SECRET=")
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    })
+}
+
 /// Connect to a server's control port, request one snapshot, render it, and exit.
 /// Read-only: the admin path never registers as a client or evicts a live one.
 pub async fn show(server: String, secret: String) -> Result<()> {
@@ -368,5 +388,14 @@ mod tests {
         assert_eq!(human_count(900), "900");
         assert_eq!(human_count(1200), "1.2k");
         assert_eq!(human_count(24010), "24.0k");
+    }
+
+    #[test]
+    fn parse_env_secret_reads_the_value() {
+        let body = "ZERONAT_SECRET=deadbeef\nZERONAT_ARGS=server --control 2222\n";
+        assert_eq!(parse_env_secret(body).as_deref(), Some("deadbeef"));
+        // Missing or empty value yields nothing.
+        assert_eq!(parse_env_secret("ZERONAT_ARGS=server\n"), None);
+        assert_eq!(parse_env_secret("ZERONAT_SECRET=\n"), None);
     }
 }

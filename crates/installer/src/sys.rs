@@ -175,6 +175,132 @@ pub fn ssh_port() -> u16 {
     22
 }
 
+/// Versions of any zeronat already installed on this host, used to offer an
+/// upgrade before a fresh install. `systemd` is the installed binary's version;
+/// `docker` is the version the running container reports. Either is None when
+/// that deployment is absent.
+pub struct Installed {
+    pub systemd: Option<String>,
+    pub docker: Option<String>,
+    pub compose: bool,
+}
+
+pub fn installed() -> Installed {
+    Installed {
+        systemd: systemd_version(),
+        docker: docker_version(),
+        compose: std::path::Path::new("/etc/zeronat/compose.yml").exists(),
+    }
+}
+
+fn systemd_version() -> Option<String> {
+    let unit = std::path::Path::new("/etc/systemd/system/zeronat.service");
+    let bin = "/usr/local/bin/zeronat";
+    if unit.exists() && std::path::Path::new(bin).exists() {
+        Some(binary_version(bin))
+    } else {
+        None
+    }
+}
+
+/// "unknown" when the binary predates `--version` or cannot run, which
+/// `version_newer` treats as upgradable.
+fn binary_version(path: &str) -> String {
+    Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| version_token(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn docker_version() -> Option<String> {
+    if !have("docker") {
+        return None;
+    }
+    let exists = run(true, "docker", &["inspect", "-f", "{{.Id}}", "zeronat"])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let compose = std::path::Path::new("/etc/zeronat/compose.yml").exists();
+    if !exists && !compose {
+        return None;
+    }
+    if !exists {
+        return Some("unknown".to_string());
+    }
+    Some(
+        run(true, "docker", &["exec", "zeronat", "/zeronat", "--version"])
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| version_token(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_else(|| "unknown".to_string()),
+    )
+}
+
+/// The newest published release version, via the GitHub `releases/latest`
+/// redirect (no API rate limit). None when offline or curl is missing.
+pub fn latest_version() -> Option<String> {
+    if !have("curl") {
+        return None;
+    }
+    let out = run(
+        false,
+        "curl",
+        &[
+            "-fsSL",
+            "-I",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            "--max-time",
+            "15",
+            "https://github.com/paltaio/zeronat/releases/latest",
+        ],
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    version_from_url(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Version out of a `releases/tag/vX.Y.Z` redirect target; None for the
+/// unresolved `releases/latest` URL.
+pub fn version_from_url(url: &str) -> Option<String> {
+    let tag = url.trim().trim_end_matches('/').rsplit('/').next()?;
+    let ver = tag.strip_prefix('v').unwrap_or(tag);
+    if ver.chars().next()?.is_ascii_digit() {
+        Some(ver.to_string())
+    } else {
+        None
+    }
+}
+
+fn version_token(s: &str) -> String {
+    s.split_whitespace().last().unwrap_or("unknown").to_string()
+}
+
+pub fn version_newer(latest: &str, current: &str) -> bool {
+    let Some(l) = parse_semver(latest) else {
+        return false;
+    };
+    match parse_semver(current) {
+        Some(c) => l > c,
+        None => true,
+    }
+}
+
+fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let core = s.split(['-', '+']).next().unwrap_or(s);
+    let mut it = core.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    let patch = it.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
 pub fn arch_target() -> Result<&'static str, String> {
     let m = Command::new("uname")
         .arg("-m")
@@ -193,4 +319,30 @@ pub fn arch_target() -> Result<&'static str, String> {
         "mips64el" => "mips64el-unknown-linux-gnuabi64",
         other => return Err(format!("unsupported arch '{other}'")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_from_url_extracts_tag() {
+        assert_eq!(
+            version_from_url("https://github.com/paltaio/zeronat/releases/tag/v0.14.0").as_deref(),
+            Some("0.14.0")
+        );
+        assert_eq!(
+            version_from_url("https://github.com/x/y/releases/latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn version_newer_compares_semver() {
+        assert!(version_newer("0.14.0", "0.13.0"));
+        assert!(!version_newer("0.14.0", "0.14.0"));
+        assert!(!version_newer("0.13.0", "0.14.0"));
+        assert!(version_newer("0.14.0", "unknown"));
+        assert!(!version_newer("unknown", "0.14.0"));
+    }
 }

@@ -527,7 +527,7 @@ pub(crate) async fn serve_stream(
             }
             match mode {
                 0 => {
-                    crate::elog!("admin connected (snapshot)");
+                    // No log line: the console polls this every second, which would flood the log.
                     let mut w = w;
                     w.send(&Msg::Snapshot(srv.snapshot()).encode()).await?;
                     Ok(())

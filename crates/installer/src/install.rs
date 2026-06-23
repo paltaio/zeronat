@@ -6,7 +6,7 @@ use std::process::Output;
 
 use crate::bridge;
 use crate::sys::{self, errtext, ok};
-use crate::ui::{Config, Deploy, Kind, Method, Mode};
+use crate::ui::{Config, Deploy, Kind, Method, Mode, UpgradeOffer};
 
 /// Seconds the operator has to confirm a risky bridge before it auto-reverts.
 const BRIDGE_TIMEOUT: u32 = 30;
@@ -28,17 +28,30 @@ pub enum Lvl {
     Info,
 }
 
+/// One labelled command in the summary. The label is a short muted tag; the
+/// command sits alone on the next line so a copy-paste grabs exactly it.
+pub struct Cmd {
+    pub label: &'static str,
+    pub cmd: String,
+}
+
 pub struct Outcome {
-    pub manage: String,
     pub headline: String,
+    /// Labelled commands shown in order (e.g. ran, logs, status, console).
+    pub cmds: Vec<Cmd>,
+    /// A one-line note with no command, e.g. where to change the config.
+    pub note: Option<String>,
     pub peer_intro: String,
     pub peer_cmd: String,
-    // The literal start command that was run, with an edit hint. None for dry-run
-    // (nothing was actually run).
-    pub ran: Option<String>,
-    // Command to open the interactive admin console. None when there is no fixed
-    // control address to point at (a DHT client).
-    pub console: Option<String>,
+}
+
+/// What a successful install/upgrade run produced, before `execute` adds the
+/// console command and peer steps: the command that ran, the follow/status
+/// commands, and a config note.
+struct Started {
+    ran: String,
+    cmds: Vec<Cmd>,
+    note: Option<String>,
 }
 
 /// Drives the install. Every external command goes through `run` so the UI can
@@ -283,19 +296,30 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
     // join. A no-op unless this is a server in bridge mode asked to create one.
     setup_bridge(cfg, r)?;
 
-    let (manage, ran) = match cfg.method {
+    let started = match cfg.method {
         Method::Docker => install_docker(cfg, &sub, r)?,
         Method::Systemd => install_systemd(cfg, &sub, r)?,
     };
 
+    let mut cmds = vec![Cmd {
+        label: "ran",
+        cmd: started.ran,
+    }];
+    cmds.extend(started.cmds);
+    if let Some(console) = console_cmd(cfg) {
+        cmds.push(Cmd {
+            label: "console",
+            cmd: console,
+        });
+    }
+
     let (peer_intro, peer_cmd) = peer_steps(cfg);
     Ok(Outcome {
-        manage,
         headline: format!("zeronat {} is running", mode_str(cfg)),
+        cmds,
+        note: started.note,
         peer_intro,
         peer_cmd,
-        ran: Some(ran),
-        console: console_cmd(cfg),
     })
 }
 
@@ -442,7 +466,7 @@ fn dry_run(cfg: &Config, _sub: &str, r: &mut dyn Runner) -> Result<Outcome, Stri
             &format!("would create bridge {} on {}", cfg.bridge, cfg.bridge_nic),
         );
     }
-    let manage = match cfg.method {
+    let mut cmds = match cfg.method {
         Method::Docker if cfg.deploy == Deploy::Compose => {
             let dc = sys::compose_argv();
             let prog = if dc.is_empty() {
@@ -452,32 +476,255 @@ fn dry_run(cfg: &Config, _sub: &str, r: &mut dyn Runner) -> Result<Outcome, Stri
             };
             dstep(r, "would fetch the compose file");
             dstep(r, "would pull the image and start via compose");
-            format!("cd {ETC_DIR} && {prog} logs -f    # status: {prog} ps")
+            vec![
+                Cmd {
+                    label: "logs",
+                    cmd: format!("cd {ETC_DIR} && {prog} logs -f"),
+                },
+                Cmd {
+                    label: "status",
+                    cmd: format!("cd {ETC_DIR} && {prog} ps"),
+                },
+            ]
         }
         Method::Docker => {
             dstep(r, "would pull the image and start the container");
-            "docker logs -f zeronat".into()
+            vec![
+                Cmd {
+                    label: "logs",
+                    cmd: "docker logs -f zeronat".into(),
+                },
+                Cmd {
+                    label: "status",
+                    cmd: "docker ps".into(),
+                },
+            ]
         }
         Method::Systemd => {
             let target = sys::arch_target().unwrap_or("this arch");
             r.info(format!("target {target}"));
             dstep(r, "would download the binary and write a systemd unit");
             dstep(r, "would enable the service");
-            "systemctl status zeronat".into()
+            vec![
+                Cmd {
+                    label: "status",
+                    cmd: "systemctl status zeronat".into(),
+                },
+                Cmd {
+                    label: "logs",
+                    cmd: "journalctl -u zeronat -f".into(),
+                },
+            ]
         }
     };
+    if let Some(console) = console_cmd(cfg) {
+        cmds.push(Cmd {
+            label: "console",
+            cmd: console,
+        });
+    }
     let (peer_intro, peer_cmd) = peer_steps(cfg);
     Ok(Outcome {
-        manage,
         headline: format!("zeronat {} ready (dry run)", mode_str(cfg)),
+        cmds,
+        note: None,
         peer_intro,
         peer_cmd,
-        ran: None,
-        console: console_cmd(cfg),
     })
 }
 
-fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(String, String), String> {
+/// Upgrade the existing install in place: download the latest binary and restart
+/// the service, and/or pull the latest image and recreate the container. Config
+/// (env file, unit, compose file) is left untouched.
+pub fn upgrade(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<Outcome, String> {
+    if offer.systemd.is_some() {
+        upgrade_systemd(r)?;
+    }
+    if offer.docker.is_some() {
+        upgrade_docker(offer, r)?;
+    }
+    Ok(upgrade_outcome(offer))
+}
+
+fn upgrade_systemd(r: &mut dyn Runner) -> Result<(), String> {
+    let target = sys::arch_target()?;
+    r.info(format!("target {target}"));
+    let url = format!("{RELEASE_BASE}/zeronat-{target}");
+    let tmp = std::env::temp_dir().join(format!("zeronat-up-{}", std::process::id()));
+    let tmps = tmp.to_string_lossy().to_string();
+
+    r.step("downloading latest binary".into());
+    let out = r.run(false, "curl", &["-fsSL", &url, "-o", &tmps])?;
+    if !ok(&out) {
+        return Err(format!("download failed (no release asset for {target}?)"));
+    }
+    let inst = r.run(true, "install", &["-m", "0755", &tmps, BIN_PATH]);
+    let _ = std::fs::remove_file(&tmp);
+    let out = inst?;
+    if !ok(&out) {
+        return Err(format!("install binary: {}", errtext(&out)));
+    }
+
+    r.step("restarting service".into());
+    let out = r.run(true, "systemctl", &["restart", "zeronat"])?;
+    if !ok(&out) {
+        return Err(format!("systemctl restart: {}", errtext(&out)));
+    }
+    Ok(())
+}
+
+fn upgrade_docker(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<(), String> {
+    if offer.compose {
+        let dc = sys::compose_argv();
+        if dc.is_empty() {
+            return Err("docker compose not available".into());
+        }
+        let base: Vec<String> = dc[1..]
+            .iter()
+            .cloned()
+            .chain(["-f".into(), COMPOSE_FILE.into()])
+            .collect();
+        r.step("pulling latest image".into());
+        compose(r, &dc[0], &base, "pull")?;
+        r.step("recreating container".into());
+        compose(r, &dc[0], &base, "up")?;
+    } else {
+        r.step("pulling latest image".into());
+        let out = r.run(true, "docker", &["pull", IMAGE])?;
+        if !ok(&out) {
+            return Err(format!("docker pull: {}", errtext(&out)));
+        }
+        r.step("recreating container".into());
+        recreate_container(r)?;
+    }
+    Ok(())
+}
+
+/// Recreate a plain `docker run` container on the freshly pulled image, carrying
+/// over the run config read back from the old container. The secret rides via the
+/// installer env file, which a docker-run install always wrote.
+fn recreate_container(r: &mut dyn Runner) -> Result<(), String> {
+    let cmd = inspect_lines(r, "{{range .Config.Cmd}}{{println .}}{{end}}");
+    let caps = inspect_lines(r, "{{range .HostConfig.CapAdd}}{{println .}}{{end}}");
+    let devices = inspect_lines(r, "{{range .HostConfig.Devices}}{{println .PathOnHost}}{{end}}");
+    let network = inspect_lines(r, "{{.HostConfig.NetworkMode}}")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "host".into());
+    let restart = inspect_lines(r, "{{.HostConfig.RestartPolicy.Name}}")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "unless-stopped".into());
+
+    let out = r.run(true, "docker", &["rm", "-f", "zeronat"])?;
+    if !ok(&out) {
+        return Err(format!("docker rm: {}", errtext(&out)));
+    }
+
+    let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--name".into(), "zeronat".into()];
+    if !restart.is_empty() && restart != "no" {
+        args.push("--restart".into());
+        args.push(restart);
+    }
+    if !network.is_empty() {
+        args.push("--network".into());
+        args.push(network);
+    }
+    for c in &caps {
+        args.push("--cap-add".into());
+        args.push(c.clone());
+    }
+    for d in &devices {
+        args.push("--device".into());
+        args.push(d.clone());
+    }
+    if std::path::Path::new(ENV_FILE).exists() {
+        args.push("--env-file".into());
+        args.push(ENV_FILE.into());
+    }
+    args.push(IMAGE.into());
+    args.extend(cmd);
+
+    let aref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = r.run(true, "docker", &aref)?;
+    if !ok(&out) {
+        return Err(format!("docker run: {}", errtext(&out)));
+    }
+    Ok(())
+}
+
+fn inspect_lines(r: &mut dyn Runner, fmt: &str) -> Vec<String> {
+    r.run(true, "docker", &["inspect", "-f", fmt, "zeronat"])
+        .ok()
+        .filter(ok)
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn upgrade_outcome(offer: &UpgradeOffer) -> Outcome {
+    let mut parts = Vec::new();
+    if let Some(c) = &offer.systemd {
+        parts.push(format!("systemd {c} -> {}", offer.latest));
+    }
+    if let Some(c) = &offer.docker {
+        parts.push(format!("docker {c} -> {}", offer.latest));
+    }
+    let summary = parts.join(", ");
+    let cmds = if offer.docker.is_some() {
+        let dc = sys::compose_argv();
+        if offer.compose && !dc.is_empty() {
+            let dcj = dc.join(" ");
+            vec![
+                Cmd {
+                    label: "logs",
+                    cmd: format!("cd {ETC_DIR} && {dcj} logs -f"),
+                },
+                Cmd {
+                    label: "status",
+                    cmd: format!("cd {ETC_DIR} && {dcj} ps"),
+                },
+            ]
+        } else {
+            vec![
+                Cmd {
+                    label: "logs",
+                    cmd: "docker logs -f zeronat".into(),
+                },
+                Cmd {
+                    label: "status",
+                    cmd: "docker ps".into(),
+                },
+            ]
+        }
+    } else {
+        vec![
+            Cmd {
+                label: "status",
+                cmd: "systemctl status zeronat".into(),
+            },
+            Cmd {
+                label: "logs",
+                cmd: "journalctl -u zeronat -f".into(),
+            },
+        ]
+    };
+    Outcome {
+        headline: format!("zeronat upgraded: {summary}"),
+        cmds,
+        note: None,
+        peer_intro: String::new(),
+        peer_cmd: String::new(),
+    }
+}
+
+fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started, String> {
     let _ = r.run(true, "docker", &["rm", "-f", "zeronat"]);
 
     if cfg.deploy == Deploy::Compose {
@@ -516,10 +763,21 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(String
         let view: Vec<&str> = std::iter::once(dc[0].as_str())
             .chain(base.iter().map(|s| s.as_str()))
             .collect();
-        let ran = format!("{} up -d    # edit {ENV_FILE} to change ports/secret", view.join(" "));
         let dcj = dc.join(" ");
-        let manage = format!("cd {ETC_DIR} && {dcj} logs -f    # status: {dcj} ps");
-        Ok((manage, ran))
+        Ok(Started {
+            ran: format!("{} up -d", view.join(" ")),
+            cmds: vec![
+                Cmd {
+                    label: "logs",
+                    cmd: format!("cd {ETC_DIR} && {dcj} logs -f"),
+                },
+                Cmd {
+                    label: "status",
+                    cmd: format!("cd {ETC_DIR} && {dcj} ps"),
+                },
+            ],
+            note: Some(format!("change ports or the secret by editing {ENV_FILE}")),
+        })
     } else {
         r.step("pulling image".into());
         let out = r.run(true, "docker", &["pull", IMAGE])?;
@@ -552,14 +810,20 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(String
         if !ok(&out) {
             return Err(format!("docker run: {}", errtext(&out)));
         }
-        let ran = format!(
-            "docker {}    # edit {ENV_FILE} to change ports/secret",
-            args.join(" ")
-        );
-        Ok((
-            "docker logs -f zeronat    # status: docker ps".into(),
-            ran,
-        ))
+        Ok(Started {
+            ran: format!("docker {}", args.join(" ")),
+            cmds: vec![
+                Cmd {
+                    label: "logs",
+                    cmd: "docker logs -f zeronat".into(),
+                },
+                Cmd {
+                    label: "status",
+                    cmd: "docker ps".into(),
+                },
+            ],
+            note: Some(format!("change ports or the secret by editing {ENV_FILE}")),
+        })
     }
 }
 
@@ -580,7 +844,7 @@ fn compose(r: &mut dyn Runner, prog: &str, base: &[String], verb: &str) -> Resul
     }
 }
 
-fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(String, String), String> {
+fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started, String> {
     let target = sys::arch_target()?;
     r.info(format!("target {target}"));
     let url = format!("{RELEASE_BASE}/zeronat-{target}");
@@ -629,11 +893,22 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<(Strin
     if !ok(&out) {
         return Err(format!("enable: {}", errtext(&out)));
     }
-    let ran = format!("systemctl enable --now zeronat    # edit {ENV_FILE} and {UNIT} to change ports/secret");
-    Ok((
-        "systemctl status zeronat    # logs: journalctl -u zeronat -f".into(),
-        ran,
-    ))
+    Ok(Started {
+        ran: "systemctl enable --now zeronat".into(),
+        cmds: vec![
+            Cmd {
+                label: "status",
+                cmd: "systemctl status zeronat".into(),
+            },
+            Cmd {
+                label: "logs",
+                cmd: "journalctl -u zeronat -f".into(),
+            },
+        ],
+        note: Some(format!(
+            "change ports or the secret by editing {ENV_FILE} and {UNIT}"
+        )),
+    })
 }
 
 #[cfg(test)]

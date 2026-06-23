@@ -22,6 +22,7 @@ Subcommands:
   server   Run on the public host (VPS)
   client   Run on the host behind CG-NAT
   admin    Inspect and control topology (interactive on a terminal)
+  upgrade  Fetch the latest release and restart this host's deployment
 
 server options:
   --bind <ADDR>       Address to bind on (default: 0.0.0.0)
@@ -77,10 +78,15 @@ admin options:
                       one-shot snapshot when piped or redirected
   show                Print the server's current topology and exit
   --server <ADDR>     Server control address host:port
-  --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
+  --secret <SECRET>   Shared secret (or env ZERONAT_SECRET, or the ZERONAT_SECRET
+                      in /etc/zeronat/.env)
+
+upgrade options:
+  --check             Report whether a newer release exists, without applying it
 
 Options:
   -h, --help          Print this help and exit
+  -V, --version       Print the version and exit
 ";
 
 enum Cmd {
@@ -126,6 +132,9 @@ enum Cmd {
         server: String,
         secret: String,
         interactive: bool,
+    },
+    Upgrade {
+        check: bool,
     },
 }
 
@@ -192,9 +201,14 @@ fn parse_args() -> Result<Cmd> {
             print!("{USAGE}");
             std::process::exit(0);
         }
+        Some("-V") | Some("--version") => {
+            println!("zeronat {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
         Some("server") => "server",
         Some("client") => "client",
         Some("admin") => "admin",
+        Some("upgrade") => "upgrade",
         Some(other) => {
             eprintln!("error: unknown subcommand '{other}'\n{USAGE}");
             std::process::exit(1);
@@ -488,6 +502,22 @@ fn parse_args() -> Result<Cmd> {
             pppoe_no_mss_clamp,
             pppoe_dns,
         })
+    } else if subcmd == "upgrade" {
+        let mut check = false;
+        for flag in iter {
+            match flag.as_str() {
+                "-h" | "--help" => {
+                    print!("{USAGE}");
+                    std::process::exit(0);
+                }
+                "--check" => check = true,
+                other => {
+                    eprintln!("error: unknown flag '{other}'");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Ok(Cmd::Upgrade { check })
     } else {
         // admin
         let mut command: Option<String> = None;
@@ -527,7 +557,8 @@ fn parse_args() -> Result<Cmd> {
         let server = server.ok_or("--server is required")?;
         let secret = secret
             .or_else(|| std::env::var("ZERONAT_SECRET").ok())
-            .ok_or("--secret or ZERONAT_SECRET is required")?;
+            .or_else(zeronat::admin::secret_from_env_file)
+            .ok_or("no secret: pass --secret, set ZERONAT_SECRET, or run where /etc/zeronat/.env has one")?;
 
         let interactive = command.is_none() && interactive_default();
         Ok(Cmd::Admin {
@@ -928,5 +959,6 @@ async fn run(cmd: Cmd) -> Result<()> {
             let _ = interactive;
             admin::show(server, secret).await
         }
+        Cmd::Upgrade { check } => zeronat::upgrade::run(check),
     }
 }

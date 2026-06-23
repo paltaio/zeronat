@@ -41,6 +41,17 @@ struct PortItem {
     checked: bool,
 }
 
+/// An available upgrade for an existing install, shown as the first wizard step.
+/// `systemd` and `docker` hold the current version of each deployment that has a
+/// newer release; a deployment already current is omitted.
+#[derive(Clone)]
+pub struct UpgradeOffer {
+    pub latest: String,
+    pub systemd: Option<String>,
+    pub docker: Option<String>,
+    pub compose: bool,
+}
+
 /// Common ports offered as toggles, most-used first.
 const COMMON_PORTS: &[(&str, &str)] = &[
     ("443/tcp", "HTTPS"),
@@ -126,6 +137,7 @@ impl Config {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Step {
+    Upgrade,
     Mode,
     Method,
     Deploy,
@@ -150,6 +162,11 @@ struct Opt {
 
 pub struct App {
     pub cfg: Config,
+    /// An available upgrade for the existing install, if any; surfaced as the
+    /// first step. None means the normal fresh-install flow.
+    upgrade: Option<UpgradeOffer>,
+    /// Set when the operator chose to upgrade rather than reinstall.
+    pub do_upgrade: bool,
     step: Step,
     history: Vec<Step>,
     sel: usize,
@@ -162,10 +179,17 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Config) -> App {
+    pub fn new(cfg: Config, upgrade: Option<UpgradeOffer>) -> App {
+        let start = if upgrade.is_some() {
+            Step::Upgrade
+        } else {
+            Step::Mode
+        };
         let mut app = App {
             cfg,
-            step: Step::Mode,
+            upgrade,
+            do_upgrade: false,
+            step: start,
             history: Vec::new(),
             sel: 0,
             input: String::new(),
@@ -175,8 +199,13 @@ impl App {
             finished: false,
             quit: false,
         };
-        app.enter(Step::Mode);
+        app.enter(start);
         app
+    }
+
+    /// The chosen upgrade offer, valid only once `do_upgrade` is set.
+    pub fn upgrade_offer(&self) -> Option<&UpgradeOffer> {
+        self.upgrade.as_ref()
     }
 
     // ---- flow ------------------------------------------------------------
@@ -195,6 +224,7 @@ impl App {
 
     fn next_step(&self) -> Step {
         match self.step {
+            Step::Upgrade => Step::Mode,
             Step::Mode => Step::Method,
             Step::Method if self.cfg.method == Method::Docker => Step::Deploy,
             Step::Method => Step::Kind,
@@ -309,6 +339,16 @@ impl App {
 
     fn options(&self) -> Vec<Opt> {
         match self.step {
+            Step::Upgrade => vec![
+                Opt {
+                    label: "Upgrade",
+                    desc: "update the existing install in place",
+                },
+                Opt {
+                    label: "Fresh install",
+                    desc: "reconfigure from scratch",
+                },
+            ],
             Step::Mode => vec![
                 Opt {
                     label: "Server",
@@ -561,6 +601,24 @@ impl App {
             self.quit = true;
             return;
         }
+        if self.step == Step::Upgrade {
+            match k {
+                Key::Up | Key::Char('k') => self.sel = self.sel.saturating_sub(1),
+                Key::Down | Key::Char('j') if self.sel == 0 => self.sel = 1,
+                Key::Enter => {
+                    if self.sel == 0 {
+                        self.do_upgrade = true;
+                        self.finished = true;
+                    } else {
+                        self.history.push(Step::Upgrade);
+                        self.enter(Step::Mode);
+                    }
+                }
+                Key::Char('q') => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
         if self.step == Step::Summary {
             match k {
                 Key::Enter => self.finished = true,
@@ -696,6 +754,8 @@ impl App {
 
         if self.step == Step::Summary {
             self.summary_rows(w, &mut body);
+        } else if self.step == Step::Upgrade {
+            self.upgrade_rows(w, &mut body);
         } else if self.step == Step::Ports {
             self.ports_rows(w, &mut body);
         } else if self.step == Step::SshExclude {
@@ -729,6 +789,7 @@ impl App {
 
     fn prompt(&self) -> &'static str {
         match self.step {
+            Step::Upgrade => "A newer zeronat is available",
             Step::Mode => "Which side is this machine?",
             Step::Method => "How should zeronat run?",
             Step::Deploy => "Docker deployment style?",
@@ -800,6 +861,26 @@ impl App {
             hint.add(MUTED, "  PORT/PROTO, e.g. 8443/tcp");
             body.push(zntui::frame::row(w, hint));
         }
+    }
+
+    fn upgrade_rows(&self, w: usize, body: &mut Vec<String>) {
+        if let Some(u) = &self.upgrade {
+            let mut row = |k: &str, cur: &str| {
+                let mut l = Line::new();
+                l.add(MUTED, &format!("  {k:<9}"));
+                l.add(PLAIN, &format!("{cur} -> "));
+                l.add(GOOD, &u.latest);
+                body.push(zntui::frame::row(w, l));
+            };
+            if let Some(c) = &u.systemd {
+                row("systemd", c);
+            }
+            if let Some(c) = &u.docker {
+                row("docker", c);
+            }
+            body.push(zntui::frame::blank(w));
+        }
+        self.select_rows(w, body);
     }
 
     fn ssh_rows(&self, w: usize, body: &mut Vec<String>) {
