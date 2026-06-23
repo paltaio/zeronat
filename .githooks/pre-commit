@@ -1,0 +1,18 @@
+#!/bin/sh
+# Format and lint gate. Enable with: git config core.hooksPath .githooks
+set -eu
+
+# Skip when the commit touches no Rust sources (docs-only commits stay fast).
+if ! git diff --cached --name-only --diff-filter=ACM | grep -q '\.rs$'; then
+    exit 0
+fi
+
+if ! cargo fmt --all -- --check; then
+    echo "pre-commit: formatting issues; run 'cargo fmt --all' and re-stage" >&2
+    exit 1
+fi
+
+if ! cargo clippy --all-targets --all-features -- -D warnings; then
+    echo "pre-commit: clippy reported warnings" >&2
+    exit 1
+fi
