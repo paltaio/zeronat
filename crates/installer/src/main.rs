@@ -123,7 +123,10 @@ fn confirm_view(prompt: &str, remaining: u32, w: usize, h: usize) -> Vec<String>
     body.push(frame::row(w, p));
     body.push(frame::blank(w));
     let mut c = Line::new();
-    c.add(WARN, &format!("  reverting in {remaining}s unless you confirm"));
+    c.add(
+        WARN,
+        &format!("  reverting in {remaining}s unless you confirm"),
+    );
     body.push(frame::row(w, c));
 
     let area = h.saturating_sub(5);
@@ -409,12 +412,22 @@ enum Status<'a> {
 /// `color` adds ANSI styling for an interactive terminal.
 fn render_outcome(o: &Outcome, color: bool) -> String {
     let (green, accent, dim, bold, reset, check) = if color {
-        ("\x1b[92m", "\x1b[96;1m", "\x1b[90m", "\x1b[1m", "\x1b[0m", "✓ ")
+        (
+            "\x1b[92m",
+            "\x1b[96;1m",
+            "\x1b[90m",
+            "\x1b[1m",
+            "\x1b[0m",
+            "✓ ",
+        )
     } else {
         ("", "", "", "", "", "")
     };
     let mut s = String::new();
-    s.push_str(&format!("\n  {green}{check}{reset}{bold}{}{reset}\n\n", o.headline));
+    s.push_str(&format!(
+        "\n  {green}{check}{reset}{bold}{}{reset}\n\n",
+        o.headline
+    ));
     for c in &o.cmds {
         s.push_str(&format!("  {dim}{}{reset}\n    {}\n\n", c.label, c.cmd));
     }

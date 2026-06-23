@@ -295,7 +295,11 @@ impl<P: Protocol> OptionFsm<P> {
     pub(super) fn send_echo_request(&mut self, id: u8, magic: u32) -> Packet<'static> {
         Packet {
             proto: self.proto.protocol(),
-            payload: Payload::PPP(Code::EchoReq, id, PPPPayload::Owned(magic.to_be_bytes().to_vec())),
+            payload: Payload::PPP(
+                Code::EchoReq,
+                id,
+                PPPPayload::Owned(magic.to_be_bytes().to_vec()),
+            ),
         }
     }
 

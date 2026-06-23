@@ -341,7 +341,10 @@ fn setup_bridge(cfg: &Config, r: &mut dyn Runner) -> Result<(), String> {
         .cloned()
         .ok_or_else(|| format!("NIC '{}' not found", cfg.bridge_nic))?;
     if nic.wifi {
-        return Err(format!("{} is wireless; bridge a wired NIC instead", nic.name));
+        return Err(format!(
+            "{} is wireless; bridge a wired NIC instead",
+            nic.name
+        ));
     }
     if nic.enslaved {
         // A re-run after a successful bridge: the NIC is already a member. If it is
@@ -349,7 +352,10 @@ fn setup_bridge(cfg: &Config, r: &mut dyn Runner) -> Result<(), String> {
         if verify_bridge(&cfg.bridge, &nic.name, r).is_ok() {
             return Ok(());
         }
-        return Err(format!("{} is already enslaved to another bridge/bond", nic.name));
+        return Err(format!(
+            "{} is already enslaved to another bridge/bond",
+            nic.name
+        ));
     }
     let mgr = bridge::detect_manager();
     if matches!(mgr, bridge::Mgr::Unsupported(_)) {
@@ -606,7 +612,10 @@ fn upgrade_docker(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<(), String
 fn recreate_container(r: &mut dyn Runner) -> Result<(), String> {
     let cmd = inspect_lines(r, "{{range .Config.Cmd}}{{println .}}{{end}}");
     let caps = inspect_lines(r, "{{range .HostConfig.CapAdd}}{{println .}}{{end}}");
-    let devices = inspect_lines(r, "{{range .HostConfig.Devices}}{{println .PathOnHost}}{{end}}");
+    let devices = inspect_lines(
+        r,
+        "{{range .HostConfig.Devices}}{{println .PathOnHost}}{{end}}",
+    );
     let network = inspect_lines(r, "{{.HostConfig.NetworkMode}}")
         .into_iter()
         .next()

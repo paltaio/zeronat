@@ -919,7 +919,10 @@ impl App {
                     format!("detected: {}", self.cfg.nics.join(", "))
                 };
                 if !self.cfg.ssh_nic.is_empty() {
-                    h.push_str(&format!("  ({} carries this SSH session)", self.cfg.ssh_nic));
+                    h.push_str(&format!(
+                        "  ({} carries this SSH session)",
+                        self.cfg.ssh_nic
+                    ));
                 }
                 h
             }
@@ -972,7 +975,11 @@ impl App {
                 add("forward", "all traffic".into(), PLAIN);
                 if self.cfg.mode == Mode::Server {
                     if self.cfg.exclude_ssh {
-                        add("ssh", format!("port {} kept on host", self.cfg.ssh_port), GOOD);
+                        add(
+                            "ssh",
+                            format!("port {} kept on host", self.cfg.ssh_port),
+                            GOOD,
+                        );
                     } else {
                         add("ssh", "forwarded (no exclusion)".into(), WARN);
                     }

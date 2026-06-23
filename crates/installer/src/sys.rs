@@ -230,11 +230,15 @@ fn docker_version() -> Option<String> {
         return Some("unknown".to_string());
     }
     Some(
-        run(true, "docker", &["exec", "zeronat", "/zeronat", "--version"])
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| version_token(&String::from_utf8_lossy(&o.stdout)))
-            .unwrap_or_else(|| "unknown".to_string()),
+        run(
+            true,
+            "docker",
+            &["exec", "zeronat", "/zeronat", "--version"],
+        )
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| version_token(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_else(|| "unknown".to_string()),
     )
 }
 

@@ -250,14 +250,19 @@ pub fn apply(
                         state.default_added = true;
                         crate::elog!(
                             "pppoe: default route via {tun_name} (was via {} dev {})",
-                            captured.gateway, captured.iface
+                            captured.gateway,
+                            captured.iface
                         );
                     }
-                    Err(e) => crate::elog!("pppoe: could not add default via {tun_name} ({e}); host routing unchanged"),
+                    Err(e) => crate::elog!(
+                        "pppoe: could not add default via {tun_name} ({e}); host routing unchanged"
+                    ),
                 }
                 state.captured = Some(captured);
             }
-            None => crate::elog!("pppoe: no original default route found; default-route swap skipped"),
+            None => {
+                crate::elog!("pppoe: no original default route found; default-route swap skipped")
+            }
         }
     }
 
@@ -319,7 +324,11 @@ fn sockaddr_in(addr: Ipv4Addr) -> libc::sockaddr {
 /// `255.255.255.255`.
 fn netmask(prefix: u8) -> Ipv4Addr {
     let bits = prefix.min(32);
-    let mask: u32 = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+    let mask: u32 = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
     Ipv4Addr::from(mask)
 }
 
@@ -383,8 +392,19 @@ fn modify_route_inner(
     if let Some(d) = dev {
         rt.rt_dev = d.as_ptr() as *mut libc::c_char;
     }
-    let req = if add { libc::SIOCADDRT } else { libc::SIOCDELRT };
-    if unsafe { libc::ioctl(sock, req as _, &rt as *const libc::rtentry as *mut libc::c_void) } < 0 {
+    let req = if add {
+        libc::SIOCADDRT
+    } else {
+        libc::SIOCDELRT
+    };
+    if unsafe {
+        libc::ioctl(
+            sock,
+            req as _,
+            &rt as *const libc::rtentry as *mut libc::c_void,
+        )
+    } < 0
+    {
         let op = if add { "SIOCADDRT" } else { "SIOCDELRT" };
         return Err(format!("{op} {dst}/{prefix}: {}", io::Error::last_os_error()).into());
     }
@@ -462,7 +482,10 @@ eth0\tZZZZ\tYYYY\tWWWW\t0\t0\tnan\tMMMM\t0\t0\t0
     #[test]
     fn renders_resolv_conf() {
         assert_eq!(
-            render_resolv_conf(&[Some(Ipv4Addr::new(1, 1, 1, 1)), Some(Ipv4Addr::new(8, 8, 8, 8))]),
+            render_resolv_conf(&[
+                Some(Ipv4Addr::new(1, 1, 1, 1)),
+                Some(Ipv4Addr::new(8, 8, 8, 8))
+            ]),
             "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
         );
         assert_eq!(
@@ -492,7 +515,15 @@ eth0\tZZZZ\tYYYY\tWWWW\t0\t0\tnan\tMMMM\t0\t0\t0
     #[test]
     fn opts_any() {
         assert!(!NetCfgOpts::default().any());
-        assert!(NetCfgOpts { default_route: true, dns: false }.any());
-        assert!(NetCfgOpts { default_route: false, dns: true }.any());
+        assert!(NetCfgOpts {
+            default_route: true,
+            dns: false
+        }
+        .any());
+        assert!(NetCfgOpts {
+            default_route: false,
+            dns: true
+        }
+        .any());
     }
 }

@@ -1,7 +1,7 @@
-use std::future::Future;
-use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 // Per-port traffic counters use the widest atomic the target supports: a 64-bit
 // atomic where one exists, falling back to 32-bit on targets (mips) that lack it.
 // The counters are display-only, so a 32-bit wrap on those targets is harmless.
-#[cfg(all(target_os = "linux", target_has_atomic = "64"))]
-use std::sync::atomic::AtomicU64 as AtomicCounter;
 #[cfg(all(target_os = "linux", not(target_has_atomic = "64")))]
 use std::sync::atomic::AtomicU32 as AtomicCounter;
+#[cfg(all(target_os = "linux", target_has_atomic = "64"))]
+use std::sync::atomic::AtomicU64 as AtomicCounter;
 
 // Widen a counter load to the wire's u64. On a 64-bit-atomic target the value is
 // already u64; on a 32-bit-atomic target the loaded u32 is widened here so the
@@ -407,8 +407,10 @@ impl PortStats {
     }
 
     fn touch(&self) {
-        self.last_activity
-            .store(self.created.elapsed().as_secs().min(u32::MAX as u64) as u32, Ordering::Relaxed);
+        self.last_activity.store(
+            self.created.elapsed().as_secs().min(u32::MAX as u64) as u32,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -620,7 +622,10 @@ impl TapSwitch {
     /// (e.g. dropped by its `SwitchHandle`) leaves the maps untouched.
     fn evict_port(&self, port_id: u32) {
         self.ports.lock().unwrap().remove(&port_id);
-        self.macs.lock().unwrap().retain(|_, &mut (p, _)| p != port_id);
+        self.macs
+            .lock()
+            .unwrap()
+            .retain(|_, &mut (p, _)| p != port_id);
     }
 
     /// Learn that `src` lives behind `port`. Skips group/zero sources (never a real
@@ -675,7 +680,9 @@ impl TapSwitch {
         {
             let mut ports = self.ports.lock().unwrap();
             if !self.is_l2 && !ports.is_empty() {
-                return Err("tun bridge already has a client; a tun server serves one client".into());
+                return Err(
+                    "tun bridge already has a client; a tun server serves one client".into(),
+                );
             }
             ports.insert(
                 port_id,
@@ -1186,18 +1193,13 @@ mod switch_tests {
         // A raw L3-ish buffer shorter than an Ethernet header; the fast path must
         // forward it without parsing.
         let raw = vec![0x45u8, 0, 0, 20, 0, 0]; // 6 bytes: too short to be Ethernet
-        let n = unsafe {
-            libc::write(peer, raw.as_ptr() as *const libc::c_void, raw.len())
-        };
+        let n = unsafe { libc::write(peer, raw.as_ptr() as *const libc::c_void, raw.len()) };
         assert_eq!(n, raw.len() as isize);
 
-        let got = tokio::time::timeout(
-            Duration::from_secs(2),
-            p.out_rx.as_mut().unwrap().recv(),
-        )
-        .await
-        .expect("fast-path frame not delivered")
-        .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), p.out_rx.as_mut().unwrap().recv())
+            .await
+            .expect("fast-path frame not delivered")
+            .unwrap();
         assert_eq!(got, raw);
         unsafe { libc::close(peer) };
     }
@@ -1378,13 +1380,21 @@ mod switch_tests {
         let tun = TapSwitch::new_without_reader(Arc::new(dev), false);
 
         let first = tun.add_port(1, None).expect("first tun port attaches");
-        assert!(tun.add_port(1, None).is_err(), "second tun port must be refused");
+        assert!(
+            tun.add_port(1, None).is_err(),
+            "second tun port must be refused"
+        );
         drop(first);
-        let _reattach = tun.add_port(1, None).expect("a freed tun slot accepts a reconnect");
+        let _reattach = tun
+            .add_port(1, None)
+            .expect("a freed tun slot accepts a reconnect");
 
         let (sw, _g2) = test_switch(); // is_l2 = true
         let _ports: Vec<_> = (0..8)
-            .map(|_| sw.add_port(1, None).expect("an l2 switch admits many ports"))
+            .map(|_| {
+                sw.add_port(1, None)
+                    .expect("an l2 switch admits many ports")
+            })
             .collect();
         assert_eq!(sw.ports.lock().unwrap().len(), 8);
     }

@@ -130,10 +130,20 @@ pub fn parse_nics(
             continue;
         }
         let toks: Vec<&str> = rest.split_whitespace().collect();
-        let mtu = field_after(&toks, "mtu").and_then(|v| v.parse().ok()).unwrap_or(1500);
+        let mtu = field_after(&toks, "mtu")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1500);
         let enslaved = toks.contains(&"master");
-        let mac = field_after(&toks, "link/ether").unwrap_or_default().to_string();
-        nics.push(Nic { name, mtu, mac, enslaved, ..Default::default() });
+        let mac = field_after(&toks, "link/ether")
+            .unwrap_or_default()
+            .to_string();
+        nics.push(Nic {
+            name,
+            mtu,
+            mac,
+            enslaved,
+            ..Default::default()
+        });
     }
 
     for (out, v6) in [(a4, false), (a6, true)] {
@@ -148,7 +158,10 @@ pub fn parse_nics(
                 Some(c) => c,
                 None => continue,
             };
-            if field_after(&toks, "scope").map(|s| s != "global").unwrap_or(true) {
+            if field_after(&toks, "scope")
+                .map(|s| s != "global")
+                .unwrap_or(true)
+            {
                 continue;
             }
             let dynamic = toks.contains(&"dynamic");
@@ -186,7 +199,10 @@ pub fn parse_nics(
 }
 
 fn field_after<'a>(toks: &[&'a str], key: &str) -> Option<&'a str> {
-    toks.iter().position(|t| *t == key).and_then(|i| toks.get(i + 1)).copied()
+    toks.iter()
+        .position(|t| *t == key)
+        .and_then(|i| toks.get(i + 1))
+        .copied()
 }
 
 fn ipv4_u32(s: &str) -> Option<u32> {
@@ -207,7 +223,11 @@ fn gw_off_subnet4(addrs4: &[String], gw: &str) -> bool {
     for a in addrs4 {
         if let Some((ip, pfx)) = a.split_once('/') {
             if let (Some(ipu), Ok(p)) = (ipv4_u32(ip), pfx.parse::<u32>()) {
-                let mask = if p == 0 { 0 } else { u32::MAX << (32 - p.min(32)) };
+                let mask = if p == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - p.min(32))
+                };
                 if (ipu & mask) == (g & mask) {
                     return false;
                 }
@@ -220,12 +240,22 @@ fn gw_off_subnet4(addrs4: &[String], gw: &str) -> bool {
 // ---- manager detection ---------------------------------------------------
 
 fn cmd_ok(program: &str, args: &[&str]) -> bool {
-    Command::new(program).args(args).output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new(program)
+        .args(args)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 pub fn detect_manager() -> Mgr {
     let has_netplan_cfg = std::fs::read_dir("/etc/netplan")
-        .map(|d| d.flatten().any(|e| e.path().extension().is_some_and(|x| x == "yaml" || x == "yml")))
+        .map(|d| {
+            d.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|x| x == "yaml" || x == "yml")
+            })
+        })
         .unwrap_or(false);
     if has_netplan_cfg && crate::sys::have("netplan") {
         return Mgr::Netplan;
@@ -258,7 +288,11 @@ pub fn nameservers() -> Vec<String> {
         let ns: Vec<String> = std::fs::read_to_string(path)
             .unwrap_or_default()
             .lines()
-            .filter_map(|l| l.trim().strip_prefix("nameserver ").map(|s| s.trim().to_string()))
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix("nameserver ")
+                    .map(|s| s.trim().to_string())
+            })
             .filter(|s| !s.is_empty() && !s.starts_with("127."))
             .collect();
         if !ns.is_empty() {
@@ -286,7 +320,10 @@ fn yesno(b: bool) -> &'static str {
 pub fn gen_netplan(bridge: &str, nic: &Nic, dns: &[String]) -> String {
     let mut s = String::from("network:\n  version: 2\n  renderer: networkd\n");
     s.push_str("  ethernets:\n");
-    s.push_str(&format!("    {}:\n      dhcp4: no\n      dhcp6: no\n      accept-ra: no\n", nic.name));
+    s.push_str(&format!(
+        "    {}:\n      dhcp4: no\n      dhcp6: no\n      accept-ra: no\n",
+        nic.name
+    ));
     s.push_str("  bridges:\n");
     s.push_str(&format!("    {bridge}:\n"));
     s.push_str(&format!("      interfaces: [{}]\n", nic.name));
@@ -330,7 +367,10 @@ pub fn gen_netplan(bridge: &str, nic: &Nic, dns: &[String]) -> String {
         }
     }
     if !dns.is_empty() && (!nic.dynamic4 || !statics.is_empty()) {
-        s.push_str(&format!("      nameservers:\n        addresses: [{}]\n", dns.join(", ")));
+        s.push_str(&format!(
+            "      nameservers:\n        addresses: [{}]\n",
+            dns.join(", ")
+        ));
     }
     s.push_str("      parameters:\n        stp: false\n        forward-delay: 0\n");
     s
@@ -415,16 +455,27 @@ fn shq(s: &str) -> String {
 /// into a new bridge.
 fn live_apply(bridge: &str, nic: &Nic) -> String {
     let mut s = String::new();
-    s.push_str(&format!("ip link add name {0} type bridge 2>/dev/null || true\n", shq(bridge)));
+    s.push_str(&format!(
+        "ip link add name {0} type bridge 2>/dev/null || true\n",
+        shq(bridge)
+    ));
     // Pin the bridge MAC to the NIC's so a reboot (where networkd would otherwise
     // assign a policy-derived MAC) keeps the same MAC the segment already knows.
     if !nic.mac.is_empty() {
-        s.push_str(&format!("ip link set {} address {}\n", shq(bridge), shq(&nic.mac)));
+        s.push_str(&format!(
+            "ip link set {} address {}\n",
+            shq(bridge),
+            shq(&nic.mac)
+        ));
     }
     s.push_str(&format!("ip link set {} mtu {}\n", shq(bridge), nic.mtu));
     s.push_str(&format!("ip link set {} up\n", shq(bridge)));
     s.push_str(&format!("ip addr flush dev {}\n", shq(&nic.name)));
-    s.push_str(&format!("ip link set {} master {}\n", shq(&nic.name), shq(bridge)));
+    s.push_str(&format!(
+        "ip link set {} master {}\n",
+        shq(&nic.name),
+        shq(bridge)
+    ));
     s.push_str(&format!("ip link set {} up\n", shq(&nic.name)));
     for a in nic.addrs() {
         // `replace` (not `add`) so a re-run over an existing address is idempotent
@@ -433,10 +484,18 @@ fn live_apply(bridge: &str, nic: &Nic) -> String {
     }
     if let Some(gw) = &nic.gw4 {
         let ol = if nic.onlink4() { " onlink" } else { "" };
-        s.push_str(&format!("ip route replace default via {} dev {}{ol}\n", shq(gw), shq(bridge)));
+        s.push_str(&format!(
+            "ip route replace default via {} dev {}{ol}\n",
+            shq(gw),
+            shq(bridge)
+        ));
     }
     if let Some(gw) = &nic.gw6 {
-        s.push_str(&format!("ip -6 route replace default via {} dev {}\n", shq(gw), shq(bridge)));
+        s.push_str(&format!(
+            "ip -6 route replace default via {} dev {}\n",
+            shq(gw),
+            shq(bridge)
+        ));
     }
     s
 }
@@ -444,12 +503,25 @@ fn live_apply(bridge: &str, nic: &Nic) -> String {
 /// Shell lines that restore the captured `ip` state back onto the NIC.
 fn live_undo(bridge: &str, nic: &Nic) -> String {
     let mut s = String::new();
-    s.push_str(&format!("ip link set {} nomaster 2>/dev/null || true\n", shq(&nic.name)));
-    s.push_str(&format!("ip link del {} 2>/dev/null || true\n", shq(bridge)));
-    s.push_str(&format!("ip addr flush dev {} 2>/dev/null || true\n", shq(&nic.name)));
+    s.push_str(&format!(
+        "ip link set {} nomaster 2>/dev/null || true\n",
+        shq(&nic.name)
+    ));
+    s.push_str(&format!(
+        "ip link del {} 2>/dev/null || true\n",
+        shq(bridge)
+    ));
+    s.push_str(&format!(
+        "ip addr flush dev {} 2>/dev/null || true\n",
+        shq(&nic.name)
+    ));
     s.push_str(&format!("ip link set {} up\n", shq(&nic.name)));
     for a in nic.addrs() {
-        s.push_str(&format!("ip addr add {} dev {} 2>/dev/null || true\n", shq(a), shq(&nic.name)));
+        s.push_str(&format!(
+            "ip addr add {} dev {} 2>/dev/null || true\n",
+            shq(a),
+            shq(&nic.name)
+        ));
     }
     if let Some(gw) = &nic.gw4 {
         let ol = if nic.onlink4() { " onlink" } else { "" };
@@ -504,7 +576,10 @@ fn persist(bridge: &str, nic: &Nic, mgr: Mgr, dns: &[String], authoritative: boo
                      [ -e \"$f\" ] && mv -f \"$f\" \"$f.zn-bak\"; done\n",
                 );
             }
-            s.push_str(&heredoc("/etc/netplan/90-zeronat.yaml", &gen_netplan(bridge, nic, dns)));
+            s.push_str(&heredoc(
+                "/etc/netplan/90-zeronat.yaml",
+                &gen_netplan(bridge, nic, dns),
+            ));
             s.push_str("chmod 600 /etc/netplan/90-zeronat.yaml\n");
             s.push_str("netplan generate\n");
             s
@@ -531,7 +606,11 @@ fn unpersist(nic: &Nic, mgr: Mgr) -> String {
              netplan generate 2>/dev/null || true\n"
             .to_string(),
         Mgr::Networkd => {
-            let files = networkd_paths(nic).iter().map(|p| shq(p)).collect::<Vec<_>>().join(" ");
+            let files = networkd_paths(nic)
+                .iter()
+                .map(|p| shq(p))
+                .collect::<Vec<_>>()
+                .join(" ");
             format!(
                 "rm -f {files}\nnetworkctl reload 2>/dev/null || systemctl restart systemd-networkd\n"
             )
@@ -548,7 +627,13 @@ fn unpersist(nic: &Nic, mgr: Mgr) -> String {
 /// `arm_revert_secs` is `Some(n)` on the risky uplink path: the timer is armed
 /// before any surgery, so its clock starts at surgery time and a death between
 /// here and the operator's confirmation is still covered.
-pub fn apply_script(bridge: &str, nic: &Nic, mgr: Mgr, dns: &[String], arm_revert_secs: Option<u32>) -> String {
+pub fn apply_script(
+    bridge: &str,
+    nic: &Nic,
+    mgr: Mgr,
+    dns: &[String],
+    arm_revert_secs: Option<u32>,
+) -> String {
     let mut s = String::from("#!/bin/sh\nset -e\n");
     if let Some(n) = arm_revert_secs {
         s.push_str(&format!(
@@ -568,7 +653,11 @@ pub fn apply_script(bridge: &str, nic: &Nic, mgr: Mgr, dns: &[String], arm_rever
 /// reverse persistence. Every step is best-effort so a partial earlier apply
 /// still gets unwound.
 pub fn undo_script(bridge: &str, nic: &Nic, mgr: Mgr) -> String {
-    format!("#!/bin/sh\n{}{}", live_undo(bridge, nic), unpersist(nic, mgr))
+    format!(
+        "#!/bin/sh\n{}{}",
+        live_undo(bridge, nic),
+        unpersist(nic, mgr)
+    )
 }
 
 // ---- connectivity probe (headless confirm) -------------------------------
@@ -616,7 +705,12 @@ mod tests {
     use super::*;
 
     fn nic(name: &str) -> Nic {
-        Nic { name: name.into(), mtu: 1500, mac: "aa:bb:cc:dd:ee:ff".into(), ..Default::default() }
+        Nic {
+            name: name.into(),
+            mtu: 1500,
+            mac: "aa:bb:cc:dd:ee:ff".into(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -666,7 +760,10 @@ mod tests {
         assert!(y.contains("via: 203.0.113.1"), "{y}");
         assert!(y.contains("on-link: true"), "{y}");
         assert!(y.contains("addresses: [1.1.1.1]"), "{y}");
-        assert!(y.contains("mtu: 1500") && y.contains("interfaces: [eth0]"), "{y}");
+        assert!(
+            y.contains("mtu: 1500") && y.contains("interfaces: [eth0]"),
+            "{y}"
+        );
         assert!(y.contains("macaddress: aa:bb:cc:dd:ee:ff"), "{y}");
     }
 
@@ -688,9 +785,15 @@ mod tests {
         n.gw4 = Some("203.0.113.1".into());
         let files = gen_networkd("br-zeronat", &n, &["1.1.1.1".into()]);
         assert_eq!(files.len(), 3);
-        assert!(files.iter().any(|(p, c)| p.ends_with(".netdev") && c.contains("Kind=bridge") && c.contains("MACAddress=aa:bb:cc:dd:ee:ff")));
-        assert!(files.iter().any(|(_, c)| c.contains("Gateway=203.0.113.1") && c.contains("GatewayOnLink=yes")));
-        assert!(files.iter().any(|(p, c)| p.contains("port-eth0") && c.contains("Bridge=br-zeronat")));
+        assert!(files.iter().any(|(p, c)| p.ends_with(".netdev")
+            && c.contains("Kind=bridge")
+            && c.contains("MACAddress=aa:bb:cc:dd:ee:ff")));
+        assert!(files
+            .iter()
+            .any(|(_, c)| c.contains("Gateway=203.0.113.1") && c.contains("GatewayOnLink=yes")));
+        assert!(files
+            .iter()
+            .any(|(p, c)| p.contains("port-eth0") && c.contains("Bridge=br-zeronat")));
     }
 
     #[test]
@@ -698,17 +801,35 @@ mod tests {
         let mut n = nic("eth0");
         n.addrs4.push("192.0.2.10/24".into());
         n.gw4 = Some("192.0.2.1".into());
-        let s = apply_script("br-zeronat", &n, Mgr::Netplan, &["1.1.1.1".into()], Some(45));
+        let s = apply_script(
+            "br-zeronat",
+            &n,
+            Mgr::Netplan,
+            &["1.1.1.1".into()],
+            Some(45),
+        );
         assert!(s.starts_with("#!/bin/sh\nset -e\n"), "{s}");
         // revert armed before any surgery
         let arm = s.find("systemd-run --on-active=45s").unwrap();
         let flush = s.find("ip addr flush dev 'eth0'").unwrap();
         let enslave = s.find("ip link set 'eth0' master 'br-zeronat'").unwrap();
         let persist = s.find("/etc/netplan/90-zeronat.yaml").unwrap();
-        assert!(arm < flush && flush < enslave && enslave < persist, "ordering wrong:\n{s}");
-        assert!(s.contains("ip link set 'br-zeronat' address 'aa:bb:cc:dd:ee:ff'"), "{s}");
-        assert!(s.contains("ip addr replace '192.0.2.10/24' dev 'br-zeronat'"), "{s}");
-        assert!(s.contains("disable-net.cfg") && s.contains("mv -f \"$f\" \"$f.zn-bak\""), "{s}");
+        assert!(
+            arm < flush && flush < enslave && enslave < persist,
+            "ordering wrong:\n{s}"
+        );
+        assert!(
+            s.contains("ip link set 'br-zeronat' address 'aa:bb:cc:dd:ee:ff'"),
+            "{s}"
+        );
+        assert!(
+            s.contains("ip addr replace '192.0.2.10/24' dev 'br-zeronat'"),
+            "{s}"
+        );
+        assert!(
+            s.contains("disable-net.cfg") && s.contains("mv -f \"$f\" \"$f.zn-bak\""),
+            "{s}"
+        );
     }
 
     #[test]
@@ -734,7 +855,10 @@ mod tests {
     #[test]
     fn undo_networkd_removes_our_files() {
         let s = undo_script("br-zeronat", &nic("eth0"), Mgr::Networkd);
-        assert!(s.contains("00-zeronat-br.netdev") && s.contains("00-zeronat-port-eth0.network"), "{s}");
+        assert!(
+            s.contains("00-zeronat-br.netdev") && s.contains("00-zeronat-port-eth0.network"),
+            "{s}"
+        );
         assert!(s.contains("networkctl reload"), "{s}");
     }
 }

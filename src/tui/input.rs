@@ -3,8 +3,8 @@
 
 use tokio::sync::mpsc;
 
-pub use zntui::key::Key;
 use zntui::key::parse;
+pub use zntui::key::Key;
 
 /// Spawn the reader thread and return the receiving end. The thread exits on
 /// EOF, a read error, or when the receiver is dropped.

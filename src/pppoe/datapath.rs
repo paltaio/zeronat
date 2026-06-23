@@ -1031,7 +1031,10 @@ mod tests {
         // emit our own Configure-Request (LCP -> AckSent, sub-Opened).
         let reneg_opts = [0x05, 0x06, 0xab, 0xcd, 0xef, 0x01];
         let phase = dp.on_l2_frame(&from_ac(&lcp(0x01, 0x42, &reneg_opts)));
-        assert_eq!(phase, DpPhase::Established(*dp.established.as_ref().unwrap()));
+        assert_eq!(
+            phase,
+            DpPhase::Established(*dp.established.as_ref().unwrap())
+        );
         assert!(!dp.link_down, "renegotiation must not declare link-down");
 
         // A tick mid-renegotiation must not redial either: LCP is sub-Opened but
@@ -1088,7 +1091,10 @@ mod tests {
         // sub-Opened but not Closed.
         let reneg_opts = [0x05, 0x06, 0xab, 0xcd, 0xef, 0x01];
         let phase = dp.on_l2_frame(&from_ac(&lcp(0x01, 0x42, &reneg_opts)));
-        assert_eq!(phase, DpPhase::Established(*dp.established.as_ref().unwrap()));
+        assert_eq!(
+            phase,
+            DpPhase::Established(*dp.established.as_ref().unwrap())
+        );
         assert!(!dp.ppp.lcp_opened(), "renegotiation dips LCP below Opened");
         assert!(!dp.ppp.lcp_closed(), "renegotiation is not a teardown");
         let _ = drain_frames(&mut dp);
@@ -1107,7 +1113,11 @@ mod tests {
             .find(|p| p.len() >= 6 && p[0..2] == [0xc0, 0x21] && p[2] == 0x0a)
             .expect("an Echo-Reply to the BRAS probe while sub-Opened");
         assert_eq!(reply[3], 0x10, "reply keeps the request id");
-        assert_eq!(&reply[6..10], &MAGIC.to_be_bytes(), "reply carries our magic");
+        assert_eq!(
+            &reply[6..10],
+            &MAGIC.to_be_bytes(),
+            "reply carries our magic"
+        );
 
         // Our own keepalive keeps firing across the stuck reneg: it goes out every
         // interval and the BRAS answering keeps the link alive for several windows.
@@ -1248,14 +1258,14 @@ mod tests {
         let mut curated: Vec<Vec<u8>> = vec![
             vec![],
             vec![0x00],
-            vec![0xff; 13],                       // runt < eth header
-            vec![0xff; 14],                       // eth header only, zero ethertype
+            vec![0xff; 13], // runt < eth header
+            vec![0xff; 14], // eth header only, zero ethertype
             PADO.to_vec(),
             PADS.to_vec(),
             session_seed.clone(),
-            from_ac(&[0x00, 0x21, 0x45]),         // session frame with a short IP
+            from_ac(&[0x00, 0x21, 0x45]), // session frame with a short IP
             from_ac(&lcp(0x01, 1, &[0x01, 0x04])),
-            from_ac(&echo_reply(PEER_MAGIC)),          // well-formed echo-reply (liveness peek)
+            from_ac(&echo_reply(PEER_MAGIC)), // well-formed echo-reply (liveness peek)
             from_ac(&[0xc0, 0x21, 0x0a, 0x01, 0x00, 0x06]), // echo-reply, truncated body
             from_ac(&[0xc0, 0x21, 0x0a, 0x01, 0xff, 0xff, 0x06, 0xc2]), // echo-reply len overrun
             from_ac(&[0xc0, 0x21, 0x0a, 0x01, 0x00, 0x00]), // echo-reply, zero-length body
@@ -1494,7 +1504,11 @@ mod tests {
         dp.set_clamp_mss(1352);
         assert_eq!(dp.clamp_mss, Some(1352));
         dp.reset().unwrap();
-        assert_eq!(dp.clamp_mss, Some(1352), "clamp persists across an in-session redial");
+        assert_eq!(
+            dp.clamp_mss,
+            Some(1352),
+            "clamp persists across an in-session redial"
+        );
     }
 
     #[test]

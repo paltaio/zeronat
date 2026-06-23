@@ -32,7 +32,11 @@ const IFF_NO_PI: i16 = 0x1000;
 /// clamped to 32; a prefix of 0 yields `0.0.0.0`.
 fn netmask_from_prefix(prefix_len: u8) -> Ipv4Addr {
     let bits = prefix_len.min(32);
-    let mask: u32 = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+    let mask: u32 = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
     Ipv4Addr::from(mask)
 }
 
@@ -114,10 +118,20 @@ fn get_mtu_ioctl(sock: RawFd, name: &str) -> Result<i32> {
 /// Bring the interface up and mark it running.
 fn bring_up(sock: RawFd, name: &str) -> Result<()> {
     let mut ifr = IfReq::new(name)?;
-    ioctl_ifr(sock, SIOCGIFFLAGS, &mut ifr, &format!("SIOCGIFFLAGS {name}"))?;
+    ioctl_ifr(
+        sock,
+        SIOCGIFFLAGS,
+        &mut ifr,
+        &format!("SIOCGIFFLAGS {name}"),
+    )?;
     let flags = ifr.get_flags() | (libc::IFF_UP as i16) | (libc::IFF_RUNNING as i16);
     ifr.set_flags(flags);
-    ioctl_ifr(sock, SIOCSIFFLAGS, &mut ifr, &format!("SIOCSIFFLAGS {name}"))
+    ioctl_ifr(
+        sock,
+        SIOCSIFFLAGS,
+        &mut ifr,
+        &format!("SIOCSIFFLAGS {name}"),
+    )
 }
 
 /// Bring an L2 TAP up, set its MTU, and optionally enslave it to a bridge. Runs
@@ -143,7 +157,12 @@ fn configure_inner(sock: RawFd, name: &str, mtu: usize, bridge: Option<&str>) ->
         // on the bridge keeps its full MTU (the smaller TAP port stays at its MTU).
         let br_mtu = get_mtu_ioctl(sock, br).ok();
         let mut ifr = IfReq::new(name)?;
-        ioctl_ifr(sock, SIOCGIFINDEX, &mut ifr, &format!("SIOCGIFINDEX {name}"))?;
+        ioctl_ifr(
+            sock,
+            SIOCGIFINDEX,
+            &mut ifr,
+            &format!("SIOCGIFINDEX {name}"),
+        )?;
         let idx = ifr.get_ifindex();
         let mut brifr = IfReq::new(br)?;
         brifr.set_ifindex(idx);

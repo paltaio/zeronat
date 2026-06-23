@@ -93,7 +93,12 @@ struct IptRule {
 
 impl IptRule {
     fn command(&self) -> Vec<String> {
-        let mut c = vec!["-t".into(), self.table.into(), "-A".into(), self.chain.into()];
+        let mut c = vec![
+            "-t".into(),
+            self.table.into(),
+            "-A".into(),
+            self.chain.into(),
+        ];
         c.extend(self.args.iter().cloned());
         c
     }
@@ -107,7 +112,14 @@ fn iptables_rules(plan: &NatPlan) -> Vec<IptRule> {
     let client = plan.client_ip.to_string();
     let server = plan.server_ip.to_string();
     let keep = plan.kept_ports();
-    let comment = || vec!["-m".into(), "comment".into(), "--comment".into(), "zeronat".into()];
+    let comment = || {
+        vec![
+            "-m".into(),
+            "comment".into(),
+            "--comment".into(),
+            "zeronat".into(),
+        ]
+    };
 
     // Negated destination-port match: one port uses `! --dport`, several use the
     // multiport module (`! --dports a,b,c`).
@@ -440,7 +452,10 @@ fn install_nft(plan: &NatPlan) -> Result<()> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string().into())
+        Err(String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .to_string()
+            .into())
     }
 }
 
@@ -518,7 +533,14 @@ mod tests {
     #[test]
     fn mss_is_mtu_minus_headers() {
         assert_eq!(plan().mss(), 1360);
-        assert_eq!(NatPlan { mtu: 1280, ..plan() }.mss(), 1240);
+        assert_eq!(
+            NatPlan {
+                mtu: 1280,
+                ..plan()
+            }
+            .mss(),
+            1240
+        );
         // A nonsensically small MTU floors at the IPv4 minimum MSS.
         assert_eq!(NatPlan { mtu: 100, ..plan() }.mss(), 536);
     }
@@ -535,8 +557,12 @@ mod tests {
         assert!(s.contains("udp dport != { 22, 2222 } dnat to 10.7.9.2"));
         assert!(s.contains("ip protocol icmp dnat to 10.7.9.2"));
         assert!(s.contains("oifname \"zn0\" snat to 10.7.9.1"));
-        assert!(s.contains("oifname \"zn0\" tcp flags & (syn | rst) == syn tcp option maxseg size set 1360"));
-        assert!(s.contains("iifname \"zn0\" tcp flags & (syn | rst) == syn tcp option maxseg size set 1360"));
+        assert!(s.contains(
+            "oifname \"zn0\" tcp flags & (syn | rst) == syn tcp option maxseg size set 1360"
+        ));
+        assert!(s.contains(
+            "iifname \"zn0\" tcp flags & (syn | rst) == syn tcp option maxseg size set 1360"
+        ));
         assert!(s.contains("forward oifname \"zn0\" accept"));
         assert!(s.contains("forward iifname \"zn0\" accept"));
     }
@@ -565,10 +591,9 @@ mod tests {
             rules[4].command().join(" "),
             "-t mangle -A FORWARD -o zn0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360 -m comment --comment zeronat"
         );
-        assert!(rules[5]
-            .command()
-            .join(" ")
-            .contains("-t mangle -A FORWARD -i zn0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360"));
+        assert!(rules[5].command().join(" ").contains(
+            "-t mangle -A FORWARD -i zn0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360"
+        ));
         // filter FORWARD accept in both directions so a default-DROP host forwards.
         assert_eq!(
             rules[6].command().join(" "),

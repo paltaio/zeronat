@@ -119,11 +119,7 @@ fn apply_netcfg_edge(
 /// than `PPPOE_STRAND_REVERT` since the default route was swapped. Keeps zppp0 and
 /// the process up; the swap is not re-applied until a real redial proves recovery
 /// (a fresh Established edge clears the latch). Returns whether it just reverted.
-fn strand_watchdog(
-    guard: &mut Option<NetCfgGuard>,
-    stranded: &mut bool,
-    last_in: Instant,
-) -> bool {
+fn strand_watchdog(guard: &mut Option<NetCfgGuard>, stranded: &mut bool, last_in: Instant) -> bool {
     if *stranded || !guard.as_ref().is_some_and(|g| g.default_applied()) {
         return false;
     }

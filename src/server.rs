@@ -24,9 +24,9 @@ use crate::proto::BridgeEntry;
 use crate::proto::{
     proto_name, ClientEntry, Listener, Msg, Proto, RouteEntry, SnapshotBody, Source,
 };
-use crate::tap::{TapConfig, TunConfig};
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
+use crate::tap::{TapConfig, TunConfig};
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -632,36 +632,37 @@ impl Server {
         // so the fleet view reads them from the switch's port table. The switch is
         // linux-only; other platforms report no bridge clients.
         #[cfg(target_os = "linux")]
-        let bridge_clients = self
-            .switch
-            .as_ref()
-            .map(|sw| {
-                sw.ports_snapshot()
-                    .into_iter()
-                    .map(|p| {
-                        let named = p.name.as_ref().is_some_and(|s| !s.is_empty());
-                        let label = p.name.filter(|s| !s.is_empty()).unwrap_or_else(|| match p.peer
-                        {
-                            Some(a) => a.to_string(),
-                            None => format!("bridge-{}", p.port_id),
-                        });
-                        BridgeEntry {
-                            label,
-                            named,
-                            transport: p.transport,
-                            peer: p.peer.map(|a| a.to_string()).unwrap_or_default(),
-                            macs: p.macs,
-                            rx_bytes: p.rx_bytes,
-                            rx_frames: p.rx_frames,
-                            tx_bytes: p.tx_bytes,
-                            tx_frames: p.tx_frames,
-                            uptime_secs: p.uptime_secs,
-                            idle_secs: p.idle_secs,
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let bridge_clients =
+            self.switch
+                .as_ref()
+                .map(|sw| {
+                    sw.ports_snapshot()
+                        .into_iter()
+                        .map(|p| {
+                            let named = p.name.as_ref().is_some_and(|s| !s.is_empty());
+                            let label = p.name.filter(|s| !s.is_empty()).unwrap_or_else(|| match p
+                                .peer
+                            {
+                                Some(a) => a.to_string(),
+                                None => format!("bridge-{}", p.port_id),
+                            });
+                            BridgeEntry {
+                                label,
+                                named,
+                                transport: p.transport,
+                                peer: p.peer.map(|a| a.to_string()).unwrap_or_default(),
+                                macs: p.macs,
+                                rx_bytes: p.rx_bytes,
+                                rx_frames: p.rx_frames,
+                                tx_bytes: p.tx_bytes,
+                                tx_frames: p.tx_frames,
+                                uptime_secs: p.uptime_secs,
+                                idle_secs: p.idle_secs,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
         #[cfg(not(target_os = "linux"))]
         let bridge_clients = Vec::new();
 

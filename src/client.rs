@@ -17,9 +17,9 @@ use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP,
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{client_handshake, client_handshake_stateless};
 use crate::proto::{Msg, Proto};
-use crate::tap::{TapConfig, TunConfig};
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
+use crate::tap::{TapConfig, TunConfig};
 
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// Liveness window for the control channel. The server replies Pong to every
@@ -638,9 +638,15 @@ async fn pppoe_udp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>,
     let _ = tx.send_name(&client.client_id).await;
     // UDP requires a literal ip:port, so the configured server is the real peer.
     let server_ip = server_v4(&client.server);
-    let result =
-        crate::pppoe::tunnel::run_dgram(dp, bringup(server_ip, &pp), rx, tx, cancel, &client.client_id)
-            .await;
+    let result = crate::pppoe::tunnel::run_dgram(
+        dp,
+        bringup(server_ip, &pp),
+        rx,
+        tx,
+        cancel,
+        &client.client_id,
+    )
+    .await;
     (result, true)
 }
 
@@ -672,9 +678,14 @@ async fn pppoe_tcp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>,
     crate::elog!("pppoe connected to {} over tcp", client.server);
     // Pin the IP the tunnel actually connected to (handles a hostname --server).
     let server_ip = peer.and_then(peer_v4);
-    let result =
-        crate::pppoe::tunnel::run_stream(dp, bringup(server_ip, &pp), nr, nw, Arc::new(Notify::new()))
-            .await;
+    let result = crate::pppoe::tunnel::run_stream(
+        dp,
+        bringup(server_ip, &pp),
+        nr,
+        nw,
+        Arc::new(Notify::new()),
+    )
+    .await;
     (result, true)
 }
 

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::admin;
 use crate::proto::{
-    proto_name, BridgeEntry, ClientEntry, Listener, Msg, Proto, RouteEntry, Source, SnapshotBody,
+    proto_name, BridgeEntry, ClientEntry, Listener, Msg, Proto, RouteEntry, SnapshotBody, Source,
 };
 use crate::Result;
 
@@ -20,8 +20,7 @@ use super::style::{Color, Line, Style, ACCENT, BAD, GOOD, MUTED, PLAIN, WARN};
 use super::{frame, term};
 
 const REFRESH: Duration = Duration::from_secs(1);
-/// Upper bound on a single admin round trip so a hung server surfaces an error
-/// toast instead of freezing the event loop.
+/// Upper bound on a single admin round trip.
 const NET_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a toast stays on screen before it ages out.
 const TOAST_TTL: Duration = Duration::from_secs(4);
@@ -89,6 +88,10 @@ enum Overlay {
         sel: usize,
         options: Vec<PickOption>,
     },
+    ClientMenu {
+        client_id: String,
+        sel: usize,
+    },
     AddForm {
         proto: Proto,
         bind: String,
@@ -127,19 +130,31 @@ impl App {
     }
 
     fn routes(&self) -> Vec<RouteEntry> {
-        let mut v = self.snap.as_ref().map(|s| s.routes.clone()).unwrap_or_default();
+        let mut v = self
+            .snap
+            .as_ref()
+            .map(|s| s.routes.clone())
+            .unwrap_or_default();
         v.sort_by_key(|r| (u32::from(r.bind_ip), pk(r.proto), r.port));
         v
     }
 
     fn listeners(&self) -> Vec<Listener> {
-        let mut v = self.snap.as_ref().map(|s| s.listeners.clone()).unwrap_or_default();
+        let mut v = self
+            .snap
+            .as_ref()
+            .map(|s| s.listeners.clone())
+            .unwrap_or_default();
         v.sort_by_key(|l| (u32::from(l.bind_ip), pk(l.proto), l.port));
         v
     }
 
     fn clients(&self) -> Vec<ClientEntry> {
-        let mut v = self.snap.as_ref().map(|s| s.clients.clone()).unwrap_or_default();
+        let mut v = self
+            .snap
+            .as_ref()
+            .map(|s| s.clients.clone())
+            .unwrap_or_default();
         v.sort_by(|a, b| a.client_id.cmp(&b.client_id));
         v
     }
@@ -155,7 +170,7 @@ impl App {
     }
 
     fn item_count(&self) -> usize {
-        self.routes().len() + self.listeners().len()
+        self.routes().len() + self.listeners().len() + self.clients().len()
     }
 
     fn clamp_sel(&mut self) {
@@ -204,6 +219,7 @@ impl App {
         match &self.overlay {
             Overlay::None => self.on_key_normal(k).await,
             Overlay::Picker { .. } => self.on_key_picker(k).await,
+            Overlay::ClientMenu { .. } => self.on_key_client_menu(k).await,
             Overlay::AddForm { .. } => self.on_key_form(k).await,
             Overlay::Confirm { .. } => self.on_key_confirm(k).await,
         }
@@ -228,41 +244,48 @@ impl App {
                 };
             }
             Key::Enter => {
-                // Enter assigns a client to the selected port. On a route row it
-                // re-targets the route; on a listener row it creates one for that
-                // bound port, preselecting any client it already routes to.
-                let target = if self.sel < routes.len() {
+                let client_start = routes.len() + listeners.len();
+                if self.sel >= client_start {
+                    if let Some(client) = self.clients().get(self.sel - client_start) {
+                        self.overlay = Overlay::ClientMenu {
+                            client_id: client.client_id.clone(),
+                            sel: 0,
+                        };
+                    }
+                    return Flow::Continue;
+                }
+
+                let (key, current) = if self.sel < routes.len() {
                     let r = &routes[self.sel];
-                    Some(((r.bind_ip, r.proto, r.port), Some(r.client_id.clone())))
-                } else if self.sel - routes.len() < listeners.len() {
+                    ((r.bind_ip, r.proto, r.port), Some(r.client_id.clone()))
+                } else {
                     let l = &listeners[self.sel - routes.len()];
                     let key = (l.bind_ip, l.proto, l.port);
                     let cur = routes
                         .iter()
                         .find(|r| (r.bind_ip, r.proto, r.port) == key)
                         .map(|r| r.client_id.clone());
-                    Some((key, cur))
-                } else {
-                    None
+                    (key, cur)
                 };
-                if let Some((key, current)) = target {
-                    let mut options: Vec<PickOption> =
-                        self.clients().into_iter().map(|c| PickOption::Client(c.client_id)).collect();
-                    options.push(PickOption::Clear);
-                    let psel = current
-                        .as_ref()
-                        .and_then(|id| {
-                            options
-                                .iter()
-                                .position(|o| matches!(o, PickOption::Client(c) if c == id))
-                        })
-                        .unwrap_or(0);
-                    self.overlay = Overlay::Picker {
-                        route: key,
-                        sel: psel,
-                        options,
-                    };
-                }
+                let mut options: Vec<PickOption> = self
+                    .clients()
+                    .into_iter()
+                    .map(|c| PickOption::Client(c.client_id))
+                    .collect();
+                options.push(PickOption::Clear);
+                let psel = current
+                    .as_ref()
+                    .and_then(|id| {
+                        options
+                            .iter()
+                            .position(|o| matches!(o, PickOption::Client(c) if c == id))
+                    })
+                    .unwrap_or(0);
+                self.overlay = Overlay::Picker {
+                    route: key,
+                    sel: psel,
+                    options,
+                };
             }
             Key::Char('c') if self.sel < routes.len() => {
                 let r = &routes[self.sel];
@@ -271,8 +294,11 @@ impl App {
                     proto: r.proto,
                     port: r.port,
                 };
-                self.apply(req, format!("cleared route {}:{}", proto_name(r.proto), r.port))
-                    .await;
+                self.apply(
+                    req,
+                    format!("cleared route {}:{}", proto_name(r.proto), r.port),
+                )
+                .await;
             }
             Key::Char('d') if self.sel >= routes.len() => {
                 if let Some(l) = listeners.get(self.sel - routes.len()) {
@@ -289,9 +315,103 @@ impl App {
         Flow::Continue
     }
 
+    async fn on_key_client_menu(&mut self, k: Key) -> Flow {
+        let (client_id, sel) = match &self.overlay {
+            Overlay::ClientMenu { client_id, sel } => (client_id.clone(), *sel),
+            _ => return Flow::Continue,
+        };
+        match k {
+            Key::Esc => self.overlay = Overlay::None,
+            Key::Up | Key::Char('k') => {
+                if let Overlay::ClientMenu { sel, .. } = &mut self.overlay {
+                    *sel = sel.saturating_sub(1);
+                }
+            }
+            Key::Down | Key::Char('j') => {
+                if let Overlay::ClientMenu { sel, .. } = &mut self.overlay {
+                    if *sel == 0 {
+                        *sel += 1;
+                    }
+                }
+            }
+            Key::Enter => {
+                self.overlay = Overlay::None;
+                if sel == 0 {
+                    self.forward_all_listeners(client_id).await;
+                }
+            }
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    async fn forward_all_listeners(&mut self, client_id: String) {
+        let listeners = self.listeners();
+        if listeners.is_empty() {
+            self.set_toast("no listeners to forward".to_string(), true);
+            return;
+        }
+
+        let routes = self.routes();
+        let mut reqs = Vec::new();
+        for l in listeners {
+            let key = (l.bind_ip, l.proto, l.port);
+            let current = routes
+                .iter()
+                .find(|r| (r.bind_ip, r.proto, r.port) == key)
+                .map(|r| r.client_id.as_str());
+            if current != Some(client_id.as_str()) {
+                reqs.push(Msg::SetRoute {
+                    bind_ip: l.bind_ip,
+                    proto: l.proto,
+                    port: l.port,
+                    client_id: client_id.clone(),
+                });
+            }
+        }
+
+        if reqs.is_empty() {
+            self.set_toast(format!("all listeners already target {client_id}"), false);
+            return;
+        }
+
+        let total = reqs.len();
+        for (i, req) in reqs.into_iter().enumerate() {
+            let send = admin::mutate(&self.server, &self.psk, req);
+            match tokio::time::timeout(NET_TIMEOUT, send).await {
+                Ok(Ok((true, _))) => {}
+                Ok(Ok((false, msg))) => {
+                    self.set_toast(
+                        format!("server reported after {}/{}: {msg}", i + 1, total),
+                        true,
+                    );
+                    self.refresh().await;
+                    return;
+                }
+                Ok(Err(e)) => {
+                    self.set_toast(format!("forwarded {i}/{total}: {e}"), true);
+                    self.refresh().await;
+                    return;
+                }
+                Err(_) => {
+                    self.set_toast(format!("forwarded {i}/{total}: request timed out"), true);
+                    self.refresh().await;
+                    return;
+                }
+            }
+        }
+
+        self.set_toast(format!("forwarded {total} listeners to {client_id}"), false);
+        self.refresh().await;
+    }
+
     async fn on_key_picker(&mut self, k: Key) -> Flow {
         let (route, sel, len) = match &self.overlay {
-            Overlay::Picker { route, sel, options } => (*route, *sel, options.len()),
+            Overlay::Picker {
+                route,
+                sel,
+                options,
+            } => (*route, *sel, options.len()),
             _ => return Flow::Continue,
         };
         match k {
@@ -325,7 +445,11 @@ impl App {
                         port,
                         client_id: id.clone(),
                     },
-                    None => Msg::ClearRoute { bind_ip, proto, port },
+                    None => Msg::ClearRoute {
+                        bind_ip,
+                        proto,
+                        port,
+                    },
                 };
                 let msg = match chosen {
                     Some(id) => format!("{}:{} → {id}", proto_name(proto), port),
@@ -367,7 +491,10 @@ impl App {
                 }
             }
             Key::Backspace => {
-                if let Overlay::AddForm { field, bind, port, .. } = &mut self.overlay {
+                if let Overlay::AddForm {
+                    field, bind, port, ..
+                } = &mut self.overlay
+                {
                     match field {
                         1 => {
                             bind.pop();
@@ -380,7 +507,10 @@ impl App {
                 }
             }
             Key::Char(c) => {
-                if let Overlay::AddForm { field, bind, port, .. } = &mut self.overlay {
+                if let Overlay::AddForm {
+                    field, bind, port, ..
+                } = &mut self.overlay
+                {
                     match field {
                         1 if c.is_ascii_digit() || c == '.' => bind.push(c),
                         2 if c.is_ascii_digit() => port.push(c),
@@ -396,7 +526,9 @@ impl App {
 
     async fn submit_form(&mut self) -> Flow {
         let (proto, bind, port) = match &self.overlay {
-            Overlay::AddForm { proto, bind, port, .. } => (*proto, bind.clone(), port.clone()),
+            Overlay::AddForm {
+                proto, bind, port, ..
+            } => (*proto, bind.clone(), port.clone()),
             _ => return Flow::Continue,
         };
         let bind_ip = if bind.trim().is_empty() {
@@ -423,21 +555,26 @@ impl App {
             proto,
             port,
         };
-        self.apply(req, format!("added {} :{port}", proto_name(proto))).await;
+        self.apply(req, format!("added {} :{port}", proto_name(proto)))
+            .await;
         Flow::Continue
     }
 
     async fn on_key_confirm(&mut self, k: Key) -> Flow {
         match k {
             Key::Char('y') | Key::Enter => {
-                if let Overlay::Confirm { bind, proto, port, .. } = self.overlay {
+                if let Overlay::Confirm {
+                    bind, proto, port, ..
+                } = self.overlay
+                {
                     self.overlay = Overlay::None;
                     let req = Msg::RemoveListener {
                         bind_ip: bind,
                         proto,
                         port,
                     };
-                    self.apply(req, format!("removed {} :{port}", proto_name(proto))).await;
+                    self.apply(req, format!("removed {} :{port}", proto_name(proto)))
+                        .await;
                 }
             }
             Key::Char('n') | Key::Esc => self.overlay = Overlay::None,
@@ -479,7 +616,13 @@ impl App {
         }
         content.push(frame::blank(w));
         content.push(frame::row(w, section_head("CLIENTS", clients.len())));
-        content.push(frame::row(w, clients_row(&clients)));
+        if clients.is_empty() {
+            content.push(frame::row(w, muted_line("  (none connected)")));
+        }
+        let client_start = routes.len() + listeners.len();
+        for (i, c) in clients.iter().enumerate() {
+            content.push(frame::row(w, self.client_row(c, client_start + i)));
+        }
         content.push(frame::blank(w));
         content.push(frame::row(w, section_head("BRIDGE", bridge.len())));
         if bridge.is_empty() {
@@ -499,7 +642,7 @@ impl App {
 
         lines.push(frame::divider(w));
         lines.push(frame::row(w, self.toast_line()));
-        lines.push(frame::row(w, self.hint_line(&routes)));
+        lines.push(frame::row(w, self.hint_line(&routes, listeners.len())));
         lines.push(frame::bottom(w));
 
         if !matches!(self.overlay, Overlay::None) {
@@ -547,8 +690,14 @@ impl App {
         l.add(proto_style(r.proto), &format!("{:<4}", proto_name(r.proto)));
         l.add(PLAIN, &format!(":{:<6}", r.port));
         l.add(MUTED, "→ ");
-        l.add(if active { BOLD } else { WARN }, &format!("{:<18}", trunc(&sanitize(&r.client_id), 18)));
-        l.add(if active { GOOD } else { BAD }, &format!("{:<9}", if active { "active" } else { "offline" }));
+        l.add(
+            if active { BOLD } else { WARN },
+            &format!("{:<18}", trunc(&sanitize(&r.client_id), 18)),
+        );
+        l.add(
+            if active { GOOD } else { BAD },
+            &format!("{:<9}", if active { "active" } else { "offline" }),
+        );
         l.add(MUTED, source_tag(r.source));
         l
     }
@@ -557,10 +706,25 @@ impl App {
         let selected = self.sel == idx && matches!(self.overlay, Overlay::None);
         let mut l = Line::new();
         caret(&mut l, selected);
-        l.add(proto_style(l_.proto), &format!("{:<4}", proto_name(l_.proto)));
+        l.add(
+            proto_style(l_.proto),
+            &format!("{:<4}", proto_name(l_.proto)),
+        );
         l.add(PLAIN, &format!(":{:<6}", l_.port));
         l.add(MUTED, &format!("{:<18}", l_.bind_ip));
         l.add(MUTED, source_tag(l_.source));
+        l
+    }
+
+    fn client_row(&self, c: &ClientEntry, idx: usize) -> Line {
+        let selected = self.sel == idx && matches!(self.overlay, Overlay::None);
+        let mut l = Line::new();
+        caret(&mut l, selected);
+        l.add(
+            ACCENT,
+            &format!("{:<18}", trunc(&sanitize(&c.client_id), 18)),
+        );
+        l.add(MUTED, crate::admin::transport_name(c.transport));
         l
     }
 
@@ -568,32 +732,44 @@ impl App {
         let mut l = Line::new();
         if let Some((msg, is_err, at)) = &self.toast {
             if at.elapsed() < TOAST_TTL {
-                l.add(if *is_err { BAD } else { GOOD }, if *is_err { "✕ " } else { "✓ " });
+                l.add(
+                    if *is_err { BAD } else { GOOD },
+                    if *is_err { "✕ " } else { "✓ " },
+                );
                 l.add(if *is_err { WARN } else { MUTED }, &sanitize(msg));
             }
         }
         l
     }
 
-    fn hint_line(&self, routes: &[RouteEntry]) -> Line {
+    fn hint_line(&self, routes: &[RouteEntry], listener_count: usize) -> Line {
         let mut l = Line::new();
         match &self.overlay {
             Overlay::None => {
                 hint(&mut l, "↑↓", "move");
                 if self.item_count() > 0 {
-                    hint(&mut l, "⏎", "set route");
+                    if self.sel >= routes.len() + listener_count {
+                        hint(&mut l, "⏎", "client");
+                    } else {
+                        hint(&mut l, "⏎", "set route");
+                    }
                 }
                 if self.sel < routes.len() {
                     hint(&mut l, "c", "clear");
                 }
                 hint(&mut l, "a", "add");
-                if self.sel >= routes.len() && self.item_count() > 0 {
+                if self.sel >= routes.len() && self.sel < routes.len() + listener_count {
                     hint(&mut l, "d", "remove");
                 }
                 hint(&mut l, "r", "refresh");
                 hint(&mut l, "q", "quit");
             }
             Overlay::Picker { .. } => {
+                hint(&mut l, "↑↓", "choose");
+                hint(&mut l, "⏎", "apply");
+                hint(&mut l, "esc", "cancel");
+            }
+            Overlay::ClientMenu { .. } => {
                 hint(&mut l, "↑↓", "choose");
                 hint(&mut l, "⏎", "apply");
                 hint(&mut l, "esc", "cancel");
@@ -615,10 +791,17 @@ impl App {
     fn overlay_panel(&self, w: usize, h: usize) -> Vec<String> {
         match &self.overlay {
             Overlay::None => Vec::new(),
-            Overlay::Picker { route, sel, options } => {
+            Overlay::Picker {
+                route,
+                sel,
+                options,
+            } => {
                 let (_, proto, port) = route;
                 let mut p = vec![frame::divider(w)];
-                p.push(frame::panel_title(w, &format!("set route  {} :{}", proto_name(*proto), port)));
+                p.push(frame::panel_title(
+                    w,
+                    &format!("set route  {} :{}", proto_name(*proto), port),
+                ));
                 // Keep the panel inside the terminal: show a window of options
                 // around the selection, with markers when some are off-screen.
                 let (start, end) = window(*sel, options.len(), h.saturating_sub(7).max(1));
@@ -629,18 +812,42 @@ impl App {
                     let mut l = Line::new();
                     caret(&mut l, i == *sel);
                     match opt {
-                        PickOption::Client(id) => l.add(if i == *sel { BOLD } else { PLAIN }, &sanitize(id)),
+                        PickOption::Client(id) => {
+                            l.add(if i == *sel { BOLD } else { PLAIN }, &sanitize(id))
+                        }
                         PickOption::Clear => l.add(WARN, "(clear route)"),
                     };
                     p.push(frame::row(w, l));
                 }
                 if end < options.len() {
-                    p.push(frame::row(w, muted_line(&format!("  ↓ {} more", options.len() - end))));
+                    p.push(frame::row(
+                        w,
+                        muted_line(&format!("  ↓ {} more", options.len() - end)),
+                    ));
                 }
                 p.push(frame::divider(w));
                 p
             }
-            Overlay::AddForm { proto, bind, port, field } => {
+            Overlay::ClientMenu { client_id, sel } => {
+                let mut p = vec![frame::divider(w)];
+                p.push(frame::panel_title(
+                    w,
+                    &format!("client  {}", sanitize(client_id)),
+                ));
+                p.push(frame::row(
+                    w,
+                    client_menu_row(*sel == 0, "forward all listeners"),
+                ));
+                p.push(frame::row(w, client_menu_row(*sel == 1, "cancel")));
+                p.push(frame::divider(w));
+                p
+            }
+            Overlay::AddForm {
+                proto,
+                bind,
+                port,
+                field,
+            } => {
                 let mut p = vec![frame::divider(w)];
                 p.push(frame::panel_title(w, "add listener"));
                 p.push(frame::row(w, form_proto(*proto, *field == 0)));
@@ -712,22 +919,6 @@ fn muted_line(text: &str) -> Line {
     l
 }
 
-fn clients_row(clients: &[ClientEntry]) -> Line {
-    let mut l = Line::new();
-    l.add(PLAIN, "  ");
-    if clients.is_empty() {
-        l.add(MUTED, "(none connected)");
-        return l;
-    }
-    for (i, c) in clients.iter().enumerate() {
-        if i > 0 {
-            l.add(MUTED, " · ");
-        }
-        l.add(ACCENT, &sanitize(&c.client_id));
-    }
-    l
-}
-
 fn bridge_row(e: &BridgeEntry) -> Line {
     let mut l = Line::new();
     l.add(PLAIN, "  ");
@@ -761,12 +952,27 @@ fn bridge_row(e: &BridgeEntry) -> Line {
     l
 }
 
+fn client_menu_row(selected: bool, label: &str) -> Line {
+    let mut l = Line::new();
+    caret(&mut l, selected);
+    l.add(if selected { BOLD } else { PLAIN }, label);
+    l
+}
+
 fn form_proto(proto: Proto, focused: bool) -> Line {
     let mut l = Line::new();
     caret(&mut l, focused);
     l.add(MUTED, &format!("{:<6}", "proto"));
-    let tcp = if matches!(proto, Proto::Tcp) { BOLD.reverse() } else { MUTED };
-    let udp = if matches!(proto, Proto::Udp) { BOLD.reverse() } else { MUTED };
+    let tcp = if matches!(proto, Proto::Tcp) {
+        BOLD.reverse()
+    } else {
+        MUTED
+    };
+    let udp = if matches!(proto, Proto::Udp) {
+        BOLD.reverse()
+    } else {
+        MUTED
+    };
     l.add(tcp, " tcp ");
     l.add(PLAIN, " ");
     l.add(udp, " udp ");

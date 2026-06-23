@@ -376,7 +376,10 @@ mod tests {
         assert_eq!(proto_of(req), ProtocolType::LCP);
         assert_eq!(code_of(req), Code::ConfigureReq);
         // Options after the 6-byte header: MRU 01 04 05 70, Magic 05 06 06 c2 7d 42.
-        assert_eq!(&req[6..], &[0x01, 0x04, 0x05, 0x70, 0x05, 0x06, 0x06, 0xc2, 0x7d, 0x42]);
+        assert_eq!(
+            &req[6..],
+            &[0x01, 0x04, 0x05, 0x70, 0x05, 0x06, 0x06, 0xc2, 0x7d, 0x42]
+        );
 
         // 2. Peer LCP ConfReq: MRU 1492 + Auth CHAP-MD5 + Magic 0xf6b2f2ce.
         let peer_opts = [
@@ -468,9 +471,7 @@ mod tests {
         s.feed(&chap_result(3, 1));
         let ireq = drain(&mut s).remove(0);
         // With usepeerdns the ConfReq carries address + DNS1 + DNS2.
-        assert!(ireq[6..]
-            .windows(2)
-            .any(|w| w == [0x81, 0x06])); // Dns1 requested
+        assert!(ireq[6..].windows(2).any(|w| w == [0x81, 0x06])); // Dns1 requested
 
         // Peer Naks the address and DNS1; we re-request with the learned values.
         let nak = [
@@ -485,7 +486,11 @@ mod tests {
             .any(|w| w == [0x81, 0x06, 0x08, 0x08, 0x08, 0x08]));
 
         // Peer ConfReq for its own address so we learn peer_address.
-        s.feed(&ipcp(Code::ConfigureReq, 1, &[0x03, 0x06, 0xba, 0x6b, 0x60, 0x01]));
+        s.feed(&ipcp(
+            Code::ConfigureReq,
+            1,
+            &[0x03, 0x06, 0xba, 0x6b, 0x60, 0x01],
+        ));
         let _ = drain(&mut s);
         // Peer Acks our request; established carries the DNS and addresses.
         s.feed(&ipcp(Code::ConfigureAck, ireq2[3], &ireq2[6..]));
@@ -517,10 +522,10 @@ mod tests {
     #[test]
     fn fuzz_receive_path_never_panics() {
         let cases: Vec<Vec<u8>> = vec![
-            vec![],                                    // 0-byte: proto-field read
-            vec![0xc0],                                // 1-byte: proto-field read
-            vec![0xc0, 0x21],                          // proto only, no body
-            vec![0xc0, 0x21, 0x01, 0x01, 0x00],        // LCP len < 6
+            vec![],                                                           // 0-byte: proto-field read
+            vec![0xc0],                         // 1-byte: proto-field read
+            vec![0xc0, 0x21],                   // proto only, no body
+            vec![0xc0, 0x21, 0x01, 0x01, 0x00], // LCP len < 6
             vec![0xc0, 0x21, 0x01, 0x01, 0x00, 0x06, 0x01, 0x04], // ConfReq, truncated option
             vec![0xc0, 0x21, 0x01, 0x01, 0x00, 0x08, 0x01, 0x01, 0x05, 0x06], // option len < 2
             vec![0xc0, 0x21, 0x01, 0x01, 0x00, 0x08, 0x01, 0xff, 0x05, 0x06], // option len overrun
@@ -532,24 +537,24 @@ mod tests {
                 }
                 lcp(Code::ConfigureReq, 1, &opts)
             },
-            lcp(Code::ConfigureNack, 1, &[0x00]),      // Nak with len < 6 body
+            lcp(Code::ConfigureNack, 1, &[0x00]), // Nak with len < 6 body
             lcp(Code::ConfigureRej, 1, &[0x01, 0xff]), // Rej with malformed option
-            vec![0xc0, 0x21, 0x09, 0x01, 0x00, 0x00],  // EchoReq, length field 0 (empty body)
-            vec![0xc0, 0x21, 0x09, 0x01, 0x00, 0x01],  // EchoReq, length 1 (< 4-byte header)
-            vec![0xc0, 0x21, 0x09, 0x01, 0x00, 0x03],  // EchoReq, length 3 (< 4-byte header)
-            vec![0xc0, 0x21, 0x05, 0x01, 0x00, 0x00],  // TerminateReq, length field 0
-            vec![0xc0, 0x21, 0x05, 0x01, 0x00, 0x02],  // TerminateReq, length 2 (< header)
+            vec![0xc0, 0x21, 0x09, 0x01, 0x00, 0x00], // EchoReq, length field 0 (empty body)
+            vec![0xc0, 0x21, 0x09, 0x01, 0x00, 0x01], // EchoReq, length 1 (< 4-byte header)
+            vec![0xc0, 0x21, 0x09, 0x01, 0x00, 0x03], // EchoReq, length 3 (< 4-byte header)
+            vec![0xc0, 0x21, 0x05, 0x01, 0x00, 0x00], // TerminateReq, length field 0
+            vec![0xc0, 0x21, 0x05, 0x01, 0x00, 0x02], // TerminateReq, length 2 (< header)
             // EchoReply variants exercising the inbound liveness pre-dispatch peek.
             vec![0xc0, 0x21, 0x0a, 0x01, 0x00, 0x08, 0x06, 0xc2, 0x7d, 0x42], // well-formed, our magic
             vec![0xc0, 0x21, 0x0a, 0x01, 0x00, 0x08, 0xde, 0xad, 0xbe, 0xef], // well-formed, wrong magic
-            vec![0xc0, 0x21, 0x0a, 0x01, 0x00, 0x06],  // EchoReply, body truncated (no magic)
+            vec![0xc0, 0x21, 0x0a, 0x01, 0x00, 0x06], // EchoReply, body truncated (no magic)
             vec![0xc0, 0x21, 0x0a, 0x01, 0xff, 0xff, 0x06, 0xc2, 0x7d, 0x42], // length overrun
-            vec![0xc0, 0x21, 0x0a, 0x01, 0x00, 0x00],  // EchoReply, length field 0 (empty body)
-            chap_challenge(1, &[0xaa; 2], b"x"),       // value-size will be 2 here (well-formed)
+            vec![0xc0, 0x21, 0x0a, 0x01, 0x00, 0x00], // EchoReply, length field 0 (empty body)
+            chap_challenge(1, &[0xaa; 2], b"x"),      // value-size will be 2 here (well-formed)
             // CHAP Challenge with value-size overrunning the packet.
             vec![0xc2, 0x23, 0x01, 0x01, 0x00, 0x09, 0xff, 0xaa, 0xbb],
-            vec![0x00, 0x21, 0xde, 0xad, 0xbe, 0xef],  // inbound IPv4 before Open
-            vec![0x12, 0x34, 0x01, 0x02, 0x03],        // unknown proto -> Protocol-Reject
+            vec![0x00, 0x21, 0xde, 0xad, 0xbe, 0xef], // inbound IPv4 before Open
+            vec![0x12, 0x34, 0x01, 0x02, 0x03],       // unknown proto -> Protocol-Reject
         ];
 
         // Each payload is replayed against a fresh session in every reachable link
@@ -569,7 +574,9 @@ mod tests {
         // Pseudo-random buffers with a fixed LCG (no IO, deterministic).
         let mut state: u64 = 0x1234_5678_9abc_def0;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as u32
         };
         for _ in 0..2000 {
@@ -622,7 +629,11 @@ mod tests {
             s.feed(&chap_result(3, 1));
             drain(&mut s).remove(0)
         };
-        s.feed(&ipcp(Code::ConfigureReq, 1, &[0x03, 0x06, 0xba, 0x6b, 0x60, 0x01]));
+        s.feed(&ipcp(
+            Code::ConfigureReq,
+            1,
+            &[0x03, 0x06, 0xba, 0x6b, 0x60, 0x01],
+        ));
         let _ = drain(&mut s);
         let our_ip = [0x03, 0x06, 0xba, 0x6b, 0x74, 0x10];
         s.feed(&ipcp(Code::ConfigureNack, ireq[3], &our_ip));
@@ -691,7 +702,11 @@ mod tests {
             .find(|f| proto_of(f) == ProtocolType::LCP && code_of(f) == Code::EchoReply)
             .expect("an LCP Echo-Reply");
         assert_eq!(reply[3], 0x42, "reply keeps the request id");
-        assert_eq!(&reply[6..10], &MAGIC.to_be_bytes(), "reply carries our magic");
+        assert_eq!(
+            &reply[6..10],
+            &MAGIC.to_be_bytes(),
+            "reply carries our magic"
+        );
     }
 
     #[test]
@@ -782,7 +797,11 @@ mod tests {
             .find(|f| proto_of(f) == ProtocolType::LCP && code_of(f) == Code::EchoReply)
             .expect("an Echo-Reply while sub-Opened after a post-Open reneg");
         assert_eq!(reply[3], 0x10, "reply keeps the request id");
-        assert_eq!(&reply[6..10], &MAGIC.to_be_bytes(), "reply carries our magic");
+        assert_eq!(
+            &reply[6..10],
+            &MAGIC.to_be_bytes(),
+            "reply carries our magic"
+        );
     }
 
     #[test]
@@ -808,7 +827,10 @@ mod tests {
         // neither answer nor originate echoes there.
         let mut s = fresh_open(); // LCP in ReqSent, never reached Opened
         assert!(!s.lcp_opened());
-        assert!(!s.send_echo_request(), "no echo before the link first opens");
+        assert!(
+            !s.send_echo_request(),
+            "no echo before the link first opens"
+        );
         let mut req = vec![0xc0, 0x21, Code::EchoReq as u8, 0x10];
         req.extend_from_slice(&8u16.to_be_bytes());
         req.extend_from_slice(&PEER_MAGIC.to_be_bytes());

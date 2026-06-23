@@ -1119,10 +1119,7 @@ mod tests {
             other => panic!("expected open, got {other:?}"),
         }
 
-        let data = Msg::Data {
-            id: 42,
-            name: None,
-        };
+        let data = Msg::Data { id: 42, name: None };
         let bytes = data.encode();
         assert_eq!(bytes.len(), 9);
         match Msg::decode(&bytes).unwrap() {

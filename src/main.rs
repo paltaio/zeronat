@@ -442,8 +442,11 @@ fn parse_args() -> Result<Cmd> {
                     pppoe_pass = Some(iter.next().ok_or("--pppoe-pass requires a value")?);
                 }
                 "--pppoe-pass-file" => {
-                    pppoe_pass_file =
-                        Some(iter.next().ok_or("--pppoe-pass-file requires a value")?.into());
+                    pppoe_pass_file = Some(
+                        iter.next()
+                            .ok_or("--pppoe-pass-file requires a value")?
+                            .into(),
+                    );
                 }
                 "--pppoe-service" => {
                     pppoe_service = Some(iter.next().ok_or("--pppoe-service requires a value")?);
@@ -734,8 +737,11 @@ async fn run(cmd: Cmd) -> Result<()> {
                 }
                 // The iptables fallback matches kept ports with the multiport
                 // module, which caps at 15 ports (control port + exclusions).
-                let mut kept: Vec<u16> =
-                    except.iter().copied().filter(|&p| p != control_port).collect();
+                let mut kept: Vec<u16> = except
+                    .iter()
+                    .copied()
+                    .filter(|&p| p != control_port)
+                    .collect();
                 kept.sort_unstable();
                 kept.dedup();
                 if kept.len() + 1 > 15 {
@@ -856,10 +862,8 @@ async fn run(cmd: Cmd) -> Result<()> {
             // effective MTU (capped to the tunnel MTU minus 8, floored). The
             // password file is read here so the precedence helper stays pure.
             let pppoe = if pppoe {
-                let user = cli::resolve_username(
-                    pppoe_user,
-                    std::env::var("ZERONAT_PPPOE_USER").ok(),
-                )?;
+                let user =
+                    cli::resolve_username(pppoe_user, std::env::var("ZERONAT_PPPOE_USER").ok())?;
                 let pass_file = match &pppoe_pass_file {
                     Some(path) => Some(std::fs::read(path).map_err(|e| -> zeronat::Error {
                         format!("reading --pppoe-pass-file {}: {e}", path.display()).into()
@@ -945,7 +949,10 @@ async fn run(cmd: Cmd) -> Result<()> {
                     tcp.len(), udp.len(), onoff(tap.is_some()), onoff(tun.is_some())
                 ),
             }
-            client::run(server, secret, tcp, udp, transport, tap, tun, pppoe, id_prefix).await
+            client::run(
+                server, secret, tcp, udp, transport, tap, tun, pppoe, id_prefix,
+            )
+            .await
         }
         Cmd::Admin {
             server,

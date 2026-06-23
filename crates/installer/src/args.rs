@@ -113,7 +113,11 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
     if (p.tap.is_some() as u8 + p.ports.is_some() as u8 + p.all as u8) > 1 {
         return Err("--ports, --tap, and --all are mutually exclusive".into());
     }
-    let mut cfg = Config::new(host.have_docker, host.have_compose, host.existing_secret.clone());
+    let mut cfg = Config::new(
+        host.have_docker,
+        host.have_compose,
+        host.existing_secret.clone(),
+    );
     cfg.ssh_port = host.ssh_port;
 
     // mode
@@ -395,8 +399,15 @@ mod tests {
 
     #[test]
     fn server_addr_gets_default_port() {
-        let p = parse(&s(&["-y", "--client", "--server-addr", "1.2.3.4", "--ports", "443/tcp"]))
-            .unwrap();
+        let p = parse(&s(&[
+            "-y",
+            "--client",
+            "--server-addr",
+            "1.2.3.4",
+            "--ports",
+            "443/tcp",
+        ]))
+        .unwrap();
         let cfg = build(&p, &host(), p.headless).unwrap();
         assert_eq!(cfg.server_addr, "1.2.3.4:2222");
         assert_eq!(cfg.control, "2222");
@@ -404,8 +415,15 @@ mod tests {
 
     #[test]
     fn server_addr_port_overrides_control() {
-        let p = parse(&s(&["-y", "--client", "--server-addr", "1.2.3.4:9000", "--ports", "443/tcp"]))
-            .unwrap();
+        let p = parse(&s(&[
+            "-y",
+            "--client",
+            "--server-addr",
+            "1.2.3.4:9000",
+            "--ports",
+            "443/tcp",
+        ]))
+        .unwrap();
         let cfg = build(&p, &host(), p.headless).unwrap();
         assert_eq!(cfg.server_addr, "1.2.3.4:9000");
         assert_eq!(cfg.control, "9000");
@@ -414,7 +432,10 @@ mod tests {
     #[test]
     fn secret_precedence() {
         // explicit flag wins over disk
-        let p = parse(&s(&["-y", "--server", "--ports", "80/tcp", "--secret", "flagsec"])).unwrap();
+        let p = parse(&s(&[
+            "-y", "--server", "--ports", "80/tcp", "--secret", "flagsec",
+        ]))
+        .unwrap();
         let mut h = host();
         h.existing_secret = Some("disksec".into());
         assert_eq!(build(&p, &h, p.headless).unwrap().secret, "flagsec");
@@ -431,13 +452,19 @@ mod tests {
 
     #[test]
     fn headless_docker_missing_errs() {
-        let p = parse(&s(&["-y", "--server", "--ports", "80/tcp", "--method", "docker"])).unwrap();
+        let p = parse(&s(&[
+            "-y", "--server", "--ports", "80/tcp", "--method", "docker",
+        ]))
+        .unwrap();
         assert!(build(&p, &host(), p.headless).is_err());
     }
 
     #[test]
     fn headless_compose_falls_back_to_run() {
-        let p = parse(&s(&["-y", "--server", "--ports", "80/tcp", "--deploy", "compose"])).unwrap();
+        let p = parse(&s(&[
+            "-y", "--server", "--ports", "80/tcp", "--deploy", "compose",
+        ]))
+        .unwrap();
         let mut h = host();
         h.have_docker = true;
         h.have_compose = false;

@@ -157,8 +157,12 @@ fn upgrade_systemd(latest: &str) -> Result<()> {
     println!("systemd: downloading zeronat-{target} ({latest})");
     let url = format!("{RELEASE_BASE}/zeronat-{target}");
     let tmp = temp_path();
-    let dl = exec(false, "curl", &["-fsSL", &url, "-o", &tmp, "--max-time", "180"])
-        .map_err(|e| format!("running curl: {e}"))?;
+    let dl = exec(
+        false,
+        "curl",
+        &["-fsSL", &url, "-o", &tmp, "--max-time", "180"],
+    )
+    .map_err(|e| format!("running curl: {e}"))?;
     if !dl.status.success() {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("download failed (no release asset for {target}?)").into());
@@ -170,8 +174,8 @@ fn upgrade_systemd(latest: &str) -> Result<()> {
         return Err(format!("installing {BIN_PATH}: {}", errtext(&inst)).into());
     }
     println!("systemd: restarting service");
-    let res =
-        exec(true, "systemctl", &["restart", "zeronat"]).map_err(|e| format!("running systemctl: {e}"))?;
+    let res = exec(true, "systemctl", &["restart", "zeronat"])
+        .map_err(|e| format!("running systemctl: {e}"))?;
     if !res.status.success() {
         return Err(format!("systemctl restart: {}", errtext(&res)).into());
     }
@@ -213,10 +217,13 @@ fn recreate_run(mode: DockerMode) -> Result<()> {
     }
     let cmd = inspect_lines(mode, "{{range .Config.Cmd}}{{println .}}{{end}}");
     let caps = inspect_lines(mode, "{{range .HostConfig.CapAdd}}{{println .}}{{end}}");
-    let devices = inspect_lines(mode, "{{range .HostConfig.Devices}}{{println .PathOnHost}}{{end}}");
+    let devices = inspect_lines(
+        mode,
+        "{{range .HostConfig.Devices}}{{println .PathOnHost}}{{end}}",
+    );
     let network = inspect_one(mode, "{{.HostConfig.NetworkMode}}").unwrap_or_else(|| "host".into());
-    let restart =
-        inspect_one(mode, "{{.HostConfig.RestartPolicy.Name}}").unwrap_or_else(|| "unless-stopped".into());
+    let restart = inspect_one(mode, "{{.HostConfig.RestartPolicy.Name}}")
+        .unwrap_or_else(|| "unless-stopped".into());
 
     let rm = dk(mode, &["rm", "-f", CONTAINER]).map_err(|e| format!("running docker: {e}"))?;
     if !rm.status.success() {
@@ -283,7 +290,10 @@ fn compose(mode: DockerMode, args: &[&str]) -> Result<()> {
     } else if have("docker-compose") {
         match mode {
             DockerMode::Direct => Command::new("docker-compose").args(args).output(),
-            DockerMode::Sudo => Command::new("sudo").arg("docker-compose").args(args).output(),
+            DockerMode::Sudo => Command::new("sudo")
+                .arg("docker-compose")
+                .args(args)
+                .output(),
         }
     } else {
         return Err("a compose file exists but docker compose is not available".into());
@@ -306,7 +316,14 @@ fn latest_version() -> Result<String> {
         false,
         "curl",
         &[
-            "-fsSL", "-I", "-o", "/dev/null", "-w", "%{url_effective}", "--max-time", "20",
+            "-fsSL",
+            "-I",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            "--max-time",
+            "20",
             LATEST_URL,
         ],
     )
