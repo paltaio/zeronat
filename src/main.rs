@@ -648,18 +648,49 @@ async fn run(cmd: Cmd) -> Result<()> {
             announce_port,
             config,
         } => {
-            // A malformed config must fail loud at startup, not boot half-configured.
+            // A valid config is authoritative. The recovery for a broken one
+            // depends on why it broke: a missing file is a normal first boot
+            // (default, then self-heal); a malformed file is set aside so its
+            // routes stay recoverable before we rewrite a fresh one, rather than
+            // crash-looping under a restart policy; an unreadable file (permission
+            // or transient IO) is fatal, because falling back here would let the
+            // next mutation overwrite intact state we never managed to read.
+            let mut self_healed = false;
             let file = match &config {
-                Some(path) => zeronat::config::load(path)?,
+                Some(path) => match zeronat::config::load(path) {
+                    Ok(cfg) => cfg,
+                    Err(zeronat::config::LoadError::Malformed(e)) => {
+                        match zeronat::config::quarantine(path) {
+                            Some(b) => zeronat::elog!(
+                                "config: {e}; moved aside to {}; starting from command-line settings and rewriting on the next change",
+                                b.display()
+                            ),
+                            None => zeronat::elog!(
+                                "config: {e}; could not set the file aside; starting from command-line settings and overwriting on the next change"
+                            ),
+                        }
+                        self_healed = true;
+                        zeronat::config::ServerConfig::default()
+                    }
+                    Err(zeronat::config::LoadError::Unreadable(e)) => return Err(e),
+                },
                 None => zeronat::config::ServerConfig::default(),
             };
 
-            let server_id = server_id
-                .or_else(|| file.id.clone())
+            // A valid file's identity/control win over the CLI; a present CLI flag
+            // that the file overrides is logged so the override is visible.
+            let (cli_id, cli_bind, cli_control) = (server_id, bind, control);
+            if let (Some(f), Some(c)) = (&file.id, &cli_id) {
+                if f != c {
+                    zeronat::elog!("config [server].id '{f}' overrides --server-id '{c}'");
+                }
+            }
+            let server_id = file
+                .id
+                .clone()
+                .or_else(|| cli_id.clone())
                 .unwrap_or_else(|| "0".to_string());
 
-            // The file's `control` (if any) names the default control endpoint;
-            // CLI --bind/--control override the address and port respectively.
             let (file_ip, file_port) = match &file.control {
                 Some(ctrl) => {
                     let addr: SocketAddrV4 = ctrl.parse().map_err(|_| -> zeronat::Error {
@@ -669,8 +700,18 @@ async fn run(cmd: Cmd) -> Result<()> {
                 }
                 None => (None, None),
             };
-            let bind_ip = bind.or(file_ip).unwrap_or(Ipv4Addr::UNSPECIFIED);
-            let control_port = control.or(file_port).unwrap_or(2222);
+            if let (Some(f), Some(c)) = (file_ip, cli_bind) {
+                if f != c {
+                    zeronat::elog!("config [server].control address {f} overrides --bind {c}");
+                }
+            }
+            if let (Some(f), Some(c)) = (file_port, cli_control) {
+                if f != c {
+                    zeronat::elog!("config [server].control port {f} overrides --control {c}");
+                }
+            }
+            let bind_ip = file_ip.or(cli_bind).unwrap_or(Ipv4Addr::UNSPECIFIED);
+            let control_port = file_port.or(cli_control).unwrap_or(2222);
 
             // Listeners: start from the file's, then fold in CLI forwards. A CLI
             // port that matches a file listener locks that file listener (kept as
@@ -793,6 +834,17 @@ async fn run(cmd: Cmd) -> Result<()> {
                 onoff(tun.is_some()),
                 onoff(dht.is_some())
             );
+            // On a self-heal the file lost its [server] table; record the resolved
+            // identity so the rewritten file matches the running server and an
+            // operator can later drop the CLI flags without a silent change.
+            let (file_id, file_control) = if self_healed {
+                (
+                    Some(server_id.clone()),
+                    Some(format!("{bind_ip}:{control_port}")),
+                )
+            } else {
+                (file.id, file.control)
+            };
             server::run(server::ServerSettings {
                 bind: bind_ip,
                 control_port,
@@ -804,8 +856,8 @@ async fn run(cmd: Cmd) -> Result<()> {
                 listeners,
                 routes,
                 config_path: config,
-                file_id: file.id,
-                file_control: file.control,
+                file_id,
+                file_control,
             })
             .await
         }

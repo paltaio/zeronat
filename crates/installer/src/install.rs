@@ -20,6 +20,11 @@ const IMAGE: &str = "ghcr.io/paltaio/zeronat:latest";
 const ETC_DIR: &str = "/etc/zeronat";
 const ENV_FILE: &str = "/etc/zeronat/.env";
 const COMPOSE_FILE: &str = "/etc/zeronat/compose.yml";
+/// Persisted route/listener state, kept in its own subdir so the container mount
+/// excludes the secret-bearing .env and compose file. Only port-forwarding
+/// servers have per-port routes worth persisting.
+const DATA_DIR: &str = "/etc/zeronat/data";
+const CONFIG_FILE: &str = "/etc/zeronat/data/server.toml";
 const BIN_PATH: &str = "/usr/local/bin/zeronat";
 const UNIT: &str = "/etc/systemd/system/zeronat.service";
 
@@ -156,6 +161,11 @@ pub fn subcmd(cfg: &Config) -> String {
                     s.push_str(&format!(" --announce-port {}", cfg.announce_port));
                 }
             }
+            // Persist per-port routes across restarts. Only port-forwarding servers
+            // have routes; tun/tap own every port and keep no per-port routing.
+            if cfg.kind == Kind::Ports {
+                s.push_str(&format!(" --config {CONFIG_FILE}"));
+            }
             s
         }
         Mode::Client if cfg.use_dht => format!("client --server dht{a}"),
@@ -282,6 +292,14 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
     let out = r.run(true, "mkdir", &["-p", ETC_DIR])?;
     if !ok(&out) {
         return Err(format!("mkdir {ETC_DIR}: {}", errtext(&out)));
+    }
+    // Port-forwarding servers persist routes into DATA_DIR; the dir must exist so
+    // the mount source is present and the server's atomic rewrite has a temp dir.
+    if cfg.mode == Mode::Server && cfg.kind == Kind::Ports {
+        let out = r.run(true, "mkdir", &["-p", DATA_DIR])?;
+        if !ok(&out) {
+            return Err(format!("mkdir {DATA_DIR}: {}", errtext(&out)));
+        }
     }
 
     r.step("writing env file".into());
@@ -616,6 +634,7 @@ fn recreate_container(r: &mut dyn Runner) -> Result<(), String> {
         r,
         "{{range .HostConfig.Devices}}{{println .PathOnHost}}{{end}}",
     );
+    let binds = inspect_lines(r, "{{range .HostConfig.Binds}}{{println .}}{{end}}");
     let network = inspect_lines(r, "{{.HostConfig.NetworkMode}}")
         .into_iter()
         .next()
@@ -646,6 +665,10 @@ fn recreate_container(r: &mut dyn Runner) -> Result<(), String> {
     for d in &devices {
         args.push("--device".into());
         args.push(d.clone());
+    }
+    for b in &binds {
+        args.push("-v".into());
+        args.push(b.clone());
     }
     if std::path::Path::new(ENV_FILE).exists() {
         args.push("--env-file".into());
@@ -810,6 +833,13 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started
                 "--device".into(),
                 "/dev/net/tun".into(),
             ]);
+        }
+        // Persist the route config across container recreation. The data subdir
+        // (not the file) is mounted: a not-yet-written file would otherwise make
+        // docker create a directory in its place, and the subdir keeps the .env
+        // secret out of the container.
+        if cfg.kind == Kind::Ports {
+            args.extend(["-v".into(), format!("{DATA_DIR}:{DATA_DIR}")]);
         }
         args.extend(["--env-file".into(), ENV_FILE.into(), IMAGE.into()]);
         args.extend(sub.split_whitespace().map(|s| s.to_string()));
@@ -1016,7 +1046,10 @@ mod tests {
         let mut c = cfg();
         c.mode = Mode::Server;
         c.ports = "443/tcp 51820/udp".into();
-        assert_eq!(subcmd(&c), "server --control 2222 --tcp 443 --udp 51820");
+        assert_eq!(
+            subcmd(&c),
+            "server --control 2222 --tcp 443 --udp 51820 --config /etc/zeronat/data/server.toml"
+        );
     }
 
     #[test]
@@ -1025,7 +1058,10 @@ mod tests {
         c.mode = Mode::Server;
         c.use_dht = true;
         c.ports = "80/tcp".into();
-        assert_eq!(subcmd(&c), "server --control 2222 --tcp 80 --server dht");
+        assert_eq!(
+            subcmd(&c),
+            "server --control 2222 --tcp 80 --server dht --config /etc/zeronat/data/server.toml"
+        );
     }
 
     #[test]
@@ -1088,7 +1124,7 @@ mod tests {
         c.announce_port = "9000".into();
         assert_eq!(
             subcmd(&c),
-            "server --control 2222 --tcp 443 --server dht --announce-ip 203.0.113.1 --announce-port 9000"
+            "server --control 2222 --tcp 443 --server dht --announce-ip 203.0.113.1 --announce-port 9000 --config /etc/zeronat/data/server.toml"
         );
     }
 

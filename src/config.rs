@@ -458,10 +458,45 @@ fn quote(s: &str) -> String {
     out
 }
 
-pub fn load(path: &Path) -> Result<ServerConfig> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| -> crate::Error { format!("read {}: {e}", path.display()).into() })?;
-    parse(&text).map_err(|e| format!("parse {}: {e}", path.display()).into())
+/// Why a config could not be loaded, kept distinct because the safe recovery
+/// differs: an unreadable file still holds intact state that must not be
+/// clobbered, while a malformed one is recoverable only by setting it aside.
+#[derive(Debug)]
+pub enum LoadError {
+    /// Present but unreadable (permission, transient IO). Contents are intact.
+    Unreadable(crate::Error),
+    /// Read but unparseable. The bytes survive; the config does not.
+    Malformed(crate::Error),
+}
+
+/// Load a server config. A missing file yields the default (empty) config so a
+/// first boot with `--config` pointing at a not-yet-written path is not an error;
+/// the file is created on the first persisted mutation.
+pub fn load(path: &Path) -> std::result::Result<ServerConfig, LoadError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ServerConfig::default()),
+        Err(e) => {
+            return Err(LoadError::Unreadable(
+                format!("read {}: {e}", path.display()).into(),
+            ))
+        }
+    };
+    parse(&text).map_err(|e| LoadError::Malformed(format!("parse {}: {e}", path.display()).into()))
+}
+
+/// Best-effort move of an unparseable config aside (`<name>.corrupt-<unixsecs>`)
+/// so its contents stay recoverable before the server writes a fresh file in its
+/// place. Returns the backup path on success.
+pub fn quarantine(path: &Path) -> Option<std::path::PathBuf> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut name = path.file_name()?.to_os_string();
+    name.push(format!(".corrupt-{ts}"));
+    let backup = path.with_file_name(name);
+    std::fs::rename(path, &backup).ok().map(|_| backup)
 }
 
 /// Write `text` to `path` crash-safely: write a same-directory temp file, fsync
@@ -689,6 +724,41 @@ mod tests {
             .collect();
         assert!(leftover.is_empty(), "no temp file should remain");
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_missing_file_is_default() {
+        let path = std::env::temp_dir().join(format!(
+            "zeronat-absent-{}-{}.toml",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert_eq!(load(&path).unwrap(), ServerConfig::default());
+    }
+
+    #[test]
+    fn load_malformed_file_is_recoverable_and_quarantinable() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeronat-bad-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.toml");
+        std::fs::write(&path, "[server\nid = ").unwrap();
+        assert!(matches!(load(&path), Err(LoadError::Malformed(_))));
+
+        // Quarantine preserves the original bytes under a sibling name and frees
+        // the path so a fresh file can take its place.
+        let backup = quarantine(&path).expect("rename aside succeeds");
+        assert!(!path.exists(), "original is moved");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "[server\nid = ");
+        assert!(backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("server.toml.corrupt-"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

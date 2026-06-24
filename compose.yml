@@ -5,4 +5,6 @@ services:
     network_mode: host
     restart: unless-stopped
     env_file: .env
+    volumes:
+      - /etc/zeronat/data:/etc/zeronat/data
     command: ${ZERONAT_ARGS}
