@@ -36,7 +36,7 @@ jobs:
           - mips64-unknown-linux-gnuabi64
           - mips64el-unknown-linux-gnuabi64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -60,7 +60,7 @@ jobs:
         run: install -D "target/${{ matrix.target }}/release/zeronat-installer" "out/zeronat-installer-${{ matrix.target }}"
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: installer-${{ matrix.target }}
           path: out/zeronat-installer-${{ matrix.target }}
@@ -73,9 +73,9 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: installer-*
@@ -90,9 +90,9 @@ jobs:
           done
           touch _site/.nojekyll
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

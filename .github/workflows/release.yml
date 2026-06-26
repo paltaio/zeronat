@@ -30,7 +30,7 @@ jobs:
           - mips64-unknown-linux-gnuabi64
           - mips64el-unknown-linux-gnuabi64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -60,7 +60,7 @@ jobs:
         run: install -D "target/${{ matrix.target }}/release/zeronat" "out/zeronat"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.target }}
           path: out/zeronat
@@ -75,7 +75,7 @@ jobs:
           - x86_64-unknown-freebsd
           - aarch64-unknown-freebsd
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -106,7 +106,7 @@ jobs:
         run: install -D "target/${{ matrix.target }}/release/zeronat" "out/zeronat"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.target }}
           path: out/zeronat
@@ -123,7 +123,7 @@ jobs:
           - x86_64-pc-windows-msvc
           - aarch64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -152,7 +152,7 @@ jobs:
         run: install -D "target/${{ matrix.target }}/release/zeronat.exe" "out/zeronat.exe"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.target }}
           path: out/zeronat.exe
@@ -163,7 +163,7 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: bin-*
@@ -178,7 +178,7 @@ jobs:
               install -m 0755 "$d/zeronat" "out/zeronat-${name}"
             fi
           done
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: out/zeronat-*
 
@@ -186,26 +186,26 @@ jobs:
     needs: binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Docker platform -> static musl target. scratch images COPY a prebuilt
       # binary, so no emulation is needed to assemble them.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: bin-x86_64-unknown-linux-musl, path: dist/linux/amd64 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: bin-aarch64-unknown-linux-musl, path: dist/linux/arm64 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: bin-armv7-unknown-linux-musleabihf, path: dist/linux/arm/v7 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: bin-arm-unknown-linux-musleabihf, path: dist/linux/arm/v6 }
 
       - name: Mark binaries executable
         run: find dist -name zeronat -exec chmod +x {} +
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -213,7 +213,7 @@ jobs:
 
       - name: Image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/zeronat
           tags: |
@@ -223,7 +223,7 @@ jobs:
             type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
