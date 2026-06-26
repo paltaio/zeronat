@@ -1,0 +1,16 @@
+[package]
+name = "znpppoe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "znpppoe"
+path = "src/main.rs"
+
+[dependencies]
+zeronat = { path = "../..", default-features = false, features = ["dht"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
+anyhow = "1"

@@ -1,11 +1,11 @@
 [package]
 name = "zeronat"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 license = "MIT"
 
 [workspace]
-members = ["crates/tui", "crates/installer"]
+members = ["crates/tui", "crates/installer", "crates/znpppoe"]
 default-members = ["."]
 
 [features]
