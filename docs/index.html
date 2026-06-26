@@ -95,6 +95,7 @@
       <a class="nav-link" href="#allports">All ports</a>
       <a class="nav-link" href="#tap">L2 bridge</a>
       <a class="nav-link" href="#dht">DHT discovery</a>
+      <a class="nav-link" href="#znpppoe">PPPoE proxy</a>
       <a class="nav-link" href="#build">Build</a>
       <a class="nav-link" href="#cli">CLI reference</a>
       <a class="nav-link" href="#scope">Scope</a>
@@ -253,6 +254,23 @@ ZERONAT_SECRET=s zeronat client --server dht --tcp 443</code></pre>
       <p><code>--announce-ip &lt;ip&gt;</code> overrides the detected IP and <code>--announce-port &lt;port&gt;</code>
       the announced port (default: the control port) when the server sits behind a port-forward. The client
       caches the last-known address and re-queries the DHT only when it stops working.</p>
+    </section>
+
+    <section id="znpppoe">
+      <h2>PPPoE proxy (znpppoe)</h2>
+      <p><code>znpppoe</code> opens many PPPoE sessions in userspace over one tunnel and exposes each as a
+      SOCKS5 egress, each with its own ISP-assigned IP. It needs no kernel interface and no privileges. The
+      server is a normal L2 bridge to the PPPoE segment (<code>--tap</code>, see above); the SOCKS credentials
+      are separate from the PPPoE login, and the username selects the egress session.</p>
+<pre><code>docker run -d --name znpppoe -p 127.0.0.1:1080:1080 \
+  -e ZN_SECRET=s -e ZN_USER=&lt;pppoe-user&gt; -e ZN_PASSWORD=&lt;pppoe-pass&gt; \
+  -e ZN_PROXY_USER=proxy -e ZN_PROXY_PASS=&lt;proxy-pass&gt; \
+  ghcr.io/paltaio/znpppoe --dht --connections 50 --socks-listen 0.0.0.0:1080
+
+<span class="c"># _pppoe&lt;K&gt; in the username picks session K, each a distinct ISP IP:</span>
+curl --socks5 proxy_pppoe7:&lt;proxy-pass&gt;@127.0.0.1:1080 https://ifconfig.me</code></pre>
+      <p>Use <code>--host &lt;ip:port&gt;</code> instead of <code>--dht</code> for a fixed server. The ISP must
+      allow concurrent PPPoE sessions on the login. Linux image, amd64 and arm64.</p>
     </section>
 
     <section id="build">
