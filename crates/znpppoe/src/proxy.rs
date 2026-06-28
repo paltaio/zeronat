@@ -126,6 +126,16 @@ pub async fn connect(handles: &[Handle], idx: usize, target: SocketAddrV4) -> Re
 }
 
 impl Conn {
+    /// Queue bytes to the remote before splicing. The plain-HTTP forward path uses
+    /// this to send the rewritten request head ahead of the client's body bytes.
+    pub async fn send(&self, bytes: Vec<u8>) -> Result<()> {
+        if self.to_tx.send(bytes).await.is_err() {
+            bail!("remote closed before request was sent");
+        }
+        self.handle.wake();
+        Ok(())
+    }
+
     /// Pump bytes between the client halves and the session until either side ends.
     pub async fn splice(self, rd: OwnedReadHalf, wr: OwnedWriteHalf) {
         let Conn {
