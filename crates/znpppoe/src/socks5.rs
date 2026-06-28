@@ -1,10 +1,7 @@
-//! Minimal SOCKS5 (CONNECT) front end. Clients authenticate with the proxy
-//! password, and the username `<proxy_user>_pppoe<K>` selects egress session K.
-//! These credentials are separate from the PPPoE login.
-//!
-//! Domain targets are resolved with the container's resolver, then dialed through
-//! the chosen session, so only the TCP egress (not the DNS lookup) carries the
-//! PPPoE source address.
+//! SOCKS5 (CONNECT) front end. Clients authenticate with the proxy password; the
+//! username picks the egress session (see `proxy::Selector`). Domain targets are
+//! resolved with the container's resolver, then dialed through the chosen session,
+//! so only the TCP egress (not the DNS lookup) carries the PPPoE source address.
 
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -12,56 +9,38 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
 
-use crate::netstack::{Connect, Handle};
+use crate::netstack::Handle;
+use crate::proxy::{self, Selector};
 
-const CHAN_DEPTH: usize = 64;
-const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(35);
 /// Cap the pre-splice handshake so a silent client cannot park a task and fd.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Credentials a SOCKS client must present. The username also carries the egress
-/// selector: `<user>_pppoe<K>`.
-pub struct Auth {
-    pub user: String,
-    pub pass: String,
-}
-
 pub async fn serve(
     listen: SocketAddr,
-    proxy_user: String,
-    proxy_pass: String,
-    handles: Vec<Handle>,
+    selector: Arc<Selector>,
+    handles: Arc<Vec<Handle>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(listen)
         .await
         .with_context(|| format!("bind socks5 {listen}"))?;
-    eprintln!(
-        "znpppoe: socks5 on {listen}; user '{proxy_user}_pppoe<0..{}>' selects egress",
-        handles.len().saturating_sub(1)
-    );
-    let auth = Arc::new(Auth {
-        user: proxy_user,
-        pass: proxy_pass,
-    });
-    let handles = Arc::new(handles);
+    eprintln!("znpppoe: socks5 on {listen}");
     loop {
         let (sock, _) = listener.accept().await?;
-        let auth = auth.clone();
+        let selector = selector.clone();
         let handles = handles.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(sock, &auth, &handles).await {
+            if let Err(e) = handle(sock, &selector, &handles).await {
                 eprintln!("znpppoe: socks5 conn: {e}");
             }
         });
     }
 }
 
-async fn handle(mut sock: TcpStream, auth: &Auth, handles: &[Handle]) -> Result<()> {
+async fn handle(mut sock: TcpStream, selector: &Selector, handles: &[Handle]) -> Result<()> {
     let (idx, target) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         negotiate_auth(&mut sock).await?;
-        let idx = read_userpass(&mut sock, auth, handles.len()).await?;
+        let idx = read_userpass(&mut sock, selector).await?;
         let target = read_request(&mut sock).await?;
         Ok::<_, anyhow::Error>((idx, target))
     })
@@ -71,62 +50,18 @@ async fn handle(mut sock: TcpStream, auth: &Auth, handles: &[Handle]) -> Result<
         Err(_) => bail!("socks5 handshake timed out"),
     };
 
-    let (to_tx, to_rx) = mpsc::channel::<Vec<u8>>(CHAN_DEPTH);
-    let (from_tx, mut from_rx) = mpsc::channel::<Vec<u8>>(CHAN_DEPTH);
-    let (ready_tx, ready_rx) = oneshot::channel::<bool>();
-    let handle = handles[idx].clone();
-    handle
-        .connect(Connect {
-            target,
-            to_remote: to_rx,
-            from_remote: from_tx,
-            ready: ready_tx,
-        })
-        .await;
-
-    // Backstop the connection wait: even if the stack never replies (cmd dropped),
-    // fail fast instead of parking the worker forever.
-    let ok = match tokio::time::timeout(CONNECT_WAIT, ready_rx).await {
-        Ok(Ok(v)) => v,
-        _ => false,
-    };
-    reply(&mut sock, if ok { 0x00 } else { 0x01 }).await?;
-    if !ok {
-        bail!("connect to {target} via session {idx} failed");
+    match proxy::connect(handles, idx, target).await {
+        Ok(conn) => {
+            reply(&mut sock, 0x00).await?;
+            let (rd, wr) = sock.into_split();
+            conn.splice(rd, wr).await;
+            Ok(())
+        }
+        Err(e) => {
+            reply(&mut sock, 0x01).await?;
+            Err(e)
+        }
     }
-
-    let (mut rd, mut wr) = sock.into_split();
-    let up = handle.clone();
-    let client_to_remote = tokio::spawn(async move {
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            match rd.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if to_tx.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                    up.wake();
-                }
-            }
-        }
-        // Drop the sender, then nudge so the stack closes the write half promptly.
-        drop(to_tx);
-        up.wake();
-    });
-    let down = handle.clone();
-    let remote_to_client = tokio::spawn(async move {
-        while let Some(chunk) = from_rx.recv().await {
-            if wr.write_all(&chunk).await.is_err() {
-                break;
-            }
-            // Nudge the stack so it refills the drained download channel promptly.
-            down.wake();
-        }
-        let _ = wr.shutdown().await;
-    });
-    let _ = tokio::join!(client_to_remote, remote_to_client);
-    Ok(())
 }
 
 async fn negotiate_auth(sock: &mut TcpStream) -> Result<()> {
@@ -145,10 +80,9 @@ async fn negotiate_auth(sock: &mut TcpStream) -> Result<()> {
     Ok(())
 }
 
-/// Read RFC1929 username/password. The password must equal the configured proxy
-/// password, and the username must be `<proxy_user>_pppoe<K>`, which also selects
-/// the egress session.
-async fn read_userpass(sock: &mut TcpStream, auth: &Auth, count: usize) -> Result<usize> {
+/// Read RFC1929 username/password and resolve the egress session through the
+/// selector (password check plus username routing).
+async fn read_userpass(sock: &mut TcpStream, selector: &Selector) -> Result<usize> {
     let mut head = [0u8; 2];
     sock.read_exact(&mut head).await?;
     if head[0] != 0x01 {
@@ -161,20 +95,10 @@ async fn read_userpass(sock: &mut TcpStream, auth: &Auth, count: usize) -> Resul
     let mut pass = vec![0u8; plen[0] as usize];
     sock.read_exact(&mut pass).await?;
 
-    let ok = pass == auth.pass.as_bytes();
-    let idx = ok
-        .then(|| parse_session(&user, &auth.user, count))
-        .flatten();
+    let idx = selector.select(&user, &pass);
     sock.write_all(&[0x01, if idx.is_some() { 0x00 } else { 0x01 }])
         .await?;
-    idx.context("bad proxy credentials")
-}
-
-fn parse_session(user: &[u8], base: &str, count: usize) -> Option<usize> {
-    let user = std::str::from_utf8(user).ok()?;
-    let suffix = user.strip_prefix(base)?.strip_prefix("_pppoe")?;
-    let idx: usize = suffix.parse().ok()?;
-    (idx < count).then_some(idx)
+    idx.context("bad proxy credentials or no live session")
 }
 
 async fn read_request(sock: &mut TcpStream) -> Result<SocketAddrV4> {
@@ -209,7 +133,8 @@ async fn read_request(sock: &mut TcpStream) -> Result<SocketAddrV4> {
     Ok(target)
 }
 
-async fn resolve_v4(host: &str, port: u16) -> Result<SocketAddrV4> {
+/// Resolve a domain to its first IPv4 address.
+pub(crate) async fn resolve_v4(host: &str, port: u16) -> Result<SocketAddrV4> {
     for addr in tokio::net::lookup_host((host, port)).await? {
         if let SocketAddr::V4(v4) = addr {
             return Ok(v4);

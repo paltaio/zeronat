@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddrV4;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,10 +59,12 @@ impl Handle {
     }
 }
 
-pub fn spawn(session: Session, mtu: usize) -> Handle {
+/// `live` reflects whether the session currently has a negotiated address, so the
+/// SOCKS selector can rotate over only the sessions that can carry traffic.
+pub fn spawn(session: Session, mtu: usize, live: Arc<AtomicBool>) -> Handle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<Connect>(CHAN_DEPTH);
     let wake = Arc::new(Notify::new());
-    tokio::spawn(run(session, mtu, cmd_rx, wake.clone()));
+    tokio::spawn(run(session, mtu, cmd_rx, wake.clone(), live));
     Handle { cmd: cmd_tx, wake }
 }
 
@@ -84,6 +87,7 @@ async fn run(
     mtu: usize,
     mut cmd_rx: mpsc::Receiver<Connect>,
     wake: Arc<Notify>,
+    live: Arc<AtomicBool>,
 ) {
     let idx = session.idx;
     let mut device = ChannelDevice {
@@ -117,6 +121,7 @@ async fn run(
                     configured = false;
                 }
             }
+            live.store(configured, Ordering::Relaxed);
         }
 
         while let Ok(pkt) = session.inbound_ip.try_recv() {

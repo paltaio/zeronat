@@ -23,6 +23,8 @@ const RETRANSMIT_TICKS: u32 = 3;
 const MAX_ATTEMPTS: u32 = 5;
 const NEGO_TICK: Duration = Duration::from_secs(1);
 const KEEPALIVE: Duration = Duration::from_secs(20);
+// Shared outbound IP queue for all sessions. Under sustained load a hot session
+// can crowd the others and a full queue drops frames (TCP retransmits recover).
 const IP_QUEUE: usize = 256;
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -187,6 +189,7 @@ async fn run(
             &mut out_rx,
             &inbound_txs,
             &est_txs,
+            &dialer.client_id,
         )
         .await;
 
@@ -212,6 +215,7 @@ async fn session_loop(
     out_rx: &mut mpsc::Receiver<(usize, Vec<u8>)>,
     inbound_txs: &[mpsc::Sender<Vec<u8>>],
     est_txs: &[watch::Sender<Option<Established>>],
+    client_id: &str,
 ) {
     let cancel = bridge.cancel.clone();
     let mut nego = tokio::time::interval(NEGO_TICK);
@@ -262,6 +266,8 @@ async fn session_loop(
                 if last_in.elapsed() >= UDP_IDLE {
                     return;
                 }
+                // Re-announce the name so a dropped attach frame self-heals.
+                bridge.tx.send_name(client_id).await.ok();
                 bridge.tx.probe().await.ok();
             }
         }

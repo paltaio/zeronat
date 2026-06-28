@@ -1,15 +1,18 @@
 //! znpppoe: spawn N userspace PPPoE sessions over one zeronat tunnel and expose
 //! each as a SOCKS5 egress. No kernel interface, no host routing, no privileges.
 //!
-//! The SOCKS5 username selects the egress session: `<user>_pppoe<K>` routes
-//! through PPPoE session K (0-based).
+//! The SOCKS5 username picks the egress: the bare proxy user round-robins over the
+//! live sessions, `_pppoe<K>` pins session K, and `_s<token>` is sticky per token.
 
 mod bridge;
 mod driver;
+mod httpproxy;
 mod netstack;
+mod proxy;
 mod socks5;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
@@ -24,16 +27,19 @@ struct Config {
     proxy_pass: String,
     connections: usize,
     socks_listen: SocketAddr,
+    http_listen: SocketAddr,
     pppoe_mtu: u16,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "znpppoe (--host IP:PORT | --dht) [--connections N] [--socks-listen ADDR] [--pppoe-mtu N]\n\
+        "znpppoe (--host IP:PORT | --dht) [--connections N]\n\
+         [--socks-listen ADDR] [--http-listen ADDR] [--pppoe-mtu N]\n\
          env: ZN_SECRET, ZN_USER, ZN_PASSWORD (PPPoE login), ZN_PROXY_USER, ZN_PROXY_PASS\n\
-         (SOCKS auth) required; ZN_SERVICE optional\n\
-         SOCKS5 auth: password = ZN_PROXY_PASS, username = <ZN_PROXY_USER>_pppoe<K> selects session K\n\
-         --socks-listen defaults to 127.0.0.1:1080"
+         (proxy auth) required; ZN_SERVICE optional\n\
+         SOCKS5 and HTTP CONNECT proxies share auth: password = ZN_PROXY_PASS; username\n\
+         <ZN_PROXY_USER> round-robins, _pppoe<K> pins session K, _s<token> is sticky\n\
+         listens default to 127.0.0.1:1080 (socks) and 127.0.0.1:8081 (http)"
     );
     std::process::exit(2);
 }
@@ -43,6 +49,7 @@ fn parse() -> Result<Config> {
     let mut dht = false;
     let mut connections = 1usize;
     let mut socks_listen: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+    let mut http_listen: SocketAddr = "127.0.0.1:8081".parse().unwrap();
     let mut pppoe_mtu = 1492u16;
 
     let mut args = std::env::args().skip(1);
@@ -63,6 +70,13 @@ fn parse() -> Result<Config> {
                     .context("--socks-listen needs a value")?
                     .parse()
                     .context("--socks-listen must be addr:port")?;
+            }
+            "--http-listen" => {
+                http_listen = args
+                    .next()
+                    .context("--http-listen needs a value")?
+                    .parse()
+                    .context("--http-listen must be addr:port")?;
             }
             "--pppoe-mtu" => {
                 pppoe_mtu = args
@@ -106,6 +120,7 @@ fn parse() -> Result<Config> {
         proxy_pass,
         connections,
         socks_listen,
+        http_listen,
         pppoe_mtu,
     })
 }
@@ -143,12 +158,19 @@ async fn main() -> Result<()> {
 
     let sessions = driver::spawn(dialer, cfg.connections, creds);
     let mtu = cfg.pppoe_mtu as usize;
-    let handles: Vec<netstack::Handle> = sessions
-        .into_iter()
-        .map(|s| netstack::spawn(s, mtu))
-        .collect();
+    let mut handles = Vec::with_capacity(cfg.connections);
+    let mut live = Vec::with_capacity(cfg.connections);
+    for s in sessions {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        handles.push(netstack::spawn(s, mtu, flag.clone()));
+        live.push(flag);
+    }
 
-    socks5::serve(cfg.socks_listen, cfg.proxy_user, cfg.proxy_pass, handles)
-        .await
-        .context("socks5 server")
+    let selector = Arc::new(proxy::Selector::new(cfg.proxy_user, cfg.proxy_pass, live));
+    let handles = Arc::new(handles);
+    tokio::try_join!(
+        socks5::serve(cfg.socks_listen, selector.clone(), handles.clone()),
+        httpproxy::serve(cfg.http_listen, selector, handles),
+    )?;
+    Ok(())
 }
