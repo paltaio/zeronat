@@ -1,7 +1,8 @@
 //! A throwaway Mainline DHT client: bootstrap, an iterative `get` lookup that
 //! also collects write tokens and our externally-seen IP (BEP42), and a `put`.
 //! It keeps no in-memory routing table; each lookup warm-starts from a persisted
-//! set of recently live nodes and falls back to the routers when that is thin.
+//! set of recently live nodes and always also seeds the bootstrap routers, with the
+//! persisted cache letting the walk proceed when router DNS resolution fails.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -78,17 +79,17 @@ impl Node {
     /// Iteratively walk toward `target`, collecting write tokens, stored values,
     /// and BEP42 IP votes.
     pub async fn lookup(&self, target: [u8; 20]) -> Result<Lookup> {
-        // Warm-start from previously live nodes; only when the cache is thin do we
-        // load the routers, sparing them the steady-state request load. The cache
-        // is pure optimization: a non-empty seed lets a lookup proceed even when
-        // every router is unreachable, and an empty seed still surfaces the same
-        // bootstrap-resolution error as before.
+        // Seed from previously live nodes and always fold in the bootstrap routers.
+        // The routers are the dependable source of BEP42 external-IP votes (which the
+        // server's announce needs to learn its own address) and of fresh, reachable
+        // nodes to converge on. After a WAN-IP change or a network blip the cached
+        // nodes can all be stale, and a cache-only lookup then fails to determine the
+        // external IP or to reach the record's storers; the routers recover both.
+        // Router DNS failure is tolerated as long as the cache still seeds the walk.
         let cached = read_node_cache();
         let mut seed: Vec<SocketAddrV4> = cached.clone();
-        if cached.len() < K {
-            if let Ok(boot) = resolve_bootstrap().await {
-                seed.extend(boot);
-            }
+        if let Ok(boot) = resolve_bootstrap().await {
+            seed.extend(boot);
         }
         let mut deduped = HashSet::new();
         seed.retain(|a| deduped.insert(*a));
