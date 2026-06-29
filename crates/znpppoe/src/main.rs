@@ -15,6 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use tokio::sync::Semaphore;
 
 /// Default PPPoE MTU. Each forwarded frame crosses the tunnel as one unreliable
 /// `CLASS_DGRAM` UDP packet (no retransmit, and IP fragments rarely survive the
@@ -25,6 +26,21 @@ use anyhow::{bail, Context, Result};
 /// a larger usable MTU can raise it with `--pppoe-mtu`.
 const DEFAULT_PPPOE_MTU: u16 = 1280;
 const _: () = assert!(DEFAULT_PPPOE_MTU as usize + 52 <= zeronat::kcp::KCP_MTU);
+
+/// Default per-connection smoltcp TCP buffers, in bytes. The receive buffer sets
+/// the advertised window and so bounds throughput (~ window / RTT); smoltcp only
+/// turns on RFC 7323 window scaling once it reaches 64 KiB. 256 KiB fills a fast
+/// link at low RTT while staying cheap per connection. The send buffer bounds upload
+/// throughput (~ tx / RTT) the same way; it is smaller because this proxy's traffic
+/// is download-dominated, so raise `--sock-tx` for upload-heavy or high-RTT paths.
+/// Both are tunable in KiB.
+const DEFAULT_SOCK_RX: usize = 256 * 1024;
+const DEFAULT_SOCK_TX: usize = 64 * 1024;
+/// smoltcp panics on a TCP buffer larger than 1 GiB.
+const MAX_SOCK_BUF: usize = 1 << 30;
+/// Default ceiling on concurrent proxied connections. With fixed (non-autotuning)
+/// buffers this cap is the only bound on total buffer memory: ~max_conns * (rx+tx).
+const DEFAULT_MAX_CONNS: usize = 1024;
 
 struct Config {
     host: Option<String>,
@@ -39,12 +55,16 @@ struct Config {
     socks_listen: SocketAddr,
     http_listen: SocketAddr,
     pppoe_mtu: u16,
+    sock_rx: usize,
+    sock_tx: usize,
+    max_conns: usize,
 }
 
 fn usage() -> ! {
     eprintln!(
         "znpppoe (--host IP:PORT | --dht) [--connections N]\n\
          [--socks-listen ADDR] [--http-listen ADDR] [--pppoe-mtu N]\n\
+         [--sock-rx KIB] [--sock-tx KIB] [--max-conns N]\n\
          env: ZN_SECRET, ZN_USER, ZN_PASSWORD (PPPoE login), ZN_PROXY_USER, ZN_PROXY_PASS\n\
          (proxy auth) required; ZN_SERVICE optional\n\
          SOCKS5 and HTTP CONNECT proxies share auth: password = ZN_PROXY_PASS; username\n\
@@ -61,6 +81,9 @@ fn parse() -> Result<Config> {
     let mut socks_listen: SocketAddr = "127.0.0.1:1080".parse().unwrap();
     let mut http_listen: SocketAddr = "127.0.0.1:8081".parse().unwrap();
     let mut pppoe_mtu = DEFAULT_PPPOE_MTU;
+    let mut sock_rx = DEFAULT_SOCK_RX;
+    let mut sock_tx = DEFAULT_SOCK_TX;
+    let mut max_conns = DEFAULT_MAX_CONNS;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -95,6 +118,29 @@ fn parse() -> Result<Config> {
                     .parse()
                     .context("--pppoe-mtu must be a number")?;
             }
+            "--sock-rx" => {
+                let kib: usize = args
+                    .next()
+                    .context("--sock-rx needs a value")?
+                    .parse()
+                    .context("--sock-rx must be a number (KiB)")?;
+                sock_rx = kib.saturating_mul(1024);
+            }
+            "--sock-tx" => {
+                let kib: usize = args
+                    .next()
+                    .context("--sock-tx needs a value")?
+                    .parse()
+                    .context("--sock-tx must be a number (KiB)")?;
+                sock_tx = kib.saturating_mul(1024);
+            }
+            "--max-conns" => {
+                max_conns = args
+                    .next()
+                    .context("--max-conns needs a value")?
+                    .parse()
+                    .context("--max-conns must be a number")?;
+            }
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
         }
@@ -109,6 +155,21 @@ fn parse() -> Result<Config> {
     let mtu_ceiling = zeronat::kcp::KCP_MTU - 52;
     if pppoe_mtu as usize > mtu_ceiling {
         bail!("--pppoe-mtu must be at most {mtu_ceiling}");
+    }
+    if sock_rx == 0 || sock_rx > MAX_SOCK_BUF {
+        bail!("--sock-rx must be 1..={} KiB", MAX_SOCK_BUF / 1024);
+    }
+    if sock_tx == 0 || sock_tx > MAX_SOCK_BUF {
+        bail!("--sock-tx must be 1..={} KiB", MAX_SOCK_BUF / 1024);
+    }
+    if sock_rx < 64 * 1024 {
+        eprintln!(
+            "znpppoe: --sock-rx {} KiB is below 64 KiB; TCP window scaling stays off and download throughput is capped",
+            sock_rx / 1024
+        );
+    }
+    if max_conns == 0 || max_conns > Semaphore::MAX_PERMITS {
+        bail!("--max-conns must be 1..={}", Semaphore::MAX_PERMITS);
     }
     if dht && host.is_some() {
         bail!("--dht and --host are mutually exclusive");
@@ -139,6 +200,9 @@ fn parse() -> Result<Config> {
         socks_listen,
         http_listen,
         pppoe_mtu,
+        sock_rx,
+        sock_tx,
+        max_conns,
     })
 }
 
@@ -179,15 +243,29 @@ async fn main() -> Result<()> {
     let mut live = Vec::with_capacity(cfg.connections);
     for s in sessions {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        handles.push(netstack::spawn(s, mtu, flag.clone()));
+        handles.push(netstack::spawn(
+            s,
+            mtu,
+            cfg.sock_rx,
+            cfg.sock_tx,
+            flag.clone(),
+        ));
         live.push(flag);
     }
 
     let selector = Arc::new(proxy::Selector::new(cfg.proxy_user, cfg.proxy_pass, live));
     let handles = Arc::new(handles);
+    // One cap shared by both front ends bounds total concurrent connections, and so
+    // the total fixed buffer memory they hold.
+    let conns = Arc::new(Semaphore::new(cfg.max_conns));
     tokio::try_join!(
-        socks5::serve(cfg.socks_listen, selector.clone(), handles.clone()),
-        httpproxy::serve(cfg.http_listen, selector, handles),
+        socks5::serve(
+            cfg.socks_listen,
+            selector.clone(),
+            handles.clone(),
+            conns.clone()
+        ),
+        httpproxy::serve(cfg.http_listen, selector, handles, conns),
     )?;
     Ok(())
 }

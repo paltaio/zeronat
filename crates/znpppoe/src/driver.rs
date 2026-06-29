@@ -34,6 +34,11 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// No inbound frame for this long means the tunnel is wedged (a silent UDP
 /// black-hole or expired NAT mapping yields no error), so bounce and reconnect.
 const UDP_IDLE: Duration = Duration::from_secs(120);
+/// Every session down for this long after the link was up means the bridge to the
+/// server is gone (e.g. the server restarted): the attach happens once per tunnel
+/// connect and cannot re-establish in place, so an in-place PPPoE redial loops
+/// forever. Bounce the tunnel to re-attach instead of waiting out `UDP_IDLE`.
+const REBRIDGE_GRACE: Duration = Duration::from_secs(30);
 
 /// How to reach the zeronat server, so the driver can redial after a tunnel drop.
 pub struct Dialer {
@@ -225,6 +230,7 @@ async fn session_loop(
     let mut keepalive = tokio::time::interval(KEEPALIVE);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_in = Instant::now();
+    let mut last_up = Instant::now();
 
     loop {
         tokio::select! {
@@ -260,6 +266,15 @@ async fn session_loop(
                     let phase = dps[i].on_tick();
                     flush_one(i, dps, bridge).await;
                     apply_phase(i, phase, dps, bridge, inbound_txs, est_txs, seen).await;
+                }
+                // A live session keeps the timer fresh; if every session has been
+                // down past the grace, the bridge is gone and redialing in place
+                // cannot recover, so bounce the tunnel to re-attach.
+                if seen.iter().any(|&s| s) {
+                    last_up = Instant::now();
+                } else if last_up.elapsed() >= REBRIDGE_GRACE {
+                    eprintln!("znpppoe: all sessions down {REBRIDGE_GRACE:?}; rebridging");
+                    return;
                 }
             }
 

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use crate::netstack::Handle;
 use crate::proxy::{self, Selector};
@@ -20,6 +21,7 @@ pub async fn serve(
     listen: SocketAddr,
     selector: Arc<Selector>,
     handles: Arc<Vec<Handle>>,
+    conns: Arc<Semaphore>,
 ) -> Result<()> {
     let listener = TcpListener::bind(listen)
         .await
@@ -27,9 +29,14 @@ pub async fn serve(
     eprintln!("znpppoe: socks5 on {listen}");
     loop {
         let (sock, _) = listener.accept().await?;
+        // Hold a permit for the connection's lifetime; at the cap, drop the socket.
+        let Ok(permit) = conns.clone().try_acquire_owned() else {
+            continue;
+        };
         let selector = selector.clone();
         let handles = handles.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle(sock, &selector, &handles).await {
                 eprintln!("znpppoe: socks5 conn: {e}");
             }

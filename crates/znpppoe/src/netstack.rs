@@ -18,12 +18,6 @@ use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::driver::Session;
 
-/// Per-socket TCP buffer. The receive half also sets the advertised window, and
-/// throughput is bounded by window / RTT. smoltcp derives its window-scale shift as
-/// `(floor(log2(rx_capacity)) + 1) - 16`, so the buffer must be at least 64 KiB for
-/// any scaling at all; 1 MiB gives shift 5 and a ~1 MiB window, enough to fill a
-/// fast link at a few ms RTT instead of stalling near 64 KiB/RTT.
-const SOCK_BUF: usize = 1024 * 1024;
 const CHAN_DEPTH: usize = 64;
 const MAX_IDLE: Duration = Duration::from_millis(500);
 /// Idle/connect timeout: a black-holed SYN or stalled connection aborts to Closed
@@ -66,10 +60,24 @@ impl Handle {
 
 /// `live` reflects whether the session currently has a negotiated address, so the
 /// SOCKS selector can rotate over only the sessions that can carry traffic.
-pub fn spawn(session: Session, mtu: usize, live: Arc<AtomicBool>) -> Handle {
+pub fn spawn(
+    session: Session,
+    mtu: usize,
+    rx_buf: usize,
+    tx_buf: usize,
+    live: Arc<AtomicBool>,
+) -> Handle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<Connect>(CHAN_DEPTH);
     let wake = Arc::new(Notify::new());
-    tokio::spawn(run(session, mtu, cmd_rx, wake.clone(), live));
+    tokio::spawn(run(
+        session,
+        mtu,
+        rx_buf,
+        tx_buf,
+        cmd_rx,
+        wake.clone(),
+        live,
+    ));
     Handle { cmd: cmd_tx, wake }
 }
 
@@ -87,9 +95,12 @@ struct Conn {
     established: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     mut session: Session,
     mtu: usize,
+    rx_buf: usize,
+    tx_buf: usize,
     mut cmd_rx: mpsc::Receiver<Connect>,
     wake: Arc<Notify>,
     live: Arc<AtomicBool>,
@@ -147,7 +158,7 @@ async fn run(
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => match cmd {
-                Some(c) => open(c, &mut iface, &mut sockets, &mut conns, &mut next_port, configured),
+                Some(c) => open(c, &mut iface, &mut sockets, &mut conns, &mut next_port, configured, rx_buf, tx_buf),
                 None => return,
             },
             Some(pkt) = session.inbound_ip.recv() => device.inbound.push_back(pkt),
@@ -165,13 +176,15 @@ fn open(
     conns: &mut HashMap<SocketHandle, Conn>,
     next_port: &mut u16,
     configured: bool,
+    rx_buf: usize,
+    tx_buf: usize,
 ) {
     if !configured {
         let _ = c.ready.send(false);
         return;
     }
-    let rx = tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]);
-    let tx = tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]);
+    let rx = tcp::SocketBuffer::new(vec![0u8; rx_buf]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; tx_buf]);
     let mut socket = tcp::Socket::new(rx, tx);
     socket.set_nagle_enabled(false);
     socket.set_timeout(Some(SOCK_TIMEOUT.into()));
