@@ -23,9 +23,11 @@ const RETRANSMIT_TICKS: u32 = 3;
 const MAX_ATTEMPTS: u32 = 5;
 const NEGO_TICK: Duration = Duration::from_secs(1);
 const KEEPALIVE: Duration = Duration::from_secs(20);
-// Shared outbound IP queue for all sessions. Under sustained load a hot session
-// can crowd the others and a full queue drops frames (TCP retransmits recover).
-const IP_QUEUE: usize = 256;
+// Depth of the per-session inbound IP queue and the shared outbound queue. A full
+// queue drops frames (TCP retransmits recover), so it is sized to hold roughly a
+// full TCP window of in-flight segments at the netstack's buffer size; too small
+// and a fast download's inbound burst is dropped faster than it is drained.
+const IP_QUEUE: usize = 1024;
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);

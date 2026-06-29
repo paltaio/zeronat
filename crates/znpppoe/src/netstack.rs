@@ -18,7 +18,12 @@ use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::driver::Session;
 
-const SOCK_BUF: usize = 32 * 1024;
+/// Per-socket TCP buffer. The receive half also sets the advertised window, and
+/// throughput is bounded by window / RTT. smoltcp derives its window-scale shift as
+/// `(floor(log2(rx_capacity)) + 1) - 16`, so the buffer must be at least 64 KiB for
+/// any scaling at all; 1 MiB gives shift 5 and a ~1 MiB window, enough to fill a
+/// fast link at a few ms RTT instead of stalling near 64 KiB/RTT.
+const SOCK_BUF: usize = 1024 * 1024;
 const CHAN_DEPTH: usize = 64;
 const MAX_IDLE: Duration = Duration::from_millis(500);
 /// Idle/connect timeout: a black-holed SYN or stalled connection aborts to Closed
