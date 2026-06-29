@@ -16,6 +16,16 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
+/// Default PPPoE MTU. Each forwarded frame crosses the tunnel as one unreliable
+/// `CLASS_DGRAM` UDP packet (no retransmit, and IP fragments rarely survive the
+/// path), wrapped with 52 bytes of framing (class+tag+nonce+AEAD tag and the
+/// Ethernet/PPPoE/PPP headers). So `pppoe_mtu + 52` must fit the tunnel's
+/// single-packet budget, `kcp::KCP_MTU`; the ceiling is `KCP_MTU - 52`. 1280 leaves
+/// margin for extra underlay encapsulation and is the IPv6 minimum MTU. Paths with
+/// a larger usable MTU can raise it with `--pppoe-mtu`.
+const DEFAULT_PPPOE_MTU: u16 = 1280;
+const _: () = assert!(DEFAULT_PPPOE_MTU as usize + 52 <= zeronat::kcp::KCP_MTU);
+
 struct Config {
     host: Option<String>,
     dht: bool,
@@ -50,7 +60,7 @@ fn parse() -> Result<Config> {
     let mut connections = 1usize;
     let mut socks_listen: SocketAddr = "127.0.0.1:1080".parse().unwrap();
     let mut http_listen: SocketAddr = "127.0.0.1:8081".parse().unwrap();
-    let mut pppoe_mtu = 1492u16;
+    let mut pppoe_mtu = DEFAULT_PPPOE_MTU;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -92,6 +102,13 @@ fn parse() -> Result<Config> {
 
     if connections == 0 {
         bail!("--connections must be at least 1");
+    }
+    // A larger MTU makes each forwarded frame exceed the tunnel's single-packet
+    // budget, silently black-holing large flows (see DEFAULT_PPPOE_MTU); reject it
+    // up front instead.
+    let mtu_ceiling = zeronat::kcp::KCP_MTU - 52;
+    if pppoe_mtu as usize > mtu_ceiling {
+        bail!("--pppoe-mtu must be at most {mtu_ceiling}");
     }
     if dht && host.is_some() {
         bail!("--dht and --host are mutually exclusive");

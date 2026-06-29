@@ -48,7 +48,7 @@ curl --proxy http://proxy_sjob42:proxypass@127.0.0.1:8081 https://ifconfig.me  #
 - `--connections N` number of PPPoE sessions (default 1).
 - `--socks-listen ADDR` SOCKS5 bind address (default `127.0.0.1:1080`).
 - `--http-listen ADDR` HTTP CONNECT bind address (default `127.0.0.1:8081`).
-- `--pppoe-mtu N` requested PPP MTU (default 1492).
+- `--pppoe-mtu N` requested PPP MTU (default 1280; raise it only on an underlay with a larger usable MTU).
 - `ZN_SECRET` tunnel secret.
 - `ZN_USER`/`ZN_PASSWORD` PPPoE login; `ZN_SERVICE` optional PPPoE service name.
 - `ZN_PROXY_USER`/`ZN_PROXY_PASS` proxy credentials (separate from the PPPoE
