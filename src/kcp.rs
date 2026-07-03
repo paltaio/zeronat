@@ -101,6 +101,7 @@ async fn drive_conv(mut kcp: Kcp<ChannelWriter>, mut ch: ConvChannels) {
     let now_ms = move || base.elapsed().as_millis() as u32;
     let mut buf = vec![0u8; 65535];
     let mut write_open = true;
+    let mut reader_open = true;
     // Monotonic last-progress mark; immune to wall-clock steps. Reset on every
     // inbound packet so an active conv never trips the idle deadline.
     let mut last_seen = Instant::now();
@@ -116,6 +117,16 @@ async fn drive_conv(mut kcp: Kcp<ChannelWriter>, mut ch: ConvChannels) {
                 return; // reader gone
             }
         }
+        // Both stream halves are gone and every queued byte has been sent and
+        // acked: the conv is finished, so release its slot now rather than
+        // holding it until CONV_IDLE. A dropped stream with unacked data keeps
+        // the driver alive to retransmit the tail; against a silent peer the
+        // idle deadline below still bounds that. A stray late segment for a
+        // reaped conv re-enters route_kcp as a new peer-initiated conv; it
+        // fails its handshake and idles out, bounded by MAX_CONVS_PER_SESSION.
+        if !reader_open && !write_open && kcp.wait_snd() == 0 {
+            return;
+        }
         let delay = kcp.check(now_ms()).max(1);
         tokio::select! {
             pkt = ch.inbound_rx.recv() => match pkt {
@@ -126,6 +137,7 @@ async fn drive_conv(mut kcp: Kcp<ChannelWriter>, mut ch: ConvChannels) {
                 Some(d) => { let _ = kcp.send(&d); }
                 None => { write_open = false; }
             },
+            _ = ch.read_tx.closed(), if reader_open => { reader_open = false; }
             _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {
                 if last_seen.elapsed() >= CONV_IDLE {
                     return; // silent peer; reclaim KCP state and the map entry
@@ -502,6 +514,101 @@ mod tests {
         cli_run.abort();
     }
 
+    // Dropping a KcpStream with nothing in flight must release the conv's map
+    // slot promptly, not hold it for the full CONV_IDLE window. The peer stays
+    // silent, so only the stream drop can trigger the reap.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_stream_releases_conv_slot() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = sock.local_addr().unwrap();
+        let sess = session(sock, peer, 1);
+
+        let (conv, stream) = sess.open_conv(CLASS_KCP);
+        assert!(sess.convs.lock().unwrap().contains_key(&conv));
+
+        drop(stream);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !sess.convs.lock().unwrap().contains_key(&conv),
+            "conv slot still held after stream drop"
+        );
+        assert!(sess.is_idle(), "live counter must reach zero after reap");
+    }
+
+    // Data written right before the stream drops must still reach the peer:
+    // the driver lingers to retransmit the unacked tail and reaps only once
+    // the peer has acked it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_stream_flushes_pending_data() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cli_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let srv_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let cli_addr = cli_sock.local_addr().unwrap();
+        let srv_addr = srv_sock.local_addr().unwrap();
+
+        let cli = session(cli_sock.clone(), srv_addr, 1);
+        let srv = session(srv_sock.clone(), cli_addr, 0);
+
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let srv_run = {
+            let srv = srv.clone();
+            tokio::spawn(async move {
+                let mut accepted_tx = Some(accepted_tx);
+                let mut buf = [0u8; 65535];
+                loop {
+                    let (n, _) = srv_sock.recv_from(&mut buf).await.unwrap();
+                    if let Some(Accepted::Stream { stream, .. }) = route(&srv, &buf[..n]) {
+                        if let Some(tx) = accepted_tx.take() {
+                            let _ = tx.send(stream);
+                        }
+                    }
+                }
+            })
+        };
+        let cli_run = {
+            let cli = cli.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 65535];
+                loop {
+                    let (n, _) = cli_sock.recv_from(&mut buf).await.unwrap();
+                    route(&cli, &buf[..n]);
+                }
+            })
+        };
+
+        let payload = vec![0xABu8; 64 * 1024];
+        let (_conv, mut stream) = cli.open_conv(CLASS_KCP);
+        for chunk in payload.chunks(16 * 1024) {
+            stream.write_all(chunk).await.unwrap();
+        }
+        drop(stream);
+
+        let mut srv_stream = tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(5), srv_stream.read_exact(&mut got))
+            .await
+            .expect("peer must receive the full payload despite the stream drop")
+            .unwrap();
+        assert_eq!(got, payload);
+
+        // Once the tail is acked the client's conv slot must be released.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cli.convs.lock().unwrap().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "conv slot not reaped after flush"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        srv_run.abort();
+        cli_run.abort();
+    }
+
     /// One CLASS_KCP datagram (class byte + minimal KCP header) naming `conv`,
     /// the shape `route` parses on the public control port.
     fn kcp_datagram(conv: u32) -> Vec<u8> {
@@ -514,15 +621,20 @@ mod tests {
     // A flood of distinct conv-ids from one peer must never grow the session's
     // live conv count past MAX_CONVS_PER_SESSION: beyond the cap each unknown
     // conv is dropped with no driver spawned, while convs already open keep
-    // their slot. This is the anti-OOM bound on a single source.
+    // their slot. This is the anti-OOM bound on a single source. The accepted
+    // streams are held for the test's duration; a dropped stream would release
+    // its slot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn route_kcp_caps_convs_per_session() {
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let peer = sock.local_addr().unwrap();
         let sess = session(sock, peer, 0);
 
+        let mut streams = Vec::new();
         for conv in 0..(MAX_CONVS_PER_SESSION as u32 + 200) {
-            route(&sess, &kcp_datagram(conv));
+            if let Some(Accepted::Stream { stream, .. }) = route(&sess, &kcp_datagram(conv)) {
+                streams.push(stream);
+            }
             assert!(
                 sess.convs.lock().unwrap().len() <= MAX_CONVS_PER_SESSION,
                 "conv count exceeded cap at conv {conv}"
