@@ -86,8 +86,7 @@ impl Node {
         // nodes can all be stale, and a cache-only lookup then fails to determine the
         // external IP or to reach the record's storers; the routers recover both.
         // Router DNS failure is tolerated as long as the cache still seeds the walk.
-        let cached = read_node_cache();
-        let mut seed: Vec<SocketAddrV4> = cached.clone();
+        let mut seed = read_node_cache();
         if let Ok(boot) = resolve_bootstrap().await {
             seed.extend(boot);
         }
@@ -96,10 +95,23 @@ impl Node {
         if seed.is_empty() {
             return Err("dht bootstrap resolution failed".into());
         }
+        let (lookup, live) = self.walk(&target, seed).await;
+        write_node_cache(&live);
+        Ok(lookup)
+    }
 
+    /// The iterative walk from `seed`, then a final `get` over the K closest
+    /// contacts still lacking a write token. Returns the lookup result and the
+    /// live node addresses to persist for the next warm start.
+    async fn walk(
+        &self,
+        target: &[u8; 20],
+        seed: Vec<SocketAddrV4>,
+    ) -> (Lookup, Vec<SocketAddrV4>) {
         let mut shortlist: Vec<Contact> = Vec::new();
         let mut seen: HashSet<SocketAddrV4> = HashSet::new();
         let mut queried: HashSet<SocketAddrV4> = HashSet::new();
+        let mut known: Vec<Contact> = Vec::new();
         let mut storers: Vec<Contact> = Vec::new();
         let mut values: Vec<Value> = Vec::new();
         let mut ip_votes: HashMap<Ipv4Addr, u32> = HashMap::new();
@@ -124,8 +136,15 @@ impl Node {
             // Routers reliably answer find_node but may not implement BEP44 get;
             // only switch to get once talking to discovered full nodes.
             let method: &[u8] = if round == 0 { b"find_node" } else { b"get" };
-            for p in self.round(&current, round, &target, method).await {
+            for p in self.round(&current, round, target, method).await {
                 responders.push(p.from);
+                if let Some(id) = p.id {
+                    known.push(Contact {
+                        id,
+                        addr: p.from,
+                        token: None,
+                    });
+                }
                 if let Some(ip) = p.ip {
                     *ip_votes.entry(ip).or_default() += 1;
                 }
@@ -145,7 +164,7 @@ impl Node {
                     }
                 }
             }
-            shortlist.sort_by_key(|c| dist(&c.id, &target));
+            shortlist.sort_by_key(|c| dist(&c.id, target));
             current = shortlist
                 .iter()
                 .filter(|c| !queried.contains(&c.addr))
@@ -154,7 +173,47 @@ impl Node {
                 .collect();
         }
 
-        storers.sort_by_key(|c| dist(&c.id, &target));
+        // Round 0 marks the seeds queried after only a find_node, so on a warm
+        // cache every closest contact can finish the walk token-less, leaving
+        // put() nowhere to store and stored values uncollected. Ask once more
+        // with get, over the K closest contacts still worth trying: responders
+        // that hold no token yet, plus discovered nodes never queried at all.
+        // A walk that already gathered K token holders converged and skips it.
+        if storers.len() < K {
+            let with_token: HashSet<SocketAddrV4> = storers.iter().map(|c| c.addr).collect();
+            let answered: HashSet<SocketAddrV4> = known.iter().map(|c| c.addr).collect();
+            let mut finalists: Vec<Contact> = known
+                .iter()
+                .chain(shortlist.iter())
+                .filter(|c| !with_token.contains(&c.addr))
+                .filter(|c| answered.contains(&c.addr) || !queried.contains(&c.addr))
+                .cloned()
+                .collect();
+            let mut uniq = HashSet::new();
+            finalists.retain(|c| uniq.insert(c.addr));
+            finalists.sort_by_key(|c| dist(&c.id, target));
+            finalists.truncate(K);
+            if !finalists.is_empty() {
+                for p in self.round(&finalists, ROUNDS, target, b"get").await {
+                    responders.push(p.from);
+                    if let Some(ip) = p.ip {
+                        *ip_votes.entry(ip).or_default() += 1;
+                    }
+                    if let Some(v) = p.value {
+                        values.push(v);
+                    }
+                    if let (Some(id), Some(token)) = (p.id, p.token) {
+                        storers.push(Contact {
+                            id,
+                            addr: p.from,
+                            token: Some(token),
+                        });
+                    }
+                }
+            }
+        }
+
+        storers.sort_by_key(|c| dist(&c.id, target));
         let mut kept = HashSet::new();
         storers.retain(|c| kept.insert(c.addr));
         storers.truncate(K);
@@ -162,8 +221,8 @@ impl Node {
             .into_iter()
             .max_by_key(|&(_, n)| n)
             .map(|(ip, _)| ip);
-        // Persist currently-live nodes for the next lookup's warm start: storers
-        // (answered with a token) first, then any other responder seen this round.
+        // Collect currently-live nodes for the next lookup's warm start: storers
+        // (answered with a token) first, then any other responder seen this walk.
         let mut live: Vec<SocketAddrV4> = Vec::new();
         let mut kept_live = HashSet::new();
         for c in storers.iter().map(|c| c.addr).chain(responders) {
@@ -174,12 +233,14 @@ impl Node {
                 break;
             }
         }
-        write_node_cache(&live);
-        Ok(Lookup {
-            storers,
-            values,
-            external_ip,
-        })
+        (
+            Lookup {
+                storers,
+                values,
+                external_ip,
+            },
+            live,
+        )
     }
 
     /// Store a signed mutable item at the nodes that returned write tokens.
@@ -453,6 +514,67 @@ mod tests {
         let encoded = encode_nodes(&nodes);
         assert_eq!(encoded.len(), nodes.len() * 6);
         assert_eq!(decode_nodes(&encoded), nodes);
+    }
+
+    /// A responder implementing just enough KRPC for the walk: answers
+    /// find_node with its id only, and get with its id, a write token, and
+    /// a stored value.
+    async fn fake_dht_node(sock: tokio::net::UdpSocket, id: [u8; 20], token: &[u8]) {
+        let mut buf = [0u8; RECV_BUF];
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
+            let Some(msg) = decode(&buf[..n]) else {
+                continue;
+            };
+            let Some(q) = msg.get(b"q").and_then(|b| b.bytes()) else {
+                continue;
+            };
+            let Some(t) = msg.get(b"t").and_then(|b| b.bytes()) else {
+                continue;
+            };
+            let mut r = BTreeMap::new();
+            r.insert(b"id".to_vec(), Ben::Bytes(id.to_vec()));
+            if q == b"get" {
+                r.insert(b"token".to_vec(), Ben::Bytes(token.to_vec()));
+                r.insert(b"k".to_vec(), Ben::Bytes(vec![3u8; 32]));
+                r.insert(b"seq".to_vec(), Ben::Int(5));
+                r.insert(b"sig".to_vec(), Ben::Bytes(vec![4u8; 64]));
+                r.insert(b"v".to_vec(), Ben::Bytes(b"payload".to_vec()));
+            }
+            let mut d = BTreeMap::new();
+            d.insert(b"r".to_vec(), Ben::Dict(r));
+            d.insert(b"t".to_vec(), Ben::Bytes(t.to_vec()));
+            d.insert(b"y".to_vec(), Ben::Bytes(b"r".to_vec()));
+            let _ = sock.send_to(&Ben::Dict(d).encode(), from).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_start_seed_yields_write_token_via_final_get() {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let SocketAddr::V4(seed_addr) = sock.local_addr().unwrap() else {
+            unreachable!();
+        };
+        let seed_id = [9u8; 20];
+        let responder = tokio::spawn(fake_dht_node(sock, seed_id, b"tok"));
+
+        // The seed answers round 0's find_node with no discoveries, so the walk
+        // ends immediately; only the final get can extract its write token and
+        // its stored value.
+        let node = Node::new().await.unwrap();
+        let (lookup, live) = node.walk(&[7u8; 20], vec![seed_addr]).await;
+        responder.abort();
+
+        assert_eq!(lookup.storers.len(), 1);
+        assert_eq!(lookup.storers[0].addr, seed_addr);
+        assert_eq!(lookup.storers[0].id, seed_id);
+        assert_eq!(lookup.storers[0].token.as_deref(), Some(&b"tok"[..]));
+        assert_eq!(lookup.values.len(), 1);
+        assert_eq!(lookup.values[0].v, b"payload".to_vec());
+        assert_eq!(lookup.values[0].seq, 5);
+        assert!(live.contains(&seed_addr));
     }
 
     #[test]
