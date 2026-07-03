@@ -54,7 +54,7 @@ impl NatPlan {
     }
 }
 
-/// The nftables ruleset for `plan`, as a script fed to `nft -f -`.
+/// The core nftables ruleset for `plan`, as a script fed to `nft -f -`.
 fn nft_script(plan: &NatPlan) -> String {
     let iface = &plan.iface;
     let cidr = plan.cidr();
@@ -77,28 +77,46 @@ fn nft_script(plan: &NatPlan) -> String {
          add rule ip zeronat prerouting iifname != \"{iface}\" ip daddr != {cidr} ip protocol icmp dnat to {client}\n\
          add rule ip zeronat postrouting oifname \"{iface}\" snat to {server}\n\
          add rule ip zeronat forward oifname \"{iface}\" tcp flags & (syn | rst) == syn tcp option maxseg size set {mss}\n\
-         add rule ip zeronat forward iifname \"{iface}\" tcp flags & (syn | rst) == syn tcp option maxseg size set {mss}\n\
-         add rule ip zeronat forward oifname \"{iface}\" accept\n\
-         add rule ip zeronat forward iifname \"{iface}\" accept\n"
+         add rule ip zeronat forward iifname \"{iface}\" tcp flags & (syn | rst) == syn tcp option maxseg size set {mss}\n"
     )
 }
 
-/// One iptables rule in the named table/chain; `command` builds its `-A`
-/// invocation. Teardown deletes by `zeronat` comment, not by this spec.
+/// Tunnel accepts for Docker's DOCKER-USER chain. An accept in zeronat's own
+/// table cannot save forwarded traffic from another table's drop: every base
+/// chain hooked at forward sees the packet, and any drop verdict is final. So
+/// when Docker manages the firewall through iptables-nft, the accepts go
+/// inside Docker's own `ip filter` table, at the top of `DOCKER-USER`, its
+/// first-evaluated chain, where accept ends that table's traversal before the
+/// FORWARD drop policy applies. Kept out of `nft_script` so this transaction
+/// can fail (a Docker restart racing install) without taking the NAT with it.
+fn nft_docker_user_script(plan: &NatPlan) -> String {
+    let iface = &plan.iface;
+    format!(
+        "insert rule ip filter DOCKER-USER oifname \"{iface}\" accept comment \"zeronat\"\n\
+         insert rule ip filter DOCKER-USER iifname \"{iface}\" accept comment \"zeronat\"\n"
+    )
+}
+
+/// One iptables rule in the named table/chain; `command` builds its `-A` (or
+/// `-I 1`) invocation. Teardown deletes by `zeronat` comment, not by this spec.
 struct IptRule {
     table: &'static str,
     chain: &'static str,
+    /// Insert at the top instead of appending: Docker's default DOCKER-USER
+    /// ends with an unconditional RETURN, so an appended rule sits behind it,
+    /// never reached.
+    insert: bool,
     args: Vec<String>,
 }
 
 impl IptRule {
     fn command(&self) -> Vec<String> {
-        let mut c = vec![
-            "-t".into(),
-            self.table.into(),
-            "-A".into(),
-            self.chain.into(),
-        ];
+        let mut c = vec!["-t".into(), self.table.into()];
+        if self.insert {
+            c.extend(["-I".into(), self.chain.into(), "1".into()]);
+        } else {
+            c.extend(["-A".into(), self.chain.into()]);
+        }
         c.extend(self.args.iter().cloned());
         c
     }
@@ -106,7 +124,9 @@ impl IptRule {
 
 /// The iptables ruleset for `plan`. Mirrors `nft_script`: DNAT every forwarded
 /// port plus ICMP to the client, SNAT egress out the tunnel to the server.
-fn iptables_rules(plan: &NatPlan) -> Vec<IptRule> {
+/// `docker_user` adds tunnel accepts to Docker's DOCKER-USER chain when it
+/// exists, where Docker's FORWARD drop policy cannot override them.
+fn iptables_rules(plan: &NatPlan, docker_user: bool) -> Vec<IptRule> {
     let iface = plan.iface.clone();
     let cidr = plan.cidr();
     let client = plan.client_ip.to_string();
@@ -165,6 +185,7 @@ fn iptables_rules(plan: &NatPlan) -> Vec<IptRule> {
         rules.push(IptRule {
             table: "nat",
             chain: "PREROUTING",
+            insert: false,
             args,
         });
     }
@@ -187,6 +208,7 @@ fn iptables_rules(plan: &NatPlan) -> Vec<IptRule> {
         rules.push(IptRule {
             table: "nat",
             chain: "PREROUTING",
+            insert: false,
             args,
         });
     }
@@ -203,6 +225,7 @@ fn iptables_rules(plan: &NatPlan) -> Vec<IptRule> {
         rules.push(IptRule {
             table: "nat",
             chain: "POSTROUTING",
+            insert: false,
             args,
         });
     }
@@ -228,22 +251,38 @@ fn iptables_rules(plan: &NatPlan) -> Vec<IptRule> {
         rules.push(IptRule {
             table: "mangle",
             chain: "FORWARD",
+            insert: false,
             args,
         });
     }
-    // Accept forwarding to/from the tunnel so a host whose filter FORWARD policy
-    // is DROP (a default-deny host, or Docker, which sets policy DROP) does not
-    // black-hole the DNAT'd traffic. Appended, so it is reached before the policy
-    // fallthrough. A host that installs its own explicit FORWARD drop ahead of
-    // this still needs operator integration (see manual_instructions).
+    // Accept forwarding to/from the tunnel so a default-deny host does not
+    // black-hole the DNAT'd traffic. Appended, so it is reached before the
+    // policy fallthrough. A host that installs its own explicit FORWARD drop
+    // ahead of this still needs operator integration (see manual_instructions).
     for dir in ["-o", "-i"] {
         let mut args = vec![dir.into(), iface.clone(), "-j".into(), "ACCEPT".into()];
         args.extend(comment());
         rules.push(IptRule {
             table: "filter",
             chain: "FORWARD",
+            insert: false,
             args,
         });
+    }
+    // When Docker manages the firewall, put the accepts at the top of its
+    // DOCKER-USER chain as well: that chain is evaluated ahead of everything
+    // Docker programs into FORWARD, so its drop policy cannot override them.
+    if docker_user {
+        for dir in ["-o", "-i"] {
+            let mut args = vec![dir.into(), iface.clone(), "-j".into(), "ACCEPT".into()];
+            args.extend(comment());
+            rules.push(IptRule {
+                table: "filter",
+                chain: "DOCKER-USER",
+                insert: true,
+                args,
+            });
+        }
     }
     rules
 }
@@ -260,6 +299,7 @@ const IPT_CHAINS: &[(&str, &str)] = &[
     ("nat", "POSTROUTING"),
     ("mangle", "FORWARD"),
     ("filter", "FORWARD"),
+    ("filter", "DOCKER-USER"),
 ];
 
 /// Holds the installed NAT and removes it on drop: an `nft delete table` (atomic)
@@ -284,7 +324,10 @@ impl NatGuard {
 impl Drop for NatGuard {
     fn drop(&mut self) {
         match self.backend {
-            Backend::Nft => nft_delete_table(),
+            Backend::Nft => {
+                nft_delete_table();
+                nft_delete_docker_user_rules();
+            }
             Backend::Iptables => flush_iptables(),
         }
         if self.restore_ip_forward {
@@ -330,7 +373,7 @@ pub fn install(plan: &NatPlan) -> Outcome {
         }
     }
     if have_ipt {
-        let rules = iptables_rules(plan);
+        let rules = iptables_rules(plan, iptables_chain_exists("filter", "DOCKER-USER"));
         match install_iptables(&rules) {
             Ok(()) => {
                 return Outcome::Installed(NatGuard {
@@ -354,15 +397,18 @@ fn manual_instructions(plan: &NatPlan) -> String {
          apply these on the server to forward every port to the client:\n\n  \
          sysctl -w net.ipv4.ip_forward=1\n",
     );
-    for r in iptables_rules(plan) {
+    for r in iptables_rules(plan, false) {
         s.push_str("  iptables ");
         s.push_str(&r.command().join(" "));
         s.push('\n');
     }
-    s.push_str(
-        "\nif the host has a restrictive FORWARD policy (e.g. Docker), also allow \
-         forwarding to/from the tunnel interface.\n",
-    );
+    s.push_str(&format!(
+        "\nif Docker manages the host firewall, its FORWARD drop policy overrides \
+         the accepts above; also insert:\n  \
+         iptables -I DOCKER-USER 1 -o {iface} -j ACCEPT\n  \
+         iptables -I DOCKER-USER 1 -i {iface} -j ACCEPT\n",
+        iface = plan.iface,
+    ));
     s
 }
 
@@ -387,6 +433,70 @@ fn nft_delete_table() {
             "zeronat".into(),
         ],
     );
+}
+
+/// True when Docker's DOCKER-USER chain exists in the nft `ip filter` table,
+/// i.e. Docker manages the firewall through iptables-nft. Probed once at
+/// install: a Docker started or restarted afterwards recreates its chains
+/// without the zeronat accepts, and forwarding stays black-holed until the
+/// next zeronat start.
+fn nft_docker_user_exists() -> bool {
+    Command::new("nft")
+        .args(["list", "chain", "ip", "filter", "DOCKER-USER"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Delete the `zeronat`-tagged accepts from Docker's DOCKER-USER chain by
+/// handle. That chain belongs to Docker's `ip filter` table, so deleting the
+/// zeronat table never reaches these rules.
+fn nft_delete_docker_user_rules() {
+    let out = match Command::new("nft")
+        .args(["-a", "list", "chain", "ip", "filter", "DOCKER-USER"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if !line.contains("comment \"zeronat\"") {
+            continue;
+        }
+        let Some(handle) = line
+            .rsplit("# handle ")
+            .next()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        else {
+            continue;
+        };
+        run_ignore(
+            "nft",
+            &[
+                "delete".into(),
+                "rule".into(),
+                "ip".into(),
+                "filter".into(),
+                "DOCKER-USER".into(),
+                "handle".into(),
+                handle.to_string(),
+            ],
+        );
+    }
+}
+
+/// True when `chain` exists in `table` (Docker creates DOCKER-USER when it
+/// manages the firewall).
+fn iptables_chain_exists(table: &str, chain: &str) -> bool {
+    Command::new("iptables")
+        .args(["-t", table, "-S", chain])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Delete every `zeronat`-tagged iptables rule across the chains we use, by rule
@@ -427,9 +537,20 @@ fn flush_iptables() {
 }
 
 fn install_nft(plan: &NatPlan) -> Result<()> {
-    // Drop any stale table first so a re-run never stacks duplicate rules.
+    // Drop any stale rules first so a re-run never stacks duplicates.
     nft_delete_table();
-    let script = nft_script(plan);
+    nft_delete_docker_user_rules();
+    nft_apply(&nft_script(plan))?;
+    // Best-effort, in its own transaction: losing a race with a Docker restart
+    // must not fail the NAT that already applied.
+    if nft_docker_user_exists() {
+        let _ = nft_apply(&nft_docker_user_script(plan));
+    }
+    Ok(())
+}
+
+/// Feed `script` to `nft -f -` as one atomic transaction.
+fn nft_apply(script: &str) -> Result<()> {
     let mut child = Command::new("nft")
         .arg("-f")
         .arg("-")
@@ -563,13 +684,26 @@ mod tests {
         assert!(s.contains(
             "iifname \"zn0\" tcp flags & (syn | rst) == syn tcp option maxseg size set 1360"
         ));
-        assert!(s.contains("forward oifname \"zn0\" accept"));
-        assert!(s.contains("forward iifname \"zn0\" accept"));
+        // Without Docker, nothing references its table.
+        assert!(!s.contains("DOCKER-USER"));
+    }
+
+    #[test]
+    fn nft_docker_accepts_go_in_docker_user_chain() {
+        // The accepts must land in Docker's table, not zeronat's.
+        let s = nft_docker_user_script(&plan());
+        assert!(s.contains(
+            "insert rule ip filter DOCKER-USER oifname \"zn0\" accept comment \"zeronat\""
+        ));
+        assert!(s.contains(
+            "insert rule ip filter DOCKER-USER iifname \"zn0\" accept comment \"zeronat\""
+        ));
+        assert!(!nft_script(&plan()).contains(" accept\n"));
     }
 
     #[test]
     fn iptables_rules_shape() {
-        let rules = iptables_rules(&plan());
+        let rules = iptables_rules(&plan(), false);
         assert_eq!(rules.len(), 8);
         // tcp/udp DNAT use multiport for several kept ports.
         let tcp = rules[0].command().join(" ");
@@ -603,6 +737,24 @@ mod tests {
             .command()
             .join(" ")
             .contains("-t filter -A FORWARD -i zn0 -j ACCEPT"));
+        // Without Docker, no rule touches its chain.
+        assert!(rules.iter().all(|r| r.chain != "DOCKER-USER"));
+    }
+
+    #[test]
+    fn iptables_docker_accepts_inserted_atop_docker_user() {
+        let rules = iptables_rules(&plan(), true);
+        assert_eq!(rules.len(), 10);
+        // DOCKER-USER ends with an unconditional RETURN, so the accepts must be
+        // inserted at the top, not appended.
+        assert_eq!(
+            rules[8].command().join(" "),
+            "-t filter -I DOCKER-USER 1 -o zn0 -j ACCEPT -m comment --comment zeronat"
+        );
+        assert_eq!(
+            rules[9].command().join(" "),
+            "-t filter -I DOCKER-USER 1 -i zn0 -j ACCEPT -m comment --comment zeronat"
+        );
     }
 
     #[test]
@@ -611,7 +763,7 @@ mod tests {
             except: vec![],
             ..plan()
         };
-        let rules = iptables_rules(&p);
+        let rules = iptables_rules(&p, false);
         let tcp = rules[0].command().join(" ");
         assert!(tcp.contains("-p tcp ! --dport 2222 -j DNAT"));
         assert!(!tcp.contains("multiport"));
