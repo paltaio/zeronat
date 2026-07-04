@@ -188,8 +188,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Docker platform -> static musl target. scratch images COPY a prebuilt
-      # binary, so no emulation is needed to assemble them.
+      # Docker platform -> static musl target.
       - uses: actions/download-artifact@v8
         with: { name: bin-x86_64-unknown-linux-musl, path: dist/linux/amd64 }
       - uses: actions/download-artifact@v8
@@ -201,6 +200,9 @@ jobs:
 
       - name: Mark binaries executable
         run: find dist -name zeronat -exec chmod +x {} +
+
+      # The base-image package install runs under emulation for the arm variants.
+      - uses: docker/setup-qemu-action@v4
 
       - uses: docker/setup-buildx-action@v4
 
