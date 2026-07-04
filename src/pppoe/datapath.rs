@@ -17,7 +17,7 @@
 //! never panics on a malformed frame (the release profile is panic=abort).
 
 use super::discovery::{Action, Discovery, Established as DiscoveryEstablished};
-use super::engine::{self, FeedOutcome, PppConfig, PppSession};
+use super::engine::{self, FeedOutcome, PppConfig, PppPhase, PppSession};
 use super::session::{build_session_frame, parse_eth_header, parse_session_frame};
 use super::{MacAddr, ETHERTYPE_DISCOVERY, ETHERTYPE_SESSION};
 
@@ -285,8 +285,8 @@ impl<'a> PppoeDatapath<'a> {
         self.our_mac
     }
 
-    /// Why the link last went down (`echo-timeout`, `padt`, `lcp-closed`), for the
-    /// shell's redial log. `unknown` before any link-down.
+    /// Why the link last went down (`echo-timeout`, `padt`, `lcp-closed`,
+    /// `ppp-timeout`), for the shell's redial log. `unknown` before any link-down.
     pub fn link_down_reason(&self) -> &'static str {
         self.link_down_reason.unwrap_or("unknown")
     }
@@ -383,15 +383,22 @@ impl<'a> PppoeDatapath<'a> {
     }
 
     /// Advance the timers and return the resulting phase. Drives
-    /// `Discovery::on_tick` (PADI/PADR retransmit, the only real retransmit in the
-    /// stack) and `PppSession::poll` (phase advance, originating ConfReqs once a
-    /// sub-FSM is Closed). The PPP layer has no restart timer, so a lost LCP/IPCP
-    /// ConfReq is not retransmitted here; the shell's idle reaper redials.
+    /// `Discovery::on_tick` (PADI/PADR retransmit) and `PppSession::on_tick`
+    /// (LCP/IPCP restart timers, phase advance, originating ConfReqs once a
+    /// sub-FSM is Closed).
     pub fn on_tick(&mut self) -> DpPhase {
         let action = self.discovery.on_tick();
         self.apply_discovery_action(action);
-        self.ppp.poll();
+        self.ppp.on_tick();
         self.drain_ppp_out();
+        // PPP gave up: a sub-FSM exhausted its RFC 1661 restart counter and
+        // negotiation cannot progress. A deterministic link-down; the shell
+        // redials. An inbound Terminate is caught on the frame instead, in
+        // `on_session_frame`, before this ever runs.
+        if self.session.is_some() && !self.link_down && self.ppp.phase() == PppPhase::Dead {
+            self.link_down = true;
+            self.link_down_reason = Some("ppp-timeout");
+        }
         self.tick_liveness();
         self.phase()
     }
@@ -789,6 +796,47 @@ mod tests {
             }
             other => panic!("expected Established, got {other:?}"),
         }
+    }
+
+    /// A lost LCP Configure-Request is retransmitted on the RFC 1661 restart
+    /// timer, and a peer that never answers exhausts Max-Configure into a
+    /// deterministic LinkDown the shell redials from.
+    #[test]
+    fn lost_confreq_retransmits_then_link_down() {
+        use crate::pppoe::ppp::{MAX_CONFIGURE, RESTART_TICKS};
+        let mut dp = fixed_dp();
+        dp.start();
+        let _ = drain_frames(&mut dp);
+        dp.on_l2_frame(PADO);
+        let _ = drain_frames(&mut dp);
+        assert_eq!(dp.on_l2_frame(PADS), DpPhase::Ppp);
+        // Our initial ConfReq goes out; the BRAS never answers (dropped frame).
+        let first = one_ppp_out(&drain_frames(&mut dp));
+        assert_eq!(first[2], 0x01);
+
+        // Ticks below the restart period send nothing.
+        for _ in 0..RESTART_TICKS - 1 {
+            dp.on_tick();
+            assert!(drain_frames(&mut dp).is_empty());
+        }
+        // The restart timer fires: the same request is re-offered.
+        dp.on_tick();
+        let retx = one_ppp_out(&drain_frames(&mut dp));
+        assert_eq!(retx[2], 0x01, "retransmitted ConfigureReq");
+        assert_eq!(retx[3], first[3], "retransmission keeps its Identifier");
+        assert_eq!(&retx[6..], &first[6..], "same options re-offered");
+
+        // Total silence exhausts Max-Configure and lands in LinkDown.
+        let mut phase = dp.phase();
+        for _ in 0..RESTART_TICKS * MAX_CONFIGURE {
+            phase = dp.on_tick();
+            let _ = drain_frames(&mut dp);
+            if phase == DpPhase::LinkDown {
+                break;
+            }
+        }
+        assert_eq!(phase, DpPhase::LinkDown);
+        assert_eq!(dp.link_down_reason(), "ppp-timeout");
     }
 
     #[test]

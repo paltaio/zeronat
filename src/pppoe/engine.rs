@@ -176,10 +176,14 @@ impl<'a> PppSession<'a> {
         outcome
     }
 
-    /// Advance the link state machine one step (phase transitions, originating
-    /// ConfReqs, opening IPCP after auth). Call on each timer tick; `feed` and
-    /// `open` already call it internally.
-    pub fn poll(&mut self) {
+    /// Advance the restart timers and the link state machine one step:
+    /// retransmit stale Configure-Requests (RFC 1661 restart timer), advance
+    /// phases, originate ConfReqs, open IPCP after auth. Call once per timer
+    /// tick; `feed` and `open` advance the state machine themselves.
+    pub fn on_tick(&mut self) {
+        let mut produced: Vec<Vec<u8>> = Vec::new();
+        self.ppp.tick(|frame| produced.push(serialize(frame)));
+        self.out.append(&mut produced);
         self.drive_poll();
     }
 

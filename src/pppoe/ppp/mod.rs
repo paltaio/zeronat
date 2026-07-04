@@ -30,6 +30,8 @@ use std::ops::Range;
 use self::ipv4cp::IPv4CP;
 use self::lcp::{AuthType, LCP};
 use self::option_fsm::{OptionFsm, State};
+#[cfg(test)]
+pub(crate) use self::option_fsm::{MAX_CONFIGURE, RESTART_TICKS};
 use self::pap::{State as PapState, PAP};
 use self::wire::{Code, Packet, ProtocolType};
 use crate::pppoe::auth::Chap;
@@ -280,6 +282,18 @@ impl<'a> PPP<'a> {
         }
     }
 
+    /// Advance the RFC 1661 restart timers one tick: retransmit a stale
+    /// Configure-Request, or park a sub-FSM in failed-`Closed` once its budget
+    /// is exhausted (`poll` then maps that to `Phase::Dead`).
+    pub fn tick(&mut self, mut tx: impl FnMut(OutFrame<'_>)) {
+        if let Some(p) = self.lcp.on_tick() {
+            tx(p.into());
+        }
+        if let Some(p) = self.ipv4cp.on_tick() {
+            tx(p.into());
+        }
+    }
+
     /// Advance the link state machine one step: originate ConfReqs, dispatch auth,
     /// open IPCP after auth, and reach `Open` when IPCP is up.
     pub fn poll(&mut self, mut tx: impl FnMut(OutFrame<'_>)) {
@@ -287,7 +301,7 @@ impl<'a> PPP<'a> {
         match self.phase {
             Phase::Dead => {}
             Phase::Establish => {
-                if self.lcp.state() == State::Closed {
+                if self.lcp.state() == State::Closed && !self.lcp.failed() {
                     tx(self.lcp.open());
                     self.opening = false;
                 }
@@ -335,7 +349,9 @@ impl<'a> PPP<'a> {
             Phase::Open => {}
         }
 
-        if self.lcp.state() == State::Closed && !self.opening {
+        // A negotiation that gave up (restart-counter exhaustion in either
+        // sub-FSM) or a torn-down LCP ends the session.
+        if (self.lcp.state() == State::Closed && !self.opening) || self.ipv4cp.failed() {
             self.phase = Phase::Dead
         }
     }
