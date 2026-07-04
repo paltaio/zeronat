@@ -490,7 +490,8 @@ impl App {
         }
     }
 
-    fn apply_selection(&mut self) {
+    /// Returns false (with `error` set) to keep the user on the step.
+    fn apply_selection(&mut self) -> bool {
         match self.step {
             Step::Mode => {
                 self.cfg.mode = if self.sel == 0 {
@@ -534,12 +535,19 @@ impl App {
                     SecretMode::Reuse => {
                         self.cfg.secret = self.cfg.existing_secret.clone().unwrap_or_default()
                     }
-                    SecretMode::Generate => self.cfg.secret = crate::sys::gen_secret(),
+                    SecretMode::Generate => match crate::sys::gen_secret() {
+                        Ok(s) => self.cfg.secret = s,
+                        Err(e) => {
+                            self.error = Some(e);
+                            return false;
+                        }
+                    },
                     SecretMode::Enter => {}
                 }
             }
             _ => {}
         }
+        true
     }
 
     /// Validate and store a text field; returns false (with `error` set) to keep
@@ -658,8 +666,9 @@ impl App {
                 self.sel += 1;
             }
             Key::Enter => {
-                self.apply_selection();
-                self.advance();
+                if self.apply_selection() {
+                    self.advance();
+                }
             }
             Key::Esc | Key::Left => self.back(),
             Key::Char('q') => self.quit = true,

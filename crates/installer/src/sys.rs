@@ -43,17 +43,23 @@ pub fn compose_argv() -> Vec<String> {
     }
 }
 
-pub fn gen_secret() -> String {
+/// A fresh random 256-bit secret, hex-encoded. Errors instead of falling back
+/// to a predictable value when the system RNG cannot be read.
+pub fn gen_secret() -> Result<String, String> {
+    gen_secret_from("/dev/urandom")
+}
+
+fn gen_secret_from(path: &str) -> Result<String, String> {
     use std::io::Read;
     let mut b = [0u8; 32];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut b);
-    }
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut b))
+        .map_err(|e| format!("cannot read {path}: {e}"))?;
     let mut s = String::with_capacity(64);
     for x in b {
         s.push_str(&format!("{x:02x}"));
     }
-    s
+    Ok(s)
 }
 
 /// Cache sudo credentials up front (prompting on the normal terminal, before the
@@ -339,6 +345,24 @@ mod tests {
             version_from_url("https://github.com/x/y/releases/latest"),
             None
         );
+    }
+
+    #[test]
+    fn gen_secret_errors_when_rng_unreadable() {
+        assert!(gen_secret_from("/nonexistent/urandom").is_err());
+    }
+
+    #[test]
+    fn gen_secret_errors_on_short_read() {
+        assert!(gen_secret_from("/dev/null").is_err());
+    }
+
+    #[test]
+    fn gen_secret_yields_random_hex() {
+        let a = gen_secret().unwrap();
+        let b = gen_secret().unwrap();
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b);
     }
 
     #[test]

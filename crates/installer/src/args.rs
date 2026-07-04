@@ -253,7 +253,7 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
     } else if let Some(s) = &host.existing_secret {
         cfg.secret = s.clone();
     } else {
-        cfg.secret = sys::gen_secret();
+        cfg.secret = sys::gen_secret()?;
     }
 
     Ok(cfg)
