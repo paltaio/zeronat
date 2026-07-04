@@ -73,12 +73,17 @@ pub struct Bridge {
     pub cancel: Arc<Notify>,
     _sess: Arc<Session>,
     _guard: zeronat::kcp::ConvGuard,
-    pump: tokio::task::JoinHandle<()>,
+    _pump: AbortOnDrop,
 }
 
-impl Drop for Bridge {
+/// Aborts its task when dropped. Ties the receive pump's lifetime to the scope
+/// that owns this guard, so no error path can strand the pump (and the socket
+/// it holds) as a detached task.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.pump.abort();
+        self.0.abort();
     }
 }
 
@@ -96,7 +101,7 @@ pub async fn connect(addr: SocketAddr, secret: &str, client_id: &str) -> Result<
     let sess = kcp_session(socket.clone(), addr, 1);
 
     let cancel = Arc::new(Notify::new());
-    let pump = {
+    let pump = AbortOnDrop({
         let sess = sess.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
@@ -122,7 +127,7 @@ pub async fn connect(addr: SocketAddr, secret: &str, client_id: &str) -> Result<
                 }
             }
         })
-    };
+    });
 
     let psk = derive_psk(secret);
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
@@ -146,6 +151,35 @@ pub async fn connect(addr: SocketAddr, secret: &str, client_id: &str) -> Result<
         cancel,
         _sess: sess,
         _guard: guard,
-        pump,
+        _pump: pump,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dial whose handshake times out must not strand any task: the pump
+    /// guard aborts on the error return, the conv driver exits at its idle
+    /// backstop, and the socket-writer follows once every sender is gone. The
+    /// socket is held only by those tasks, so no surviving task means the fd
+    /// is released too.
+    #[tokio::test(start_paused = true)]
+    async fn handshake_timeout_leaves_no_tasks_behind() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+
+        assert!(connect(addr, "secret", "test").await.is_err());
+
+        for _ in 0..200 {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::task::yield_now().await;
+            if metrics.num_alive_tasks() <= baseline {
+                break;
+            }
+        }
+        assert_eq!(metrics.num_alive_tasks(), baseline);
+    }
 }
