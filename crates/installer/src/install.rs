@@ -528,7 +528,7 @@ fn dry_run(cfg: &Config, _sub: &str, r: &mut dyn Runner) -> Result<Outcome, Stri
             let target = sys::arch_target().unwrap_or("this arch");
             r.info(format!("target {target}"));
             dstep(r, "would download the binary and write a systemd unit");
-            dstep(r, "would enable the service");
+            dstep(r, "would enable and restart the service");
             vec![
                 Cmd {
                     label: "status",
@@ -928,12 +928,19 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Starte
     if !ok(&out) {
         return Err(format!("daemon-reload: {}", errtext(&out)));
     }
-    let out = r.run(true, "systemctl", &["enable", "--now", "zeronat"])?;
+    let out = r.run(true, "systemctl", &["enable", "zeronat"])?;
     if !ok(&out) {
         return Err(format!("enable: {}", errtext(&out)));
     }
+    // `enable --now` is a no-op on an already-active unit, so a re-install with
+    // a changed env file or unit would keep running the old config. Restart
+    // applies it; on a fresh install it is the start.
+    let out = r.run(true, "systemctl", &["restart", "zeronat"])?;
+    if !ok(&out) {
+        return Err(format!("restart: {}", errtext(&out)));
+    }
     Ok(Started {
-        ran: "systemctl enable --now zeronat".into(),
+        ran: "systemctl enable zeronat && systemctl restart zeronat".into(),
         cmds: vec![
             Cmd {
                 label: "status",
@@ -952,11 +959,47 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Starte
 
 #[cfg(test)]
 mod tests {
-    use super::{check_forwards, console_cmd, peer_steps, subcmd};
+    use super::{check_forwards, console_cmd, install_systemd, peer_steps, subcmd, Runner};
     use crate::ui::{Config, Kind, Method, Mode};
+    use std::process::Output;
 
     fn cfg() -> Config {
         Config::new(false, false, None)
+    }
+
+    /// Records every command instead of running it; all commands succeed.
+    struct FakeRunner {
+        cmds: Vec<String>,
+    }
+
+    impl Runner for FakeRunner {
+        fn step(&mut self, _: String) {}
+        fn info(&mut self, _: String) {}
+        fn run(&mut self, _: bool, program: &str, args: &[&str]) -> Result<Output, String> {
+            use std::os::unix::process::ExitStatusExt;
+            self.cmds.push(format!("{program} {}", args.join(" ")));
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+        fn confirm(&mut self, _: &str, _: u32) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn systemd_install_restarts_after_writing_config() {
+        let mut r = FakeRunner { cmds: Vec::new() };
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        install_systemd(&c, "server", &mut r).unwrap();
+
+        let reload = r.cmds.iter().position(|c| c == "systemctl daemon-reload");
+        let restart = r.cmds.iter().position(|c| c == "systemctl restart zeronat");
+        assert!(r.cmds.contains(&"systemctl enable zeronat".to_string()));
+        assert!(restart.unwrap() > reload.unwrap());
     }
 
     #[test]
