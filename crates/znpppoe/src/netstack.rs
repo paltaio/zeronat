@@ -27,6 +27,11 @@ const SOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// established socket, so a peer that vanishes with no FIN/RST would never be
 /// reaped; the probes make the timeout fire on silence.
 const SOCK_KEEPALIVE: Duration = Duration::from_secs(10);
+/// Cap on bytes staged per connection between the client channel and the socket's
+/// transmit buffer. Draining stops at this mark, so when the socket cannot send,
+/// the backlog stays in the bounded channel and blocks the client's sender instead
+/// of growing memory; `out_buf` never holds more than this plus one channel chunk.
+const OUT_BUF_BUDGET: usize = 64 * 1024;
 
 /// A request to open a TCP connection through this session's stack. `to_remote`
 /// carries client bytes outbound; `from_remote` carries server bytes back; once
@@ -246,7 +251,7 @@ fn service(sockets: &mut SocketSet<'static>, conns: &mut HashMap<SocketHandle, C
         }
 
         // client -> remote
-        loop {
+        while conn.out_buf.len() < OUT_BUF_BUDGET {
             match conn.to_remote.try_recv() {
                 Ok(chunk) => conn.out_buf.extend(chunk),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -271,6 +276,7 @@ fn service(sockets: &mut SocketSet<'static>, conns: &mut HashMap<SocketHandle, C
         }
 
         // remote -> client
+        let mut client_gone = false;
         while socket.can_recv() {
             let Some(tx) = &conn.from_remote else { break };
             match tx.try_reserve() {
@@ -285,8 +291,19 @@ fn service(sockets: &mut SocketSet<'static>, conns: &mut HashMap<SocketHandle, C
                     }
                     permit.send(chunk);
                 }
-                Err(_) => break,
+                Err(mpsc::error::TrySendError::Full(())) => break,
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    client_gone = true;
+                    break;
+                }
             }
+        }
+        if client_gone {
+            // The client receiver is gone, so buffered data can never be
+            // delivered; abort instead of holding a zero-window socket open
+            // for a peer that keeps answering keep-alives.
+            conn.from_remote = None;
+            socket.abort();
         }
         // Remote half-closed (after Established) and its buffer is drained: signal
         // EOF to the SOCKS client by dropping the sender, otherwise a
@@ -377,5 +394,183 @@ impl TxToken for TxTok<'_> {
         let r = f(&mut buf);
         let _ = self.out.try_send((self.idx, buf));
         r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHUNK: usize = 16 * 1024;
+    const SOCK_BUF: usize = 4096;
+
+    /// One interface whose device output is fed back into its own input, so two
+    /// sockets on it can talk to each other without a kernel or a peer stack.
+    struct Loopback {
+        device: ChannelDevice,
+        iface: Interface,
+        sockets: SocketSet<'static>,
+        out_rx: mpsc::Receiver<(usize, Vec<u8>)>,
+    }
+
+    impl Loopback {
+        fn new() -> Self {
+            let (out_tx, out_rx) = mpsc::channel(1024);
+            let mut device = ChannelDevice {
+                inbound: VecDeque::new(),
+                outbound: out_tx,
+                idx: 0,
+                mtu: 1400,
+            };
+            let config = Config::new(HardwareAddress::Ip);
+            let mut iface = Interface::new(config, &mut device, SmolInstant::now());
+            iface.update_ip_addrs(|a| {
+                let _ = a.push(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 32));
+                let _ = a.push(IpCidr::new(IpAddress::v4(10, 0, 0, 2), 32));
+            });
+            let _ = iface
+                .routes_mut()
+                .add_default_ipv4_route(Ipv4Address::new(10, 0, 0, 1));
+            Loopback {
+                device,
+                iface,
+                sockets: SocketSet::new(Vec::new()),
+                out_rx,
+            }
+        }
+
+        /// Poll the stack a few rounds, looping every emitted packet back in.
+        fn pump(&mut self) {
+            for _ in 0..4 {
+                let _ = self
+                    .iface
+                    .poll(SmolInstant::now(), &mut self.device, &mut self.sockets);
+                while let Ok((_, pkt)) = self.out_rx.try_recv() {
+                    self.device.inbound.push_back(pkt);
+                }
+            }
+        }
+
+        /// Poll once and discard everything emitted, so the peer never sees it
+        /// and no ACKs come back: a stalled uplink.
+        fn pump_blackhole(&mut self) {
+            let _ = self
+                .iface
+                .poll(SmolInstant::now(), &mut self.device, &mut self.sockets);
+            while self.out_rx.try_recv().is_ok() {}
+        }
+
+        fn tcp(&mut self, handle: SocketHandle) -> &mut tcp::Socket<'static> {
+            self.sockets.get_mut::<tcp::Socket>(handle)
+        }
+    }
+
+    fn sock_buf() -> tcp::SocketBuffer<'static> {
+        tcp::SocketBuffer::new(vec![0u8; SOCK_BUF])
+    }
+
+    /// Set up an established client/server socket pair over the loopback.
+    fn establish() -> (Loopback, SocketHandle, SocketHandle) {
+        let mut lo = Loopback::new();
+        let mut server = tcp::Socket::new(sock_buf(), sock_buf());
+        server.listen(80).unwrap();
+        let server = lo.sockets.add(server);
+        let client = lo.sockets.add(tcp::Socket::new(sock_buf(), sock_buf()));
+        let Loopback { iface, sockets, .. } = &mut lo;
+        sockets
+            .get_mut::<tcp::Socket>(client)
+            .connect(iface.context(), (IpAddress::v4(10, 0, 0, 2), 80), 49153)
+            .unwrap();
+        for _ in 0..10 {
+            lo.pump();
+            if lo.tcp(client).state() == tcp::State::Established
+                && lo.tcp(server).state() == tcp::State::Established
+            {
+                return (lo, client, server);
+            }
+        }
+        panic!("loopback pair failed to establish");
+    }
+
+    fn conn(to_remote: mpsc::Receiver<Vec<u8>>, from_remote: mpsc::Sender<Vec<u8>>) -> Conn {
+        Conn {
+            to_remote,
+            from_remote: Some(from_remote),
+            out_buf: VecDeque::new(),
+            ready: None,
+            to_remote_done: false,
+            established: true,
+        }
+    }
+
+    #[test]
+    fn out_buf_stays_within_budget_when_uplink_stalls() {
+        let (mut lo, client, _server) = establish();
+        let (to_tx, to_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (from_tx, _from_rx) = mpsc::channel::<Vec<u8>>(64);
+        let mut conns = HashMap::new();
+        conns.insert(client, conn(to_rx, from_tx));
+
+        for _ in 0..32 {
+            // A fast client keeps the bounded channel topped up while the
+            // uplink delivers nothing back.
+            while to_tx.try_send(vec![0u8; CHUNK]).is_ok() {}
+            service(&mut lo.sockets, &mut conns);
+            let staged = conns[&client].out_buf.len();
+            assert!(
+                staged < OUT_BUF_BUDGET + CHUNK,
+                "out_buf grew to {staged} bytes"
+            );
+            lo.pump_blackhole();
+        }
+        // The backlog stayed in the channel: the producer is blocked.
+        assert!(to_tx.try_send(vec![0u8; CHUNK]).is_err());
+    }
+
+    #[test]
+    fn upload_drains_fully_under_budget() {
+        let (mut lo, client, server) = establish();
+        let (to_tx, to_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (from_tx, _from_rx) = mpsc::channel::<Vec<u8>>(64);
+        let mut conns = HashMap::new();
+        conns.insert(client, conn(to_rx, from_tx));
+
+        let total = 8 * OUT_BUF_BUDGET;
+        let mut sent = 0;
+        let mut received = 0;
+        for _ in 0..10_000 {
+            while sent < total && to_tx.try_send(vec![0xA5u8; CHUNK]).is_ok() {
+                sent += CHUNK;
+            }
+            service(&mut lo.sockets, &mut conns);
+            lo.pump();
+            let srv = lo.tcp(server);
+            while srv.can_recv() {
+                received += srv.recv(|data| (data.len(), data.len())).unwrap();
+            }
+            if received >= total {
+                break;
+            }
+        }
+        assert_eq!(received, total);
+    }
+
+    #[test]
+    fn closed_client_receiver_aborts_connection() {
+        let (mut lo, client, server) = establish();
+        lo.tcp(server).send_slice(b"undeliverable").unwrap();
+        lo.pump();
+        assert!(lo.tcp(client).can_recv());
+
+        let (_to_tx, to_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (from_tx, from_rx) = mpsc::channel::<Vec<u8>>(4);
+        drop(from_rx);
+        let mut conns = HashMap::new();
+        conns.insert(client, conn(to_rx, from_tx));
+
+        service(&mut lo.sockets, &mut conns);
+        assert_eq!(lo.tcp(client).state(), tcp::State::Closed);
+        service(&mut lo.sockets, &mut conns);
+        assert!(conns.is_empty());
     }
 }

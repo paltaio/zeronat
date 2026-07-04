@@ -39,7 +39,8 @@ const DEFAULT_SOCK_TX: usize = 64 * 1024;
 /// smoltcp panics on a TCP buffer larger than 1 GiB.
 const MAX_SOCK_BUF: usize = 1 << 30;
 /// Default ceiling on concurrent proxied connections. With fixed (non-autotuning)
-/// buffers this cap is the only bound on total buffer memory: ~max_conns * (rx+tx).
+/// buffers this cap is the only bound on total buffer memory:
+/// ~max_conns * (rx + tx + the netstack staging budget).
 const DEFAULT_MAX_CONNS: usize = 1024;
 
 struct Config {
