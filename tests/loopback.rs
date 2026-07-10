@@ -118,6 +118,65 @@ async fn tcp_tagged(port: u16, tag: &'static [u8]) {
     }
 }
 
+/// Replies a fixed constant to every datagram it receives on a local UDP port, so
+/// a caller can tell which of several services a route resolved to.
+async fn udp_tagged(port: u16, tag: &'static [u8]) {
+    let s = UdpSocket::bind(("127.0.0.1", port)).await.unwrap();
+    let mut buf = [0u8; 65535];
+    loop {
+        let (_, src) = s.recv_from(&mut buf).await.unwrap();
+        s.send_to(tag, src).await.unwrap();
+    }
+}
+
+/// Start a server with one public port plus two clients mapping that port to
+/// tagged local services (ONE and TWO). Returns both full client ids in that
+/// order, once both are registered.
+async fn start_tagged_pair(
+    control: u16,
+    proto: Proto,
+    public_port: u16,
+    target1: u16,
+    target2: u16,
+) -> (String, String) {
+    let (tcp_ports, udp_ports) = match proto {
+        Proto::Tcp => (vec![public_port], vec![]),
+        Proto::Udp => (vec![], vec![public_port]),
+    };
+    tokio::spawn(zeronat::server::run(cli_settings(
+        control, tcp_ports, udp_ports,
+    )));
+
+    for (name, target) in [("rpi-1", target1), ("rpi-2", target2)] {
+        let (tcp_map, udp_map) = match proto {
+            Proto::Tcp => (vec![(public_port, format!("127.0.0.1:{target}"))], vec![]),
+            Proto::Udp => (vec![], vec![(public_port, format!("127.0.0.1:{target}"))]),
+        };
+        tokio::spawn(zeronat::client::run(
+            format!("127.0.0.1:{control}"),
+            SECRET.into(),
+            tcp_map,
+            udp_map,
+            zeronat::client::Transport::Tcp,
+            None,
+            None,
+            None,
+            Some(name.into()),
+        ));
+    }
+
+    let snap = wait_clients(control, 2).await;
+    let id_of = |prefix: &str| {
+        snap.clients
+            .iter()
+            .find(|c| c.client_id.starts_with(prefix))
+            .unwrap_or_else(|| panic!("{prefix} connected"))
+            .client_id
+            .clone()
+    };
+    (id_of("rpi-1-"), id_of("rpi-2-"))
+}
+
 /// Public ports of a started server/client pair, for tests to drive traffic.
 struct Tunnel {
     control: u16,
@@ -272,6 +331,43 @@ async fn probe_tcp(public_tcp: u16) -> Option<Vec<u8>> {
     Some(buf[..n].to_vec())
 }
 
+/// Connect to the public TCP port, retrying until a round-trip returns exactly
+/// `want`, and hand back the established connection.
+async fn hold_tcp_conn(public_tcp: u16, want: &[u8]) -> TcpStream {
+    loop {
+        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", public_tcp)).await {
+            s.set_nodelay(true).ok();
+            if s.write_all(b"probe").await.is_ok() {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = s.read(&mut buf).await {
+                    if &buf[..n] == want {
+                        return s;
+                    }
+                }
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Drive an established connection until the server cuts it (EOF or error);
+/// the caller's timeout bounds the wait, so a connection that idles out
+/// instead of being cut fails the test.
+async fn wait_tcp_cut(conn: &mut TcpStream) {
+    let mut buf = [0u8; 64];
+    loop {
+        if conn.write_all(b"still-there").await.is_err() {
+            return;
+        }
+        match timeout(Duration::from_millis(300), conn.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return,
+            // A reply raced in from the old bridge before the abort landed.
+            Ok(Ok(_)) => {}
+            Err(_) => {}
+        }
+    }
+}
+
 /// Poll fresh public TCP connections until one returns exactly `want`, or panic.
 async fn wait_tcp_reply(public_tcp: u16, want: &[u8]) {
     loop {
@@ -369,57 +465,9 @@ async fn multi_client_route_switch() {
         let public_tcp = free_tcp_port();
         let target1 = free_tcp_port();
         let target2 = free_tcp_port();
-
-        // Two distinguishable local services.
         tokio::spawn(tcp_tagged(target1, b"ONE"));
         tokio::spawn(tcp_tagged(target2, b"TWO"));
-
-        tokio::spawn(zeronat::server::run(cli_settings(
-            control,
-            vec![public_tcp],
-            vec![],
-        )));
-
-        // Two clients, each mapping the same public port to its own target.
-        tokio::spawn(zeronat::client::run(
-            format!("127.0.0.1:{control}"),
-            SECRET.into(),
-            vec![(public_tcp, format!("127.0.0.1:{target1}"))],
-            vec![],
-            zeronat::client::Transport::Tcp,
-            None,
-            None,
-            None,
-            Some("rpi-1".into()),
-        ));
-        tokio::spawn(zeronat::client::run(
-            format!("127.0.0.1:{control}"),
-            SECRET.into(),
-            vec![(public_tcp, format!("127.0.0.1:{target2}"))],
-            vec![],
-            zeronat::client::Transport::Tcp,
-            None,
-            None,
-            None,
-            Some("rpi-2".into()),
-        ));
-
-        // Discover both full client ids.
-        let snap = wait_clients(control, 2).await;
-        let id1 = snap
-            .clients
-            .iter()
-            .find(|c| c.client_id.starts_with("rpi-1-"))
-            .expect("rpi-1 connected")
-            .client_id
-            .clone();
-        let id2 = snap
-            .clients
-            .iter()
-            .find(|c| c.client_id.starts_with("rpi-2-"))
-            .expect("rpi-2 connected")
-            .client_id
-            .clone();
+        let (id1, id2) = start_tagged_pair(control, Proto::Tcp, public_tcp, target1, target2).await;
 
         // Route the public port to rpi-1 and assert a fresh connection reaches ONE.
         let (ok, msg) = admin_mutate(
@@ -453,6 +501,164 @@ async fn multi_client_route_switch() {
     timeout(Duration::from_secs(30), body)
         .await
         .expect("multi-client route switch did not complete within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_switch_cuts_established_tcp() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let target1 = free_tcp_port();
+        let target2 = free_tcp_port();
+        tokio::spawn(tcp_tagged(target1, b"ONE"));
+        tokio::spawn(tcp_tagged(target2, b"TWO"));
+        let (id1, id2) = start_tagged_pair(control, Proto::Tcp, public_tcp, target1, target2).await;
+
+        let (ok, msg) = admin_mutate(
+            control,
+            Msg::SetRoute {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Tcp,
+                port: public_tcp,
+                client_id: id1,
+            },
+        )
+        .await;
+        assert!(ok, "set route to rpi-1 failed: {msg}");
+
+        let mut conn = hold_tcp_conn(public_tcp, b"ONE").await;
+
+        let (ok, msg) = admin_mutate(
+            control,
+            Msg::SetRoute {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Tcp,
+                port: public_tcp,
+                client_id: id2,
+            },
+        )
+        .await;
+        assert!(ok, "set route to rpi-2 failed: {msg}");
+
+        wait_tcp_cut(&mut conn).await;
+
+        // Fresh connections reach the new client.
+        wait_tcp_reply(public_tcp, b"TWO").await;
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("tcp route cut did not complete within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_clear_cuts_established_tcp() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let target1 = free_tcp_port();
+        let target2 = free_tcp_port();
+        tokio::spawn(tcp_tagged(target1, b"ONE"));
+        tokio::spawn(tcp_tagged(target2, b"TWO"));
+        let (id1, _id2) =
+            start_tagged_pair(control, Proto::Tcp, public_tcp, target1, target2).await;
+
+        let (ok, msg) = admin_mutate(
+            control,
+            Msg::SetRoute {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Tcp,
+                port: public_tcp,
+                client_id: id1,
+            },
+        )
+        .await;
+        assert!(ok, "set route to rpi-1 failed: {msg}");
+
+        let mut conn = hold_tcp_conn(public_tcp, b"ONE").await;
+
+        // With two clients connected, clearing the route leaves the key with no
+        // resolved target, so the established flow must be cut.
+        let (ok, msg) = admin_mutate(
+            control,
+            Msg::ClearRoute {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Tcp,
+                port: public_tcp,
+            },
+        )
+        .await;
+        assert!(ok, "clear route failed: {msg}");
+
+        wait_tcp_cut(&mut conn).await;
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("tcp route clear cut did not complete within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_switch_cuts_established_udp() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_udp = free_udp_port();
+        let target1 = free_udp_port();
+        let target2 = free_udp_port();
+        tokio::spawn(udp_tagged(target1, b"ONE"));
+        tokio::spawn(udp_tagged(target2, b"TWO"));
+        let (id1, id2) = start_tagged_pair(control, Proto::Udp, public_udp, target1, target2).await;
+
+        let (ok, msg) = admin_mutate(
+            control,
+            Msg::SetRoute {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Udp,
+                port: public_udp,
+                client_id: id1,
+            },
+        )
+        .await;
+        assert!(ok, "set route to rpi-1 failed: {msg}");
+
+        // Pin this source to rpi-1's session.
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.connect(("127.0.0.1", public_udp)).await.unwrap();
+        let mut buf = [0u8; 64];
+        loop {
+            sock.send(b"probe").await.unwrap();
+            match timeout(Duration::from_millis(300), sock.recv(&mut buf)).await {
+                Ok(Ok(n)) if &buf[..n] == b"ONE" => break,
+                _ => sleep(Duration::from_millis(100)).await,
+            }
+        }
+
+        let (ok, msg) = admin_mutate(
+            control,
+            Msg::SetRoute {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                proto: Proto::Udp,
+                port: public_udp,
+                client_id: id2,
+            },
+        )
+        .await;
+        assert!(ok, "set route to rpi-2 failed: {msg}");
+
+        // The same source must be flushed and re-routed well before the session
+        // TTL: its datagrams start reaching rpi-2.
+        loop {
+            sock.send(b"probe").await.unwrap();
+            match timeout(Duration::from_millis(300), sock.recv(&mut buf)).await {
+                Ok(Ok(n)) if &buf[..n] == b"TWO" => break,
+                _ => sleep(Duration::from_millis(100)).await,
+            }
+        }
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("udp route cut did not complete within 30s");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

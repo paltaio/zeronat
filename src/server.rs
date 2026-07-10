@@ -94,14 +94,17 @@ struct ClientHandle {
     transport: ActiveTransport,
 }
 
-/// A running listener's teardown handles: `cancel` stops the accept/recv loop and
-/// `bridges` collects active TCP bridge tasks so they can be aborted on removal.
-/// `source` records where the listener came from; `cli_locked` marks a listener
-/// pinned by a CLI arg, which admin may not remove and which persists as `File`
-/// only when it is also declared in the config file.
+/// A running listener's teardown handles: `cancel` stops the accept/recv loop,
+/// `bridges` collects active TCP bridge tasks so they can be aborted on removal,
+/// and `flush` tells a UDP recv loop to drop its per-source sessions so live
+/// sources re-resolve the route table. `source` records where the listener came
+/// from; `cli_locked` marks a listener pinned by a CLI arg, which admin may not
+/// remove and which persists as `File` only when it is also declared in the
+/// config file.
 struct ListenerHandle {
     cancel: Arc<Notify>,
     bridges: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    flush: Arc<Notify>,
     source: Source,
     cli_locked: bool,
 }
@@ -154,26 +157,32 @@ impl Server {
         next
     }
 
-    /// Resolve a public listener key to the client that should serve it. An
-    /// explicit route wins; with no route and exactly one connected client, that
-    /// client is the implicit target (single-client deployments need no route).
-    /// Locks are taken and dropped one at a time, never across a `try_send`.
-    fn route_to(&self, key: RouteKey) -> Option<ClientHandle> {
+    /// Resolve a public listener key to the id of the client that should serve
+    /// it. An explicit route wins; with no route and exactly one connected
+    /// client, that client is the implicit target (single-client deployments
+    /// need no route). Locks are taken and dropped one at a time.
+    fn serving_client_id(&self, key: RouteKey) -> Option<String> {
         let routed_id = self
             .routes
             .lock()
             .unwrap()
             .get(&key)
             .map(|r| r.client_id.clone());
-        if let Some(id) = routed_id {
-            return self.clients.lock().unwrap().get(&id).cloned();
-        }
-        let clients = self.clients.lock().unwrap();
-        if clients.len() == 1 {
-            clients.values().next().cloned()
-        } else {
-            None
-        }
+        routed_id.or_else(|| {
+            let clients = self.clients.lock().unwrap();
+            if clients.len() == 1 {
+                clients.keys().next().cloned()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The connected client's handle for the target `serving_client_id`
+    /// resolves. Locks are never held across a `try_send`.
+    fn route_to(&self, key: RouteKey) -> Option<ClientHandle> {
+        let id = self.serving_client_id(key)?;
+        self.clients.lock().unwrap().get(&id).cloned()
     }
 
     /// Register a new public stream against the routed client, notify it, and
@@ -788,13 +797,20 @@ async fn apply_mutation(srv: &Arc<Server>, req: Msg) -> (bool, String) {
             port,
             client_id,
         } => {
+            let key = (bind_ip, proto, port);
+            // Compared against the new target so re-pointing a route at the
+            // client already serving it does not cut its traffic.
+            let prev = srv.serving_client_id(key);
             srv.routes.lock().unwrap().insert(
-                (bind_ip, proto, port),
+                key,
                 Route {
-                    client_id,
+                    client_id: client_id.clone(),
                     source: mutation_source,
                 },
             );
+            if prev.as_deref() != Some(client_id.as_str()) {
+                cut_established(srv, key);
+            }
             save_after_mutation(srv).await
         }
         Msg::ClearRoute {
@@ -802,7 +818,14 @@ async fn apply_mutation(srv: &Arc<Server>, req: Msg) -> (bool, String) {
             proto,
             port,
         } => {
-            srv.routes.lock().unwrap().remove(&(bind_ip, proto, port));
+            let key = (bind_ip, proto, port);
+            let prev = srv.serving_client_id(key);
+            srv.routes.lock().unwrap().remove(&key);
+            // Clearing an explicit route can hand the key to the single-client
+            // fallback; only a change in the resolved target cuts traffic.
+            if prev != srv.serving_client_id(key) {
+                cut_established(srv, key);
+            }
             save_after_mutation(srv).await
         }
         other => (false, format!("unexpected mutation message: {other:?}")),
@@ -843,6 +866,7 @@ async fn spawn_listener(
 
     let cancel = Arc::new(Notify::new());
     let bridges = Arc::new(Mutex::new(Vec::new()));
+    let flush = Arc::new(Notify::new());
 
     match proto {
         Proto::Tcp => {
@@ -856,6 +880,7 @@ async fn spawn_listener(
                 ListenerHandle {
                     cancel: cancel.clone(),
                     bridges: bridges.clone(),
+                    flush,
                     source,
                     cli_locked,
                 },
@@ -874,18 +899,47 @@ async fn spawn_listener(
                 ListenerHandle {
                     cancel: cancel.clone(),
                     bridges,
+                    flush: flush.clone(),
                     source,
                     cli_locked,
                 },
             );
             let srv = srv.clone();
             tokio::spawn(async move {
-                udp_listener(srv, socket, bind_ip, port, cancel).await;
+                udp_listener(srv, socket, bind_ip, port, cancel, flush).await;
             });
         }
     }
     crate::elog!("listener added: {bind_ip} {} {port}", proto_name(proto));
     Ok(())
+}
+
+/// Cut every established flow on a listener so traffic re-resolves the route
+/// table: abort the active TCP bridges (the peer sees a reset and reconnects)
+/// and flush the UDP loop's per-source sessions, which closes each inbound
+/// channel and ends the matching bridge. The listener itself stays bound, so
+/// new connections and datagrams are served throughout. A connection accepted
+/// concurrently with the cut can register its bridge after the drain and keep
+/// the old target; the window is microseconds and accepted.
+fn cut_established(srv: &Server, key: RouteKey) {
+    let handles = srv
+        .listeners
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map(|h| (h.bridges.clone(), h.flush.clone()));
+    let Some((bridges, flush)) = handles else {
+        return;
+    };
+    for bridge in bridges.lock().unwrap().drain(..) {
+        bridge.abort();
+    }
+    flush.notify_one();
+    let (bind_ip, proto, port) = key;
+    crate::elog!(
+        "route changed: cutting established flows on {bind_ip} {} {port}",
+        proto_name(proto)
+    );
 }
 
 /// Remove a listener: cancel its accept/recv loop, then abort any active TCP
@@ -908,6 +962,20 @@ fn remove_listener(srv: &Server, key: RouteKey) -> Result<()> {
             let (bind_ip, proto, port) = key;
             Err(format!("no such listener {bind_ip} {} {port}", proto_name(proto)).into())
         }
+    }
+}
+
+/// Removes a `pending` open entry when dropped. Held by a bridge task across
+/// its open window so an abort (route cut, listener removal) cannot strand the
+/// entry; once the client's data connection claims it, the remove is a no-op.
+struct PendingReclaim {
+    srv: Arc<Server>,
+    id: u64,
+}
+
+impl Drop for PendingReclaim {
+    fn drop(&mut self) {
+        self.srv.pending.lock().unwrap().remove(&self.id);
     }
 }
 
@@ -941,11 +1009,12 @@ async fn tcp_listener(
             let Some((id, rx)) = srv.open(bind_ip, Proto::Tcp, port) else {
                 return;
             };
-            match timeout(OPEN_TIMEOUT, rx).await {
-                Ok(Ok((nr, nw))) => bridge::tcp(public, nr, nw).await,
-                _ => {
-                    srv.pending.lock().unwrap().remove(&id);
-                }
+            let _reclaim = PendingReclaim {
+                srv: srv.clone(),
+                id,
+            };
+            if let Ok(Ok((nr, nw))) = timeout(OPEN_TIMEOUT, rx).await {
+                bridge::tcp(public, nr, nw).await;
             }
         });
         let mut active = bridges.lock().unwrap();
@@ -959,13 +1028,16 @@ async fn tcp_listener(
 /// each source to the routed client, until `cancel` fires. On cancel the task
 /// returns, dropping `sessions`; that closes every per-source `dtx`, which ends the
 /// matching `bridge::udp_server` / `udp_server_stateless` and tears down active UDP
-/// sources (see `accept_udp_forward`'s teardown comment).
+/// sources (see `accept_udp_forward`'s teardown comment). A `flush` clears the
+/// sessions map the same way but keeps the loop serving, so each live source is
+/// torn down and its next datagram re-resolves the route table.
 async fn udp_listener(
     srv: Arc<Server>,
     socket: Arc<UdpSocket>,
     bind_ip: Ipv4Addr,
     port: u16,
     cancel: Arc<Notify>,
+    flush: Arc<Notify>,
 ) {
     // Each entry holds the bridge's inbound channel and the last time a datagram
     // reached it. A closed channel (bridge ended) or a stale TTL evicts the entry,
@@ -980,6 +1052,10 @@ async fn udp_listener(
         // off briefly, and keep serving. The sweep runs between recvs.
         let (n, src) = tokio::select! {
             _ = cancel.notified() => break,
+            _ = flush.notified() => {
+                sessions.clear();
+                continue;
+            }
             r = socket.recv_from(&mut buf) => match r {
                 Ok(v) => v,
                 Err(e) => {
