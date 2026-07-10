@@ -72,7 +72,7 @@ enum Flow {
 
 enum Status {
     Connecting,
-    Live,
+    Connected,
     Error(String),
 }
 
@@ -187,7 +187,7 @@ impl App {
         match tokio::time::timeout(NET_TIMEOUT, fetch).await {
             Ok(Ok(snap)) => {
                 self.snap = Some(snap);
-                self.status = Status::Live;
+                self.status = Status::Connected;
                 self.clamp_sel();
             }
             Ok(Err(e)) => self.status = Status::Error(e.to_string()),
@@ -670,9 +670,9 @@ impl App {
             Status::Connecting => {
                 l.add(MUTED, "● connecting");
             }
-            Status::Live => {
+            Status::Connected => {
                 l.add(GOOD, "● ");
-                l.add(MUTED, "live");
+                l.add(MUTED, "connected");
             }
             Status::Error(e) => {
                 l.add(BAD, "● ");
