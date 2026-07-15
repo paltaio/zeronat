@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::str::FromStr;
 
 use crate::client::Transport;
@@ -16,6 +17,7 @@ use crate::config::codec::{
     err, parse_bool, parse_int, parse_string, parse_u32, quote, reject_dup, split_kv, strip_comment,
 };
 use crate::config::parse_proto;
+use crate::config::LoadError;
 use crate::proto::{proto_name, Proto};
 use crate::Result;
 
@@ -168,6 +170,13 @@ struct PartialRecord {
     request_dns: Option<bool>,
     dev: Option<String>,
     address: Option<(Ipv4Addr, u8)>,
+}
+
+/// Load a client config. A missing file yields the default (empty) config so a
+/// first boot with `--config` pointing at a not-yet-written path is not an
+/// error.
+pub fn load(path: &Path) -> std::result::Result<ClientConfig, LoadError> {
+    crate::config::codec::load(path, parse_client)
 }
 
 pub fn parse_client(text: &str) -> Result<ClientConfig> {
@@ -816,5 +825,22 @@ mod tests {
         let cfg = parse_client("").unwrap();
         assert_eq!(cfg, ClientConfig::default());
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn load_missing_file_is_default() {
+        let path =
+            std::env::temp_dir().join(format!("zeronat-client-absent-{}.toml", std::process::id()));
+        assert_eq!(load(&path).unwrap(), ClientConfig::default());
+    }
+
+    #[test]
+    fn load_reports_malformed() {
+        let dir = std::env::temp_dir().join(format!("zeronat-client-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client.toml");
+        std::fs::write(&path, "[client\nid = ").unwrap();
+        assert!(matches!(load(&path), Err(LoadError::Malformed(_))));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

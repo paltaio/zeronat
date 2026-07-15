@@ -1,5 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
+use zeronat::clientcfg::{CfgForward, CfgPppoe, CfgServer, ClientConfig};
 use zeronat::proto::{Proto, Source};
 use zeronat::tap::TapConfig;
 use zeronat::{admin, client, server, Result};
@@ -46,6 +47,7 @@ client options:
   --server <ADDR>     Server control address host:port, or 'dht' to discover via DHT
   --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
   --id <PREFIX>       Client id prefix (default: short hostname)
+  --config <PATH>     Load servers/forwards/identity from a config file
   --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT, plus
                       optional +proxy (send a PROXY protocol v2 header to the
                       target) and +idle=SECS modifiers (repeatable)
@@ -111,16 +113,17 @@ enum Cmd {
         config: Option<std::path::PathBuf>,
     },
     Client {
-        server: String,
-        secret: String,
+        server: Option<String>,
+        secret: Option<String>,
         id_prefix: Option<String>,
         tcp: Vec<String>,
         udp: Vec<String>,
         proxy: bool,
-        transport: String,
-        tap: Option<TapConfig>,
+        transport: Option<String>,
+        tap_name: Option<String>,
+        bridge: Option<String>,
         tun: bool,
-        mtu: usize,
+        mtu: Option<usize>,
         pppoe: bool,
         pppoe_user: Option<String>,
         pppoe_pass: Option<String>,
@@ -132,6 +135,7 @@ enum Cmd {
         pppoe_default_route: bool,
         pppoe_no_mss_clamp: bool,
         pppoe_dns: bool,
+        config: Option<std::path::PathBuf>,
     },
     Admin {
         server: String,
@@ -240,6 +244,88 @@ fn parse_forward(spec: &str, proto: Proto) -> Result<client::Forward> {
         target,
         proxy,
         idle,
+    })
+}
+
+/// Whether the config file declares any list-shaped setting. Declaring even one
+/// makes the file authoritative for the whole client shape, so the matching CLI
+/// flags are ignored.
+fn declares_shape(cfg: &ClientConfig) -> bool {
+    !cfg.servers.is_empty()
+        || !cfg.forwards.is_empty()
+        || !cfg.pppoe.is_empty()
+        || cfg.tap.is_some()
+        || cfg.tun.is_some()
+}
+
+/// The `[[servers]]` entry to dial at boot: `[client].active` when set (its
+/// target is guaranteed by `validate`), else the first entry.
+fn active_server(cfg: &ClientConfig) -> Result<&CfgServer> {
+    match &cfg.active {
+        Some(name) => cfg.servers.iter().find(|s| &s.name == name),
+        None => cfg.servers.first(),
+    }
+    .ok_or_else(|| "config declares no [[servers]] entry to dial".into())
+}
+
+/// Split `[[forwards]]` entries into the per-proto lists `client::run` takes.
+fn split_forwards(fwds: &[CfgForward]) -> (Vec<client::Forward>, Vec<client::Forward>) {
+    let (mut tcp, mut udp) = (Vec::new(), Vec::new());
+    for f in fwds {
+        let fwd = client::Forward {
+            port: f.port,
+            target: f.target.clone(),
+            proxy: f.proxy,
+            idle: f
+                .idle
+                .map(|secs| std::time::Duration::from_secs(secs.into())),
+        };
+        match f.proto {
+            Proto::Tcp => tcp.push(fwd),
+            Proto::Udp => udp.push(fwd),
+        }
+    }
+    (tcp, udp)
+}
+
+/// Resolve a `[[pppoe]]` entry into a run config. `password_file` wins over the
+/// inline `password`; the MTU cap uses the default tunnel MTU, since the file
+/// grammar has no tunnel-MTU key.
+fn pppoe_from_entry(p: &CfgPppoe) -> Result<client::PppoeRunConfig> {
+    use zeronat::pppoe::cli;
+    if p.password.is_none() && p.password_file.is_none() {
+        return Err(format!("pppoe '{}' needs `password` or `password_file`", p.name).into());
+    }
+    let pass_file = match &p.password_file {
+        Some(path) => Some(std::fs::read(path).map_err(|e| -> zeronat::Error {
+            format!("reading [[pppoe]] password_file {path}: {e}").into()
+        })?),
+        None => None,
+    };
+    let password = cli::resolve_password(pass_file, None, p.password.clone())?;
+    let resolved = cli::resolve_effective_mtu(p.mtu, DEFAULT_TAP_MTU as u16)?;
+    if resolved.capped {
+        eprintln!(
+            "pppoe: requested MTU {} exceeds what the tunnel carries; using {}",
+            p.mtu, resolved.effective
+        );
+    }
+    Ok(client::PppoeRunConfig {
+        username: p.username.clone().into_bytes(),
+        password,
+        service_name: p.service.clone().into_bytes(),
+        ac_name: None,
+        tun_name: "zppp0".to_string(),
+        effective_mtu: resolved.effective,
+        default_route: p.default_route,
+        // The MSS clamp rides with default_route unless opted out; value is the
+        // effective IP MTU minus the IPv4+TCP headers.
+        clamp_mss: if p.default_route && p.clamp_mss {
+            Some(resolved.effective.saturating_sub(40).max(536))
+        } else {
+            None
+        },
+        request_dns: p.request_dns,
     })
 }
 
@@ -425,11 +511,12 @@ fn parse_args() -> Result<Cmd> {
         let mut tcp: Vec<String> = Vec::new();
         let mut udp: Vec<String> = Vec::new();
         let mut proxy = false;
-        let mut transport = "auto".to_string();
+        let mut transport: Option<String> = None;
         let mut tap_name: Option<String> = None;
-        let mut tap_mtu: usize = DEFAULT_TAP_MTU;
+        let mut tap_mtu: Option<usize> = None;
         let mut bridge: Option<String> = None;
         let mut tun = false;
+        let mut config: Option<std::path::PathBuf> = None;
         let mut pppoe = false;
         let mut pppoe_user: Option<String> = None;
         let mut pppoe_pass: Option<String> = None;
@@ -472,16 +559,19 @@ fn parse_args() -> Result<Cmd> {
                     proxy = true;
                 }
                 "--transport" => {
-                    transport = iter.next().ok_or("--transport requires a value")?;
+                    transport = Some(iter.next().ok_or("--transport requires a value")?);
+                }
+                "--config" => {
+                    config = Some(iter.next().ok_or("--config requires a value")?.into());
                 }
                 "--tap" => {
                     tap_name = Some(iter.next().ok_or("--tap requires a value")?);
                 }
                 "--tap-mtu" | "--tun-mtu" => {
                     let v = iter.next().ok_or("--tap-mtu requires a value")?;
-                    tap_mtu = v.parse().map_err(|_| -> zeronat::Error {
+                    tap_mtu = Some(v.parse().map_err(|_| -> zeronat::Error {
                         format!("--tap-mtu must be a positive integer, got '{v}'").into()
-                    })?;
+                    })?);
                 }
                 "--bridge" => {
                     bridge = Some(iter.next().ok_or("--bridge requires a value")?);
@@ -527,16 +617,6 @@ fn parse_args() -> Result<Cmd> {
             }
         }
 
-        let server = server.ok_or("--server is required")?;
-        let secret = secret
-            .or_else(|| std::env::var("ZERONAT_SECRET").ok())
-            .ok_or("--secret or ZERONAT_SECRET is required")?;
-
-        if tun && bridge.is_some() {
-            return Err("--bridge applies to --tap only, not --tun".into());
-        }
-
-        let tap = build_tap(tap_name, tap_mtu, bridge);
         Ok(Cmd::Client {
             server,
             secret,
@@ -547,7 +627,8 @@ fn parse_args() -> Result<Cmd> {
             transport,
             tun,
             mtu: tap_mtu,
-            tap,
+            tap_name,
+            bridge,
             pppoe,
             pppoe_user,
             pppoe_pass,
@@ -559,6 +640,7 @@ fn parse_args() -> Result<Cmd> {
             pppoe_default_route,
             pppoe_no_mss_clamp,
             pppoe_dns,
+            config,
         })
     } else if subcmd == "upgrade" {
         let mut check = false;
@@ -924,7 +1006,8 @@ async fn run(cmd: Cmd) -> Result<()> {
             udp,
             proxy,
             transport,
-            tap,
+            tap_name,
+            bridge,
             tun,
             mtu,
             pppoe,
@@ -938,121 +1021,270 @@ async fn run(cmd: Cmd) -> Result<()> {
             pppoe_default_route,
             pppoe_no_mss_clamp,
             pppoe_dns,
+            config,
         } => {
             use zeronat::pppoe::cli;
-            // --pppoe owns the L2 channel; reject the device/forward flags it
-            // conflicts with. --transport is orthogonal and stays valid.
-            cli::validate_pppoe_exclusions(
-                pppoe,
-                tap.is_some(),
-                tun,
-                !tcp.is_empty() || !udp.is_empty(),
-            )?;
-            cli::validate_pppoe_netcfg(pppoe, pppoe_default_route, pppoe_no_mss_clamp, pppoe_dns)?;
-            if tun {
-                if tap.is_some() {
-                    return Err("--tun cannot be combined with --tap".into());
-                }
-                if !tcp.is_empty() || !udp.is_empty() {
-                    return Err("--tun cannot be combined with --tcp/--udp forwards".into());
-                }
-            }
-            if tap.is_some() && (!tcp.is_empty() || !udp.is_empty()) {
-                return Err("--tap cannot be combined with --tcp/--udp forwards".into());
-            }
-            if !pppoe && !tun && tap.is_none() && tcp.is_empty() && udp.is_empty() {
-                return Err(
-                    "nothing to do: pass --pppoe, --tun, --tap, or at least one --tcp/--udp".into(),
-                );
-            }
-            if proxy && tcp.is_empty() {
-                return Err("--proxy requires at least one --tcp forward".into());
-            }
+            // Same recovery split as the server: a missing file is a normal
+            // first boot; a malformed file is set aside so its contents stay
+            // recoverable and the client starts from command-line settings; an
+            // unreadable file (permission or transient IO) is fatal, so a
+            // restart retries rather than running with settings we never
+            // managed to read.
+            let file = match &config {
+                Some(path) => match zeronat::clientcfg::load(path) {
+                    Ok(cfg) => cfg,
+                    Err(zeronat::config::LoadError::Malformed(e)) => {
+                        match zeronat::config::quarantine(path) {
+                            Some(b) => zeronat::elog!(
+                                "config: {e}; moved aside to {}; starting from command-line settings",
+                                b.display()
+                            ),
+                            None => zeronat::elog!(
+                                "config: {e}; could not set the file aside; starting from command-line settings"
+                            ),
+                        }
+                        ClientConfig::default()
+                    }
+                    Err(zeronat::config::LoadError::Unreadable(e)) => return Err(e),
+                },
+                None => ClientConfig::default(),
+            };
+            // A parseable but contradictory file is an operator error to fix
+            // in place, never quarantined.
+            file.validate()?;
 
-            // Resolve the PPPoE config: credentials (file > env > flag) and the
-            // effective MTU (capped to the tunnel MTU minus 8, floored). The
-            // password file is read here so the precedence helper stays pure.
-            let pppoe = if pppoe {
-                let user =
-                    cli::resolve_username(pppoe_user, std::env::var("ZERONAT_PPPOE_USER").ok())?;
-                let pass_file = match &pppoe_pass_file {
-                    Some(path) => Some(std::fs::read(path).map_err(|e| -> zeronat::Error {
-                        format!("reading --pppoe-pass-file {}: {e}", path.display()).into()
-                    })?),
-                    None => None,
+            // Scalars merge field by field; a valid file wins over the CLI and
+            // a present CLI flag it overrides is logged.
+            if let (Some(f), Some(c)) = (&file.id, &id_prefix) {
+                if f != c {
+                    zeronat::elog!("config [client].id '{f}' overrides --id '{c}'");
+                }
+            }
+            let id_prefix = file.id.clone().or(id_prefix);
+
+            let (server, secret, tcp, udp, transport, tap, tun, pppoe) = if declares_shape(&file) {
+                if let Some(v) = &server {
+                    zeronat::elog!("config overrides --server '{v}'");
+                }
+                if secret.is_some() {
+                    zeronat::elog!("config overrides --secret");
+                }
+                if let Some(v) = &transport {
+                    zeronat::elog!("config overrides --transport '{v}'");
+                }
+                for spec in &tcp {
+                    zeronat::elog!("config overrides --tcp '{spec}'");
+                }
+                for spec in &udp {
+                    zeronat::elog!("config overrides --udp '{spec}'");
+                }
+                if proxy {
+                    zeronat::elog!("config overrides --proxy");
+                }
+                if let Some(v) = &tap_name {
+                    zeronat::elog!("config overrides --tap '{v}'");
+                }
+                if tun {
+                    zeronat::elog!("config overrides --tun");
+                }
+                if let Some(v) = mtu {
+                    zeronat::elog!("config overrides --tap-mtu {v}");
+                }
+                if let Some(v) = &bridge {
+                    zeronat::elog!("config overrides --bridge '{v}'");
+                }
+                if pppoe {
+                    zeronat::elog!("config overrides --pppoe");
+                }
+
+                let srv = active_server(&file)?;
+                let (tcp, udp) = split_forwards(&file.forwards);
+                let tap = file.tap.as_ref().map(|t| TapConfig {
+                    name: t.dev.clone(),
+                    mtu: DEFAULT_TAP_MTU,
+                    bridge: None,
+                });
+                let tun = file.tun.as_ref().map(|t| {
+                    let (_subnet, _server_ip, client_ip) = tun_addrs(&srv.secret);
+                    let (addr, prefix_len) = t.address.unwrap_or((client_ip, TUN_PREFIX_LEN));
+                    zeronat::tap::TunConfig {
+                        name: t
+                            .dev
+                            .clone()
+                            .unwrap_or_else(|| DEFAULT_TUN_NAME.to_string()),
+                        mtu: DEFAULT_TAP_MTU,
+                        addr,
+                        prefix_len,
+                    }
+                });
+                // Boot mode: forwards when any are declared, else the one
+                // [[pppoe]] entry marked autostart.
+                let pppoe = if file.forwards.is_empty() {
+                    file.pppoe
+                        .iter()
+                        .find(|p| p.autostart)
+                        .map(pppoe_from_entry)
+                        .transpose()?
+                } else {
+                    None
                 };
-                let pass = cli::resolve_password(
-                    pass_file,
-                    std::env::var("ZERONAT_PPPOE_PASS").ok(),
-                    pppoe_pass,
+                if tcp.is_empty()
+                    && udp.is_empty()
+                    && tap.is_none()
+                    && tun.is_none()
+                    && pppoe.is_none()
+                {
+                    return Err(
+                        "nothing to do: the config declares no [[forwards]], autostart [[pppoe]], [tap], or [tun]"
+                            .into(),
+                    );
+                }
+                (
+                    srv.addr.clone(),
+                    srv.secret.clone(),
+                    tcp,
+                    udp,
+                    srv.transport,
+                    tap,
+                    tun,
+                    pppoe,
+                )
+            } else {
+                let server = server.ok_or("--server is required")?;
+                let secret = secret
+                    .or_else(|| std::env::var("ZERONAT_SECRET").ok())
+                    .ok_or("--secret or ZERONAT_SECRET is required")?;
+                if tun && bridge.is_some() {
+                    return Err("--bridge applies to --tap only, not --tun".into());
+                }
+                let mtu = mtu.unwrap_or(DEFAULT_TAP_MTU);
+                let tap = build_tap(tap_name, mtu, bridge);
+                // --pppoe owns the L2 channel; reject the device/forward flags it
+                // conflicts with. --transport is orthogonal and stays valid.
+                cli::validate_pppoe_exclusions(
+                    pppoe,
+                    tap.is_some(),
+                    tun,
+                    !tcp.is_empty() || !udp.is_empty(),
                 )?;
-                let pppoe_mtu_u16: u16 = pppoe_mtu.try_into().map_err(|_| -> zeronat::Error {
-                    format!("--pppoe-mtu {pppoe_mtu} exceeds the 65535 MTU limit").into()
-                })?;
-                let tap_mtu_u16: u16 = mtu.try_into().map_err(|_| -> zeronat::Error {
-                    format!("--tap-mtu {mtu} exceeds the 65535 MTU limit").into()
-                })?;
-                let resolved = cli::resolve_effective_mtu(pppoe_mtu_u16, tap_mtu_u16)?;
-                if resolved.capped {
-                    eprintln!(
+                cli::validate_pppoe_netcfg(
+                    pppoe,
+                    pppoe_default_route,
+                    pppoe_no_mss_clamp,
+                    pppoe_dns,
+                )?;
+                if tun {
+                    if tap.is_some() {
+                        return Err("--tun cannot be combined with --tap".into());
+                    }
+                    if !tcp.is_empty() || !udp.is_empty() {
+                        return Err("--tun cannot be combined with --tcp/--udp forwards".into());
+                    }
+                }
+                if tap.is_some() && (!tcp.is_empty() || !udp.is_empty()) {
+                    return Err("--tap cannot be combined with --tcp/--udp forwards".into());
+                }
+                if !pppoe && !tun && tap.is_none() && tcp.is_empty() && udp.is_empty() {
+                    return Err(
+                        "nothing to do: pass --pppoe, --tun, --tap, or at least one --tcp/--udp"
+                            .into(),
+                    );
+                }
+                if proxy && tcp.is_empty() {
+                    return Err("--proxy requires at least one --tcp forward".into());
+                }
+
+                // Resolve the PPPoE config: credentials (file > env > flag) and the
+                // effective MTU (capped to the tunnel MTU minus 8, floored). The
+                // password file is read here so the precedence helper stays pure.
+                let pppoe = if pppoe {
+                    let user = cli::resolve_username(
+                        pppoe_user,
+                        std::env::var("ZERONAT_PPPOE_USER").ok(),
+                    )?;
+                    let pass_file = match &pppoe_pass_file {
+                        Some(path) => Some(std::fs::read(path).map_err(|e| -> zeronat::Error {
+                            format!("reading --pppoe-pass-file {}: {e}", path.display()).into()
+                        })?),
+                        None => None,
+                    };
+                    let pass = cli::resolve_password(
+                        pass_file,
+                        std::env::var("ZERONAT_PPPOE_PASS").ok(),
+                        pppoe_pass,
+                    )?;
+                    let pppoe_mtu_u16: u16 =
+                        pppoe_mtu.try_into().map_err(|_| -> zeronat::Error {
+                            format!("--pppoe-mtu {pppoe_mtu} exceeds the 65535 MTU limit").into()
+                        })?;
+                    let tap_mtu_u16: u16 = mtu.try_into().map_err(|_| -> zeronat::Error {
+                        format!("--tap-mtu {mtu} exceeds the 65535 MTU limit").into()
+                    })?;
+                    let resolved = cli::resolve_effective_mtu(pppoe_mtu_u16, tap_mtu_u16)?;
+                    if resolved.capped {
+                        eprintln!(
                         "pppoe: requested MTU {pppoe_mtu} exceeds what the tunnel carries; using {}",
                         resolved.effective
                     );
+                    }
+                    Some(client::PppoeRunConfig {
+                        username: user,
+                        password: pass,
+                        service_name: pppoe_service.map(String::into_bytes).unwrap_or_default(),
+                        ac_name: pppoe_ac.map(String::into_bytes),
+                        tun_name: pppoe_tun,
+                        effective_mtu: resolved.effective,
+                        default_route: pppoe_default_route,
+                        // The MSS clamp rides with --pppoe-default-route unless opted out;
+                        // value is the effective IP MTU minus the IPv4+TCP headers.
+                        clamp_mss: if pppoe_default_route && !pppoe_no_mss_clamp {
+                            Some(resolved.effective.saturating_sub(40).max(536))
+                        } else {
+                            None
+                        },
+                        request_dns: pppoe_dns,
+                    })
+                } else {
+                    None
+                };
+                let tun = if tun {
+                    let (_subnet, _server_ip, client_ip) = tun_addrs(&secret);
+                    Some(zeronat::tap::TunConfig {
+                        name: DEFAULT_TUN_NAME.to_string(),
+                        mtu,
+                        addr: client_ip,
+                        prefix_len: TUN_PREFIX_LEN,
+                    })
+                } else {
+                    None
+                };
+                let mut tcp = tcp
+                    .iter()
+                    .map(|s| parse_forward(s, Proto::Tcp))
+                    .collect::<Result<Vec<_>>>()?;
+                if proxy {
+                    for f in &mut tcp {
+                        f.proxy = true;
+                    }
                 }
-                Some(client::PppoeRunConfig {
-                    username: user,
-                    password: pass,
-                    service_name: pppoe_service.map(String::into_bytes).unwrap_or_default(),
-                    ac_name: pppoe_ac.map(String::into_bytes),
-                    tun_name: pppoe_tun,
-                    effective_mtu: resolved.effective,
-                    default_route: pppoe_default_route,
-                    // The MSS clamp rides with --pppoe-default-route unless opted out;
-                    // value is the effective IP MTU minus the IPv4+TCP headers.
-                    clamp_mss: if pppoe_default_route && !pppoe_no_mss_clamp {
-                        Some(resolved.effective.saturating_sub(40).max(536))
-                    } else {
-                        None
-                    },
-                    request_dns: pppoe_dns,
-                })
-            } else {
-                None
+                let udp = udp
+                    .iter()
+                    .map(|s| parse_forward(s, Proto::Udp))
+                    .collect::<Result<Vec<_>>>()?;
+                let transport = match transport.as_deref().unwrap_or("auto") {
+                    "auto" => client::Transport::Auto,
+                    "udp" => client::Transport::Udp,
+                    "tcp" => client::Transport::Tcp,
+                    other => {
+                        return Err(format!(
+                            "invalid --transport '{other}' (expected auto|udp|tcp)"
+                        )
+                        .into())
+                    }
+                };
+                (server, secret, tcp, udp, transport, tap, tun, pppoe)
             };
-            let tun = if tun {
-                let (_subnet, _server_ip, client_ip) = tun_addrs(&secret);
-                Some(zeronat::tap::TunConfig {
-                    name: DEFAULT_TUN_NAME.to_string(),
-                    mtu,
-                    addr: client_ip,
-                    prefix_len: TUN_PREFIX_LEN,
-                })
-            } else {
-                None
-            };
-            let mut tcp = tcp
-                .iter()
-                .map(|s| parse_forward(s, Proto::Tcp))
-                .collect::<Result<Vec<_>>>()?;
-            if proxy {
-                for f in &mut tcp {
-                    f.proxy = true;
-                }
-            }
-            let udp = udp
-                .iter()
-                .map(|s| parse_forward(s, Proto::Udp))
-                .collect::<Result<Vec<_>>>()?;
-            let transport = match transport.as_str() {
-                "auto" => client::Transport::Auto,
-                "udp" => client::Transport::Udp,
-                "tcp" => client::Transport::Tcp,
-                other => {
-                    return Err(
-                        format!("invalid --transport '{other}' (expected auto|udp|tcp)").into(),
-                    )
-                }
-            };
+
             let v = env!("CARGO_PKG_VERSION");
             let tl = transport_label(transport);
             match &pppoe {
@@ -1193,5 +1425,144 @@ mod tests {
         assert!(parse_forward("443+nope", Proto::Tcp).is_err());
         assert!(parse_forward("443+", Proto::Tcp).is_err());
         assert!(parse_forward("443+PROXY", Proto::Tcp).is_err());
+    }
+
+    fn cfg_server(name: &str) -> CfgServer {
+        CfgServer {
+            name: name.into(),
+            addr: format!("{name}.example:2222"),
+            secret: "s".into(),
+            transport: zeronat::client::Transport::Auto,
+        }
+    }
+
+    #[test]
+    fn shape_declared_by_any_list_kind() {
+        assert!(!declares_shape(&ClientConfig::default()));
+        assert!(!declares_shape(&ClientConfig {
+            id: Some("x".into()),
+            control: Some("/tmp/x.sock".into()),
+            ..ClientConfig::default()
+        }));
+        for cfg in [
+            ClientConfig {
+                servers: vec![cfg_server("a")],
+                ..ClientConfig::default()
+            },
+            ClientConfig {
+                forwards: vec![CfgForward {
+                    proto: Proto::Tcp,
+                    port: 443,
+                    target: "127.0.0.1:443".into(),
+                    proxy: false,
+                    idle: None,
+                }],
+                ..ClientConfig::default()
+            },
+            ClientConfig {
+                pppoe: vec![cfg_pppoe(false)],
+                ..ClientConfig::default()
+            },
+            ClientConfig {
+                tap: Some(zeronat::clientcfg::CfgTap { dev: "t0".into() }),
+                ..ClientConfig::default()
+            },
+            ClientConfig {
+                tun: Some(zeronat::clientcfg::CfgTun {
+                    dev: None,
+                    address: None,
+                }),
+                ..ClientConfig::default()
+            },
+        ] {
+            assert!(declares_shape(&cfg));
+        }
+    }
+
+    #[test]
+    fn active_server_prefers_named_entry_then_first() {
+        let cfg = ClientConfig {
+            servers: vec![cfg_server("a"), cfg_server("b")],
+            ..ClientConfig::default()
+        };
+        assert_eq!(active_server(&cfg).unwrap().name, "a");
+
+        let cfg = ClientConfig {
+            active: Some("b".into()),
+            ..cfg
+        };
+        assert_eq!(active_server(&cfg).unwrap().name, "b");
+    }
+
+    #[test]
+    fn active_server_requires_an_entry() {
+        assert!(active_server(&ClientConfig::default()).is_err());
+    }
+
+    #[test]
+    fn split_forwards_by_proto_with_options() {
+        let fwds = [
+            CfgForward {
+                proto: Proto::Tcp,
+                port: 443,
+                target: "10.0.0.5:8443".into(),
+                proxy: true,
+                idle: Some(600),
+            },
+            CfgForward {
+                proto: Proto::Udp,
+                port: 51820,
+                target: "127.0.0.1:51820".into(),
+                proxy: false,
+                idle: None,
+            },
+        ];
+        let (tcp, udp) = split_forwards(&fwds);
+        assert_eq!(tcp, vec![fwd(443, "10.0.0.5:8443", true, Some(600))]);
+        assert_eq!(udp, vec![fwd(51820, "127.0.0.1:51820", false, None)]);
+    }
+
+    fn cfg_pppoe(default_route: bool) -> zeronat::clientcfg::CfgPppoe {
+        zeronat::clientcfg::CfgPppoe {
+            name: "wan".into(),
+            autostart: true,
+            username: "user@isp".into(),
+            password: Some("pw".into()),
+            password_file: None,
+            service: "fibra".into(),
+            mtu: 1492,
+            default_route,
+            clamp_mss: true,
+            request_dns: true,
+        }
+    }
+
+    #[test]
+    fn pppoe_entry_resolves_run_config() {
+        let cfg = pppoe_from_entry(&cfg_pppoe(true)).unwrap();
+        assert_eq!(cfg.username, b"user@isp");
+        assert_eq!(cfg.password, b"pw");
+        assert_eq!(cfg.service_name, b"fibra");
+        assert_eq!(cfg.tun_name, "zppp0");
+        // 1492 caps to the 1400-byte tunnel minus the PPPoE overhead.
+        assert_eq!(cfg.effective_mtu, 1392);
+        assert_eq!(cfg.clamp_mss, Some(1352));
+        assert!(cfg.default_route);
+        assert!(cfg.request_dns);
+    }
+
+    #[test]
+    fn pppoe_entry_clamp_rides_with_default_route() {
+        let cfg = pppoe_from_entry(&cfg_pppoe(false)).unwrap();
+        assert_eq!(cfg.clamp_mss, None);
+    }
+
+    #[test]
+    fn pppoe_entry_needs_a_password_source() {
+        let entry = zeronat::clientcfg::CfgPppoe {
+            password: None,
+            ..cfg_pppoe(false)
+        };
+        assert!(pppoe_from_entry(&entry).is_err());
     }
 }
