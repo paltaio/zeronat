@@ -286,7 +286,9 @@ client = "rpi-2-ab12"</code></pre>
       <h2>Admin</h2>
       <p>Inspect a running server's topology over the control port (read-only, one-shot):</p>
 <pre><code>ZERONAT_SECRET=$SECRET zeronat admin --server &lt;public-ip&gt;:2222 show</code></pre>
-      <p>It prints the server, its routes, connected clients, and active listeners.</p>
+      <p>It prints the server, its routes, connected clients, and active listeners. Each client lists
+      the forwards it announced with non-default options (<code>tcp:443  +proxy+idle=600</code>), and a
+      route shows its forward's options in the OPTIONS column.</p>
     </section>
 
     <section id="allports">

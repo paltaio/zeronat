@@ -699,6 +699,12 @@ impl App {
             &format!("{:<9}", if active { "active" } else { "offline" }),
         );
         l.add(MUTED, source_tag(r.source));
+        if let Some(snap) = &self.snap {
+            let opts = crate::admin::route_opts(snap, r);
+            if opts != "-" {
+                l.add(MUTED, &format!("  {opts}"));
+            }
+        }
         l
     }
 
@@ -725,6 +731,17 @@ impl App {
             &format!("{:<18}", trunc(&sanitize(&c.client_id), 18)),
         );
         l.add(MUTED, crate::admin::transport_name(c.transport));
+        for e in &c.fwd {
+            l.add(
+                MUTED,
+                &format!(
+                    "  {}:{}{}",
+                    proto_name(e.proto),
+                    e.port,
+                    crate::admin::fwd_opts(e.proxy, e.idle_secs)
+                ),
+            );
+        }
         l
     }
 

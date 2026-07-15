@@ -28,11 +28,14 @@ pub struct Listener {
 }
 
 /// A connected client, as reported in a `Snapshot`. `transport` is the observed
-/// control transport: 1 = tcp, 2 = udp.
+/// control transport: 1 = tcp, 2 = udp. `fwd` is the client's announced
+/// per-forward options, which cover only forwards carrying a non-default
+/// option (empty until a `FwdOptions` arrives).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientEntry {
     pub client_id: String,
     pub transport: u8,
+    pub fwd: Vec<FwdOptionEntry>,
 }
 
 /// A route in the server's table, as reported in a `Snapshot`. `state` is 0 when
@@ -304,6 +307,58 @@ fn take_sockaddr(b: &[u8], at: &mut usize) -> Result<SocketAddr> {
     Ok(SocketAddr::new(ip, port))
 }
 
+/// Encode a forward-option list: a u16 count then the fixed 8-byte entries.
+/// Shared by the `FwdOptions` body and each snapshot client's announced list;
+/// the count is a u16 on the wire, so the encoded entries are capped to match
+/// and the count and body never disagree.
+fn put_fwd_entries(b: &mut Vec<u8>, entries: &[FwdOptionEntry]) {
+    debug_assert!(entries.len() <= u16::MAX as usize);
+    let entries = &entries[..entries.len().min(u16::MAX as usize)];
+    b.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    for e in entries {
+        b.push(proto_byte(e.proto));
+        b.extend_from_slice(&e.port.to_be_bytes());
+        // Flags byte: bit0 = proxy; the remaining bits are reserved and must
+        // stay zero (the decoder rejects them).
+        b.push(u8::from(e.proxy));
+        b.extend_from_slice(&e.idle_secs.to_be_bytes());
+    }
+}
+
+/// Decode a forward-option list written by [`put_fwd_entries`]. Every read is
+/// length-guarded and the list is grown without preallocating from the
+/// untrusted count, so a malformed or truncated body errors rather than
+/// panicking or over-allocating.
+fn take_fwd_entries(b: &[u8], at: &mut usize) -> Result<Vec<FwdOptionEntry>> {
+    if *at + 2 > b.len() {
+        return Err("truncated forward options count".into());
+    }
+    let count = u16::from_be_bytes([b[*at], b[*at + 1]]) as usize;
+    *at += 2;
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        if *at + 8 > b.len() {
+            return Err("truncated forward option entry".into());
+        }
+        let proto = proto_from_byte(b[*at])?;
+        let port = u16::from_be_bytes([b[*at + 1], b[*at + 2]]);
+        let proxy = match b[*at + 3] {
+            0 => false,
+            1 => true,
+            n => return Err(format!("unknown forward option flags byte {n}").into()),
+        };
+        let idle_secs = u32::from_be_bytes(b[*at + 4..*at + 8].try_into().unwrap());
+        *at += 8;
+        entries.push(FwdOptionEntry {
+            proto,
+            port,
+            proxy,
+            idle_secs,
+        });
+    }
+    Ok(entries)
+}
+
 /// Decode the bridge-client trailer that follows the routes in a snapshot: a u16
 /// count followed by that many entries. Every multi-byte read is length-guarded
 /// first, the count is u16-bounded, and the list is grown without preallocating
@@ -433,6 +488,7 @@ impl Msg {
                 for c in &snap.clients {
                     put_str(&mut b, &c.client_id);
                     b.push(c.transport);
+                    put_fwd_entries(&mut b, &c.fwd);
                 }
                 debug_assert!(snap.routes.len() <= u16::MAX as usize);
                 b.extend_from_slice(&(snap.routes.len() as u16).to_be_bytes());
@@ -525,21 +581,9 @@ impl Msg {
                 b
             }
             Msg::FwdOptions { entries } => {
-                debug_assert!(entries.len() <= u16::MAX as usize);
-                // The count is a u16 on the wire; cap the encoded entries to
-                // match so the count and body never disagree.
-                let entries = &entries[..entries.len().min(u16::MAX as usize)];
                 let mut b = Vec::with_capacity(3 + entries.len() * 8);
                 b.push(13);
-                b.extend_from_slice(&(entries.len() as u16).to_be_bytes());
-                for e in entries {
-                    b.push(proto_byte(e.proto));
-                    b.extend_from_slice(&e.port.to_be_bytes());
-                    // Flags byte: bit0 = proxy; the remaining bits are reserved
-                    // and must stay zero (the decoder rejects them).
-                    b.push(u8::from(e.proxy));
-                    b.extend_from_slice(&e.idle_secs.to_be_bytes());
-                }
+                put_fwd_entries(&mut b, entries);
                 b
             }
             Msg::FwdOptionsAck => vec![14],
@@ -645,9 +689,11 @@ impl Msg {
                     if transport != 1 && transport != 2 {
                         return Err(format!("unknown transport byte {transport}").into());
                     }
+                    let fwd = take_fwd_entries(b, &mut at)?;
                     clients.push(ClientEntry {
                         client_id,
                         transport,
+                        fwd,
                     });
                 }
                 if at + 2 > b.len() {
@@ -766,32 +812,8 @@ impl Msg {
                 Ok(Msg::MutationResult { ok, msg })
             }
             Some(13) => {
-                if b.len() < 3 {
-                    return Err("truncated forward options count".into());
-                }
-                let count = u16::from_be_bytes([b[1], b[2]]) as usize;
-                let mut at = 3;
-                let mut entries = Vec::new();
-                for _ in 0..count {
-                    if at + 8 > b.len() {
-                        return Err("truncated forward option entry".into());
-                    }
-                    let proto = proto_from_byte(b[at])?;
-                    let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
-                    let proxy = match b[at + 3] {
-                        0 => false,
-                        1 => true,
-                        n => return Err(format!("unknown forward option flags byte {n}").into()),
-                    };
-                    let idle_secs = u32::from_be_bytes(b[at + 4..at + 8].try_into().unwrap());
-                    at += 8;
-                    entries.push(FwdOptionEntry {
-                        proto,
-                        port,
-                        proxy,
-                        idle_secs,
-                    });
-                }
+                let mut at = 1;
+                let entries = take_fwd_entries(b, &mut at)?;
                 if at != b.len() {
                     return Err("trailing bytes in forward options".into());
                 }
@@ -886,10 +908,25 @@ mod tests {
                 ClientEntry {
                     client_id: "rpi-1-ab12".into(),
                     transport: 1,
+                    fwd: vec![
+                        FwdOptionEntry {
+                            proto: Proto::Tcp,
+                            port: 443,
+                            proxy: true,
+                            idle_secs: 600,
+                        },
+                        FwdOptionEntry {
+                            proto: Proto::Udp,
+                            port: 51820,
+                            proxy: false,
+                            idle_secs: 300,
+                        },
+                    ],
                 },
                 ClientEntry {
                     client_id: "rpi-2-cd34".into(),
                     transport: 2,
+                    fwd: Vec::new(),
                 },
             ],
             routes: vec![
@@ -1211,15 +1248,16 @@ mod tests {
             clients: vec![ClientEntry {
                 client_id: "rpi".into(),
                 transport: 1,
+                fwd: Vec::new(),
             }],
             routes: Vec::new(),
             bridge_clients: Vec::new(),
         })
         .encode();
-        // The trailing four bytes are the zero route count then the zero bridge
-        // count; back up past them to the client transport byte and corrupt it.
+        // The trailing six bytes are the zero forward-option, route, and bridge
+        // counts; back up past them to the client transport byte and corrupt it.
         let n = snap.len();
-        snap[n - 5] = 3;
+        snap[n - 7] = 3;
         assert!(Msg::decode(&snap).is_err());
 
         // tag-7 with a bad listener source byte (5). A single listener and no
@@ -1264,6 +1302,32 @@ mod tests {
         .encode();
         let n = snap.len();
         snap[n - 3] = 7;
+        assert!(Msg::decode(&snap).is_err());
+
+        // tag-7 with a client forward-option flags byte carrying reserved bits
+        // (2). A single client with one entry and nothing else puts the flags
+        // byte before the entry's idle u32 and the two zero route-count and
+        // bridge-count bytes, i.e. nine bytes from the end.
+        let mut snap = Msg::Snapshot(SnapshotBody {
+            version: 1,
+            server_id: "0".into(),
+            listeners: Vec::new(),
+            clients: vec![ClientEntry {
+                client_id: "rpi".into(),
+                transport: 1,
+                fwd: vec![FwdOptionEntry {
+                    proto: Proto::Tcp,
+                    port: 443,
+                    proxy: true,
+                    idle_secs: 0,
+                }],
+            }],
+            routes: Vec::new(),
+            bridge_clients: Vec::new(),
+        })
+        .encode();
+        let n = snap.len();
+        snap[n - 9] = 2;
         assert!(Msg::decode(&snap).is_err());
     }
 

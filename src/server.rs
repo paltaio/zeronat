@@ -22,7 +22,7 @@ use crate::noise::{server_handshake, server_handshake_stateless, Noise, Stateles
 #[cfg(target_os = "linux")]
 use crate::proto::BridgeEntry;
 use crate::proto::{
-    proto_name, ClientEntry, Listener, Msg, Proto, RouteEntry, SnapshotBody, Source,
+    proto_name, ClientEntry, FwdOptionEntry, Listener, Msg, Proto, RouteEntry, SnapshotBody, Source,
 };
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
@@ -672,9 +672,26 @@ impl Server {
             let connected = map.keys().cloned().collect();
             let clients = map
                 .iter()
-                .map(|(id, h)| ClientEntry {
-                    client_id: id.clone(),
-                    transport: transport_byte(h.transport),
+                .map(|(id, h)| {
+                    let mut fwd: Vec<FwdOptionEntry> = h
+                        .fwd
+                        .iter()
+                        .map(|(&(proto, port), o)| FwdOptionEntry {
+                            proto,
+                            port,
+                            proxy: o.proxy,
+                            idle_secs: o
+                                .idle
+                                .map(|d| d.as_secs().try_into().unwrap_or(u32::MAX))
+                                .unwrap_or(0),
+                        })
+                        .collect();
+                    fwd.sort_unstable_by_key(|e| (e.port, e.proto == Proto::Udp));
+                    ClientEntry {
+                        client_id: id.clone(),
+                        transport: transport_byte(h.transport),
+                        fwd,
+                    }
                 })
                 .collect();
             (connected, clients)

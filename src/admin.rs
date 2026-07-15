@@ -1,4 +1,4 @@
-use crate::proto::{proto_name, Msg, SnapshotBody, Source};
+use crate::proto::{proto_name, Msg, RouteEntry, SnapshotBody, Source};
 use crate::Result;
 use tokio::net::TcpStream;
 
@@ -109,18 +109,19 @@ fn render(snap: &SnapshotBody, addr: &str) -> String {
         out.push_str("  (no routes)\n");
     } else {
         out.push_str(&format!(
-            "  {:<8}  {:<15}  {:<5}  {:<5}  {:<16}  {:<14}  {}\n",
-            "SERVER", "BIND IP", "PROTO", "PORT", "TARGET", "STATE", "SOURCE"
+            "  {:<8}  {:<15}  {:<5}  {:<5}  {:<16}  {:<14}  {:<16}  {}\n",
+            "SERVER", "BIND IP", "PROTO", "PORT", "TARGET", "STATE", "OPTIONS", "SOURCE"
         ));
         for route in &snap.routes {
             out.push_str(&format!(
-                "  {:<8}  {:<15}  {:<5}  {:<5}  {:<16}  {:<14}  {}\n",
+                "  {:<8}  {:<15}  {:<5}  {:<5}  {:<16}  {:<14}  {:<16}  {}\n",
                 snap.server_id,
                 route.bind_ip,
                 proto_name(route.proto),
                 route.port,
                 route.client_id,
                 route_state(route.state),
+                route_opts(snap, route),
                 source_name(route.source),
             ));
         }
@@ -135,6 +136,14 @@ fn render(snap: &SnapshotBody, addr: &str) -> String {
                 "  {}  connected to {}\n",
                 c.client_id, snap.server_id
             ));
+            for e in &c.fwd {
+                out.push_str(&format!(
+                    "    {}:{}  {}\n",
+                    proto_name(e.proto),
+                    e.port,
+                    fwd_opts(e.proxy, e.idle_secs),
+                ));
+            }
         }
     }
 
@@ -240,6 +249,38 @@ pub(crate) fn human_count(n: u64) -> String {
     format!("{v:.1}{}", UNITS[unit])
 }
 
+/// The announced options for a route's forward, joined from the routed
+/// client's snapshot entry; "-" when the client is offline or the forward
+/// runs on defaults.
+pub(crate) fn route_opts(snap: &SnapshotBody, r: &RouteEntry) -> String {
+    snap.clients
+        .iter()
+        .find(|c| c.client_id == r.client_id)
+        .and_then(|c| {
+            c.fwd
+                .iter()
+                .find(|e| e.proto == r.proto && e.port == r.port)
+        })
+        .map(|e| fwd_opts(e.proxy, e.idle_secs))
+        .unwrap_or_else(|| "-".into())
+}
+
+/// A forward's client-announced options in the CLI's spec-modifier syntax,
+/// e.g. "+proxy+idle=600"; "-" when the forward runs on defaults.
+pub(crate) fn fwd_opts(proxy: bool, idle_secs: u32) -> String {
+    let mut s = String::new();
+    if proxy {
+        s.push_str("+proxy");
+    }
+    if idle_secs > 0 {
+        s.push_str(&format!("+idle={idle_secs}"));
+    }
+    if s.is_empty() {
+        s.push('-');
+    }
+    s
+}
+
 /// Compact duration for the fleet view, e.g. "45s", "4m12s", "1h03m".
 pub(crate) fn fmt_dur(secs: u32) -> String {
     let s = secs % 60;
@@ -257,7 +298,7 @@ pub(crate) fn fmt_dur(secs: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{BridgeEntry, ClientEntry, Listener, Proto, RouteEntry, Source};
+    use crate::proto::{BridgeEntry, ClientEntry, FwdOptionEntry, Listener, Proto, Source};
     use std::net::Ipv4Addr;
 
     #[test]
@@ -282,6 +323,12 @@ mod tests {
             clients: vec![ClientEntry {
                 client_id: "rpi-2-ab12".into(),
                 transport: 1,
+                fwd: vec![FwdOptionEntry {
+                    proto: Proto::Tcp,
+                    port: 443,
+                    proxy: true,
+                    idle_secs: 600,
+                }],
             }],
             routes: vec![RouteEntry {
                 bind_ip: Ipv4Addr::LOCALHOST,
@@ -310,6 +357,19 @@ mod tests {
         assert!(s.contains("file"));
         assert!(s.contains("cli"));
         assert!(s.contains("runtime"));
+        // OPTIONS column: the route joins the client's announced options, and
+        // the client lists its optioned forwards.
+        assert!(s.contains("OPTIONS"));
+        assert!(s.contains("+proxy+idle=600"));
+        assert!(s.contains("tcp:443  +proxy+idle=600"));
+    }
+
+    #[test]
+    fn fwd_opts_renders_each_combination() {
+        assert_eq!(fwd_opts(false, 0), "-");
+        assert_eq!(fwd_opts(true, 0), "+proxy");
+        assert_eq!(fwd_opts(false, 300), "+idle=300");
+        assert_eq!(fwd_opts(true, 600), "+proxy+idle=600");
     }
 
     #[test]
