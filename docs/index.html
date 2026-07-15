@@ -89,6 +89,8 @@
       <a class="nav-link" href="#install">Install</a>
       <a class="nav-link" href="#start">Quick start</a>
       <a class="nav-link" href="#forwarding">Forwarding</a>
+      <a class="nav-link" href="#proxy">Proxy protocol</a>
+      <a class="nav-link" href="#transparency">Transparency</a>
       <a class="nav-link" href="#transport">Transport</a>
       <a class="nav-link" href="#routing">Routing</a>
       <a class="nav-link" href="#admin">Admin</a>
@@ -149,6 +151,96 @@ ZERONAT_SECRET=somelongsecret zeronat client \
         </tbody>
       </table>
       <p><code>--udp</code> works the same way. Both flags are repeatable.</p>
+    </section>
+
+    <section id="proxy">
+      <h2>Proxy protocol</h2>
+      <p>Any client forward spec takes appended modifiers: <code>SPEC[+proxy][+idle=SECS]</code>.
+      <code>+proxy</code> applies to TCP forwards only and is rejected on <code>--udp</code>. For each public
+      connection, the client writes a PROXY protocol v2 header as the first bytes to the local target,
+      carrying the real public peer address and the public listener address the connection arrived on. The
+      target must be configured to expect the header; one that is not reads it as garbage at the start of
+      every connection.</p>
+<pre><code>zeronat client --server &lt;public-ip&gt;:2222 --tcp 443:10.0.0.5:443+proxy+idle=600</code></pre>
+      <p>Both ends must run a release that supports <code>+proxy</code>. After connecting, the client
+      announces its per-forward options and waits for the server's acknowledgment; against a server that
+      never acknowledges, the client logs an error naming the affected forwards and those forwards refuse
+      every connection rather than relay without the header. Removing <code>+proxy</code> and restarting
+      the client restores plain relaying against any server.</p>
+      <h3>Traefik cutover</h3>
+      <p>For a deployment where the forward's target is Traefik: configure Traefik to trust PROXY headers
+      from the address the zeronat client dials from (on a Docker network typically the bridge gateway, e.g.
+      172.18.0.1) and restart it, then add <code>+proxy</code> to the client's forward specs and restart the
+      client. Rollback is removing <code>+proxy</code> again; no Traefik change is needed.</p>
+<pre><code><span class="c"># traefik static configuration</span>
+entryPoints:
+  websecure:
+    address: ":443"
+    proxyProtocol:
+      trustedIPs:
+        - "172.18.0.1/32"</code></pre>
+      <p>Tested on traefik v3.6 with <code>trustedIPs</code> set: a headerless connection from a trusted
+      source is served normally using the TCP peer address, a header from a trusted source is honored (v1
+      and v2 auto-detected), and a header from an untrusted source is consumed and ignored. So the cutover
+      need not be atomic: enabling <code>trustedIPs</code> first has zero impact on headerless traffic. Any host
+      matching <code>trustedIPs</code> can forge client addresses, so scope it to the exact dial source
+      (a /32), never a whole subnet.</p>
+      <p>Once headers flow, IP-keyed middleware (geoip, allow and deny lists, rate limits) sees real public
+      addresses; rules that matched the internal dial source stop matching.</p>
+    </section>
+
+    <section id="transparency">
+      <h2>Transparency</h2>
+      <p>Per-port forwarding relays payload bytes untouched, but a service behind zeronat observes its
+      network environment differently than the same service on a public IP:</p>
+      <table>
+        <thead><tr><th>Behavior</th><th>On a public IP</th><th>Behind zeronat</th></tr></thead>
+        <tbody>
+          <tr><td>TCP client address</td><td>Real peer address</td><td>The client's dial source; real address via <code>+proxy</code></td></tr>
+          <tr><td>UDP peer address</td><td>Real peer address per datagram</td><td>The client's local socket, one per public source</td></tr>
+          <tr><td>Destination address</td><td>The public IP and port</td><td>The forward's target address</td></tr>
+          <tr><td>TLS</td><td>Terminated by the service</td><td>Same: passthrough, never terminated or inspected</td></tr>
+          <tr><td>TCP half-close</td><td>One direction keeps flowing</td><td>Not propagated: a FIN closes both directions</td></tr>
+          <tr><td>Reset vs orderly close</td><td>RST visible as a reset</td><td>A reset surfaces as an orderly close</td></tr>
+          <tr><td>Idle TCP lifetime</td><td>Unlimited</td><td>Unlimited while the tunnel is healthy</td></tr>
+          <tr><td>Idle UDP flow lifetime</td><td>No flow state kept</td><td>Source forgotten after max(180s, idle+60s)</td></tr>
+          <tr><td>IPv6</td><td>As deployed</td><td>Public listeners are IPv4-only</td></tr>
+          <tr><td>UDP datagram size</td><td>Path MTU</td><td>1442 bytes on a 1500 path over the UDP transport</td></tr>
+          <tr><td>Client disconnected</td><td>Connection refused</td><td>TCP: accepted then closed; UDP: silently dropped</td></tr>
+        </tbody>
+      </table>
+      <p>Without <code>+proxy</code>, the target sees the source the client dialed from: on a Docker network
+      the bridge gateway, on a plain host the loopback or LAN address. UDP peer
+      addresses are never preserved in per-port mode: the client opens one local socket per public source
+      and there is no PROXY protocol for UDP; <code>--tun</code> preserves real sources when a UDP service
+      needs them. The destination the target sees is the forward's target (<code>127.0.0.1:PORT</code> or
+      the spec's <code>HOST:PORT</code>), not the public listener; with <code>+proxy</code> the header's
+      destination field carries the public listener address and port, so a parsing target recovers it.</p>
+      <p>Relayed bytes are opaque payload: TLS certificates, ALPN, and SNI pass through byte for byte, and
+      the tunnel's Noise encryption is a separate layer invisible to both the public peer and the target.
+      A FIN from either end tears down both directions, and a reset or socket error on one side surfaces
+      on the other as an orderly close, so software cannot distinguish a clean EOF from an abort through
+      the relay.</p>
+      <p>A healthy but idle TCP stream survives indefinitely: both relay ends exchange encrypted keepalive
+      probes every half idle window, and the window (default 120s, tunable per forward with
+      <code>+idle=SECS</code>) reaps only a stream whose path has black-holed: no frames at all,
+      probes included, for a full window. For UDP forwards, the server also tracks each public source and
+      forgets it after max(180s, idle + 60s) without an inbound datagram; the next datagram re-establishes
+      the flow through a fresh client-side socket, so the target sees a new source port. Raising
+      <code>+idle</code> extends both the tunnel window and the source lifetime.</p>
+      <p>Public listeners are IPv4-only: <code>--bind</code> takes an IPv4 address. The PROXY v2 header
+      encoding handles IPv6 and IPv4-mapped addresses, but no IPv6 traffic reaches the listeners.</p>
+      <p>Over the UDP transport, each forwarded datagram rides in one tunnel packet with 30 bytes of framing
+      (1 class + 4 tag + 8 nonce + 1 kind + 16 AEAD tag bytes) plus the tunnel packet's own IPv4 and UDP
+      headers (28 bytes); on a 1500-byte path, 1500 - 28 - 30 = 1442, and a larger datagram produces an
+      oversized tunnel packet that fragments or is dropped depending on the path. A WireGuard peer dialing a
+      forwarded UDP port adds 32 bytes of its own framing, so keep the WireGuard interface MTU at 1410 or
+      lower on a 1500-byte path (1442 - 32 = 1410). Over the TCP transport there is no per-datagram limit
+      below 65 KB, but loss on the tunnel path becomes retransmission delay instead of a dropped
+      datagram.</p>
+      <p>While no client is connected, TCP listeners stay bound and keep accepting, closing each connection
+      immediately; a direct service that is down refuses instead, so health checks that distinguish refused
+      from closed see different results. UDP datagrams are silently dropped.</p>
     </section>
 
     <section id="transport">
@@ -314,8 +406,8 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
           <tr><td><code>--server &lt;ADDR&gt;</code></td><td>Server control address <code>host:port</code>, or <code>dht</code> to discover via DHT</td></tr>
           <tr><td><code>--secret &lt;SECRET&gt;</code></td><td>Shared secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
           <tr><td><code>--id &lt;PREFIX&gt;</code></td><td>Client id prefix (default: short hostname)</td></tr>
-          <tr><td><code>--tcp &lt;SPEC&gt;</code></td><td>Forward TCP: <code>PORT</code> | <code>PORT:LOCALPORT</code> | <code>PORT:HOST:PORT</code> (repeatable)</td></tr>
-          <tr><td><code>--udp &lt;SPEC&gt;</code></td><td>Forward UDP, same spec as <code>--tcp</code> (repeatable)</td></tr>
+          <tr><td><code>--tcp &lt;SPEC&gt;</code></td><td>Forward TCP: <code>PORT</code> | <code>PORT:LOCALPORT</code> | <code>PORT:HOST:PORT</code>, with optional <code>+proxy</code> and <code>+idle=SECS</code> (repeatable)</td></tr>
+          <tr><td><code>--udp &lt;SPEC&gt;</code></td><td>Forward UDP, same spec as <code>--tcp</code>; <code>+idle</code> only, <code>+proxy</code> is TCP-only (repeatable)</td></tr>
           <tr><td><code>--transport &lt;MODE&gt;</code></td><td><code>auto</code> | <code>udp</code> | <code>tcp</code> (default auto)</td></tr>
           <tr><td><code>--tun</code></td><td>All-ports mode (Linux): receive every forwarded port on local services</td></tr>
           <tr><td><code>--tap &lt;NAME&gt;</code></td><td>L2 bridge mode (Linux): create or attach this TAP device</td></tr>
