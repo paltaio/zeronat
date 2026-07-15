@@ -179,12 +179,9 @@ entryPoints:
     proxyProtocol:
       trustedIPs:
         - "172.18.0.1/32"</code></pre>
-      <p>Tested on traefik v3.6 with <code>trustedIPs</code> set: a headerless connection from a trusted
-      source is served normally using the TCP peer address, a header from a trusted source is honored (v1
-      and v2 auto-detected), and a header from an untrusted source is consumed and ignored. So the cutover
-      need not be atomic: enabling <code>trustedIPs</code> first has zero impact on headerless traffic. Any host
-      matching <code>trustedIPs</code> can forge client addresses, so scope it to the exact dial source
-      (a /32), never a whole subnet.</p>
+      <p>Traefik serves connections without a header even when <code>trustedIPs</code> is set, so the two
+      restarts can happen in either order. Any host matching <code>trustedIPs</code> can forge client
+      addresses; keep it a /32.</p>
       <p>Once headers flow, IP-keyed middleware (geoip, allow and deny lists, rate limits) sees real public
       addresses; rules that matched the internal dial source stop matching.</p>
     </section>
