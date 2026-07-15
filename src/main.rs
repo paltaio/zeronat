@@ -51,6 +51,7 @@ client options:
                       target) and +idle=SECS modifiers (repeatable)
   --udp <SPEC>        Forward UDP: PORT | PORT:LOCALPORT | PORT:HOST:PORT, plus
                       an optional +idle=SECS modifier (repeatable)
+  --proxy             Send a PROXY protocol v2 header on every --tcp forward
   --tun               L3 all-ports mode (Linux only): receive every forwarded
                       port on local services (bind 0.0.0.0 or the tunnel address)
   --transport <MODE>  auto|udp|tcp (default: auto)
@@ -115,6 +116,7 @@ enum Cmd {
         id_prefix: Option<String>,
         tcp: Vec<String>,
         udp: Vec<String>,
+        proxy: bool,
         transport: String,
         tap: Option<TapConfig>,
         tun: bool,
@@ -422,6 +424,7 @@ fn parse_args() -> Result<Cmd> {
         let mut id_prefix: Option<String> = None;
         let mut tcp: Vec<String> = Vec::new();
         let mut udp: Vec<String> = Vec::new();
+        let mut proxy = false;
         let mut transport = "auto".to_string();
         let mut tap_name: Option<String> = None;
         let mut tap_mtu: usize = DEFAULT_TAP_MTU;
@@ -464,6 +467,9 @@ fn parse_args() -> Result<Cmd> {
                 "--udp" => {
                     let v = iter.next().ok_or("--udp requires a value")?;
                     udp.push(v);
+                }
+                "--proxy" => {
+                    proxy = true;
                 }
                 "--transport" => {
                     transport = iter.next().ok_or("--transport requires a value")?;
@@ -537,6 +543,7 @@ fn parse_args() -> Result<Cmd> {
             id_prefix,
             tcp,
             udp,
+            proxy,
             transport,
             tun,
             mtu: tap_mtu,
@@ -915,6 +922,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             id_prefix,
             tcp,
             udp,
+            proxy,
             transport,
             tap,
             tun,
@@ -956,6 +964,9 @@ async fn run(cmd: Cmd) -> Result<()> {
                 return Err(
                     "nothing to do: pass --pppoe, --tun, --tap, or at least one --tcp/--udp".into(),
                 );
+            }
+            if proxy && tcp.is_empty() {
+                return Err("--proxy requires at least one --tcp forward".into());
             }
 
             // Resolve the PPPoE config: credentials (file > env > flag) and the
@@ -1019,10 +1030,15 @@ async fn run(cmd: Cmd) -> Result<()> {
             } else {
                 None
             };
-            let tcp = tcp
+            let mut tcp = tcp
                 .iter()
                 .map(|s| parse_forward(s, Proto::Tcp))
                 .collect::<Result<Vec<_>>>()?;
+            if proxy {
+                for f in &mut tcp {
+                    f.proxy = true;
+                }
+            }
             let udp = udp
                 .iter()
                 .map(|s| parse_forward(s, Proto::Udp))

@@ -24,7 +24,7 @@ ZERONAT_SECRET=somelongsecret zeronat server --control 2222 --tcp 443 --udp 5182
 ZERONAT_SECRET=somelongsecret zeronat client --server <public-ip>:2222 --tcp 443 --udp 51820
 ```
 
-`--tcp 443` maps to `127.0.0.1:443`. Remap with `--tcp 443:10.0.0.5:443`; `--udp` works the same. Specs take `+` modifiers: `--tcp 443+proxy` hands the target the real client address in a PROXY protocol v2 header, and `+idle=SECS` tunes the per-forward idle window. Open the control port (2222, UDP and TCP) on the server's firewall.
+`--tcp 443` maps to `127.0.0.1:443`. Remap with `--tcp 443:10.0.0.5:443`; `--udp` works the same. Specs take `+` modifiers: `--tcp 443+proxy` hands the target the real client address in a PROXY protocol v2 header (`--proxy` enables it on every TCP forward), and `+idle=SECS` tunes the per-forward idle window. Open the control port (2222, UDP and TCP) on the server's firewall.
 
 What a service behind zeronat sees, and the PROXY protocol cutover, are covered at https://paltaio.github.io/zeronat/#transparency and https://paltaio.github.io/zeronat/#proxy.
 

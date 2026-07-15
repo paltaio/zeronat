@@ -156,7 +156,8 @@ ZERONAT_SECRET=somelongsecret zeronat client \
     <section id="proxy">
       <h2>Proxy protocol</h2>
       <p>Any client forward spec takes appended modifiers: <code>SPEC[+proxy][+idle=SECS]</code>.
-      <code>+proxy</code> applies to TCP forwards only and is rejected on <code>--udp</code>. For each public
+      <code>+proxy</code> applies to TCP forwards only and is rejected on <code>--udp</code>; the client
+      flag <code>--proxy</code> enables it on every <code>--tcp</code> forward at once. For each public
       connection, the client writes a PROXY protocol v2 header as the first bytes to the local target,
       carrying the real public peer address and the public listener address the connection arrived on. The
       target must be configured to expect the header; one that is not reads it as garbage at the start of
@@ -405,6 +406,7 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
           <tr><td><code>--id &lt;PREFIX&gt;</code></td><td>Client id prefix (default: short hostname)</td></tr>
           <tr><td><code>--tcp &lt;SPEC&gt;</code></td><td>Forward TCP: <code>PORT</code> | <code>PORT:LOCALPORT</code> | <code>PORT:HOST:PORT</code>, with optional <code>+proxy</code> and <code>+idle=SECS</code> (repeatable)</td></tr>
           <tr><td><code>--udp &lt;SPEC&gt;</code></td><td>Forward UDP, same spec as <code>--tcp</code>; <code>+idle</code> only, <code>+proxy</code> is TCP-only (repeatable)</td></tr>
+          <tr><td><code>--proxy</code></td><td>Send a PROXY protocol v2 header on every <code>--tcp</code> forward</td></tr>
           <tr><td><code>--transport &lt;MODE&gt;</code></td><td><code>auto</code> | <code>udp</code> | <code>tcp</code> (default auto)</td></tr>
           <tr><td><code>--tun</code></td><td>All-ports mode (Linux): receive every forwarded port on local services</td></tr>
           <tr><td><code>--tap &lt;NAME&gt;</code></td><td>L2 bridge mode (Linux): create or attach this TAP device</td></tr>
