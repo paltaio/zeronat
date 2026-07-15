@@ -80,7 +80,7 @@ impl LocalWrite for OwnedWriteHalf {
 /// Copy frames both ways between a reliable local side and the encrypted Noise
 /// stream, on a probe-then-reap watchdog. Returns when the local side closes,
 /// the encrypted stream errors, the peer stops answering liveness probes for
-/// TCP_IDLE, or `cancel` resolves.
+/// the `idle` window, or `cancel` resolves.
 ///
 /// Both directions run concurrently so a write blocked on backpressure in one
 /// never stalls the other (serializing them can deadlock a full-duplex stream).
@@ -96,6 +96,7 @@ async fn stream_relay<R, W, C>(
     mut local_w: W,
     mut nr: NoiseReader,
     mut nw: NoiseWriter,
+    idle: Duration,
     cancel: C,
 ) where
     R: LocalRead,
@@ -106,11 +107,14 @@ async fn stream_relay<R, W, C>(
     // source (and so a paused-time test can drive it deterministically).
     let base = tokio::time::Instant::now();
     let last_in = Arc::new(AtomicU32::new(0));
-    let win = TCP_IDLE.as_secs();
+    let win = idle.as_secs();
 
     let up = async move {
         loop {
-            match timeout(Duration::from_secs(win / 2), local_r.read()).await {
+            // The probe cadence is half the window, floored at a second so a
+            // 1-second window cannot degenerate into a zero-length timeout that
+            // spins probes back to back.
+            match timeout(Duration::from_secs((win / 2).max(1)), local_r.read()).await {
                 Ok(r) => {
                     let m = r?;
                     if m.is_empty() {
@@ -171,18 +175,24 @@ async fn stream_relay<R, W, C>(
 
 /// Copy bytes both ways between a plaintext TCP stream and the encrypted
 /// connection. Returns when either side closes or the peer stops answering
-/// liveness probes for TCP_IDLE.
-pub async fn tcp(plain: TcpStream, nr: NoiseReader, nw: NoiseWriter) {
+/// liveness probes for the `idle` window.
+pub async fn tcp(plain: TcpStream, nr: NoiseReader, nw: NoiseWriter, idle: Duration) {
     plain.set_nodelay(true).ok();
     let (pr, pw) = plain.into_split();
-    stream_relay(pr, pw, nr, nw, std::future::pending()).await;
+    stream_relay(pr, pw, nr, nw, idle, std::future::pending()).await;
 }
 
 /// Client side of a UDP stream: shuttle datagrams between a local UDP socket
 /// (connected to the target service) and the encrypted connection.
-pub async fn udp_client(local: UdpSocket, mut nr: NoiseReader, mut nw: NoiseWriter) {
+pub async fn udp_client(
+    local: UdpSocket,
+    mut nr: NoiseReader,
+    mut nw: NoiseWriter,
+    idle: Duration,
+) {
     let mut buf = [0u8; UDP_BUF];
-    let half = UDP_IDLE / 2;
+    // Floored at a second: interval_at panics on a zero period.
+    let half = (idle / 2).max(Duration::from_secs(1));
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_in = Instant::now();
@@ -200,7 +210,7 @@ pub async fn udp_client(local: UdpSocket, mut nr: NoiseReader, mut nw: NoiseWrit
                 Err(_) => false,
             },
             _ = tick.tick() => {
-                last_in.elapsed() < UDP_IDLE
+                last_in.elapsed() < idle
                     && matches!(timeout(UDP_SEND_TIMEOUT, nw.probe()).await, Ok(Ok(())))
             }
         };
@@ -219,8 +229,10 @@ pub async fn udp_server(
     mut dgram_rx: mpsc::Receiver<Vec<u8>>,
     mut nr: NoiseReader,
     mut nw: NoiseWriter,
+    idle: Duration,
 ) {
-    let half = UDP_IDLE / 2;
+    // Floored at a second: interval_at panics on a zero period.
+    let half = (idle / 2).max(Duration::from_secs(1));
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_in = Instant::now();
@@ -238,7 +250,7 @@ pub async fn udp_server(
                 Err(_) => false,
             },
             _ = tick.tick() => {
-                last_in.elapsed() < UDP_IDLE
+                last_in.elapsed() < idle
                     && matches!(timeout(UDP_SEND_TIMEOUT, nw.probe()).await, Ok(Ok(())))
             }
         };
@@ -341,6 +353,7 @@ pub async fn tap_stream(
         TapWrite(tap),
         nr,
         nw,
+        TCP_IDLE,
         cancel.notified(),
     )
     .await;
@@ -869,7 +882,7 @@ pub async fn switch_port_stream(mut handle: SwitchHandle, nr: NoiseReader, nw: N
     };
     let port_cancel = handle.cancel.clone();
     let stop = async move { port_cancel.notified().await };
-    stream_relay(local_r, local_w, nr, nw, stop).await;
+    stream_relay(local_r, local_w, nr, nw, TCP_IDLE, stop).await;
 }
 
 /// `stream_relay` local-read half for a switch port: yields the next switch-routed
@@ -909,9 +922,10 @@ impl LocalWrite for PortWrite {
 }
 
 /// Client side of a UDP-forward stream over the raw datagram channel.
-pub async fn udp_client_stateless(local: UdpSocket, mut rx: DgramRx, tx: DgramTx) {
+pub async fn udp_client_stateless(local: UdpSocket, mut rx: DgramRx, tx: DgramTx, idle: Duration) {
     let mut buf = [0u8; UDP_BUF];
-    let half = UDP_IDLE / 2;
+    // Floored at a second: interval_at panics on a zero period.
+    let half = (idle / 2).max(Duration::from_secs(1));
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_in = Instant::now();
@@ -932,7 +946,7 @@ pub async fn udp_client_stateless(local: UdpSocket, mut rx: DgramRx, tx: DgramTx
                 Ok(n) => tx.send(&buf[..n]).await.is_ok(),
                 Err(_) => false,
             },
-            _ = tick.tick() => last_in.elapsed() < UDP_IDLE && tx.probe().await.is_ok(),
+            _ = tick.tick() => last_in.elapsed() < idle && tx.probe().await.is_ok(),
         };
         if !alive {
             break;
@@ -947,8 +961,10 @@ pub async fn udp_server_stateless(
     mut dgram_rx: mpsc::Receiver<Vec<u8>>,
     mut rx: DgramRx,
     tx: DgramTx,
+    idle: Duration,
 ) {
-    let half = UDP_IDLE / 2;
+    // Floored at a second: interval_at panics on a zero period.
+    let half = (idle / 2).max(Duration::from_secs(1));
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_in = Instant::now();
@@ -969,7 +985,7 @@ pub async fn udp_server_stateless(
                 }
                 None => false,
             },
-            _ = tick.tick() => last_in.elapsed() < UDP_IDLE && tx.probe().await.is_ok(),
+            _ = tick.tick() => last_in.elapsed() < idle && tx.probe().await.is_ok(),
         };
         if !alive {
             break;
@@ -1024,6 +1040,7 @@ mod tests {
             ChanWrite(out_tx),
             cr,
             cw,
+            TCP_IDLE,
             std::future::pending(),
         ));
         relay.await.unwrap();
@@ -1032,6 +1049,41 @@ mod tests {
             elapsed >= TCP_IDLE && elapsed < TCP_IDLE * 2,
             "reaped at {elapsed:?}, expected near {TCP_IDLE:?}"
         );
+    }
+
+    // A per-forward idle window narrower than TCP_IDLE reaps a black-holed
+    // relay at that window, not at the default.
+    #[tokio::test(start_paused = true)]
+    async fn custom_idle_window_reaps_early() {
+        let idle = Duration::from_secs(10);
+        let (cr, cw, _sr, _sw) = noise_pair().await;
+        let (_feed_tx, feed_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let start = tokio::time::Instant::now();
+        let relay = tokio::spawn(stream_relay(
+            ChanRead(feed_rx),
+            ChanWrite(out_tx),
+            cr,
+            cw,
+            idle,
+            std::future::pending(),
+        ));
+        relay.await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= idle && elapsed < TCP_IDLE,
+            "reaped at {elapsed:?}, expected near {idle:?}"
+        );
+    }
+
+    // A zero idle window from a library caller must not panic the probe
+    // interval; the floored tick reaps the relay instead.
+    #[tokio::test(start_paused = true)]
+    async fn zero_idle_udp_relay_reaps_without_panic() {
+        let (cr, cw, _sr, _sw) = noise_pair().await;
+        let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        local.connect(local.local_addr().unwrap()).await.unwrap();
+        udp_client(local, cr, cw, Duration::ZERO).await;
     }
 
     // (b) A peer that answers every probe keeps the relay alive well past the
@@ -1054,6 +1106,7 @@ mod tests {
             ChanWrite(out_tx),
             cr,
             cw,
+            TCP_IDLE,
             std::future::pending(),
         ));
         // Far longer than one idle window: a live peer must not be reaped.
@@ -1075,6 +1128,7 @@ mod tests {
             ChanWrite(out_tx),
             cr,
             cw,
+            TCP_IDLE,
             std::future::pending(),
         ));
         // Drain inbound on the peer so the relay's nw.send/probe never blocks.

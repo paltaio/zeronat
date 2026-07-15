@@ -49,6 +49,17 @@ fn cli_settings(control: u16, tcp: Vec<u16>, udp: Vec<u16>) -> ServerSettings {
     }
 }
 
+/// A plain forward of `port` to a local target port: no proxy header, default
+/// idle window.
+fn fwd(port: u16, target: u16) -> zeronat::client::Forward {
+    zeronat::client::Forward {
+        port,
+        target: format!("127.0.0.1:{target}"),
+        proxy: false,
+        idle: None,
+    }
+}
+
 fn free_tcp_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -149,8 +160,8 @@ async fn start_tagged_pair(
 
     for (name, target) in [("rpi-1", target1), ("rpi-2", target2)] {
         let (tcp_map, udp_map) = match proto {
-            Proto::Tcp => (vec![(public_port, format!("127.0.0.1:{target}"))], vec![]),
-            Proto::Udp => (vec![], vec![(public_port, format!("127.0.0.1:{target}"))]),
+            Proto::Tcp => (vec![fwd(public_port, target)], vec![]),
+            Proto::Udp => (vec![], vec![fwd(public_port, target)]),
         };
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
@@ -208,8 +219,8 @@ fn start_tunnel(transport: zeronat::client::Transport) -> Tunnel {
     tokio::spawn(zeronat::client::run(
         format!("127.0.0.1:{control}"),
         SECRET.into(),
-        vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
-        vec![(public_udp, format!("127.0.0.1:{local_udp}"))],
+        vec![fwd(public_tcp, local_tcp)],
+        vec![fwd(public_udp, local_udp)],
         transport,
         None,
         None,
@@ -837,7 +848,7 @@ async fn reconnect_same_id_supersede() {
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
             SECRET.into(),
-            vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
+            vec![fwd(public_tcp, local_tcp)],
             vec![],
             zeronat::client::Transport::Tcp,
             None,
@@ -848,7 +859,7 @@ async fn reconnect_same_id_supersede() {
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
             SECRET.into(),
-            vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
+            vec![fwd(public_tcp, local_tcp)],
             vec![],
             zeronat::client::Transport::Tcp,
             None,
@@ -918,7 +929,7 @@ async fn config_autosave_persists_route() {
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
             SECRET.into(),
-            vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
+            vec![fwd(public_tcp, local_tcp)],
             vec![],
             zeronat::client::Transport::Tcp,
             None,
@@ -1004,7 +1015,7 @@ async fn cli_listener_remove_refused() {
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
             SECRET.into(),
-            vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
+            vec![fwd(public_tcp, local_tcp)],
             vec![],
             zeronat::client::Transport::Tcp,
             None,
@@ -1058,7 +1069,7 @@ async fn runtime_node_does_not_persist() {
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
             SECRET.into(),
-            vec![(public_tcp, format!("127.0.0.1:{local_tcp}"))],
+            vec![fwd(public_tcp, local_tcp)],
             vec![],
             zeronat::client::Transport::Tcp,
             None,
@@ -1146,4 +1157,310 @@ async fn save_failure_reports_error() {
     timeout(Duration::from_secs(20), body)
         .await
         .expect("save-failure check did not complete within 20s");
+}
+
+/// Drive a `+proxy` TCP forward and assert the local service's byte stream
+/// starts with an exact PROXY v2 header followed immediately by the payload.
+/// The local service is `tcp_echo`, which reflects every byte it receives in
+/// order, so the echoed stream is a faithful capture of what reached it:
+/// header first, then payload, and the round-trip itself proves the relay still
+/// works after the header.
+async fn run_proxy_header_test(transport: zeronat::client::Transport) {
+    let control = free_tcp_port();
+    let public_tcp = free_tcp_port();
+    let local_tcp = free_tcp_port();
+    tokio::spawn(tcp_echo(local_tcp));
+    tokio::spawn(zeronat::server::run(cli_settings(
+        control,
+        vec![public_tcp],
+        vec![],
+    )));
+    let mut forward = fwd(public_tcp, local_tcp);
+    forward.proxy = true;
+    tokio::spawn(zeronat::client::run(
+        format!("127.0.0.1:{control}"),
+        SECRET.into(),
+        vec![forward],
+        vec![],
+        transport,
+        None,
+        None,
+        None,
+        Some("rpi".into()),
+    ));
+
+    let payload = b"proxied-payload";
+    let want = 28 + payload.len();
+    // Retry until the tunnel is live: a fresh connection whose echo returns the
+    // full header + payload.
+    let (bytes, src) = 'outer: loop {
+        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", public_tcp)).await {
+            s.set_nodelay(true).ok();
+            let src = s.local_addr().unwrap();
+            if s.write_all(payload).await.is_ok() {
+                let mut buf = vec![0u8; want];
+                let mut got = 0;
+                while got < want {
+                    match timeout(Duration::from_secs(2), s.read(&mut buf[got..])).await {
+                        Ok(Ok(n)) if n > 0 => got += n,
+                        _ => {
+                            sleep(Duration::from_millis(100)).await;
+                            continue 'outer;
+                        }
+                    }
+                }
+                break (buf, src);
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    };
+
+    // Signature, version/command, family/protocol, and address length.
+    assert_eq!(
+        &bytes[..12],
+        &[0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A]
+    );
+    assert_eq!(bytes[12], 0x21, "version/command");
+    assert_eq!(bytes[13], 0x11, "AF_INET/STREAM");
+    assert_eq!(u16::from_be_bytes([bytes[14], bytes[15]]), 12, "length");
+    // src is the connecting socket, dst the public listener.
+    let src_ip = match src.ip() {
+        std::net::IpAddr::V4(v4) => v4.octets(),
+        other => panic!("loopback test connected from {other}"),
+    };
+    assert_eq!(&bytes[16..20], &src_ip, "src ip");
+    assert_eq!(&bytes[20..24], &[127, 0, 0, 1], "dst ip");
+    assert_eq!(
+        u16::from_be_bytes([bytes[24], bytes[25]]),
+        src.port(),
+        "src port"
+    );
+    assert_eq!(
+        u16::from_be_bytes([bytes[26], bytes[27]]),
+        public_tcp,
+        "dst port"
+    );
+    // The payload follows immediately after the 28-byte header.
+    assert_eq!(&bytes[28..], payload);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_forward_delivers_v2_header_tcp_transport() {
+    timeout(
+        Duration::from_secs(30),
+        run_proxy_header_test(zeronat::client::Transport::Tcp),
+    )
+    .await
+    .expect("proxy header over tcp transport did not complete within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_forward_delivers_v2_header_udp_transport() {
+    timeout(
+        Duration::from_secs(30),
+        run_proxy_header_test(zeronat::client::Transport::Udp),
+    )
+    .await
+    .expect("proxy header over udp transport did not complete within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_forward_has_zero_extra_bytes() {
+    let body = async {
+        let tunnel = start_tunnel(zeronat::client::Transport::Tcp);
+
+        let payload = b"plain-forward-payload";
+        // Retry fresh connections until the tunnel round-trips the payload; the
+        // echo reflects exactly what the local service received, so the first
+        // bytes must be the payload itself with no injected prefix.
+        let bytes = 'outer: loop {
+            if let Ok(mut s) = TcpStream::connect(("127.0.0.1", tunnel.public_tcp)).await {
+                s.set_nodelay(true).ok();
+                if s.write_all(payload).await.is_ok() {
+                    let mut buf = vec![0u8; payload.len()];
+                    let mut got = 0;
+                    while got < buf.len() {
+                        match timeout(Duration::from_secs(2), s.read(&mut buf[got..])).await {
+                            Ok(Ok(n)) if n > 0 => got += n,
+                            _ => {
+                                sleep(Duration::from_millis(100)).await;
+                                continue 'outer;
+                            }
+                        }
+                    }
+                    // Nothing else may be in flight: the service saw only the
+                    // payload, so only the payload comes back.
+                    let mut extra = [0u8; 1];
+                    assert!(
+                        timeout(Duration::from_millis(500), s.read(&mut extra))
+                            .await
+                            .is_err(),
+                        "unexpected extra bytes after the echoed payload"
+                    );
+                    break buf;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(&bytes, payload, "prefix bytes were injected into the relay");
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("plain forward byte check did not complete within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_forward_refuses_headerless_open() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let local_tcp = free_tcp_port();
+        let local = TcpListener::bind(("127.0.0.1", local_tcp)).await.unwrap();
+
+        // A hand-rolled server modeling an old release: it answers Ping with
+        // Pong, ignores every other control frame (so FwdOptions is never
+        // acked), and sends a plain Open for the proxy-flagged port. It fires
+        // `open_sent` only after validating ClientHello and sending the Open;
+        // a bad first frame drops the sender so the test fails loudly.
+        let extra_conns = Arc::new(AtomicUsize::new(0));
+        let control_dead = Arc::new(AtomicBool::new(false));
+        let (open_sent_tx, open_sent_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let extra_conns = extra_conns.clone();
+            let control_dead = control_dead.clone();
+            let l = TcpListener::bind(("127.0.0.1", control)).await.unwrap();
+            tokio::spawn(async move {
+                let psk = zeronat::noise::derive_psk(SECRET);
+                // The first connection is the control channel.
+                let (sock, _) = l.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = zeronat::noise::server_handshake(sock, &psk)
+                        .await
+                        .expect("control handshake");
+                    let first = r.recv().await.expect("client hello");
+                    if !matches!(Msg::decode(&first), Ok(Msg::ClientHello { .. })) {
+                        return; // drops open_sent_tx
+                    }
+                    w.send(
+                        &Msg::Open {
+                            proto: Proto::Tcp,
+                            port: public_tcp,
+                            id: 1,
+                        }
+                        .encode(),
+                    )
+                    .await
+                    .expect("send open");
+                    open_sent_tx.send(()).ok();
+                    while let Ok(bytes) = r.recv().await {
+                        if let Ok(Msg::Ping) = Msg::decode(&bytes) {
+                            w.send(&Msg::Pong.encode()).await.ok();
+                        }
+                    }
+                    control_dead.store(true, Ordering::Relaxed);
+                });
+                // Any further connection would be the data connection for the
+                // open the client is supposed to refuse.
+                loop {
+                    if l.accept().await.is_ok() {
+                        extra_conns.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+
+        let mut forward = fwd(public_tcp, local_tcp);
+        forward.proxy = true;
+        tokio::spawn(zeronat::client::run(
+            format!("127.0.0.1:{control}"),
+            SECRET.into(),
+            vec![forward],
+            vec![],
+            zeronat::client::Transport::Tcp,
+            None,
+            None,
+            None,
+            Some("rpi".into()),
+        ));
+
+        // Wait until the fake server has actually seen the ClientHello and
+        // sent the plain Open; only then does the no-dial window prove a
+        // refusal rather than a client that never connected.
+        timeout(Duration::from_secs(10), open_sent_rx)
+            .await
+            .expect("fake server never received the client hello")
+            .expect("fake server rejected the first control frame");
+
+        // The client must refuse the headerless open outright: no dial back to
+        // the server for the stream and no connection to the local target.
+        assert!(
+            timeout(Duration::from_secs(5), local.accept())
+                .await
+                .is_err(),
+            "client dialed the local target despite the refused open"
+        );
+        assert_eq!(
+            extra_conns.load(Ordering::Relaxed),
+            0,
+            "client opened a data connection for the refused open"
+        );
+        assert!(
+            !control_dead.load(Ordering::Relaxed),
+            "control connection died instead of staying alive"
+        );
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("headerless-open refusal did not complete within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_healthy_stream_outlives_reap_tcp_transport() {
+    let body = async {
+        let tunnel = start_tunnel(zeronat::client::Transport::Tcp);
+        let mut conn = wait_tcp_path(tunnel.public_tcp).await;
+        // Fully quiet for longer than TCP_IDLE (120s): the relay's liveness
+        // probes must keep the healthy stream alive, not reap it.
+        sleep(Duration::from_secs(150)).await;
+        conn.write_all(b"after-quiet").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"after-quiet",
+            "stream did not survive the quiet window"
+        );
+    };
+
+    timeout(Duration::from_secs(240), body)
+        .await
+        .expect("tcp idle survival did not complete within 240s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_healthy_stream_outlives_reap_udp_transport() {
+    let body = async {
+        let tunnel = start_tunnel(zeronat::client::Transport::Udp);
+        let mut conn = wait_tcp_path(tunnel.public_tcp).await;
+        // Fully quiet past both the relay idle window (120s) and the KCP conv
+        // idle (180s): the probes must keep the whole path warm.
+        sleep(Duration::from_secs(200)).await;
+        conn.write_all(b"after-quiet").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"after-quiet",
+            "stream did not survive the quiet window"
+        );
+    };
+
+    timeout(Duration::from_secs(320), body)
+        .await
+        .expect("udp idle survival did not complete within 320s");
 }

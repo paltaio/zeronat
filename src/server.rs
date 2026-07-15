@@ -86,12 +86,23 @@ fn transport_byte(t: ActiveTransport) -> u8 {
 /// keys the route table, so a public connection maps directly to a route.
 type RouteKey = (Ipv4Addr, Proto, u16);
 
-/// A connected client's control channel and the transport it arrived on. Cloned
-/// out of the registry per public connection so a `try_send` never holds a lock.
+/// A connected client's control channel, the transport it arrived on, and its
+/// announced per-forward options (empty until a `FwdOptions` arrives). Cloned
+/// out of the registry per public connection so a `try_send` never holds a lock;
+/// the options ride an `Arc` so the clone stays cheap.
 #[derive(Clone)]
 struct ClientHandle {
     tx: mpsc::Sender<Vec<u8>>,
     transport: ActiveTransport,
+    fwd: Arc<HashMap<(Proto, u16), FwdOpt>>,
+}
+
+/// One forward's client-announced options: send `OpenProxy` for TCP opens, and
+/// the relay idle window (`None` = proto default).
+#[derive(Clone, Copy)]
+struct FwdOpt {
+    proxy: bool,
+    idle: Option<Duration>,
 }
 
 /// A running listener's teardown handles: `cancel` stops the accept/recv loop,
@@ -117,10 +128,15 @@ struct Route {
     source: Source,
 }
 
-/// A parked public UDP source, the public socket its replies must go out on, and
-/// the channel carrying its inbound datagrams, awaiting the matching UDP-forward
-/// setup conv.
-type UdpPending = (Arc<UdpSocket>, SocketAddr, mpsc::Receiver<Vec<u8>>);
+/// A parked public UDP source, the public socket its replies must go out on, the
+/// channel carrying its inbound datagrams, and the relay's idle window, awaiting
+/// the matching UDP-forward setup conv.
+type UdpPending = (
+    Arc<UdpSocket>,
+    SocketAddr,
+    mpsc::Receiver<Vec<u8>>,
+    Duration,
+);
 
 pub(crate) struct Server {
     psk: [u8; 32],
@@ -186,24 +202,45 @@ impl Server {
     }
 
     /// Register a new public stream against the routed client, notify it, and
-    /// return the channel that will receive the matching data connection. `None`
-    /// if no client serves this key. The `try_send` runs outside every lock.
+    /// return the channel that will receive the matching data connection plus
+    /// the relay's idle window (the client's per-forward option or the proto
+    /// default). `addrs` is a TCP accept's `(peer, local)` pair; when the routed
+    /// client flagged this TCP port for PROXY headers, the open is sent as
+    /// `OpenProxy` carrying them. `None` if no client serves this key. The
+    /// `try_send` runs outside every lock.
     fn open(
         &self,
         bind_ip: Ipv4Addr,
         proto: Proto,
         port: u16,
-    ) -> Option<(u64, oneshot::Receiver<Noise>)> {
+        addrs: Option<(SocketAddr, SocketAddr)>,
+    ) -> Option<(u64, oneshot::Receiver<Noise>, Duration)> {
         let handle = self.route_to((bind_ip, proto, port))?;
+        let opt = handle.fwd.get(&(proto, port)).copied();
+        let idle = opt.and_then(|o| o.idle).unwrap_or(match proto {
+            Proto::Tcp => bridge::TCP_IDLE,
+            Proto::Udp => bridge::UDP_IDLE,
+        });
         let id = self.next_id();
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        let msg = Msg::Open { proto, port, id }.encode();
+        let msg = match addrs {
+            Some((peer, local)) if proto == Proto::Tcp && opt.is_some_and(|o| o.proxy) => {
+                Msg::OpenProxy {
+                    port,
+                    id,
+                    peer,
+                    local,
+                }
+                .encode()
+            }
+            _ => Msg::Open { proto, port, id }.encode(),
+        };
         if handle.tx.try_send(msg).is_err() {
             self.pending.lock().unwrap().remove(&id);
             return None;
         }
-        Some((id, rx))
+        Some((id, rx, idle))
     }
 }
 
@@ -487,6 +524,7 @@ pub(crate) async fn serve_stream(
                     ClientHandle {
                         tx: tx.clone(),
                         transport,
+                        fwd: Arc::new(HashMap::new()),
                     },
                 )
             };
@@ -508,8 +546,44 @@ pub(crate) async fn serve_stream(
             // whole window) or a recv error breaks the loop and tears down: a
             // black-holed link delivers no FIN/RST, so only the deadline catches it.
             while let Ok(Ok(bytes)) = timeout(CONTROL_TIMEOUT, r.recv()).await {
-                if let Ok(Msg::Ping) = Msg::decode(&bytes) {
-                    tx.try_send(Msg::Pong.encode()).ok();
+                match Msg::decode(&bytes) {
+                    Ok(Msg::Ping) => {
+                        tx.try_send(Msg::Pong.encode()).ok();
+                    }
+                    Ok(Msg::FwdOptions { entries }) => {
+                        let map: HashMap<(Proto, u16), FwdOpt> = entries
+                            .iter()
+                            .map(|e| {
+                                (
+                                    (e.proto, e.port),
+                                    FwdOpt {
+                                        // PROXY headers are a TCP framing; a udp
+                                        // entry claiming one is never honored.
+                                        proxy: e.proxy && e.proto == Proto::Tcp,
+                                        idle: (e.idle_secs > 0)
+                                            .then(|| Duration::from_secs(e.idle_secs.into())),
+                                    },
+                                )
+                            })
+                            .collect();
+                        // Swap the options into the registry only while this
+                        // session still owns its slot (same guard as the
+                        // teardown below), so a superseding session's options
+                        // are never clobbered by a stale reader.
+                        {
+                            let mut clients = srv.clients.lock().unwrap();
+                            if let Some(h) = clients.get_mut(&client_id) {
+                                if h.tx.same_channel(&tx) {
+                                    h.fwd = Arc::new(map);
+                                }
+                            }
+                        }
+                        // The ack tells the client its options (PROXY headers
+                        // included) are honored; it is only ever sent in reply,
+                        // so an old client never sees an undecodable frame.
+                        tx.try_send(Msg::FwdOptionsAck.encode()).ok();
+                    }
+                    _ => {}
                 }
             }
             // Remove this client only if the registry still points at this
@@ -991,10 +1065,10 @@ async fn tcp_listener(
     bridges: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 ) {
     loop {
-        let public = tokio::select! {
+        let (public, peer) = tokio::select! {
             _ = cancel.notified() => break,
             r = l.accept() => match r {
-                Ok((public, _)) => public,
+                Ok(v) => v,
                 // Keep the forwarded port alive across transient accept errors so
                 // fd pressure does not silently and permanently kill this listener.
                 Err(e) => {
@@ -1006,7 +1080,14 @@ async fn tcp_listener(
         };
         let srv = srv.clone();
         let handle = tokio::spawn(async move {
-            let Some((id, rx)) = srv.open(bind_ip, Proto::Tcp, port) else {
+            // The accept's peer and local addresses feed a PROXY header when the
+            // routed client asked for one; the bound tuple stands in if the
+            // kernel cannot report the local side.
+            let local = public
+                .local_addr()
+                .unwrap_or_else(|_| SocketAddr::from((bind_ip, port)));
+            let Some((id, rx, idle)) = srv.open(bind_ip, Proto::Tcp, port, Some((peer, local)))
+            else {
                 return;
             };
             let _reclaim = PendingReclaim {
@@ -1014,7 +1095,7 @@ async fn tcp_listener(
                 id,
             };
             if let Ok(Ok((nr, nw))) = timeout(OPEN_TIMEOUT, rx).await {
-                bridge::tcp(public, nr, nw).await;
+                bridge::tcp(public, nr, nw, idle).await;
             }
         });
         let mut active = bridges.lock().unwrap();
@@ -1039,10 +1120,13 @@ async fn udp_listener(
     cancel: Arc<Notify>,
     flush: Arc<Notify>,
 ) {
-    // Each entry holds the bridge's inbound channel and the last time a datagram
-    // reached it. A closed channel (bridge ended) or a stale TTL evicts the entry,
-    // so a one-shot/vanished source cannot pin a dead Sender slot forever.
-    let mut sessions: HashMap<SocketAddr, (mpsc::Sender<Vec<u8>>, Instant)> = HashMap::new();
+    // Each entry holds the bridge's inbound channel, the last time a datagram
+    // reached it, and its eviction TTL (UDP_DATA_TTL, widened when the forward
+    // carries a custom idle so the sweep never undercuts a longer-lived bridge).
+    // A closed channel (bridge ended) or a stale TTL evicts the entry, so a
+    // one-shot/vanished source cannot pin a dead Sender slot forever.
+    let mut sessions: HashMap<SocketAddr, (mpsc::Sender<Vec<u8>>, Instant, Duration)> =
+        HashMap::new();
     let mut buf = [0u8; 65535];
     let mut sweep = tokio::time::interval(UDP_SWEEP_INTERVAL);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1066,8 +1150,8 @@ async fn udp_listener(
             },
             _ = sweep.tick() => {
                 let now = Instant::now();
-                sessions.retain(|_, (tx, last)| {
-                    !tx.is_closed() && now.duration_since(*last) < UDP_DATA_TTL
+                sessions.retain(|_, (tx, last, ttl)| {
+                    !tx.is_closed() && now.duration_since(*last) < *ttl
                 });
                 continue;
             }
@@ -1075,7 +1159,7 @@ async fn udp_listener(
         let data = buf[..n].to_vec();
 
         // Route to an existing session; recover the datagram if it is dead.
-        let data = if let Some((tx, last)) = sessions.get_mut(&src) {
+        let data = if let Some((tx, last, _)) = sessions.get_mut(&src) {
             match tx.try_send(data) {
                 Ok(()) => {
                     *last = Instant::now();
@@ -1100,13 +1184,20 @@ async fn udp_listener(
             continue;
         };
 
+        // A custom per-forward idle widens the entry's TTL so the sweep cannot
+        // evict a source whose bridge is deliberately allowed to idle longer.
+        let fwd_idle = handle.fwd.get(&(Proto::Udp, port)).and_then(|o| o.idle);
+        let ttl = match fwd_idle {
+            Some(idle) => UDP_DATA_TTL.max(idle + Duration::from_secs(60)),
+            None => UDP_DATA_TTL,
+        };
         let (dtx, drx) = mpsc::channel::<Vec<u8>>(64);
         dtx.try_send(data).ok();
-        sessions.insert(src, (dtx, Instant::now()));
+        sessions.insert(src, (dtx, Instant::now(), ttl));
 
         match handle.transport {
             ActiveTransport::Tcp => {
-                let Some((id, rx)) = srv.open(bind_ip, Proto::Udp, port) else {
+                let Some((id, rx, idle)) = srv.open(bind_ip, Proto::Udp, port, None) else {
                     sessions.remove(&src);
                     continue;
                 };
@@ -1114,7 +1205,9 @@ async fn udp_listener(
                 let srv = srv.clone();
                 tokio::spawn(async move {
                     match timeout(OPEN_TIMEOUT, rx).await {
-                        Ok(Ok((nr, nw))) => bridge::udp_server(socket, src, drx, nr, nw).await,
+                        Ok(Ok((nr, nw))) => {
+                            bridge::udp_server(socket, src, drx, nr, nw, idle).await
+                        }
                         _ => {
                             srv.pending.lock().unwrap().remove(&id);
                         }
@@ -1123,10 +1216,11 @@ async fn udp_listener(
             }
             ActiveTransport::Udp => {
                 let id = srv.next_id();
+                let idle = fwd_idle.unwrap_or(bridge::UDP_IDLE);
                 srv.udp_pending
                     .lock()
                     .unwrap()
-                    .insert(id, (socket.clone(), src, drx));
+                    .insert(id, (socket.clone(), src, drx, idle));
                 if handle
                     .tx
                     .try_send(
@@ -1298,7 +1392,7 @@ async fn accept_udp_forward(
     id: u64,
     noise: StatelessNoise,
 ) {
-    let Some((public_socket, public_src, dgram_rx)) = take_udp_pending(&srv, id) else {
+    let Some((public_socket, public_src, dgram_rx, idle)) = take_udp_pending(&srv, id) else {
         return;
     };
     let noise = Arc::new(noise);
@@ -1306,7 +1400,7 @@ async fn accept_udp_forward(
     let (inbound, _guard) = sess.register_dgram(conv);
     let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
     let rx = DgramRx::new(inbound, noise);
-    crate::bridge::udp_server_stateless(public_socket, public_src, dgram_rx, rx, tx).await;
+    crate::bridge::udp_server_stateless(public_socket, public_src, dgram_rx, rx, tx, idle).await;
 }
 
 fn take_udp_pending(srv: &Server, id: u64) -> Option<UdpPending> {

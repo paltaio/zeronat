@@ -46,8 +46,11 @@ client options:
   --server <ADDR>     Server control address host:port, or 'dht' to discover via DHT
   --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
   --id <PREFIX>       Client id prefix (default: short hostname)
-  --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
-  --udp <SPEC>        Forward UDP: PORT | PORT:LOCALPORT | PORT:HOST:PORT (repeatable)
+  --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT, plus
+                      optional +proxy (send a PROXY protocol v2 header to the
+                      target) and +idle=SECS modifiers (repeatable)
+  --udp <SPEC>        Forward UDP: PORT | PORT:LOCALPORT | PORT:HOST:PORT, plus
+                      an optional +idle=SECS modifier (repeatable)
   --tun               L3 all-ports mode (Linux only): receive every forwarded
                       port on local services (bind 0.0.0.0 or the tunnel address)
   --transport <MODE>  auto|udp|tcp (default: auto)
@@ -171,26 +174,71 @@ fn transport_label(t: client::Transport) -> &'static str {
     }
 }
 
-/// Parse a forward spec into (public_port, "host:port" target).
-fn parse_forward(spec: &str) -> Result<(u16, String)> {
-    let parts: Vec<&str> = spec.split(':').collect();
-    match parts.as_slice() {
+/// Parse a client forward spec: `PORT | PORT:LOCALPORT | PORT:HOST:PORT`, then
+/// optional `+`-appended modifiers (`+proxy`, `+idle=SECS`). Splitting on the
+/// first `+` cannot collide with the base grammar: `+` appears in neither ports
+/// nor hostnames. `+proxy` is a TCP framing, so it is a parse error on a udp
+/// spec; duplicate and unknown modifiers are parse errors too.
+fn parse_forward(spec: &str, proto: Proto) -> Result<client::Forward> {
+    let (base, mods) = match spec.split_once('+') {
+        Some((base, mods)) => (base, Some(mods)),
+        None => (spec, None),
+    };
+
+    let parts: Vec<&str> = base.split(':').collect();
+    let (port, target) = match parts.as_slice() {
         [p] => {
             let port: u16 = p.parse()?;
-            Ok((port, format!("127.0.0.1:{port}")))
+            (port, format!("127.0.0.1:{port}"))
         }
         [p, lp] => {
             let port: u16 = p.parse()?;
             let lport: u16 = lp.parse()?;
-            Ok((port, format!("127.0.0.1:{lport}")))
+            (port, format!("127.0.0.1:{lport}"))
         }
         [p, host, lp] => {
             let port: u16 = p.parse()?;
             let lport: u16 = lp.parse()?;
-            Ok((port, format!("{host}:{lport}")))
+            (port, format!("{host}:{lport}"))
         }
-        _ => Err(format!("invalid forward spec '{spec}'").into()),
+        _ => return Err(format!("invalid forward spec '{spec}'").into()),
+    };
+
+    let mut proxy = false;
+    let mut idle: Option<std::time::Duration> = None;
+    if let Some(mods) = mods {
+        for m in mods.split('+') {
+            if m == "proxy" {
+                if proxy {
+                    return Err(format!("duplicate modifier '+proxy' in '{spec}'").into());
+                }
+                if proto == Proto::Udp {
+                    return Err("+proxy is not supported on udp forwards".into());
+                }
+                proxy = true;
+            } else if let Some(v) = m.strip_prefix("idle=") {
+                if idle.is_some() {
+                    return Err(format!("duplicate modifier '+idle' in '{spec}'").into());
+                }
+                let secs: u32 = v.parse().map_err(|_| -> zeronat::Error {
+                    format!("+idle wants whole seconds, got '{v}'").into()
+                })?;
+                if secs == 0 {
+                    return Err("+idle must be at least 1 second".into());
+                }
+                idle = Some(std::time::Duration::from_secs(secs.into()));
+            } else {
+                return Err(format!("unknown modifier '+{m}' in '{spec}'").into());
+            }
+        }
     }
+
+    Ok(client::Forward {
+        port,
+        target,
+        proxy,
+        idle,
+    })
 }
 
 fn parse_args() -> Result<Cmd> {
@@ -973,11 +1021,11 @@ async fn run(cmd: Cmd) -> Result<()> {
             };
             let tcp = tcp
                 .iter()
-                .map(|s| parse_forward(s))
+                .map(|s| parse_forward(s, Proto::Tcp))
                 .collect::<Result<Vec<_>>>()?;
             let udp = udp
                 .iter()
-                .map(|s| parse_forward(s))
+                .map(|s| parse_forward(s, Proto::Udp))
                 .collect::<Result<Vec<_>>>()?;
             let transport = match transport.as_str() {
                 "auto" => client::Transport::Auto,
@@ -1019,5 +1067,115 @@ async fn run(cmd: Cmd) -> Result<()> {
             admin::show(server, secret).await
         }
         Cmd::Upgrade { check } => zeronat::upgrade::run(check),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use zeronat::client::Forward;
+
+    fn fwd(port: u16, target: &str, proxy: bool, idle: Option<u64>) -> Forward {
+        Forward {
+            port,
+            target: target.into(),
+            proxy,
+            idle: idle.map(Duration::from_secs),
+        }
+    }
+
+    #[test]
+    fn forward_base_forms() {
+        for proto in [Proto::Tcp, Proto::Udp] {
+            assert_eq!(
+                parse_forward("443", proto).unwrap(),
+                fwd(443, "127.0.0.1:443", false, None)
+            );
+            assert_eq!(
+                parse_forward("443:8443", proto).unwrap(),
+                fwd(443, "127.0.0.1:8443", false, None)
+            );
+            assert_eq!(
+                parse_forward("443:10.0.0.5:8443", proto).unwrap(),
+                fwd(443, "10.0.0.5:8443", false, None)
+            );
+        }
+        assert!(parse_forward("a:b:c:d", Proto::Tcp).is_err());
+        assert!(parse_forward("notaport", Proto::Tcp).is_err());
+    }
+
+    #[test]
+    fn forward_proxy_modifier_on_every_base_form() {
+        assert_eq!(
+            parse_forward("443+proxy", Proto::Tcp).unwrap(),
+            fwd(443, "127.0.0.1:443", true, None)
+        );
+        assert_eq!(
+            parse_forward("443:8443+proxy", Proto::Tcp).unwrap(),
+            fwd(443, "127.0.0.1:8443", true, None)
+        );
+        assert_eq!(
+            parse_forward("443:10.0.0.5:443+proxy", Proto::Tcp).unwrap(),
+            fwd(443, "10.0.0.5:443", true, None)
+        );
+    }
+
+    #[test]
+    fn forward_idle_modifier_on_every_base_form() {
+        for proto in [Proto::Tcp, Proto::Udp] {
+            assert_eq!(
+                parse_forward("51820+idle=300", proto).unwrap(),
+                fwd(51820, "127.0.0.1:51820", false, Some(300))
+            );
+            assert_eq!(
+                parse_forward("51820:51821+idle=300", proto).unwrap(),
+                fwd(51820, "127.0.0.1:51821", false, Some(300))
+            );
+            assert_eq!(
+                parse_forward("51820:10.0.0.5:51820+idle=300", proto).unwrap(),
+                fwd(51820, "10.0.0.5:51820", false, Some(300))
+            );
+        }
+    }
+
+    #[test]
+    fn forward_modifiers_combine() {
+        assert_eq!(
+            parse_forward("443:10.0.0.5:443+proxy+idle=600", Proto::Tcp).unwrap(),
+            fwd(443, "10.0.0.5:443", true, Some(600))
+        );
+        assert_eq!(
+            parse_forward("443+idle=600+proxy", Proto::Tcp).unwrap(),
+            fwd(443, "127.0.0.1:443", true, Some(600))
+        );
+    }
+
+    #[test]
+    fn forward_proxy_rejected_on_udp() {
+        let err = parse_forward("51820+proxy", Proto::Udp).unwrap_err();
+        assert!(err.to_string().contains("not supported on udp"));
+        assert!(parse_forward("51820+proxy+idle=300", Proto::Udp).is_err());
+    }
+
+    #[test]
+    fn forward_idle_rejects_zero_and_junk() {
+        assert!(parse_forward("443+idle=0", Proto::Tcp).is_err());
+        assert!(parse_forward("443+idle=abc", Proto::Tcp).is_err());
+        assert!(parse_forward("443+idle=", Proto::Tcp).is_err());
+        assert!(parse_forward("443+idle=-5", Proto::Tcp).is_err());
+    }
+
+    #[test]
+    fn forward_duplicate_modifiers_rejected() {
+        assert!(parse_forward("443+proxy+proxy", Proto::Tcp).is_err());
+        assert!(parse_forward("443+idle=30+idle=60", Proto::Tcp).is_err());
+    }
+
+    #[test]
+    fn forward_unknown_modifier_rejected() {
+        assert!(parse_forward("443+nope", Proto::Tcp).is_err());
+        assert!(parse_forward("443+", Proto::Tcp).is_err());
+        assert!(parse_forward("443+PROXY", Proto::Tcp).is_err());
     }
 }

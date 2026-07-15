@@ -16,6 +16,7 @@ pub mod netfilter;
 pub mod noise;
 pub mod pppoe;
 pub mod proto;
+pub mod proxyproto;
 pub mod server;
 pub mod tap;
 #[cfg(all(feature = "tui", unix))]

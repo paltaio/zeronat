@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::Result;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
@@ -16,7 +18,7 @@ use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP,
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{client_handshake, client_handshake_stateless};
-use crate::proto::{Msg, Proto};
+use crate::proto::{FwdOptionEntry, Msg, Proto};
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
 use crate::tap::{TapConfig, TunConfig};
@@ -49,6 +51,11 @@ const UDP_MIN_HEALTHY: Duration = Duration::from_secs(30);
 const UDP_QUICK_FAILS: u32 = 2;
 /// How long Auto prefers TCP after UDP flaps, before it re-probes UDP again.
 const UDP_COOLDOWN: Duration = Duration::from_secs(120);
+/// How long after sending `FwdOptions` to wait for the server's ack before
+/// warning that proxy-enabled forwards will refuse connections. Sized well past
+/// a control round-trip; an old server never acks (it ignores the frame), so
+/// this fires exactly once per control session against such a server.
+const FWD_OPTIONS_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// UDP-health memory carried across reconnects in Auto mode. Owned by the
 /// reconnect loop (not the Arc<Client>, not global) so each running client keeps
@@ -147,12 +154,32 @@ enum UdpOutcome {
     Unhealthy,
 }
 
+/// One parsed `--tcp`/`--udp` forward: the public port, the local target it
+/// dials, and the per-forward options. `proxy` (TCP only) prefixes every local
+/// connection with a PROXY protocol v2 header carrying the real public peer;
+/// `idle` overrides the proto-default relay idle window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Forward {
+    pub port: u16,
+    pub target: String,
+    pub proxy: bool,
+    pub idle: Option<Duration>,
+}
+
+/// A forward as the control loop consults it on each open, keyed by port.
+#[derive(Clone)]
+struct ForwardTarget {
+    target: String,
+    proxy: bool,
+    idle: Option<Duration>,
+}
+
 struct Client {
     server: String,
     psk: [u8; 32],
     client_id: String,
-    tcp: HashMap<u16, String>,
-    udp: HashMap<u16, String>,
+    tcp: HashMap<u16, ForwardTarget>,
+    udp: HashMap<u16, ForwardTarget>,
     transport: Transport,
 }
 
@@ -233,8 +260,8 @@ impl Discovery {
 pub async fn run(
     server: String,
     secret: String,
-    tcp: Vec<(u16, String)>,
-    udp: Vec<(u16, String)>,
+    tcp: Vec<Forward>,
+    udp: Vec<Forward>,
     transport: Transport,
     tap: Option<TapConfig>,
     tun: Option<TunConfig>,
@@ -243,8 +270,22 @@ pub async fn run(
 ) -> Result<()> {
     let psk = crate::noise::derive_psk(&secret);
     let client_id = crate::identity::derive_client_id(id_prefix.as_deref());
-    let tcp: HashMap<u16, String> = tcp.into_iter().collect();
-    let udp: HashMap<u16, String> = udp.into_iter().collect();
+    let by_port = |fwds: Vec<Forward>| -> HashMap<u16, ForwardTarget> {
+        fwds.into_iter()
+            .map(|f| {
+                (
+                    f.port,
+                    ForwardTarget {
+                        target: f.target,
+                        proxy: f.proxy,
+                        idle: f.idle,
+                    },
+                )
+            })
+            .collect()
+    };
+    let tcp = by_port(tcp);
+    let udp = by_port(udp);
     let discovery = Discovery::new(&server, &secret)?;
     // TAP and TUN share the same device I/O and tunnel datapath; only the open
     // (L2 bridge vs L3 address) differs. Either becomes the single bridge device.
@@ -820,6 +861,15 @@ async fn control_loop(
         .encode(),
     )
     .ok();
+    // Announce per-forward options right after the hello, but only when at
+    // least one forward carries a non-default option: an all-default client
+    // stays byte-identical on the wire to older releases.
+    let options = fwd_options(&client);
+    let ack = Arc::new(AtomicBool::new(false));
+    if !options.is_empty() {
+        tx.try_send(Msg::FwdOptions { entries: options }.encode())
+            .ok();
+    }
 
     let mut w = w;
     let writer = tokio::spawn(async move {
@@ -841,6 +891,40 @@ async fn control_loop(
             }
         }
     });
+
+    // Fail loud at setup for proxy-enabled forwards: they never fall back to a
+    // headerless relay, so a server that does not ack the options (an older
+    // release ignores the frame) leaves those ports refusing every connection.
+    // Say so once, loudly, instead of letting each open fail quietly.
+    let watchdog = {
+        let mut proxied: Vec<u16> = client
+            .tcp
+            .iter()
+            .filter(|(_, f)| f.proxy)
+            .map(|(&p, _)| p)
+            .collect();
+        if proxied.is_empty() {
+            None
+        } else {
+            proxied.sort_unstable();
+            let ports = proxied
+                .iter()
+                .map(|p| format!(":{p}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ack = ack.clone();
+            Some(tokio::spawn(async move {
+                sleep(FWD_OPTIONS_ACK_TIMEOUT).await;
+                if !ack.load(Ordering::Relaxed) {
+                    crate::elog!(
+                        "server did not acknowledge PROXY protocol support; tcp forward(s) {ports} \
+                         will refuse connections rather than relay without the header; upgrade the \
+                         server to a release that supports +proxy"
+                    );
+                }
+            }))
+        }
+    };
 
     // Handles of in-flight forward tasks spawned for this control session, so a
     // teardown can abort black-holed forwards instead of leaking them.
@@ -867,26 +951,42 @@ async fn control_loop(
                 Err(_) => break Err("control channel timed out (link dead)".into()),
             },
         };
-        match Msg::decode(&msg) {
-            Ok(Msg::Open { proto, port, id }) => {
-                let client = client.clone();
-                let link = link.clone();
-                // Drop handles of forwards that already finished so the tracking
-                // vector stays bounded over a long healthy session.
-                forwards.retain(|h| !h.is_finished());
-                forwards.push(tokio::spawn(async move {
-                    if let Err(e) = handle_open(client, link, proto, port, id).await {
-                        crate::elog!("stream {id} ({proto:?} :{port}) failed: {e}");
-                    }
-                }));
+        let open = match Msg::decode(&msg) {
+            Ok(Msg::Open { proto, port, id }) => Some((proto, port, id, None)),
+            // TCP-only by construction: the server sends OpenProxy exclusively
+            // for TCP ports this client flagged proxy.
+            Ok(Msg::OpenProxy {
+                port,
+                id,
+                peer,
+                local,
+            }) => Some((Proto::Tcp, port, id, Some((peer, local)))),
+            Ok(Msg::FwdOptionsAck) => {
+                ack.store(true, Ordering::Relaxed);
+                None
             }
-            Ok(_) => {}
+            Ok(_) => None,
             Err(e) => break Err(e),
+        };
+        if let Some((proto, port, id, proxy_addrs)) = open {
+            let client = client.clone();
+            let link = link.clone();
+            // Drop handles of forwards that already finished so the tracking
+            // vector stays bounded over a long healthy session.
+            forwards.retain(|h| !h.is_finished());
+            forwards.push(tokio::spawn(async move {
+                if let Err(e) = handle_open(client, link, proto, port, id, proxy_addrs).await {
+                    crate::elog!("stream {id} ({proto:?} :{port}) failed: {e}");
+                }
+            }));
         }
     };
 
     writer.abort();
     pinger.abort();
+    if let Some(h) = watchdog {
+        h.abort();
+    }
     // Tear down forwards tied to this dead control session; abort is a no-op on
     // tasks that already completed, so this never races into a panic.
     for h in forwards {
@@ -895,15 +995,57 @@ async fn control_loop(
     result
 }
 
+/// Wire entries for every forward carrying a non-default option; empty when the
+/// whole config is default, in which case no `FwdOptions` frame is sent.
+fn fwd_options(client: &Client) -> Vec<FwdOptionEntry> {
+    let mut entries = Vec::new();
+    for (proto, map) in [(Proto::Tcp, &client.tcp), (Proto::Udp, &client.udp)] {
+        for (&port, f) in map {
+            if f.proxy || f.idle.is_some() {
+                entries.push(FwdOptionEntry {
+                    proto,
+                    port,
+                    proxy: f.proxy,
+                    idle_secs: f.idle.map(|d| d.as_secs() as u32).unwrap_or(0),
+                });
+            }
+        }
+    }
+    entries
+}
+
+/// Connect the local TCP target and, on a proxy-enabled open, write the PROXY
+/// v2 header ahead of any tunneled payload so it is the very first bytes the
+/// target sees.
+async fn connect_local_tcp(
+    target: &str,
+    proxy_addrs: Option<(SocketAddr, SocketAddr)>,
+) -> Result<TcpStream> {
+    let mut local = TcpStream::connect(target)
+        .await
+        .map_err(|e| -> crate::Error { format!("connecting to local {target}: {e}").into() })?;
+    if let Some((peer, listener)) = proxy_addrs {
+        local
+            .write_all(&crate::proxyproto::encode_v2(peer, listener))
+            .await?;
+    }
+    Ok(local)
+}
+
 /// Open a data connection back to the server and bridge it to the local target.
+/// `proxy_addrs` is the public `(peer, listener)` pair from an `OpenProxy`. A
+/// proxy-enabled forward has no headerless mode: a plain `Open` for it is
+/// refused before anything is dialed, and an `OpenProxy` for a forward that
+/// never asked for one is refused the same way.
 async fn handle_open(
     client: Arc<Client>,
     link: Arc<Link>,
     proto: Proto,
     port: u16,
     id: u64,
+    proxy_addrs: Option<(SocketAddr, SocketAddr)>,
 ) -> Result<()> {
-    let target = match proto {
+    let fwd = match proto {
         Proto::Tcp => client.tcp.get(&port),
         Proto::Udp => client.udp.get(&port),
     }
@@ -911,6 +1053,21 @@ async fn handle_open(
         format!("no local target configured for {proto:?} :{port}").into()
     })?
     .clone();
+    if fwd.proxy && proxy_addrs.is_none() {
+        return Err(format!(
+            "forward :{port} requires a PROXY header but the server sent no peer addresses \
+             (it does not support +proxy); refusing to relay without the header"
+        )
+        .into());
+    }
+    if !fwd.proxy && proxy_addrs.is_some() {
+        return Err(format!("unexpected proxy open for {proto:?} :{port}").into());
+    }
+    let target = fwd.target;
+    let idle = fwd.idle.unwrap_or(match proto {
+        Proto::Tcp => bridge::TCP_IDLE,
+        Proto::Udp => bridge::UDP_IDLE,
+    });
 
     match (link.as_ref(), proto) {
         // --- TCP transport (unchanged behavior) ---
@@ -923,12 +1080,8 @@ async fn handle_open(
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
             nw.send(&Msg::Data { id, name: None }.encode()).await?;
-            let local = TcpStream::connect(&target)
-                .await
-                .map_err(|e| -> crate::Error {
-                    format!("connecting to local {target}: {e}").into()
-                })?;
-            bridge::tcp(local, nr, nw).await;
+            let local = connect_local_tcp(&target, proxy_addrs).await?;
+            bridge::tcp(local, nr, nw, idle).await;
         }
         (Link::Tcp, Proto::Udp) => {
             let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
@@ -943,7 +1096,7 @@ async fn handle_open(
             local.connect(&target).await.map_err(|e| -> crate::Error {
                 format!("connecting to local {target}: {e}").into()
             })?;
-            bridge::udp_client(local, nr, nw).await;
+            bridge::udp_client(local, nr, nw, idle).await;
         }
         // --- UDP transport ---
         (Link::Udp(sess, _, _), Proto::Tcp) => {
@@ -955,12 +1108,8 @@ async fn handle_open(
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
             nw.send(&Msg::Data { id, name: None }.encode()).await?;
-            let local = TcpStream::connect(&target)
-                .await
-                .map_err(|e| -> crate::Error {
-                    format!("connecting to local {target}: {e}").into()
-                })?;
-            bridge::tcp(local, nr, nw).await;
+            let local = connect_local_tcp(&target, proxy_addrs).await?;
+            bridge::tcp(local, nr, nw, idle).await;
         }
         (Link::Udp(sess, _, _), Proto::Udp) => {
             let conv = (id as u32) | SETUP_CONV_BIT;
@@ -980,7 +1129,7 @@ async fn handle_open(
             let (inbound, _guard) = sess.register_dgram(conv);
             let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
             let rx = DgramRx::new(inbound, noise);
-            bridge::udp_client_stateless(local, rx, tx).await;
+            bridge::udp_client_stateless(local, rx, tx, idle).await;
         }
     }
     Ok(())

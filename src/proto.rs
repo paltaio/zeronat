@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::Result;
 
@@ -79,11 +79,29 @@ pub struct SnapshotBody {
     pub bridge_clients: Vec<BridgeEntry>,
 }
 
+/// Per-forward options a client announces for one of its public ports.
+/// `idle_secs` 0 means the proto default idle window; `proxy` asks the server to
+/// send `OpenProxy` (with the real peer addresses) instead of `Open` for TCP
+/// connections on this port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FwdOptionEntry {
+    pub proto: Proto,
+    pub port: u16,
+    pub proxy: bool,
+    pub idle_secs: u32,
+}
+
 /// Messages exchanged over the encrypted Noise channels.
 ///
-/// Control channel (client -> server): `ClientHello`, then periodic `Ping`.
-/// Control channel (server -> client): `Pong` in reply to each `Ping`, and
-/// `Open` for each new public connection.
+/// Control channel (client -> server): `ClientHello`, then optionally one
+/// `FwdOptions` (only when at least one forward carries a non-default option),
+/// then periodic `Ping`.
+/// Control channel (server -> client): `Pong` in reply to each `Ping`,
+/// `FwdOptionsAck` strictly in reply to `FwdOptions` (an old client cannot
+/// decode it, so it is never sent unsolicited; an old server silently ignores
+/// `FwdOptions` and never acks), and `Open` for each new public connection,
+/// replaced by `OpenProxy` on TCP ports the client flagged `proxy` (TCP-only by
+/// construction, so it carries no proto byte).
 /// Data channel (client -> server, first message): `Data` carrying the stream id.
 /// Admin channel (admin -> server): `AdminHello` mode 0 -> `Snapshot`; mode 1 ->
 /// one mutation message (`AddListener`/`RemoveListener`/`SetRoute`/`ClearRoute`),
@@ -137,6 +155,18 @@ pub enum Msg {
     MutationResult {
         ok: bool,
         msg: String,
+    },
+    FwdOptions {
+        entries: Vec<FwdOptionEntry>,
+    },
+    FwdOptionsAck,
+    OpenProxy {
+        port: u16,
+        id: u64,
+        /// The public connection's real source address.
+        peer: SocketAddr,
+        /// The public listener address the connection arrived on.
+        local: SocketAddr,
     },
 }
 
@@ -218,6 +248,60 @@ fn take_ip(b: &[u8], at: &mut usize) -> Result<Ipv4Addr> {
     let ip = Ipv4Addr::new(b[*at], b[*at + 1], b[*at + 2], b[*at + 3]);
     *at += 4;
     Ok(ip)
+}
+
+/// Append a socket address: a family byte (4 or 6), the raw ip octets, then the
+/// port. Addresses are carried verbatim; collapsing an IPv4-mapped IPv6 address
+/// is the consumer's concern, not the codec's.
+fn put_sockaddr(b: &mut Vec<u8>, a: SocketAddr) {
+    match a.ip() {
+        IpAddr::V4(ip) => {
+            b.push(4);
+            b.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            b.push(6);
+            b.extend_from_slice(&ip.octets());
+        }
+    }
+    b.extend_from_slice(&a.port().to_be_bytes());
+}
+
+/// Read a socket address at `*at`, advancing the cursor. Rejects any family byte
+/// other than 4 or 6 and length-guards the octets and port.
+fn take_sockaddr(b: &[u8], at: &mut usize) -> Result<SocketAddr> {
+    if *at >= b.len() {
+        return Err("truncated address family".into());
+    }
+    let fam = b[*at];
+    *at += 1;
+    let ip: IpAddr = match fam {
+        4 => {
+            if *at + 4 > b.len() {
+                return Err("truncated ipv4 socket address".into());
+            }
+            let mut o = [0u8; 4];
+            o.copy_from_slice(&b[*at..*at + 4]);
+            *at += 4;
+            IpAddr::from(o)
+        }
+        6 => {
+            if *at + 16 > b.len() {
+                return Err("truncated ipv6 socket address".into());
+            }
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&b[*at..*at + 16]);
+            *at += 16;
+            IpAddr::from(o)
+        }
+        n => return Err(format!("unknown address family byte {n}").into()),
+    };
+    if *at + 2 > b.len() {
+        return Err("truncated socket address port".into());
+    }
+    let port = u16::from_be_bytes([b[*at], b[*at + 1]]);
+    *at += 2;
+    Ok(SocketAddr::new(ip, port))
 }
 
 /// Decode the bridge-client trailer that follows the routes in a snapshot: a u16
@@ -440,6 +524,39 @@ impl Msg {
                 put_str(&mut b, msg);
                 b
             }
+            Msg::FwdOptions { entries } => {
+                debug_assert!(entries.len() <= u16::MAX as usize);
+                // The count is a u16 on the wire; cap the encoded entries to
+                // match so the count and body never disagree.
+                let entries = &entries[..entries.len().min(u16::MAX as usize)];
+                let mut b = Vec::with_capacity(3 + entries.len() * 8);
+                b.push(13);
+                b.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+                for e in entries {
+                    b.push(proto_byte(e.proto));
+                    b.extend_from_slice(&e.port.to_be_bytes());
+                    // Flags byte: bit0 = proxy; the remaining bits are reserved
+                    // and must stay zero (the decoder rejects them).
+                    b.push(u8::from(e.proxy));
+                    b.extend_from_slice(&e.idle_secs.to_be_bytes());
+                }
+                b
+            }
+            Msg::FwdOptionsAck => vec![14],
+            Msg::OpenProxy {
+                port,
+                id,
+                peer,
+                local,
+            } => {
+                let mut b = Vec::with_capacity(49);
+                b.push(15);
+                b.extend_from_slice(&port.to_be_bytes());
+                b.extend_from_slice(&id.to_be_bytes());
+                put_sockaddr(&mut b, *peer);
+                put_sockaddr(&mut b, *local);
+                b
+            }
         }
     }
 
@@ -647,6 +764,58 @@ impl Msg {
                     return Err("trailing bytes in mutation result".into());
                 }
                 Ok(Msg::MutationResult { ok, msg })
+            }
+            Some(13) => {
+                if b.len() < 3 {
+                    return Err("truncated forward options count".into());
+                }
+                let count = u16::from_be_bytes([b[1], b[2]]) as usize;
+                let mut at = 3;
+                let mut entries = Vec::new();
+                for _ in 0..count {
+                    if at + 8 > b.len() {
+                        return Err("truncated forward option entry".into());
+                    }
+                    let proto = proto_from_byte(b[at])?;
+                    let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
+                    let proxy = match b[at + 3] {
+                        0 => false,
+                        1 => true,
+                        n => return Err(format!("unknown forward option flags byte {n}").into()),
+                    };
+                    let idle_secs = u32::from_be_bytes(b[at + 4..at + 8].try_into().unwrap());
+                    at += 8;
+                    entries.push(FwdOptionEntry {
+                        proto,
+                        port,
+                        proxy,
+                        idle_secs,
+                    });
+                }
+                if at != b.len() {
+                    return Err("trailing bytes in forward options".into());
+                }
+                Ok(Msg::FwdOptions { entries })
+            }
+            Some(14) if b.len() == 1 => Ok(Msg::FwdOptionsAck),
+            Some(15) => {
+                if b.len() < 11 {
+                    return Err("truncated proxy open".into());
+                }
+                let port = u16::from_be_bytes([b[1], b[2]]);
+                let id = u64::from_be_bytes(b[3..11].try_into().unwrap());
+                let mut at = 11;
+                let peer = take_sockaddr(b, &mut at)?;
+                let local = take_sockaddr(b, &mut at)?;
+                if at != b.len() {
+                    return Err("trailing bytes in proxy open".into());
+                }
+                Ok(Msg::OpenProxy {
+                    port,
+                    id,
+                    peer,
+                    local,
+                })
             }
             _ => Err(format!("malformed message ({} bytes)", b.len()).into()),
         }
@@ -1096,6 +1265,148 @@ mod tests {
         let n = snap.len();
         snap[n - 3] = 7;
         assert!(Msg::decode(&snap).is_err());
+    }
+
+    #[test]
+    fn fwd_options_roundtrip() {
+        let entries = vec![
+            FwdOptionEntry {
+                proto: Proto::Tcp,
+                port: 443,
+                proxy: true,
+                idle_secs: 0,
+            },
+            FwdOptionEntry {
+                proto: Proto::Tcp,
+                port: 8443,
+                proxy: true,
+                idle_secs: 600,
+            },
+            FwdOptionEntry {
+                proto: Proto::Udp,
+                port: 51820,
+                proxy: false,
+                idle_secs: 300,
+            },
+        ];
+        match roundtrip(&Msg::FwdOptions {
+            entries: entries.clone(),
+        }) {
+            Msg::FwdOptions { entries: got } => assert_eq!(got, entries),
+            other => panic!("expected fwd options, got {other:?}"),
+        }
+        match roundtrip(&Msg::FwdOptions {
+            entries: Vec::new(),
+        }) {
+            Msg::FwdOptions { entries: got } => assert!(got.is_empty()),
+            other => panic!("expected fwd options, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fwd_options_rejects_malformed() {
+        let good = Msg::FwdOptions {
+            entries: vec![FwdOptionEntry {
+                proto: Proto::Tcp,
+                port: 443,
+                proxy: true,
+                idle_secs: 600,
+            }],
+        }
+        .encode();
+        assert_eq!(good.len(), 11);
+        // Any truncation errors, never panics.
+        for cut in 1..good.len() {
+            assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
+        }
+        // Trailing junk after a valid body.
+        let mut junk = good.clone();
+        junk.push(0x00);
+        assert!(Msg::decode(&junk).is_err());
+        // A count larger than the remaining bytes.
+        let mut big = good.clone();
+        big[1] = 0xff;
+        big[2] = 0xff;
+        assert!(Msg::decode(&big).is_err());
+        // A flags byte with a reserved bit set.
+        let mut bad_flags = good.clone();
+        bad_flags[6] = 0x02;
+        assert!(Msg::decode(&bad_flags).is_err());
+        // An unknown proto byte.
+        let mut bad_proto = good.clone();
+        bad_proto[3] = 9;
+        assert!(Msg::decode(&bad_proto).is_err());
+    }
+
+    #[test]
+    fn fwd_options_ack_exact() {
+        let enc = Msg::FwdOptionsAck.encode();
+        assert_eq!(enc, vec![14]);
+        assert!(matches!(Msg::decode(&enc), Ok(Msg::FwdOptionsAck)));
+        // Any other length is malformed.
+        assert!(Msg::decode(&[14, 0]).is_err());
+    }
+
+    #[test]
+    fn open_proxy_roundtrip() {
+        let pairs: [(SocketAddr, SocketAddr); 3] = [
+            (
+                "203.0.113.5:51820".parse().unwrap(),
+                "198.51.100.1:443".parse().unwrap(),
+            ),
+            (
+                "[2001:db8::1]:4000".parse().unwrap(),
+                "[2001:db8::2]:8443".parse().unwrap(),
+            ),
+            (
+                "203.0.113.5:51820".parse().unwrap(),
+                "[2001:db8::2]:443".parse().unwrap(),
+            ),
+        ];
+        for (peer, local) in pairs {
+            match roundtrip(&Msg::OpenProxy {
+                port: 443,
+                id: u64::MAX,
+                peer,
+                local,
+            }) {
+                Msg::OpenProxy {
+                    port,
+                    id,
+                    peer: p,
+                    local: l,
+                } => {
+                    assert_eq!(port, 443);
+                    assert_eq!(id, u64::MAX);
+                    assert_eq!(p, peer);
+                    assert_eq!(l, local);
+                }
+                other => panic!("expected open proxy, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn open_proxy_rejects_malformed() {
+        let good = Msg::OpenProxy {
+            port: 443,
+            id: 7,
+            peer: "203.0.113.5:51820".parse().unwrap(),
+            local: "[2001:db8::2]:443".parse().unwrap(),
+        }
+        .encode();
+        // 1 tag + 2 port + 8 id + 7 (v4 addr) + 19 (v6 addr).
+        assert_eq!(good.len(), 37);
+        for cut in 1..good.len() {
+            assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
+        }
+        let mut junk = good.clone();
+        junk.push(0x00);
+        assert!(Msg::decode(&junk).is_err());
+        // The peer's family byte sits right after the port and id.
+        let mut bad_family = good.clone();
+        bad_family[11] = 5;
+        assert!(Msg::decode(&bad_family).is_err());
     }
 
     #[test]
