@@ -116,7 +116,7 @@ impl Backoff {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
     Auto,
     Udp,

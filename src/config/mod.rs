@@ -240,7 +240,7 @@ fn close_record(
     Ok(())
 }
 
-fn parse_proto(value: &str, n: usize) -> Result<Proto> {
+pub(crate) fn parse_proto(value: &str, n: usize) -> Result<Proto> {
     let s = parse_string(value, n)?;
     match s.as_str() {
         "tcp" => Ok(Proto::Tcp),

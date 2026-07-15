@@ -18,13 +18,13 @@ use crate::Result;
 /// the same process never collide on the temp name.
 pub(super) static COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// A parsed scalar value. The grammar has no bool key, but the lexer recognizes
-/// `true`/`false` so a bool used where a string or int is expected surfaces as a
-/// clear type error rather than a parse error.
+/// A parsed scalar value: a double-quoted string, a bare unsigned integer, or a
+/// bare `true`/`false`. A scalar of the wrong kind surfaces as a clear type
+/// error from the typed accessors rather than a parse error.
 enum Scalar {
     Str(String),
-    Int(u16),
-    Bool,
+    Int(u64),
+    Bool(bool),
 }
 
 pub(crate) fn reject_dup<'a>(seen: &mut Vec<&'a str>, key: &'a str, n: usize) -> Result<()> {
@@ -85,7 +85,7 @@ pub(crate) fn split_kv(line: &str) -> Option<(&str, &str)> {
 /// Lex one scalar from an already-trimmed value slice, rejecting trailing junk.
 fn lex_scalar(value: &str, n: usize) -> Result<Scalar> {
     if value == "true" || value == "false" {
-        return Ok(Scalar::Bool);
+        return Ok(Scalar::Bool(value == "true"));
     }
     if let Some(rest) = value.strip_prefix('"') {
         let mut out = String::new();
@@ -118,7 +118,7 @@ fn lex_scalar(value: &str, n: usize) -> Result<Scalar> {
     } else {
         // Bare integer; parse via str::parse so overflow/sign/empty all reject.
         let v = value
-            .parse::<u16>()
+            .parse::<u64>()
             .map_err(|_| err(n, &format!("invalid integer `{value}`")))?;
         Ok(Scalar::Int(v))
     }
@@ -127,14 +127,28 @@ fn lex_scalar(value: &str, n: usize) -> Result<Scalar> {
 pub(crate) fn parse_string(value: &str, n: usize) -> Result<String> {
     match lex_scalar(value, n)? {
         Scalar::Str(s) => Ok(s),
-        Scalar::Int(_) | Scalar::Bool => Err(err(n, "expected a string value")),
+        Scalar::Int(_) | Scalar::Bool(_) => Err(err(n, "expected a string value")),
     }
 }
 
 pub(crate) fn parse_int(value: &str, n: usize) -> Result<u16> {
     match lex_scalar(value, n)? {
-        Scalar::Int(v) => Ok(v),
-        Scalar::Str(_) | Scalar::Bool => Err(err(n, "expected an integer value")),
+        Scalar::Int(v) => u16::try_from(v).map_err(|_| err(n, &format!("invalid integer `{v}`"))),
+        Scalar::Str(_) | Scalar::Bool(_) => Err(err(n, "expected an integer value")),
+    }
+}
+
+pub(crate) fn parse_u32(value: &str, n: usize) -> Result<u32> {
+    match lex_scalar(value, n)? {
+        Scalar::Int(v) => u32::try_from(v).map_err(|_| err(n, &format!("invalid integer `{v}`"))),
+        Scalar::Str(_) | Scalar::Bool(_) => Err(err(n, "expected an integer value")),
+    }
+}
+
+pub(crate) fn parse_bool(value: &str, n: usize) -> Result<bool> {
+    match lex_scalar(value, n)? {
+        Scalar::Bool(b) => Ok(b),
+        Scalar::Str(_) | Scalar::Int(_) => Err(err(n, "expected a boolean value")),
     }
 }
 
