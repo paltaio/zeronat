@@ -216,9 +216,8 @@ entryPoints:
       destination field carries the public listener address and port, so a parsing target recovers it.</p>
       <p>Relayed bytes are opaque payload: TLS certificates, ALPN, and SNI pass through byte for byte, and
       the tunnel's Noise encryption is a separate layer invisible to both the public peer and the target.
-      A FIN from either end tears down both directions, and a reset or socket error on one side surfaces
-      on the other as an orderly close, so software cannot distinguish a clean EOF from an abort through
-      the relay.</p>
+      Any close, orderly or not, reaches the far side as a plain EOF on both directions, so software
+      cannot distinguish a clean shutdown from an abort through the relay.</p>
       <p>A healthy but idle TCP stream survives indefinitely: both relay ends exchange encrypted keepalive
       probes every half idle window, and the window (default 120s, tunable per forward with
       <code>+idle=SECS</code>) reaps only a stream whose path has black-holed: no frames at all,
