@@ -217,7 +217,9 @@ pub fn quarantine(path: &Path) -> Option<std::path::PathBuf> {
 
 /// Write `text` to `path` crash-safely: write a same-directory temp file, fsync
 /// its data, rename it over the target, then fsync the parent directory so the
-/// rename itself survives a crash.
+/// rename itself survives a crash. The temp file takes the target's existing
+/// mode before the rename (owner-only for a fresh file: every config carries
+/// secrets), so a save never widens the file's permissions.
 pub fn save_atomic(path: &Path, text: &str) -> Result<()> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -237,7 +239,17 @@ pub fn save_atomic(path: &Path, text: &str) -> Result<()> {
     ));
 
     let write = || -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = match std::fs::metadata(path) {
+            Ok(meta) => meta.permissions().mode(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0o600,
+            Err(e) => return Err(e.into()),
+        };
         let mut f = File::create(&tmp)?;
+        // fchmod after create: the open(2) mode is masked by the umask, and
+        // the file is still empty here, so no secret bytes are ever readable
+        // through the default-mode window.
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;

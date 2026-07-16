@@ -510,6 +510,30 @@ mod tests {
     }
 
     #[test]
+    fn save_atomic_preserves_the_target_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zeronat-cfg-mode-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let cfg = sample();
+        save_atomic(&path, &serialize(&cfg)).unwrap();
+        assert_eq!(mode(&path), 0o600, "a fresh config file must be owner-only");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        save_atomic(&path, &serialize(&cfg)).unwrap();
+        assert_eq!(mode(&path), 0o640, "a save must keep the target's mode");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn load_missing_file_is_default() {
         let path = std::env::temp_dir().join(format!(
             "zeronat-absent-{}-{}.toml",
