@@ -4,6 +4,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub mod admin;
 pub mod bridge;
 pub mod client;
+pub mod client_admin;
 pub mod clientcfg;
 pub mod clientctl;
 pub mod clientproto;

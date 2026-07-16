@@ -1485,53 +1485,25 @@ fn client_settings(
     }
 }
 
-/// Connect to a client admin socket, retrying until it accepts, and send the
-/// hello for `mode`.
-async fn client_admin(
-    sock: &Path,
-    mode: u8,
-) -> (zeronat::noise::NoiseReader, zeronat::noise::NoiseWriter) {
-    let psk = zeronat::clientctl::admin_psk();
+/// One snapshot exchange over a client admin socket, retrying until the
+/// socket accepts: it comes up with the client.
+async fn client_snapshot(sock: &Path) -> ClientSnapshotBody {
     loop {
-        if let Ok(stream) = tokio::net::UnixStream::connect(sock).await {
-            if let Ok((r, mut w)) = zeronat::noise::client_handshake(stream, &psk).await {
-                if w.send(
-                    &ClientMsg::ClientAdminHello {
-                        version: zeronat::identity::PROTO_VERSION,
-                        mode,
-                    }
-                    .encode(),
-                )
-                .await
-                .is_ok()
-                {
-                    return (r, w);
-                }
-            }
+        if let Ok(snap) = zeronat::client_admin::snapshot(sock).await {
+            return snap;
         }
         sleep(Duration::from_millis(50)).await;
     }
 }
 
-/// One snapshot exchange over a client admin socket.
-async fn client_snapshot(sock: &Path) -> ClientSnapshotBody {
-    let (mut r, _w) = client_admin(sock, 0).await;
-    let frame = r.recv().await.unwrap();
-    match ClientMsg::decode(&frame).unwrap() {
-        ClientMsg::ClientSnapshot(snap) => snap,
-        other => panic!("expected client snapshot, got {other:?}"),
-    }
-}
-
-/// One mutation exchange over a client admin socket.
+/// One mutation exchange over a client admin socket. Mutations are never
+/// retried; waiting for a snapshot first keeps the single-shot send from
+/// racing the socket coming up.
 async fn client_mutate(sock: &Path, req: ClientMsg) -> (bool, String) {
-    let (mut r, mut w) = client_admin(sock, 1).await;
-    w.send(&req.encode()).await.unwrap();
-    let frame = r.recv().await.unwrap();
-    match ClientMsg::decode(&frame).unwrap() {
-        ClientMsg::MutationResult { ok, msg } => (ok, msg),
-        other => panic!("expected mutation result, got {other:?}"),
-    }
+    client_snapshot(sock).await;
+    zeronat::client_admin::mutate(sock, req)
+        .await
+        .expect("mutation exchange")
 }
 
 /// Poll client snapshots until `pred` holds; the caller's timeout bounds the
@@ -1727,6 +1699,85 @@ async fn client_admin_socket_serves_snapshot() {
         .expect("client admin socket did not answer within 20s");
 }
 
+/// `show` against a live client: the rendered snapshot lists each forward with
+/// its modifiers in the forward-list syntax, and the pppoe one-shots are refused when
+/// nothing is configured to spawn and no pppoe body is running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_admin_show_renders_forward_options() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let public_udp = free_udp_port();
+        let local_tcp = free_tcp_port();
+        let local_udp = free_udp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control,
+            vec![public_tcp],
+            vec![public_udp],
+        )));
+
+        let dir = temp_config_dir("showopts");
+        let sock = dir.join("client.sock");
+        let mut proxied = fwd(public_tcp, local_tcp);
+        proxied.proxy = true;
+        proxied.idle = Some(Duration::from_secs(600));
+        let mut idled = fwd(public_udp, local_udp);
+        idled.idle = Some(Duration::from_secs(300));
+        let mut settings = client_settings(
+            vec![server_target("home", control, SECRET)],
+            vec![proxied],
+            "show",
+            Some(&sock),
+        );
+        settings.udp = vec![idled];
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("home", control, SECRET)),
+            settings,
+        ));
+
+        let snap = wait_client_snapshot(&sock, |s| s.mode == SessionMode::Forwards).await;
+        let s = zeronat::client_admin::render(&snap);
+        assert!(s.contains("active  home"), "render:\n{s}");
+        assert!(s.contains("mode    forwards"), "render:\n{s}");
+        assert!(
+            s.contains(&format!(
+                "tcp:{public_tcp} -> 127.0.0.1:{local_tcp}  +proxy+idle=600"
+            )),
+            "render:\n{s}"
+        );
+        assert!(
+            s.contains(&format!(
+                "udp:{public_udp} -> 127.0.0.1:{local_udp}  +idle=300"
+            )),
+            "render:\n{s}"
+        );
+
+        zeronat::client_admin::show(Some(&sock))
+            .await
+            .expect("show one-shot");
+        let err = zeronat::client_admin::spawn_pppoe(Some(&sock), "wan".into())
+            .await
+            .expect_err("spawn must be refused with no pppoe entries");
+        assert!(
+            err.to_string().contains("no configured pppoe session"),
+            "unexpected refusal: {err}"
+        );
+        let err = zeronat::client_admin::stop_pppoe(Some(&sock), "wan".into())
+            .await
+            .expect_err("stop must be refused on a forwards body");
+        assert!(
+            err.to_string().contains("no active pppoe session"),
+            "unexpected refusal: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(20), body)
+        .await
+        .expect("show render flow did not complete within 20s");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn select_server_moves_session_and_persists() {
     let body = async {
@@ -1778,25 +1829,27 @@ async fn select_server_moves_session_and_persists() {
 
         let mut conn = wait_tcp_path(public_a).await;
 
-        // An unknown profile is refused and changes nothing, on disk or live.
+        // An unknown profile is refused through the one-shot (the client's
+        // refusal message is the error) and changes nothing, on disk or live.
         let before = std::fs::read_to_string(&path).unwrap();
-        let (ok, _) = client_mutate(
-            &sock,
-            ClientMsg::SelectServer {
-                name: "nope".into(),
-            },
-        )
-        .await;
-        assert!(!ok, "an unknown server name must be refused");
+        let err = zeronat::client_admin::select_server(Some(&sock), "nope".into())
+            .await
+            .expect_err("an unknown server name must be refused");
+        assert!(
+            err.to_string().contains("no configured server"),
+            "unexpected refusal: {err}"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         let snap = client_snapshot(&sock).await;
         assert_eq!(snap.active, "a");
         assert_eq!(snap.mode, SessionMode::Forwards);
 
-        // Selecting b moves the session: the relay through a is cut and
-        // traffic round-trips through b's public port under b's secret.
-        let (ok, msg) = client_mutate(&sock, ClientMsg::SelectServer { name: "b".into() }).await;
-        assert!(ok, "select server b failed: {msg}");
+        // Selecting b through the one-shot moves the session: the relay
+        // through a is cut and traffic round-trips through b's public port
+        // under b's secret.
+        zeronat::client_admin::select_server(Some(&sock), "b".into())
+            .await
+            .expect("select server b");
         timeout(Duration::from_secs(15), async {
             wait_tcp_cut(&mut conn).await;
             wait_tcp_path(public_b).await;
@@ -2001,13 +2054,19 @@ async fn spawn_and_stop_pppoe_swap_the_session_body() {
         assert_eq!(snap.mode, SessionMode::Forwards);
         assert_eq!(snap.phase, PppPhase::None);
 
-        let (ok, _) = client_mutate(&sock, ClientMsg::SpawnPppoe { name: "dsl".into() }).await;
-        assert!(!ok, "an unknown pppoe name must be refused");
+        let err = zeronat::client_admin::spawn_pppoe(Some(&sock), "dsl".into())
+            .await
+            .expect_err("an unknown pppoe name must be refused");
+        assert!(
+            err.to_string().contains("no configured pppoe session"),
+            "unexpected refusal: {err}"
+        );
 
         // Spawn tears the forwards body down and brings the pppoe up; the
         // live datapath writes its phase into the status cell.
-        let (ok, msg) = client_mutate(&sock, ClientMsg::SpawnPppoe { name: "wan".into() }).await;
-        assert!(ok, "spawn pppoe failed: {msg}");
+        zeronat::client_admin::spawn_pppoe(Some(&sock), "wan".into())
+            .await
+            .expect("spawn pppoe");
         wait_client_snapshot(&sock, |s| {
             s.mode == SessionMode::Pppoe && s.phase != PppPhase::None
         })
@@ -2038,19 +2097,26 @@ async fn spawn_and_stop_pppoe_swap_the_session_body() {
         // Stop with the wrong name is refused; the right name returns to the
         // boot-derived base mode and the forwards session (with the edited
         // options) comes back up.
-        let (ok, _) = client_mutate(&sock, ClientMsg::StopSession { name: "dsl".into() }).await;
+        let err = zeronat::client_admin::stop_pppoe(Some(&sock), "dsl".into())
+            .await
+            .expect_err("stopping a session that is not running must be refused");
         assert!(
-            !ok,
-            "stopping a session that is not running must be refused"
+            err.to_string().contains("no active pppoe session"),
+            "unexpected refusal: {err}"
         );
-        let (ok, msg) = client_mutate(&sock, ClientMsg::StopSession { name: "wan".into() }).await;
-        assert!(ok, "stop pppoe failed: {msg}");
+        zeronat::client_admin::stop_pppoe(Some(&sock), "wan".into())
+            .await
+            .expect("stop pppoe");
         wait_client_snapshot(&sock, |s| s.mode == SessionMode::Forwards).await;
         let _conn = wait_tcp_path(public_tcp).await;
 
         // With the forwards body running there is no pppoe to stop.
-        let (ok, _) = client_mutate(&sock, ClientMsg::StopSession { name: "wan".into() }).await;
-        assert!(!ok, "stop must be refused when the body is not that pppoe");
+        assert!(
+            zeronat::client_admin::stop_pppoe(Some(&sock), "wan".into())
+                .await
+                .is_err(),
+            "stop must be refused when the body is not that pppoe"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     };

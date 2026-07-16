@@ -20,8 +20,10 @@ use crate::proto::{proto_name, Proto};
 use crate::Result;
 
 /// Directory hosting the default socket when the client can create it.
-const PRIMARY_DIR: &str = "/run/zeronat";
-const SOCKET_NAME: &str = "client.sock";
+pub(crate) const PRIMARY_DIR: &str = "/run/zeronat";
+/// Socket directory under `$XDG_RUNTIME_DIR` when the primary is unusable.
+pub(crate) const RUNTIME_SUBDIR: &str = "zeronat";
+pub(crate) const SOCKET_NAME: &str = "client.sock";
 /// Bound for one whole admin exchange (handshake, request, response), so a
 /// peer that connects and stalls cannot wedge the accept loop.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -96,7 +98,7 @@ fn resolve_control_dir(primary: &Path, runtime_dir: Option<&Path>) -> Result<Pat
         )
         .into());
     };
-    let dir = base.join("zeronat");
+    let dir = base.join(RUNTIME_SUBDIR);
     create_dir_0700(&dir)
         .map_err(|e| -> crate::Error { format!("creating {}: {e}", dir.display()).into() })?;
     Ok(dir)
