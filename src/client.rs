@@ -932,7 +932,7 @@ async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop, Arc<
     // A connected UDP socket whose peer black-holes never errors on recv, so this
     // pump must be aborted on teardown; the returned guard ties it to the caller's
     // connection scope and fires on both handshake-failure and control-death paths.
-    // A peer that vanishes ungracefully (server restart) does surface an ICMP
+    // A peer that vanishes without closing (server restart) does surface an ICMP
     // port-unreachable as ConnectionRefused/ConnectionReset; firing `cancel` then
     // makes the owner tear down in seconds instead of waiting out CONTROL_TIMEOUT.
     let cancel = Arc::new(Notify::new());

@@ -207,7 +207,7 @@ fn console_cmd(cfg: &Config) -> Option<String> {
 }
 
 /// The intro line and the single-line command to run on the *other* machine,
-/// mirroring the shell installer. One line so it is easy to copy and paste.
+/// mirroring the shell installer.
 fn peer_steps(cfg: &Config) -> (String, String) {
     let fwd = forward_flag(cfg);
     match cfg.mode {

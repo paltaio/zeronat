@@ -149,7 +149,7 @@ struct Request {
 }
 
 /// Header field-names always dropped before forwarding a plain-HTTP request: the
-/// connection-management hop-by-hop set (RFC 7230 §6.1), plus `Host` (replaced from
+/// connection-management hop-by-hop set (RFC 7230 section 6.1), plus `Host` (replaced from
 /// the request target). `Content-Length` and `Transfer-Encoding` are deliberately
 /// kept so the origin frames the body that is relayed unchanged.
 const STRIP_HEADERS: [&str; 9] = [

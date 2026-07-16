@@ -3,8 +3,8 @@
 //!
 //! Each call is a complete connect/handshake/exchange over the Unix stream:
 //! hello mode 0 fetches one snapshot, mode 1 carries one mutation and returns
-//! the client's verdict. The one-shots (`show`, `select_server`, `spawn_pppoe`,
-//! `stop_pppoe`) wrap those exchanges for the CLI; a mutation one-shot returns
+//! the client's verdict. The CLI commands (`show`, `select_server`, `spawn_pppoe`,
+//! `stop_pppoe`) wrap those exchanges; a mutation command returns
 //! as soon as the client accepts it, never waiting on the teardown or bringup
 //! it triggers.
 
@@ -104,17 +104,17 @@ pub async fn show(socket: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// One-shot `select-server NAME`: switch the active server profile.
+/// `select-server NAME`: switch the active server profile.
 pub async fn select_server(socket: Option<&Path>, name: String) -> Result<()> {
     one_shot(socket, ClientMsg::SelectServer { name }).await
 }
 
-/// One-shot `spawn-pppoe NAME`: bring up the named PPPoE session.
+/// `spawn-pppoe NAME`: bring up the named PPPoE session.
 pub async fn spawn_pppoe(socket: Option<&Path>, name: String) -> Result<()> {
     one_shot(socket, ClientMsg::SpawnPppoe { name }).await
 }
 
-/// One-shot `stop-pppoe NAME`: stop the named PPPoE session and fall back to
+/// `stop-pppoe NAME`: stop the named PPPoE session and fall back to
 /// the client's base mode.
 pub async fn stop_pppoe(socket: Option<&Path>, name: String) -> Result<()> {
     one_shot(socket, ClientMsg::StopSession { name }).await
@@ -153,9 +153,8 @@ fn phase_name(phase: PppPhase) -> &'static str {
     }
 }
 
-/// Render a client snapshot to a human-readable report. Pure (no IO) so it is
-/// testable. The PPP phase appears only under a pppoe body, where it means
-/// something.
+/// Render a client snapshot to a human-readable report. The PPP phase appears
+/// only under a pppoe body, where it means something.
 pub fn render(snap: &ClientSnapshotBody) -> String {
     let mut out = String::new();
 

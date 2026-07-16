@@ -11,7 +11,7 @@ default-members = ["."]
 [features]
 default = ["dht", "tui"]
 dht = ["dep:ed25519-dalek", "dep:sha1", "dep:sha2"]
-# Interactive admin console (unix only; falls back to one-shot output without it).
+# Interactive admin console (unix only; prints the snapshot and exits without it).
 tui = ["dep:zntui"]
 
 [dependencies]

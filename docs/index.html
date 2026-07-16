@@ -337,7 +337,7 @@ password_file = "/etc/zeronat/wan.pass"</code></pre>
 
     <section id="admin">
       <h2>Admin</h2>
-      <p>Inspect a running server's topology over the control port (read-only, one-shot):</p>
+      <p>Inspect a running server's topology over the control port (read-only):</p>
 <pre><code>ZERONAT_SECRET=$SECRET zeronat admin --server &lt;public-ip&gt;:2222 show</code></pre>
       <p>It prints the server, its routes, connected clients, and active listeners. Each client lists
       the forwards it announced with non-default options (<code>tcp:443  +proxy+idle=600</code>), and a
@@ -345,7 +345,7 @@ password_file = "/etc/zeronat/wan.pass"</code></pre>
       <h3>Client admin</h3>
       <p>Drive a running client over its local admin socket:</p>
 <pre><code>zeronat client admin                       <span class="c"># interactive console on a terminal</span>
-zeronat client admin show                  <span class="c"># one-shot status</span>
+zeronat client admin show                  <span class="c"># print status and exit</span>
 zeronat client admin select-server backup
 zeronat client admin spawn-pppoe wan</code></pre>
       <p>The socket is <code>/run/zeronat/client.sock</code>, or

@@ -540,7 +540,7 @@ fn live_undo(bridge: &str, nic: &Nic) -> String {
     }
     if nic.dynamic4 {
         // The captured lease address is re-added above for immediate reachability;
-        // also kick a DHCP client so the lease is renewed properly.
+        // also kick a DHCP client so the lease keeps renewing.
         s.push_str(&format!(
             "{{ command -v dhclient >/dev/null 2>&1 && dhclient -nw {0}; }} || \
              {{ command -v udhcpc >/dev/null 2>&1 && udhcpc -b -i {0}; }} || true\n",

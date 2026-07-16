@@ -309,7 +309,7 @@ impl<'a> PppoeDatapath<'a> {
     /// starts a new one the BRAS treats independently.
     ///
     /// Errors only if the system RNG fails while drawing the new Magic-Number,
-    /// which on Linux is effectively impossible; the shell then tears down the
+    /// which on Linux does not happen in practice; the shell then tears down the
     /// tunnel and the reconnect loop redials from scratch.
     pub fn reset(&mut self) -> super::Result<()> {
         self.discovery = Discovery::new(

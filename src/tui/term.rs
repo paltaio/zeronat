@@ -28,7 +28,7 @@ static SAVED: Saved = Saved(UnsafeCell::new(MaybeUninit::uninit()));
 static RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// True when stdout is a terminal. Used to decide between the interactive
-/// console and the scriptable one-shot output.
+/// console and plain scriptable output.
 pub fn stdout_is_tty() -> bool {
     unsafe { libc::isatty(STDOUT) == 1 }
 }

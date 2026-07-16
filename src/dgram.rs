@@ -20,7 +20,7 @@ const KIND_NAME: u8 = 0x02;
 const MAX_NAME_LEN: usize = 256;
 
 /// A decrypted datagram frame: an inner datagram to forward, a keepalive that only
-/// refreshes the receiver's idle window, or a one-shot bridge client label.
+/// refreshes the receiver's idle window, or a bridge client label sent once.
 pub enum Frame {
     Data(Vec<u8>),
     Keepalive,
@@ -56,8 +56,8 @@ impl DgramTx {
         self.frame(&[KIND_KEEPALIVE])
     }
 
-    /// Announce this bridge client's label. Best-effort and one-shot; a server
-    /// that does not understand the kind simply drops it.
+    /// Announce this bridge client's label. Best-effort and sent once; a server
+    /// that does not understand the kind drops it.
     pub async fn send_name(&self, name: &str) -> Result<()> {
         let mut plaintext = Vec::with_capacity(1 + name.len());
         plaintext.push(KIND_NAME);

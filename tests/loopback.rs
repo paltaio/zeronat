@@ -1707,7 +1707,7 @@ async fn client_admin_socket_serves_snapshot() {
 }
 
 /// `show` against a live client: the rendered snapshot lists each forward with
-/// its modifiers in the forward-list syntax, and the pppoe one-shots are refused when
+/// its modifiers in the forward-list syntax, and the pppoe commands are refused when
 /// nothing is configured to spawn and no pppoe body is running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_admin_show_renders_forward_options() {
@@ -1761,7 +1761,7 @@ async fn client_admin_show_renders_forward_options() {
 
         zeronat::client_admin::show(Some(&sock))
             .await
-            .expect("show one-shot");
+            .expect("show command");
         let err = zeronat::client_admin::spawn_pppoe(Some(&sock), "wan".into())
             .await
             .expect_err("spawn must be refused with no pppoe entries");
@@ -1836,7 +1836,7 @@ async fn select_server_moves_session_and_persists() {
 
         let mut conn = wait_tcp_path(public_a).await;
 
-        // An unknown profile is refused through the one-shot (the client's
+        // An unknown profile is refused through the admin command (the client's
         // refusal message is the error) and changes nothing, on disk or live.
         let before = std::fs::read_to_string(&path).unwrap();
         let err = zeronat::client_admin::select_server(Some(&sock), "nope".into())
@@ -1854,7 +1854,7 @@ async fn select_server_moves_session_and_persists() {
         let names: Vec<&str> = snap.servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["a", "b"]);
 
-        // Selecting b through the one-shot moves the session: the relay
+        // Selecting b through the admin command moves the session: the relay
         // through a is cut and traffic round-trips through b's public port
         // under b's secret.
         zeronat::client_admin::select_server(Some(&sock), "b".into())

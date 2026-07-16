@@ -80,8 +80,8 @@ client options:
                       Docker; the servers are also logged)
 
 client admin options:
-  (no command)        Open the interactive console on a terminal; prints a
-                      one-shot snapshot when piped or redirected
+  (no command)        Open the interactive console on a terminal; prints the
+                      status and exits when piped or redirected
   show                Print the running client's status and exit
   select-server <NAME> Switch the active server profile
   spawn-pppoe <NAME>  Bring up the named PPPoE session
@@ -90,8 +90,8 @@ client admin options:
                       else $XDG_RUNTIME_DIR/zeronat/client.sock)
 
 admin options:
-  (no command)        Open the interactive console on a terminal; prints a
-                      one-shot snapshot when piped or redirected
+  (no command)        Open the interactive console on a terminal; prints the
+                      status and exits when piped or redirected
   show                Print the server's current topology and exit
   --server <ADDR>     Server control address host:port
   --secret <SECRET>   Shared secret (or env ZERONAT_SECRET, or the ZERONAT_SECRET

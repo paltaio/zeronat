@@ -500,7 +500,7 @@ fn iptables_chain_exists(table: &str, chain: &str) -> bool {
 }
 
 /// Delete every `zeronat`-tagged iptables rule across the chains we use, by rule
-/// number (high to low so indices stay valid). Robust to a config change or a
+/// number (high to low so indices stay valid). Works after a config change or a
 /// prior hard kill: it removes stale rules regardless of their current spec.
 fn flush_iptables() {
     for (table, chain) in IPT_CHAINS {

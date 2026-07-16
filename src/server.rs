@@ -1141,7 +1141,7 @@ async fn udp_listener(
     // reached it, and its eviction TTL (UDP_DATA_TTL, widened when the forward
     // carries a custom idle so the sweep never undercuts a longer-lived bridge).
     // A closed channel (bridge ended) or a stale TTL evicts the entry, so a
-    // one-shot/vanished source cannot pin a dead Sender slot forever.
+    // source that sends once and vanishes cannot pin a dead Sender slot forever.
     let mut sessions: HashMap<SocketAddr, (mpsc::Sender<Vec<u8>>, Instant, Duration)> =
         HashMap::new();
     let mut buf = [0u8; 65535];

@@ -235,7 +235,7 @@ pub fn apply(
                     ),
                 }
                 // Add the zppp0 default before deleting the captured original. The
-                // delete is best-effort: if it no-ops, the original simply remains as
+                // delete is best-effort: if it no-ops, the original remains as
                 // a lower-priority fallback and zppp0 (priority 0) still wins.
                 match modify_route(true, Ipv4Addr::UNSPECIFIED, 0, None, Some(tun_name), 0) {
                     Ok(()) => {
