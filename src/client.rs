@@ -183,11 +183,11 @@ struct Client {
     transport: Transport,
 }
 
-/// Aborts its task when dropped. Ties a detached pump's lifetime to the scope
+/// Aborts its task when dropped. Ties a spawned task's lifetime to the scope
 /// that owns this guard, so the task cannot outlive the connection it serves.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+struct AbortOnDrop<T = ()>(tokio::task::JoinHandle<T>);
 
-impl Drop for AbortOnDrop {
+impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -286,6 +286,10 @@ pub struct ActiveTarget {
 
 struct ActiveState {
     target: ServerTarget,
+    // Fired with notify_one, which hands out exactly one permit. The
+    // run_switchable loop must stay the sole waiter on this Notify: a second
+    // waiter could consume the permit, the loop would never see the cancel,
+    // and it would redial the old target, silently dropping the switch.
     cancel: Arc<Notify>,
 }
 
@@ -464,41 +468,46 @@ pub async fn run_switchable(
             let try_udp =
                 target.transport != Transport::Auto || choose_udp(&udp_health, Instant::now());
             // The session body runs in its own task so a switch can abort it
-            // mid-flight. The (Some(tap), Some(pppoe)) case is impossible: the
-            // exclusion checks reject --pppoe with --tap/--tun before the loop.
-            // Match tap first so the precedence is deterministic without an
+            // mid-flight. The guard covers the other direction: a caller
+            // dropping this future takes the session down with it instead of
+            // detaching it (a detached pppoe session would keep the hijacked
+            // default route and rewritten resolv.conf applied). The
+            // (Some(tap), Some(pppoe)) case is impossible: the exclusion
+            // checks reject --pppoe with --tap/--tun before the loop. Match
+            // tap first so the precedence is deterministic without an
             // unreachable! arm.
             #[cfg(target_os = "linux")]
             let mut session_task = {
                 let tap_dev = tap_dev.clone();
                 let pppoe = pppoe.clone();
-                tokio::spawn(async move {
+                AbortOnDrop(tokio::spawn(async move {
                     match (&tap_dev, &pppoe) {
                         (Some(tap), _) => bridge_session(client, tap.clone(), try_udp).await,
                         (None, Some(pp)) => pppoe_session(client, pp.clone(), try_udp).await,
                         (None, None) => session(client, try_udp).await,
                     }
-                })
+                }))
             };
             #[cfg(not(target_os = "linux"))]
-            let mut session_task = tokio::spawn(session(client, try_udp));
+            let mut session_task = AbortOnDrop(tokio::spawn(session(client, try_udp)));
             let joined = tokio::select! {
                 _ = cancel.notified() => None,
-                r = &mut session_task => Some(r),
+                r = &mut session_task.0 => Some(r),
             };
             let (result, outcome, established) = match joined {
                 None => {
                     // Teardown half of the switch: abort the session and await its
                     // exit so every handle it holds (the device included) is gone
                     // before the next profile's bringup opens its own.
-                    session_task.abort();
-                    let _ = session_task.await;
+                    session_task.0.abort();
+                    let _ = (&mut session_task.0).await;
                     break;
                 }
                 Some(Ok(v)) => v,
-                // Only the switch arm above aborts this task, so a join error
-                // here is a panic in the session body; surface it exactly as the
-                // inline await it replaced would have.
+                // The only aborts are the switch arm above (which takes the
+                // None branch) and the guard's drop (which means this future is
+                // gone), so a join error here is a panic in the session body;
+                // surface it exactly as the inline await it replaced would have.
                 Some(Err(e)) => std::panic::resume_unwind(e.into_panic()),
             };
             if target.transport == Transport::Auto && outcome != UdpOutcome::Skipped {

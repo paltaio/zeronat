@@ -1486,19 +1486,59 @@ async fn server_switch_moves_session() {
         // Session up against A: traffic round-trips through A's public port.
         let mut conn = wait_tcp_path(public_a).await;
 
-        // Switch to B. The in-flight session against A must be torn down, which
-        // cuts the established relay through A...
+        // Switch to B. The switch must abort the in-flight session, not sit
+        // out the 90s control timeout waiting to notice A is gone: the
+        // established relay through A is cut and traffic round-trips through
+        // B's public port under B's secret within the 15s bound.
         active.switch(target("b", control_b, SECRET_B));
-        wait_tcp_cut(&mut conn).await;
-
-        // ...and the same session body comes up against B under B's secret:
-        // traffic round-trips through B's public port.
-        let _conn_b = wait_tcp_path(public_b).await;
+        timeout(Duration::from_secs(15), async {
+            wait_tcp_cut(&mut conn).await;
+            wait_tcp_path(public_b).await;
+        })
+        .await
+        .expect("switch did not move traffic to B within 15s");
     };
 
     timeout(Duration::from_secs(30), body)
         .await
         .expect("server switch did not complete within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_client_future_aborts_session() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let local_tcp = free_tcp_port();
+        tokio::spawn(tcp_echo(local_tcp));
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control,
+            vec![public_tcp],
+            vec![],
+        )));
+        let client = tokio::spawn(zeronat::client::run(
+            format!("127.0.0.1:{control}"),
+            SECRET.into(),
+            vec![fwd(public_tcp, local_tcp)],
+            vec![],
+            zeronat::client::Transport::Tcp,
+            None,
+            None,
+            None,
+            Some("drop".into()),
+        ));
+
+        let mut conn = wait_tcp_path(public_tcp).await;
+
+        // Dropping the client future must take the live session down with it:
+        // a detached session would keep relaying and the cut would never come.
+        client.abort();
+        wait_tcp_cut(&mut conn).await;
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("dropped client future did not cut the session within 30s");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
