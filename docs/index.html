@@ -93,6 +93,7 @@
       <a class="nav-link" href="#transparency">Transparency</a>
       <a class="nav-link" href="#transport">Transport</a>
       <a class="nav-link" href="#routing">Routing</a>
+      <a class="nav-link" href="#clientconfig">Client config</a>
       <a class="nav-link" href="#admin">Admin</a>
       <a class="nav-link" href="#allports">All ports</a>
       <a class="nav-link" href="#tap">L2 bridge</a>
@@ -282,6 +283,58 @@ client = "rpi-2-ab12"</code></pre>
       booting half-configured.</p>
     </section>
 
+    <section id="clientconfig">
+      <h2>Client config</h2>
+      <p>Load servers, forwards, and identity from a file with <code>--config</code>:</p>
+<pre><code>zeronat client --config /etc/zeronat/client.toml</code></pre>
+<pre><code><span class="c"># client.toml</span>
+[client]
+id = "rpi-2"
+active = "home"
+
+[[servers]]
+name = "home"
+addr = "203.0.113.7:2222"
+secret = "somelongsecret"
+transport = "auto"
+
+[[servers]]
+name = "backup"
+addr = "dht"
+secret = "otherlongsecret"
+
+[[forwards]]
+proto = "tcp"
+port = 443
+target = "127.0.0.1:8443"
+proxy = true
+idle = 600
+
+[[pppoe]]
+name = "wan"
+username = "user@isp"
+password_file = "/etc/zeronat/wan.pass"</code></pre>
+      <p>Each <code>[[servers]]</code> entry is a named profile with its own address, secret, and
+      <code>transport</code>; <code>[client].active</code> picks the one to dial (default: the first).
+      <code>[[forwards]]</code> entries take the same options as the CLI specs: <code>proxy</code> is
+      TCP-only, <code>idle</code> is whole seconds. A <code>[[pppoe]]</code> entry names a session that
+      can be spawned at runtime; one may set <code>autostart = true</code> to dial at boot when no
+      forwards are declared. <code>[tap]</code> or <code>[tun]</code> declares a device mode instead,
+      exclusive with forwards and PPPoE.</p>
+      <p>A file that declares any servers, forwards, PPPoE sessions, or a device is authoritative for
+      the whole client shape: the matching CLI flags are ignored, each with a log line. A file that
+      declares none leaves the CLI flags in charge, so an existing command line keeps working next to
+      <code>--config</code>. Scalars apply either way; the file's <code>id</code> overrides
+      <code>--id</code>.</p>
+      <p>A missing file is a normal first boot. A file that fails to parse is moved aside to
+      <code>&lt;name&gt;.corrupt-&lt;timestamp&gt;</code> and the client starts from the command line. A
+      file that parses but contradicts itself (an <code>active</code> naming no server, duplicate server
+      names, duplicate <code>proto</code>/<code>port</code> forwards, two <code>autostart</code> entries)
+      aborts startup for you to fix in place, as does an unreadable file.</p>
+      <p>The file carries the per-server secrets; keep it mode 600. <code>password_file</code> keeps the
+      PPPoE password out of the config itself.</p>
+    </section>
+
     <section id="admin">
       <h2>Admin</h2>
       <p>Inspect a running server's topology over the control port (read-only, one-shot):</p>
@@ -289,6 +342,23 @@ client = "rpi-2-ab12"</code></pre>
       <p>It prints the server, its routes, connected clients, and active listeners. Each client lists
       the forwards it announced with non-default options (<code>tcp:443  +proxy+idle=600</code>), and a
       route shows its forward's options in the OPTIONS column.</p>
+      <h3>Client admin</h3>
+      <p>Drive a running client over its local admin socket:</p>
+<pre><code>zeronat client admin                       <span class="c"># interactive console on a terminal</span>
+zeronat client admin show                  <span class="c"># one-shot status</span>
+zeronat client admin select-server backup
+zeronat client admin spawn-pppoe wan</code></pre>
+      <p>The socket is <code>/run/zeronat/client.sock</code>, or
+      <code>$XDG_RUNTIME_DIR/zeronat/client.sock</code> when the client cannot create
+      <code>/run/zeronat</code>; <code>--socket</code> overrides it and <code>[client].control</code>
+      pins it. Access control is the filesystem: the socket is mode 600 in a 700 directory, so whoever
+      can open it drives the client; no secret is needed.</p>
+      <p>The console lists the configured server profiles, the active session (mode and, for PPPoE, the
+      link phase), and the forwards with their options. Selecting a server tears the current session
+      down and redials it against the new one, with a brief link drop while it switches.
+      <code>select-server</code> and forward-option edits persist to the config file when the client
+      booted from one; <code>spawn-pppoe</code>/<code>stop-pppoe</code> are runtime-only and do not
+      survive a restart.</p>
     </section>
 
     <section id="allports">
@@ -405,6 +475,7 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
           <tr><td><code>--server &lt;ADDR&gt;</code></td><td>Server control address <code>host:port</code>, or <code>dht</code> to discover via DHT</td></tr>
           <tr><td><code>--secret &lt;SECRET&gt;</code></td><td>Shared secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
           <tr><td><code>--id &lt;PREFIX&gt;</code></td><td>Client id prefix (default: short hostname)</td></tr>
+          <tr><td><code>--config &lt;PATH&gt;</code></td><td>Load servers, forwards, and identity from a config file</td></tr>
           <tr><td><code>--tcp &lt;SPEC&gt;</code></td><td>Forward TCP: <code>PORT</code> | <code>PORT:LOCALPORT</code> | <code>PORT:HOST:PORT</code>, with optional <code>+proxy</code> and <code>+idle=SECS</code> (repeatable)</td></tr>
           <tr><td><code>--udp &lt;SPEC&gt;</code></td><td>Forward UDP, same spec as <code>--tcp</code>; <code>+idle</code> only, <code>+proxy</code> is TCP-only (repeatable)</td></tr>
           <tr><td><code>--proxy</code></td><td>Send a PROXY protocol v2 header on every <code>--tcp</code> forward</td></tr>
@@ -413,6 +484,17 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
           <tr><td><code>--tap &lt;NAME&gt;</code></td><td>L2 bridge mode (Linux): create or attach this TAP device</td></tr>
           <tr><td><code>--tap-mtu &lt;N&gt;</code></td><td>TAP MTU (default 1400)</td></tr>
           <tr><td><code>--bridge &lt;NAME&gt;</code></td><td>Enslave the TAP to this existing bridge</td></tr>
+        </tbody>
+      </table>
+
+      <h3>zeronat client admin</h3>
+      <table>
+        <tbody>
+          <tr><td><code>show</code></td><td>Print the running client's status (default command)</td></tr>
+          <tr><td><code>select-server &lt;NAME&gt;</code></td><td>Switch the active server profile</td></tr>
+          <tr><td><code>spawn-pppoe &lt;NAME&gt;</code></td><td>Bring up the named PPPoE session</td></tr>
+          <tr><td><code>stop-pppoe &lt;NAME&gt;</code></td><td>Stop the named PPPoE session and return to the base mode</td></tr>
+          <tr><td><code>--socket &lt;PATH&gt;</code></td><td>Admin socket path</td></tr>
         </tbody>
       </table>
 
