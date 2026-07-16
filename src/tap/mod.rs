@@ -9,6 +9,7 @@
 use std::net::Ipv4Addr;
 
 /// L2 bridge-mode configuration parsed from the CLI.
+#[derive(Clone)]
 pub struct TapConfig {
     pub name: String,
     pub mtu: usize,
@@ -17,6 +18,7 @@ pub struct TapConfig {
 
 /// L3 tunnel-mode configuration. `addr`/`prefix_len` are this node's address on
 /// the secret-derived tunnel subnet (server `.1`, client `.2`).
+#[derive(Clone)]
 pub struct TunConfig {
     pub name: String,
     pub mtu: usize,

@@ -8,14 +8,15 @@
 //! handshake supplies framing and channel integrity, not admission.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::client::ActiveTarget;
-use crate::clientproto::{
-    ClientForwardEntry, ClientMsg, ClientSnapshotBody, PppPhase, SessionMode,
-};
+use crate::client::{ActiveTarget, PppoeRunConfig, RunMode, ServerTarget, SharedForwards};
+use crate::clientcfg::{serialize_client, ClientConfig};
+use crate::clientproto::{ClientMsg, ClientSnapshotBody, PppStatus};
+use crate::proto::{proto_name, Proto};
 use crate::Result;
 
 /// Directory hosting the default socket when the client can create it.
@@ -110,13 +111,51 @@ fn create_dir_0700(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The client-runtime state the accept loop answers snapshots from.
+/// Admin-mutation persistence target: the config file and its parsed
+/// contents, present only when the client's shape came from that file. The
+/// dispatcher edits the parsed config and rewrites the whole file, so a saved
+/// file always passes the client parser and validation.
+pub struct Persist {
+    path: PathBuf,
+    /// The parsed config; the dispatcher applies edits here in mutation order.
+    cfg: Arc<std::sync::Mutex<ClientConfig>>,
+    /// Gate serializing the disk writes. An exchange timeout abandons a
+    /// spawn_blocking save without stopping it, so without the gate an older
+    /// abandoned rename could land after a newer one; each save serializes the
+    /// config under the gate, so the last rename carries the newest state.
+    write: Arc<std::sync::Mutex<()>>,
+}
+
+impl Persist {
+    pub fn new(path: PathBuf, cfg: ClientConfig) -> Self {
+        Persist {
+            path,
+            cfg: Arc::new(std::sync::Mutex::new(cfg)),
+            write: Arc::new(std::sync::Mutex::new(())),
+        }
+    }
+}
+
+/// The client-runtime state the accept loop answers snapshots and mutations
+/// from. Snapshot reads and mutation applies are lock-only: the dispatcher
+/// never waits on the switch cancel (whose `Notify` has a sole-waiter contract
+/// with the reconnect loop) and never awaits a teardown before replying.
 pub struct ControlState {
-    /// Shared active target. Read for the profile name only, never waited on:
-    /// its cancel `Notify` has a sole-waiter contract with the reconnect loop.
+    /// Shared active target and session body; mutations fire its cancel.
     pub active: ActiveTarget,
-    pub mode: SessionMode,
-    pub forwards: Vec<ClientForwardEntry>,
+    /// Live forward set, edited by `SetForwardOptions`.
+    pub forwards: SharedForwards,
+    /// Live PPP phase, written by the pppoe datapath shell.
+    pub ppp: PppStatus,
+    /// Profiles `SelectServer` may switch to.
+    pub servers: Vec<ServerTarget>,
+    /// Sessions `SpawnPppoe` may bring up, by name.
+    pub pppoe: Vec<(String, Arc<PppoeRunConfig>)>,
+    /// The body `StopSession` falls back to: forwards when any are declared,
+    /// idle otherwise.
+    pub base_mode: RunMode,
+    /// `None` on a runtime-only client; mutations then stay in memory.
+    pub persist: Option<Persist>,
 }
 
 /// The bound admin socket. Dropping it removes the socket file, so an aborted
@@ -217,14 +256,8 @@ async fn handle(stream: UnixStream, state: &ControlState) -> Result<()> {
         }
         1 => {
             let frame = r.recv().await?;
-            let msg = match ClientMsg::decode(&frame)? {
-                ClientMsg::SelectServer { .. }
-                | ClientMsg::SetForwardOptions { .. }
-                | ClientMsg::SpawnPppoe { .. }
-                | ClientMsg::StopSession { .. } => "not implemented".to_string(),
-                other => format!("expected a mutation, got {other:?}"),
-            };
-            w.send(&ClientMsg::MutationResult { ok: false, msg }.encode())
+            let (ok, msg) = mutate(state, ClientMsg::decode(&frame)?).await;
+            w.send(&ClientMsg::MutationResult { ok, msg }.encode())
                 .await?;
         }
         n => return Err(format!("unknown admin hello mode {n}").into()),
@@ -233,19 +266,133 @@ async fn handle(stream: UnixStream, state: &ControlState) -> Result<()> {
 }
 
 fn snapshot(state: &ControlState) -> ClientSnapshotBody {
+    let (active, mode) = state.active.admin_view();
     ClientSnapshotBody {
         version: crate::identity::PROTO_VERSION,
-        active: state.active.active_name(),
-        mode: state.mode,
-        phase: PppPhase::None,
-        forwards: state.forwards.clone(),
+        active,
+        mode,
+        phase: state.ppp.get(),
+        forwards: state.forwards.entries(),
+    }
+}
+
+/// Apply one admin mutation. Every reply is an acceptance reply: validate,
+/// update the shared state, persist when file-sourced, fire the switch cancel,
+/// and answer without awaiting the teardown or bringup the cancel triggers. A
+/// validation failure changes nothing; a save failure returns `false` even
+/// though the mutation already applied in memory, so a scripted admin detects
+/// that the on-disk config did not change.
+async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
+    match msg {
+        ClientMsg::SelectServer { name } => {
+            let Some(target) = state.servers.iter().find(|s| s.name == name) else {
+                return (false, format!("no configured server named `{name}`"));
+            };
+            // One call updates the target and fires the cancel; the session
+            // body is preserved and comes back up against the new server.
+            state.active.switch(target.clone());
+            persist(state, move |cfg| cfg.active = Some(name)).await
+        }
+        ClientMsg::SetForwardOptions {
+            proto,
+            port,
+            proxy,
+            idle_secs,
+        } => {
+            // Mirror the config parser's per-entry rules, so what is applied
+            // here is exactly what the persisted file will parse back.
+            if proxy && proto == Proto::Udp {
+                return (false, "`proxy` is not supported on udp forwards".into());
+            }
+            // Wire 0 clears the idle override; the config value is therefore
+            // never Some(0), which the parser would reject.
+            let idle = if idle_secs == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(u64::from(idle_secs)))
+            };
+            if !state.forwards.set_options(proto, port, proxy, idle) {
+                return (
+                    false,
+                    format!("no {} forward on port {port}", proto_name(proto)),
+                );
+            }
+            let saved = persist(state, move |cfg| {
+                if let Some(f) = cfg
+                    .forwards
+                    .iter_mut()
+                    .find(|f| f.proto == proto && f.port == port)
+                {
+                    f.proxy = proxy;
+                    f.idle = if idle_secs == 0 {
+                        None
+                    } else {
+                        Some(idle_secs)
+                    };
+                }
+            })
+            .await;
+            state.active.kick_if_forwards();
+            saved
+        }
+        ClientMsg::SpawnPppoe { name } => {
+            let Some((_, config)) = state.pppoe.iter().find(|(n, _)| *n == name) else {
+                return (false, format!("no configured pppoe session named `{name}`"));
+            };
+            // Runtime-only: which session runs is never written back.
+            state.active.set_mode(RunMode::Pppoe {
+                name,
+                config: config.clone(),
+            });
+            (true, String::new())
+        }
+        ClientMsg::StopSession { name } => {
+            // Runtime-only, valid only against the running pppoe body; the
+            // loop falls back to the boot-derived base mode.
+            if state.active.stop_pppoe(&name, state.base_mode.clone()) {
+                (true, String::new())
+            } else {
+                (false, format!("no active pppoe session named `{name}`"))
+            }
+        }
+        other => (false, format!("expected a mutation, got {other:?}")),
+    }
+}
+
+/// Persist an applied mutation on a file-sourced client: edit the parsed
+/// config, then rewrite the file crash-safely off the runtime threads. The
+/// blocking task serializes under the write gate, so a save that outlives its
+/// exchange can neither reorder renames nor write a stale config. A
+/// runtime-only client returns success without touching any file.
+async fn persist(state: &ControlState, edit: impl FnOnce(&mut ClientConfig)) -> (bool, String) {
+    let Some(p) = &state.persist else {
+        return (true, String::new());
+    };
+    {
+        let mut cfg = p.cfg.lock().unwrap();
+        edit(&mut cfg);
+    }
+    let path = p.path.clone();
+    let cfg = p.cfg.clone();
+    let write = p.write.clone();
+    match tokio::task::spawn_blocking(move || {
+        let _gate = write.lock().unwrap();
+        let text = serialize_client(&cfg.lock().unwrap());
+        crate::config::save_atomic(&path, &text)
+    })
+    .await
+    {
+        Ok(Ok(())) => (true, String::new()),
+        Ok(Err(e)) => (false, format!("client rejected config save: {e}")),
+        Err(e) => (false, format!("config save task failed: {e}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{ServerTarget, Transport};
+    use crate::client::{Forward, Transport};
+    use crate::clientproto::{PppPhase, SessionMode};
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -264,17 +411,232 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    fn server_target(name: &str, port: u16) -> ServerTarget {
+        ServerTarget {
+            name: name.into(),
+            addr: format!("127.0.0.1:{port}"),
+            secret: "s".into(),
+            transport: Transport::Tcp,
+        }
+    }
+
     fn idle_state(name: &str) -> ControlState {
         ControlState {
-            active: ActiveTarget::new(ServerTarget {
-                name: name.into(),
-                addr: "127.0.0.1:1".into(),
-                secret: "s".into(),
-                transport: Transport::Tcp,
-            }),
-            mode: SessionMode::Idle,
-            forwards: Vec::new(),
+            active: ActiveTarget::new(server_target(name, 1)),
+            forwards: SharedForwards::new(Vec::new(), Vec::new()),
+            ppp: PppStatus::default(),
+            servers: Vec::new(),
+            pppoe: Vec::new(),
+            base_mode: RunMode::Idle,
+            persist: None,
         }
+    }
+
+    fn pppoe_config() -> Arc<PppoeRunConfig> {
+        Arc::new(PppoeRunConfig {
+            username: b"u".to_vec(),
+            password: b"p".to_vec(),
+            service_name: Vec::new(),
+            ac_name: None,
+            tun_name: "zppp0".into(),
+            effective_mtu: 1400,
+            default_route: false,
+            clamp_mss: None,
+            request_dns: false,
+        })
+    }
+
+    fn tcp_fwd(port: u16) -> Forward {
+        Forward {
+            port,
+            target: format!("127.0.0.1:{}", port + 1),
+            proxy: false,
+            idle: None,
+        }
+    }
+
+    /// The snapshot reports whatever the datapath last wrote into the cell.
+    #[test]
+    fn snapshot_reports_the_live_ppp_phase() {
+        let state = idle_state("home");
+        assert_eq!(snapshot(&state).phase, PppPhase::None);
+        for phase in [
+            PppPhase::Discovery,
+            PppPhase::Negotiating,
+            PppPhase::Established,
+            PppPhase::LinkDown,
+            PppPhase::Dead,
+            PppPhase::None,
+        ] {
+            state.ppp.set(phase);
+            assert_eq!(snapshot(&state).phase, phase);
+        }
+    }
+
+    #[tokio::test]
+    async fn select_server_validates_and_persists() {
+        let dir = temp_dir("selsrv");
+        let path = dir.join("client.toml");
+        let cfg = crate::clientcfg::parse_client(
+            "[client]\nactive = \"a\"\n\
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\
+             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"t\"\n",
+        )
+        .unwrap();
+        let mut state = idle_state("a");
+        state.servers = vec![server_target("a", 1), server_target("b", 2)];
+        state.persist = Some(Persist::new(path.clone(), cfg));
+
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::SelectServer {
+                name: "nope".into(),
+            },
+        )
+        .await;
+        assert!(!ok);
+        assert!(!path.exists(), "a rejected mutation must not write: {msg}");
+        assert_eq!(state.active.admin_view().0, "a");
+
+        let (ok, msg) = mutate(&state, ClientMsg::SelectServer { name: "b".into() }).await;
+        assert!(ok, "{msg}");
+        assert_eq!(state.active.admin_view().0, "b");
+        // The saved file parses back with the new active profile and passes
+        // the same validation boot applies.
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.active.as_deref(), Some("b"));
+        assert_eq!(on_disk.servers.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn set_forward_options_validates_edits_and_persists() {
+        let dir = temp_dir("fwdopt");
+        let path = dir.join("client.toml");
+        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\
+                    [[forwards]]\nproto = \"tcp\"\nport = 443\ntarget = \"127.0.0.1:444\"\n\
+                    [[forwards]]\nproto = \"udp\"\nport = 53\ntarget = \"127.0.0.1:54\"\n";
+        std::fs::write(&path, text).unwrap();
+        let mut state = idle_state("a");
+        state.forwards = SharedForwards::new(
+            vec![tcp_fwd(443)],
+            vec![Forward {
+                port: 53,
+                target: "127.0.0.1:54".into(),
+                proxy: false,
+                idle: None,
+            }],
+        );
+        state.persist = Some(Persist::new(
+            path.clone(),
+            crate::clientcfg::parse_client(text).unwrap(),
+        ));
+
+        // Failing validation persists and applies nothing: proxy on udp,
+        // then a forward that does not exist.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let entries_before = state.forwards.entries();
+        let (ok, _) = mutate(
+            &state,
+            ClientMsg::SetForwardOptions {
+                proto: Proto::Udp,
+                port: 53,
+                proxy: true,
+                idle_secs: 0,
+            },
+        )
+        .await;
+        assert!(!ok, "proxy on a udp forward must be rejected");
+        let (ok, _) = mutate(
+            &state,
+            ClientMsg::SetForwardOptions {
+                proto: Proto::Tcp,
+                port: 80,
+                proxy: false,
+                idle_secs: 5,
+            },
+        )
+        .await;
+        assert!(!ok, "an unknown forward must be rejected");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(state.forwards.entries(), entries_before);
+
+        // A valid edit lands in memory and round-trips through the parser.
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::SetForwardOptions {
+                proto: Proto::Tcp,
+                port: 443,
+                proxy: true,
+                idle_secs: 600,
+            },
+        )
+        .await;
+        assert!(ok, "{msg}");
+        let snap = snapshot(&state);
+        assert!(snap.forwards[0].proxy);
+        assert_eq!(snap.forwards[0].idle_secs, 600);
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        assert!(on_disk.forwards[0].proxy);
+        assert_eq!(on_disk.forwards[0].idle, Some(600));
+
+        // Wire idle 0 clears the override; the file never carries idle = 0,
+        // which the parser would reject.
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::SetForwardOptions {
+                proto: Proto::Tcp,
+                port: 443,
+                proxy: true,
+                idle_secs: 0,
+            },
+        )
+        .await;
+        assert!(ok, "{msg}");
+        assert_eq!(snapshot(&state).forwards[0].idle_secs, 0);
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.forwards[0].idle, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn spawn_and_stop_pppoe_move_the_session_mode() {
+        let mut state = idle_state("a");
+        state.pppoe = vec![("wan".into(), pppoe_config())];
+
+        let (ok, _) = mutate(
+            &state,
+            ClientMsg::SpawnPppoe {
+                name: "nope".into(),
+            },
+        )
+        .await;
+        assert!(!ok, "spawning an unknown session must fail");
+        let (ok, _) = mutate(&state, ClientMsg::StopSession { name: "wan".into() }).await;
+        assert!(!ok, "stopping with a non-pppoe body must fail");
+
+        let (ok, msg) = mutate(&state, ClientMsg::SpawnPppoe { name: "wan".into() }).await;
+        assert!(ok, "{msg}");
+        assert_eq!(state.active.admin_view().1, SessionMode::Pppoe);
+
+        let (ok, _) = mutate(
+            &state,
+            ClientMsg::StopSession {
+                name: "other".into(),
+            },
+        )
+        .await;
+        assert!(!ok, "stopping a session that is not running must fail");
+        assert_eq!(state.active.admin_view().1, SessionMode::Pppoe);
+
+        let (ok, msg) = mutate(&state, ClientMsg::StopSession { name: "wan".into() }).await;
+        assert!(ok, "{msg}");
+        assert_eq!(state.active.admin_view().1, SessionMode::Idle);
     }
 
     #[test]

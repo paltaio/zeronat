@@ -19,6 +19,7 @@ use tokio::sync::Notify;
 use tokio::time::{interval, interval_at, Instant, MissedTickBehavior};
 
 use crate::bridge::UDP_IDLE;
+use crate::clientproto::{PppPhase, PppStatus};
 use crate::dgram::{DgramRx, DgramTx, Frame};
 use crate::noise::{NoiseReader, NoiseWriter};
 use crate::pppoe::datapath::{DpPhase, PppoeDatapath};
@@ -53,6 +54,20 @@ pub struct ZpppBringup<'a> {
     pub netcfg: NetCfgOpts,
     /// Resolved IPv4 server address for the WAN pin, or `None` to skip it.
     pub server_ip: Option<Ipv4Addr>,
+    /// Live phase cell the shell updates as the datapath advances, so admin
+    /// snapshots report the real link state.
+    pub status: PppStatus,
+}
+
+/// The snapshot phase for a datapath phase.
+fn wire_phase(phase: DpPhase) -> PppPhase {
+    match phase {
+        DpPhase::Discovery => PppPhase::Discovery,
+        DpPhase::Ppp => PppPhase::Negotiating,
+        DpPhase::Established(_) => PppPhase::Established,
+        DpPhase::LinkDown => PppPhase::LinkDown,
+        DpPhase::Dead => PppPhase::Dead,
+    }
 }
 
 /// Bring up zppp0 once PPP reports Established. Opens the TUN with the IPCP
@@ -207,6 +222,7 @@ pub async fn run_dgram(
     let mut stranded = false;
 
     dp.start();
+    cfg.status.set(PppPhase::Discovery);
     flush_to_dgram(&mut dp, &tx).await?;
 
     loop {
@@ -228,6 +244,7 @@ pub async fn run_dgram(
                 Some(Frame::Data(d)) => {
                     last_in = Instant::now();
                     let phase = dp.on_l2_frame(&d);
+                    cfg.status.set(wire_phase(phase));
                     flush_to_dgram(&mut dp, &tx).await?;
                     // Bring-up first: a no-op on any non-Established phase, so it is
                     // safe to call before the LinkDown handler that closes zppp0.
@@ -257,6 +274,7 @@ pub async fn run_dgram(
 
             _ = nego.tick() => {
                 let phase = dp.on_tick();
+                cfg.status.set(wire_phase(phase));
                 flush_to_dgram(&mut dp, &tx).await?;
                 let (t, est_edge) = maybe_bring_up_zppp0(tun, phase, &cfg)?;
                 tun = t;
@@ -307,6 +325,7 @@ pub async fn run_stream(
     let mut stranded = false;
 
     dp.start();
+    cfg.status.set(PppPhase::Discovery);
     flush_to_stream(&mut dp, &mut nw).await?;
 
     loop {
@@ -327,6 +346,7 @@ pub async fn run_stream(
                         continue; // keepalive record
                     }
                     let phase = dp.on_l2_frame(&d);
+                    cfg.status.set(wire_phase(phase));
                     flush_to_stream(&mut dp, &mut nw).await?;
                     // Bring-up first: a no-op on any non-Established phase, so it is
                     // safe to call before the LinkDown handler that closes zppp0.
@@ -356,6 +376,7 @@ pub async fn run_stream(
 
             _ = nego.tick() => {
                 let phase = dp.on_tick();
+                cfg.status.set(wire_phase(phase));
                 flush_to_stream(&mut dp, &mut nw).await?;
                 let (t, est_edge) = maybe_bring_up_zppp0(tun, phase, &cfg)?;
                 tun = t;

@@ -74,6 +74,24 @@ fn phase_from_byte(n: u8) -> Result<PppPhase> {
     }
 }
 
+/// Live PPP phase of the active session, written by the PPPoE datapath shell
+/// and read by snapshot handlers. A single byte cell so the per-frame datapath
+/// update never takes a lock.
+#[derive(Clone, Default)]
+pub struct PppStatus(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl PppStatus {
+    pub fn set(&self, phase: PppPhase) {
+        self.0
+            .store(phase_byte(phase), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> PppPhase {
+        // Only `set` writes the cell, so the byte is always a valid phase.
+        phase_from_byte(self.0.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(PppPhase::None)
+    }
+}
+
 /// A forward as reported in a `ClientSnapshot`: the public port, the local
 /// target it dials, and the per-forward options. `idle_secs` 0 means the proto
 /// default idle window.

@@ -1073,7 +1073,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 None => zeronat::clientctl::default_control(),
             };
 
-            let (server, secret, tcp, udp, transport, tap, tun, pppoe) = if declares_shape(&file) {
+            if declares_shape(&file) {
                 if let Some(v) = &server {
                     zeronat::elog!("config overrides --server '{v}'");
                 }
@@ -1115,51 +1115,79 @@ async fn run(cmd: Cmd) -> Result<()> {
                     mtu: DEFAULT_TAP_MTU,
                     bridge: None,
                 });
-                let tun = file.tun.as_ref().map(|t| {
-                    let (_subnet, _server_ip, client_ip) = tun_addrs(&srv.secret);
-                    let (addr, prefix_len) = t.address.unwrap_or((client_ip, TUN_PREFIX_LEN));
-                    zeronat::tap::TunConfig {
-                        name: t
-                            .dev
-                            .clone()
-                            .unwrap_or_else(|| DEFAULT_TUN_NAME.to_string()),
-                        mtu: DEFAULT_TAP_MTU,
-                        addr,
-                        prefix_len,
-                    }
+                // An unpinned [tun] address is derived from the active
+                // server's secret at each bringup, so a server switch moves
+                // the device onto the new server's subnet.
+                let tun = file.tun.as_ref().map(|t| client::ClientTun {
+                    name: t
+                        .dev
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_TUN_NAME.to_string()),
+                    mtu: DEFAULT_TAP_MTU,
+                    address: t.address,
                 });
-                // Boot mode: forwards when any are declared, else the one
-                // [[pppoe]] entry marked autostart.
-                let pppoe = if file.forwards.is_empty() {
-                    file.pppoe
-                        .iter()
-                        .find(|p| p.autostart)
-                        .map(pppoe_from_entry)
-                        .transpose()?
-                } else {
-                    None
+                // Every [[pppoe]] entry is resolved at boot so the admin can
+                // spawn any of them; run_switchable derives the boot body
+                // (forwards, else the autostart entry, else the device, else
+                // idle with only the admin socket up).
+                let pppoe = file
+                    .pppoe
+                    .iter()
+                    .map(|p| {
+                        Ok(client::PppoeSession {
+                            name: p.name.clone(),
+                            config: pppoe_from_entry(p)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let autostart = file
+                    .pppoe
+                    .iter()
+                    .find(|p| p.autostart)
+                    .map(|p| p.name.clone());
+                let servers: Vec<client::ServerTarget> = file
+                    .servers
+                    .iter()
+                    .map(|s| client::ServerTarget {
+                        name: s.name.clone(),
+                        addr: s.addr.clone(),
+                        secret: s.secret.clone(),
+                        transport: s.transport,
+                    })
+                    .collect();
+                let target = client::ServerTarget {
+                    name: srv.name.clone(),
+                    addr: srv.addr.clone(),
+                    secret: srv.secret.clone(),
+                    transport: srv.transport,
                 };
-                if tcp.is_empty()
-                    && udp.is_empty()
-                    && tap.is_none()
-                    && tun.is_none()
-                    && pppoe.is_none()
-                {
-                    return Err(
-                        "nothing to do: the config declares no [[forwards]], autostart [[pppoe]], [tap], or [tun]"
-                            .into(),
-                    );
-                }
-                (
-                    srv.addr.clone(),
-                    srv.secret.clone(),
+
+                let v = env!("CARGO_PKG_VERSION");
+                zeronat::elog!(
+                    "zeronat {v} client: server={} transport={} tcp-forwards={} udp-forwards={} pppoe-sessions={} tap={} tun={}",
+                    target.addr,
+                    transport_label(target.transport),
+                    tcp.len(),
+                    udp.len(),
+                    pppoe.len(),
+                    onoff(tap.is_some()),
+                    onoff(tun.is_some())
+                );
+                let settings = client::ClientSettings {
+                    servers,
                     tcp,
                     udp,
-                    srv.transport,
                     tap,
                     tun,
                     pppoe,
-                )
+                    autostart,
+                    id_prefix,
+                    control,
+                    // The shape came from the file, so admin mutations
+                    // persist back to it.
+                    config: config.map(|path| (path, file)),
+                };
+                client::run_switchable(client::ActiveTarget::new(target), settings).await
             } else {
                 let server = server.ok_or("--server is required")?;
                 let secret = secret
@@ -1259,12 +1287,10 @@ async fn run(cmd: Cmd) -> Result<()> {
                     None
                 };
                 let tun = if tun {
-                    let (_subnet, _server_ip, client_ip) = tun_addrs(&secret);
-                    Some(zeronat::tap::TunConfig {
+                    Some(client::ClientTun {
                         name: DEFAULT_TUN_NAME.to_string(),
                         mtu,
-                        addr: client_ip,
-                        prefix_len: TUN_PREFIX_LEN,
+                        address: None,
                     })
                 } else {
                     None
@@ -1293,25 +1319,23 @@ async fn run(cmd: Cmd) -> Result<()> {
                         .into())
                     }
                 };
-                (server, secret, tcp, udp, transport, tap, tun, pppoe)
-            };
-
-            let v = env!("CARGO_PKG_VERSION");
-            let tl = transport_label(transport);
-            match &pppoe {
-                Some(pp) => zeronat::elog!(
-                    "zeronat {v} client: pppoe server={server} transport={tl} tun={} mtu={} default-route={} mss-clamp={} dns={}",
-                    pp.tun_name, pp.effective_mtu, onoff(pp.default_route), onoff(pp.clamp_mss.is_some()), onoff(pp.request_dns)
-                ),
-                None => zeronat::elog!(
-                    "zeronat {v} client: server={server} transport={tl} tcp-forwards={} udp-forwards={} tap={} tun={}",
-                    tcp.len(), udp.len(), onoff(tap.is_some()), onoff(tun.is_some())
-                ),
+                let v = env!("CARGO_PKG_VERSION");
+                let tl = transport_label(transport);
+                match &pppoe {
+                    Some(pp) => zeronat::elog!(
+                        "zeronat {v} client: pppoe server={server} transport={tl} tun={} mtu={} default-route={} mss-clamp={} dns={}",
+                        pp.tun_name, pp.effective_mtu, onoff(pp.default_route), onoff(pp.clamp_mss.is_some()), onoff(pp.request_dns)
+                    ),
+                    None => zeronat::elog!(
+                        "zeronat {v} client: server={server} transport={tl} tcp-forwards={} udp-forwards={} tap={} tun={}",
+                        tcp.len(), udp.len(), onoff(tap.is_some()), onoff(tun.is_some())
+                    ),
+                }
+                client::run(
+                    server, secret, tcp, udp, transport, tap, tun, pppoe, id_prefix, control,
+                )
+                .await
             }
-            client::run(
-                server, secret, tcp, udp, transport, tap, tun, pppoe, id_prefix, control,
-            )
-            .await
         }
         Cmd::Admin {
             server,

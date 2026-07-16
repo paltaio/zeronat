@@ -1,12 +1,12 @@
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::{sleep, timeout};
 
-use zeronat::clientproto::{ClientMsg, SessionMode};
+use zeronat::clientproto::{ClientMsg, ClientSnapshotBody, PppPhase, SessionMode};
 use zeronat::proto::{Msg, Proto, Source};
 use zeronat::server::{ListenerSpec, ServerSettings};
 
@@ -1453,6 +1453,120 @@ async fn proxy_forward_refuses_headerless_open() {
         .expect("headerless-open refusal did not complete within 30s");
 }
 
+fn server_target(name: &str, control: u16, secret: &str) -> zeronat::client::ServerTarget {
+    zeronat::client::ServerTarget {
+        name: name.into(),
+        addr: format!("127.0.0.1:{control}"),
+        secret: secret.into(),
+        transport: zeronat::client::Transport::Tcp,
+    }
+}
+
+/// `ClientSettings` for a switchable client: the given profiles and TCP
+/// forwards, an admin socket when `sock` is set, and nothing else. Tests add
+/// pppoe sessions or a persistence target on top.
+fn client_settings(
+    servers: Vec<zeronat::client::ServerTarget>,
+    tcp: Vec<zeronat::client::Forward>,
+    id: &str,
+    sock: Option<&Path>,
+) -> zeronat::client::ClientSettings {
+    zeronat::client::ClientSettings {
+        servers,
+        tcp,
+        udp: vec![],
+        tap: None,
+        tun: None,
+        pppoe: vec![],
+        autostart: None,
+        id_prefix: Some(id.into()),
+        control: sock.map(|p| zeronat::clientctl::ControlPath::Explicit(p.to_path_buf())),
+        config: None,
+    }
+}
+
+/// Connect to a client admin socket, retrying until it accepts, and send the
+/// hello for `mode`.
+async fn client_admin(
+    sock: &Path,
+    mode: u8,
+) -> (zeronat::noise::NoiseReader, zeronat::noise::NoiseWriter) {
+    let psk = zeronat::clientctl::admin_psk();
+    loop {
+        if let Ok(stream) = tokio::net::UnixStream::connect(sock).await {
+            if let Ok((r, mut w)) = zeronat::noise::client_handshake(stream, &psk).await {
+                if w.send(
+                    &ClientMsg::ClientAdminHello {
+                        version: zeronat::identity::PROTO_VERSION,
+                        mode,
+                    }
+                    .encode(),
+                )
+                .await
+                .is_ok()
+                {
+                    return (r, w);
+                }
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// One snapshot exchange over a client admin socket.
+async fn client_snapshot(sock: &Path) -> ClientSnapshotBody {
+    let (mut r, _w) = client_admin(sock, 0).await;
+    let frame = r.recv().await.unwrap();
+    match ClientMsg::decode(&frame).unwrap() {
+        ClientMsg::ClientSnapshot(snap) => snap,
+        other => panic!("expected client snapshot, got {other:?}"),
+    }
+}
+
+/// One mutation exchange over a client admin socket.
+async fn client_mutate(sock: &Path, req: ClientMsg) -> (bool, String) {
+    let (mut r, mut w) = client_admin(sock, 1).await;
+    w.send(&req.encode()).await.unwrap();
+    let frame = r.recv().await.unwrap();
+    match ClientMsg::decode(&frame).unwrap() {
+        ClientMsg::MutationResult { ok, msg } => (ok, msg),
+        other => panic!("expected mutation result, got {other:?}"),
+    }
+}
+
+/// Poll client snapshots until `pred` holds; the caller's timeout bounds the
+/// wait. Returns the matching snapshot.
+async fn wait_client_snapshot(
+    sock: &Path,
+    pred: impl Fn(&ClientSnapshotBody) -> bool,
+) -> ClientSnapshotBody {
+    loop {
+        let snap = client_snapshot(sock).await;
+        if pred(&snap) {
+            return snap;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A pppoe session config whose discovery runs over the tunnel but never
+/// completes (no access concentrator answers in the harness); the spawn/stop
+/// tests exercise the mode machinery, not a full PPP bringup.
+#[cfg(target_os = "linux")]
+fn test_pppoe_config() -> zeronat::client::PppoeRunConfig {
+    zeronat::client::PppoeRunConfig {
+        username: b"user".to_vec(),
+        password: b"pass".to_vec(),
+        service_name: Vec::new(),
+        ac_name: None,
+        tun_name: "zpppt0".into(),
+        effective_mtu: 1400,
+        default_route: false,
+        clamp_mss: None,
+        request_dns: false,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_switch_moves_session() {
     let body = async {
@@ -1476,22 +1590,15 @@ async fn server_switch_moves_session() {
 
         // One client dialing A, carrying forwards for both servers' public
         // ports so the same forward set serves whichever server is active.
-        let target = |name: &str, control: u16, secret: &str| zeronat::client::ServerTarget {
-            name: name.into(),
-            addr: format!("127.0.0.1:{control}"),
-            secret: secret.into(),
-            transport: zeronat::client::Transport::Tcp,
-        };
-        let active = zeronat::client::ActiveTarget::new(target("a", control_a, SECRET));
+        let active = zeronat::client::ActiveTarget::new(server_target("a", control_a, SECRET));
         tokio::spawn(zeronat::client::run_switchable(
             active.clone(),
-            vec![fwd(public_a, local_echo), fwd(public_b, local_echo)],
-            vec![],
-            None,
-            None,
-            None,
-            Some("sw".into()),
-            None,
+            client_settings(
+                vec![],
+                vec![fwd(public_a, local_echo), fwd(public_b, local_echo)],
+                "sw",
+                None,
+            ),
         ));
 
         // Session up against A: traffic round-trips through A's public port.
@@ -1501,7 +1608,7 @@ async fn server_switch_moves_session() {
         // out the 90s control timeout waiting to notice A is gone: the
         // established relay through A is cut and traffic round-trips through
         // B's public port under B's secret within the 15s bound.
-        active.switch(target("b", control_b, SECRET_B));
+        active.switch(server_target("b", control_b, SECRET_B));
         timeout(Duration::from_secs(15), async {
             wait_tcp_cut(&mut conn).await;
             wait_tcp_path(public_b).await;
@@ -1583,31 +1690,11 @@ async fn client_admin_socket_serves_snapshot() {
 
         // The admin socket comes up with the client; retry until the whole
         // snapshot exchange completes.
-        let psk = zeronat::clientctl::admin_psk();
-        let snap = loop {
-            if let Ok(stream) = tokio::net::UnixStream::connect(&sock).await {
-                if let Ok((mut r, mut w)) = zeronat::noise::client_handshake(stream, &psk).await {
-                    w.send(
-                        &ClientMsg::ClientAdminHello {
-                            version: zeronat::identity::PROTO_VERSION,
-                            mode: 0,
-                        }
-                        .encode(),
-                    )
-                    .await
-                    .unwrap();
-                    let frame = r.recv().await.unwrap();
-                    match ClientMsg::decode(&frame).unwrap() {
-                        ClientMsg::ClientSnapshot(snap) => break snap,
-                        other => panic!("expected client snapshot, got {other:?}"),
-                    }
-                }
-            }
-            sleep(Duration::from_millis(50)).await;
-        };
+        let snap = client_snapshot(&sock).await;
         assert_eq!(snap.version, zeronat::identity::PROTO_VERSION);
         assert_eq!(snap.active, format!("127.0.0.1:{control}"));
         assert_eq!(snap.mode, SessionMode::Forwards);
+        assert_eq!(snap.phase, PppPhase::None);
         assert_eq!(snap.forwards.len(), 1);
         let f = &snap.forwards[0];
         assert_eq!(f.proto, Proto::Tcp);
@@ -1617,36 +1704,20 @@ async fn client_admin_socket_serves_snapshot() {
         assert_eq!(f.idle_secs, 0);
 
         // Mode 1 carries one mutation and gets a result on the same
-        // connection.
-        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
-        let (mut r, mut w) = zeronat::noise::client_handshake(stream, &psk)
-            .await
-            .unwrap();
-        w.send(
-            &ClientMsg::ClientAdminHello {
-                version: zeronat::identity::PROTO_VERSION,
-                mode: 1,
-            }
-            .encode(),
-        )
-        .await
-        .unwrap();
-        w.send(
-            &ClientMsg::SelectServer {
+        // connection; a CLI client's only profile is its server address, so
+        // any other name is refused.
+        let (ok, msg) = client_mutate(
+            &sock,
+            ClientMsg::SelectServer {
                 name: "other".into(),
-            }
-            .encode(),
+            },
         )
-        .await
-        .unwrap();
-        let frame = r.recv().await.unwrap();
-        match ClientMsg::decode(&frame).unwrap() {
-            ClientMsg::MutationResult { ok, msg } => {
-                assert!(!ok);
-                assert_eq!(msg, "not implemented");
-            }
-            other => panic!("expected mutation result, got {other:?}"),
-        }
+        .await;
+        assert!(!ok);
+        assert!(
+            msg.contains("no configured server"),
+            "unexpected refusal message: {msg}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     };
@@ -1654,6 +1725,451 @@ async fn client_admin_socket_serves_snapshot() {
     timeout(Duration::from_secs(20), body)
         .await
         .expect("client admin socket did not answer within 20s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn select_server_moves_session_and_persists() {
+    let body = async {
+        let control_a = free_tcp_port();
+        let control_b = free_tcp_port();
+        let public_a = free_tcp_port();
+        let public_b = free_tcp_port();
+        let local_echo = free_tcp_port();
+        tokio::spawn(tcp_echo(local_echo));
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control_a,
+            vec![public_a],
+            vec![],
+        )));
+        let mut settings_b = cli_settings(control_b, vec![public_b], vec![]);
+        settings_b.secret = SECRET_B.into();
+        tokio::spawn(zeronat::server::run(settings_b));
+
+        // A file-backed client: the config on disk is what mutations persist
+        // into, and it parses to the same shape the settings carry.
+        let dir = temp_config_dir("selectsrv");
+        let path = dir.join("client.toml");
+        let sock = dir.join("client.sock");
+        let text = format!(
+            "[client]\nactive = \"a\"\n\
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:{control_a}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
+             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:{control_b}\"\nsecret = \"{SECRET_B}\"\ntransport = \"tcp\"\n\
+             [[forwards]]\nproto = \"tcp\"\nport = {public_a}\ntarget = \"127.0.0.1:{local_echo}\"\n\
+             [[forwards]]\nproto = \"tcp\"\nport = {public_b}\ntarget = \"127.0.0.1:{local_echo}\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
+        cfg.validate().unwrap();
+
+        let mut settings = client_settings(
+            vec![
+                server_target("a", control_a, SECRET),
+                server_target("b", control_b, SECRET_B),
+            ],
+            vec![fwd(public_a, local_echo), fwd(public_b, local_echo)],
+            "sel",
+            Some(&sock),
+        );
+        settings.config = Some((path.clone(), cfg));
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("a", control_a, SECRET)),
+            settings,
+        ));
+
+        let mut conn = wait_tcp_path(public_a).await;
+
+        // An unknown profile is refused and changes nothing, on disk or live.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (ok, _) = client_mutate(
+            &sock,
+            ClientMsg::SelectServer {
+                name: "nope".into(),
+            },
+        )
+        .await;
+        assert!(!ok, "an unknown server name must be refused");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let snap = client_snapshot(&sock).await;
+        assert_eq!(snap.active, "a");
+        assert_eq!(snap.mode, SessionMode::Forwards);
+
+        // Selecting b moves the session: the relay through a is cut and
+        // traffic round-trips through b's public port under b's secret.
+        let (ok, msg) = client_mutate(&sock, ClientMsg::SelectServer { name: "b".into() }).await;
+        assert!(ok, "select server b failed: {msg}");
+        timeout(Duration::from_secs(15), async {
+            wait_tcp_cut(&mut conn).await;
+            wait_tcp_path(public_b).await;
+        })
+        .await
+        .expect("select-server did not move traffic to b within 15s");
+
+        // The switch preserved the session body.
+        let snap = client_snapshot(&sock).await;
+        assert_eq!(snap.active, "b");
+        assert_eq!(snap.mode, SessionMode::Forwards);
+
+        // The persisted config round-trips through the client parser with the
+        // new active profile and the rest of the shape intact.
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.active.as_deref(), Some("b"));
+        assert_eq!(on_disk.servers.len(), 2);
+        assert_eq!(on_disk.forwards.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("select-server flow did not complete within 60s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_forward_options_redials_and_persists() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let public_udp = free_udp_port();
+        let local_tcp = free_tcp_port();
+        let local_udp = free_udp_port();
+        tokio::spawn(tcp_echo(local_tcp));
+        tokio::spawn(udp_echo(local_udp));
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control,
+            vec![public_tcp],
+            vec![public_udp],
+        )));
+
+        let dir = temp_config_dir("fwdopts");
+        let path = dir.join("client.toml");
+        let sock = dir.join("client.sock");
+        let text = format!(
+            "[[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
+             [[forwards]]\nproto = \"tcp\"\nport = {public_tcp}\ntarget = \"127.0.0.1:{local_tcp}\"\n\
+             [[forwards]]\nproto = \"udp\"\nport = {public_udp}\ntarget = \"127.0.0.1:{local_udp}\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
+        cfg.validate().unwrap();
+
+        let mut settings = client_settings(
+            vec![server_target("home", control, SECRET)],
+            vec![fwd(public_tcp, local_tcp)],
+            "fwo",
+            Some(&sock),
+        );
+        settings.udp = vec![fwd(public_udp, local_udp)];
+        settings.config = Some((path.clone(), cfg));
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("home", control, SECRET)),
+            settings,
+        ));
+
+        let mut conn = wait_tcp_path(public_tcp).await;
+
+        // A valid edit is accepted, redials the forwards session (the
+        // established relay is cut), and shows up in the next snapshot.
+        let (ok, msg) = client_mutate(
+            &sock,
+            ClientMsg::SetForwardOptions {
+                proto: Proto::Tcp,
+                port: public_tcp,
+                proxy: false,
+                idle_secs: 600,
+            },
+        )
+        .await;
+        assert!(ok, "set forward options failed: {msg}");
+        timeout(Duration::from_secs(15), wait_tcp_cut(&mut conn))
+            .await
+            .expect("option edit did not redial the forwards session");
+        let _conn = wait_tcp_path(public_tcp).await;
+        let snap = client_snapshot(&sock).await;
+        let f = snap
+            .forwards
+            .iter()
+            .find(|f| f.proto == Proto::Tcp && f.port == public_tcp)
+            .expect("tcp forward in snapshot");
+        assert_eq!(f.idle_secs, 600);
+
+        // The persisted entry round-trips through the client parser.
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        let entry = on_disk
+            .forwards
+            .iter()
+            .find(|f| f.proto == Proto::Tcp && f.port == public_tcp)
+            .expect("tcp forward on disk");
+        assert_eq!(entry.idle, Some(600));
+
+        // Wire idle 0 clears the override; the file carries no idle key.
+        let (ok, msg) = client_mutate(
+            &sock,
+            ClientMsg::SetForwardOptions {
+                proto: Proto::Tcp,
+                port: public_tcp,
+                proxy: false,
+                idle_secs: 0,
+            },
+        )
+        .await;
+        assert!(ok, "clearing the idle override failed: {msg}");
+        let snap = client_snapshot(&sock).await;
+        assert_eq!(snap.forwards[0].idle_secs, 0);
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.forwards[0].idle, None);
+
+        // A failing validation persists and applies nothing: the file bytes
+        // and the snapshot stay exactly as they were.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let snap_before = client_snapshot(&sock).await;
+        let (ok, _) = client_mutate(
+            &sock,
+            ClientMsg::SetForwardOptions {
+                proto: Proto::Udp,
+                port: public_udp,
+                proxy: true,
+                idle_secs: 0,
+            },
+        )
+        .await;
+        assert!(!ok, "proxy on a udp forward must be refused");
+        let (ok, _) = client_mutate(
+            &sock,
+            ClientMsg::SetForwardOptions {
+                proto: Proto::Tcp,
+                port: 9,
+                proxy: false,
+                idle_secs: 5,
+            },
+        )
+        .await;
+        assert!(!ok, "an unknown forward must be refused");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let snap = client_snapshot(&sock).await;
+        assert_eq!(snap.forwards, snap_before.forwards);
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("forward-options flow did not complete within 60s");
+}
+
+/// Real PPPoE needs an access concentrator on the far side, so this drives
+/// the state machinery as far as the harness allows: the mode swap into and
+/// out of a spawned session, the live discovery phase in snapshots, and the
+/// no-drop rule for forward edits while the pppoe body runs. LCP/auth/IPCP
+/// and zppp0 bringup never happen here.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_and_stop_pppoe_swap_the_session_body() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let local_tcp = free_tcp_port();
+        tokio::spawn(tcp_echo(local_tcp));
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control,
+            vec![public_tcp],
+            vec![],
+        )));
+
+        // Runtime-only client: spawn/stop and the option edit stay in memory.
+        let dir = temp_config_dir("pppoeswap");
+        let sock = dir.join("client.sock");
+        let mut settings = client_settings(
+            vec![server_target("a", control, SECRET)],
+            vec![fwd(public_tcp, local_tcp)],
+            "pps",
+            Some(&sock),
+        );
+        settings.pppoe = vec![zeronat::client::PppoeSession {
+            name: "wan".into(),
+            config: test_pppoe_config(),
+        }];
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("a", control, SECRET)),
+            settings,
+        ));
+
+        let _conn = wait_tcp_path(public_tcp).await;
+        let snap = client_snapshot(&sock).await;
+        assert_eq!(snap.mode, SessionMode::Forwards);
+        assert_eq!(snap.phase, PppPhase::None);
+
+        let (ok, _) = client_mutate(&sock, ClientMsg::SpawnPppoe { name: "dsl".into() }).await;
+        assert!(!ok, "an unknown pppoe name must be refused");
+
+        // Spawn tears the forwards body down and brings the pppoe up; the
+        // live datapath writes its phase into the status cell.
+        let (ok, msg) = client_mutate(&sock, ClientMsg::SpawnPppoe { name: "wan".into() }).await;
+        assert!(ok, "spawn pppoe failed: {msg}");
+        wait_client_snapshot(&sock, |s| {
+            s.mode == SessionMode::Pppoe && s.phase != PppPhase::None
+        })
+        .await;
+
+        // A forward edit while the pppoe body runs lands in memory but must
+        // not drop the unrelated session.
+        let (ok, msg) = client_mutate(
+            &sock,
+            ClientMsg::SetForwardOptions {
+                proto: Proto::Tcp,
+                port: public_tcp,
+                proxy: false,
+                idle_secs: 300,
+            },
+        )
+        .await;
+        assert!(ok, "forward edit under a pppoe body failed: {msg}");
+        sleep(Duration::from_millis(300)).await;
+        let snap = client_snapshot(&sock).await;
+        assert_eq!(
+            snap.mode,
+            SessionMode::Pppoe,
+            "forward edit dropped the pppoe body"
+        );
+        assert_eq!(snap.forwards[0].idle_secs, 300);
+
+        // Stop with the wrong name is refused; the right name returns to the
+        // boot-derived base mode and the forwards session (with the edited
+        // options) comes back up.
+        let (ok, _) = client_mutate(&sock, ClientMsg::StopSession { name: "dsl".into() }).await;
+        assert!(
+            !ok,
+            "stopping a session that is not running must be refused"
+        );
+        let (ok, msg) = client_mutate(&sock, ClientMsg::StopSession { name: "wan".into() }).await;
+        assert!(ok, "stop pppoe failed: {msg}");
+        wait_client_snapshot(&sock, |s| s.mode == SessionMode::Forwards).await;
+        let _conn = wait_tcp_path(public_tcp).await;
+
+        // With the forwards body running there is no pppoe to stop.
+        let (ok, _) = client_mutate(&sock, ClientMsg::StopSession { name: "wan".into() }).await;
+        assert!(!ok, "stop must be refused when the body is not that pppoe");
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("pppoe spawn/stop flow did not complete within 60s");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autostart_pppoe_boots_and_stops_to_idle() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+
+        let dir = temp_config_dir("autostart");
+        let sock = dir.join("client.sock");
+        let mut settings = client_settings(
+            vec![server_target("a", control, SECRET)],
+            vec![],
+            "auto",
+            Some(&sock),
+        );
+        settings.pppoe = vec![zeronat::client::PppoeSession {
+            name: "wan".into(),
+            config: test_pppoe_config(),
+        }];
+        settings.autostart = Some("wan".into());
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("a", control, SECRET)),
+            settings,
+        ));
+
+        // Boot derives the pppoe body from the autostart entry; the live
+        // datapath reports its phase.
+        wait_client_snapshot(&sock, |s| {
+            s.mode == SessionMode::Pppoe && s.phase != PppPhase::None
+        })
+        .await;
+
+        // No concentrator answers, so discovery exhausts its retries and the
+        // session task exits; snapshots must report the link dead through the
+        // redial backoff instead of the last live phase.
+        wait_client_snapshot(&sock, |s| {
+            s.mode == SessionMode::Pppoe && s.phase == PppPhase::Dead
+        })
+        .await;
+
+        // Stopping it falls back to idle (no forwards are declared), from
+        // which the same session can be spawned again.
+        let (ok, msg) = client_mutate(&sock, ClientMsg::StopSession { name: "wan".into() }).await;
+        assert!(ok, "stop autostart pppoe failed: {msg}");
+        wait_client_snapshot(&sock, |s| s.mode == SessionMode::Idle).await;
+        let (ok, msg) = client_mutate(&sock, ClientMsg::SpawnPppoe { name: "wan".into() }).await;
+        assert!(ok, "respawn after stop failed: {msg}");
+        wait_client_snapshot(&sock, |s| s.mode == SessionMode::Pppoe).await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("autostart pppoe flow did not complete within 60s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_client_with_no_session_body_idles() {
+    let body = async {
+        // Servers are declared but never dialed: an idle client runs no
+        // session body, so no server process is needed at all.
+        let dir = temp_config_dir("idleboot");
+        let path = dir.join("client.toml");
+        let sock = dir.join("client.sock");
+        let text = "[client]\nactive = \"a\"\n\
+                    [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\
+                    [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"t\"\n";
+        std::fs::write(&path, text).unwrap();
+        let cfg = zeronat::clientcfg::parse_client(text).unwrap();
+        cfg.validate().unwrap();
+
+        let a = server_target("a", 1, "s");
+        let b = server_target("b", 2, "t");
+        let mut settings = client_settings(vec![a.clone(), b], vec![], "idle", Some(&sock));
+        settings.config = Some((path.clone(), cfg));
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(a),
+            settings,
+        ));
+
+        // The client boots into idle with only the admin socket up.
+        let snap = client_snapshot(&sock).await;
+        assert_eq!(snap.mode, SessionMode::Idle);
+        assert_eq!(snap.active, "a");
+        assert_eq!(snap.phase, PppPhase::None);
+        assert!(snap.forwards.is_empty());
+
+        // Idle has no pppoe to stop and nothing configured to spawn.
+        let (ok, _) = client_mutate(&sock, ClientMsg::StopSession { name: "a".into() }).await;
+        assert!(!ok, "stop must be refused on an idle body");
+        let (ok, _) = client_mutate(&sock, ClientMsg::SpawnPppoe { name: "wan".into() }).await;
+        assert!(!ok, "spawn must be refused with no pppoe entries");
+
+        // Selecting another profile keeps the idle body and persists.
+        let (ok, msg) = client_mutate(&sock, ClientMsg::SelectServer { name: "b".into() }).await;
+        assert!(ok, "select server on an idle client failed: {msg}");
+        let snap = client_snapshot(&sock).await;
+        assert_eq!(snap.active, "b");
+        assert_eq!(snap.mode, SessionMode::Idle);
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.active.as_deref(), Some("b"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(20), body)
+        .await
+        .expect("idle-mode client flow did not complete within 20s");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

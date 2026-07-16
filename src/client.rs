@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,17 +14,18 @@ use tokio::time::timeout as tokio_timeout;
 use tokio::time::{interval, sleep};
 
 use crate::bridge;
-use crate::clientctl::{ControlPath, ControlState};
-use crate::clientproto::{ClientForwardEntry, SessionMode};
+use crate::clientcfg::ClientConfig;
+use crate::clientctl::{ControlPath, ControlState, Persist};
+use crate::clientproto::{ClientForwardEntry, PppPhase, PppStatus, SessionMode};
 use crate::dgram::{DgramRx, DgramTx};
 use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{client_handshake, client_handshake_stateless};
 use crate::proto::{FwdOptionEntry, Msg, Proto};
+use crate::tap::TapConfig;
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
-use crate::tap::{TapConfig, TunConfig};
 
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// Liveness window for the control channel. The server replies Pong to every
@@ -176,6 +178,94 @@ struct ForwardTarget {
     idle: Option<Duration>,
 }
 
+/// The live forward set, shared between the reconnect loop (each connection
+/// attempt snapshots it) and the admin dispatcher (option edits and snapshot
+/// views). Lock-only: no holder ever awaits with the lock taken.
+#[derive(Clone)]
+pub struct SharedForwards {
+    inner: Arc<std::sync::Mutex<ForwardMaps>>,
+}
+
+struct ForwardMaps {
+    tcp: HashMap<u16, ForwardTarget>,
+    udp: HashMap<u16, ForwardTarget>,
+}
+
+impl SharedForwards {
+    pub(crate) fn new(tcp: Vec<Forward>, udp: Vec<Forward>) -> Self {
+        let by_port = |fwds: Vec<Forward>| -> HashMap<u16, ForwardTarget> {
+            fwds.into_iter()
+                .map(|f| {
+                    (
+                        f.port,
+                        ForwardTarget {
+                            target: f.target,
+                            proxy: f.proxy,
+                            idle: f.idle,
+                        },
+                    )
+                })
+                .collect()
+        };
+        SharedForwards {
+            inner: Arc::new(std::sync::Mutex::new(ForwardMaps {
+                tcp: by_port(tcp),
+                udp: by_port(udp),
+            })),
+        }
+    }
+
+    /// Per-attempt copy for a `Client`; an edit after this lands on the next
+    /// connection attempt.
+    fn maps(&self) -> (HashMap<u16, ForwardTarget>, HashMap<u16, ForwardTarget>) {
+        let m = self.inner.lock().unwrap();
+        (m.tcp.clone(), m.udp.clone())
+    }
+
+    /// Replace the full option state of the `(proto, port)` forward. `false`
+    /// (and no change at all) when no such forward exists.
+    pub(crate) fn set_options(
+        &self,
+        proto: Proto,
+        port: u16,
+        proxy: bool,
+        idle: Option<Duration>,
+    ) -> bool {
+        let mut m = self.inner.lock().unwrap();
+        let map = match proto {
+            Proto::Tcp => &mut m.tcp,
+            Proto::Udp => &mut m.udp,
+        };
+        match map.get_mut(&port) {
+            Some(f) => {
+                f.proxy = proxy;
+                f.idle = idle;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Snapshot view of every forward: tcp before udp, sorted by port.
+    pub(crate) fn entries(&self) -> Vec<ClientForwardEntry> {
+        let m = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        for (proto, map) in [(Proto::Tcp, &m.tcp), (Proto::Udp, &m.udp)] {
+            for (&port, f) in map {
+                out.push(ClientForwardEntry {
+                    proto,
+                    port,
+                    target: f.target.clone(),
+                    proxy: f.proxy,
+                    idle_secs: f.idle.map(|d| d.as_secs() as u32).unwrap_or(0),
+                });
+            }
+        }
+        out.sort_by_key(|e| (e.proto == Proto::Udp, e.port));
+        out
+    }
+}
+
 struct Client {
     server: String,
     psk: [u8; 32],
@@ -277,9 +367,72 @@ struct DialState {
     discovery: Discovery,
 }
 
-/// The server the reconnect loop should be running, shared between the loop
-/// and whoever drives a switch. Also holds the cancel scoped to the profile
-/// currently up: `switch` replaces the target and fires that cancel; the loop
+/// L3 tunnel shape as the client carries it between bringups. The address is
+/// resolved against the active server's secret each time the device opens, so
+/// a server switch moves the device onto the new server's subnet unless the
+/// operator pinned an explicit address.
+#[derive(Clone)]
+pub struct ClientTun {
+    pub name: String,
+    pub mtu: usize,
+    /// Explicitly configured `addr/prefix`, or `None` to derive the client
+    /// `.2` on the active secret's `/24` at bringup.
+    pub address: Option<(Ipv4Addr, u8)>,
+}
+
+impl ClientTun {
+    /// The concrete device config for a bringup against `secret`'s server.
+    #[cfg(any(test, target_os = "linux"))]
+    fn resolve(&self, secret: &str) -> crate::tap::TunConfig {
+        let (addr, prefix_len) = self.address.unwrap_or_else(|| {
+            let base = crate::identity::derive_tun_subnet(secret);
+            (Ipv4Addr::new(base[0], base[1], base[2], 2), 24)
+        });
+        crate::tap::TunConfig {
+            name: self.name.clone(),
+            mtu: self.mtu,
+            addr,
+            prefix_len,
+        }
+    }
+}
+
+/// Which OS device a `RunMode::Device` body opens.
+#[derive(Clone)]
+pub enum DeviceConfig {
+    Tap(TapConfig),
+    Tun(ClientTun),
+}
+
+/// The session body the reconnect loop runs for the active profile: exactly
+/// one at any instant, or none in `Idle`, where only the admin socket is up.
+#[derive(Clone)]
+pub enum RunMode {
+    Idle,
+    Forwards,
+    Device(DeviceConfig),
+    /// One named pppoe session; carries its resolved config so bringup needs
+    /// no lookup.
+    Pppoe {
+        name: String,
+        config: Arc<PppoeRunConfig>,
+    },
+}
+
+impl RunMode {
+    pub fn session_mode(&self) -> SessionMode {
+        match self {
+            RunMode::Idle => SessionMode::Idle,
+            RunMode::Forwards => SessionMode::Forwards,
+            RunMode::Device(_) => SessionMode::Device,
+            RunMode::Pppoe { .. } => SessionMode::Pppoe,
+        }
+    }
+}
+
+/// The server and session body the reconnect loop should be running, shared
+/// between the loop and whoever drives a switch. Also holds the cancel scoped
+/// to the profile currently up: every mutator fires that cancel; the loop
 /// installs a fresh one each time it brings a profile up.
 #[derive(Clone)]
 pub struct ActiveTarget {
@@ -288,6 +441,7 @@ pub struct ActiveTarget {
 
 struct ActiveState {
     target: ServerTarget,
+    mode: RunMode,
     // Fired with notify_one, which hands out exactly one permit. The
     // run_switchable loop must stay the sole waiter on this Notify: a second
     // waiter could consume the permit, the loop would never see the cancel,
@@ -300,34 +454,77 @@ impl ActiveTarget {
         ActiveTarget {
             state: Arc::new(std::sync::Mutex::new(ActiveState {
                 target,
+                mode: RunMode::Idle,
                 cancel: Arc::new(Notify::new()),
             })),
         }
     }
 
+    /// Install the boot-derived session body before the loop starts. Fires no
+    /// cancel: nothing runs yet.
+    fn init_mode(&self, mode: RunMode) {
+        self.state.lock().unwrap().mode = mode;
+    }
+
     /// Retarget the client: replace the shared target and fire the current
-    /// profile's cancel. The loop aborts the in-flight session task, awaits its
-    /// teardown, and brings the same session body up against the new target; the
-    /// brief link drop is inherent to the teardown-then-bringup.
+    /// profile's cancel, preserving the session body. The loop aborts the
+    /// in-flight session task, awaits its teardown, and brings the same body up
+    /// against the new target; the brief link drop is inherent to the
+    /// teardown-then-bringup.
     pub fn switch(&self, target: ServerTarget) {
         let mut s = self.state.lock().unwrap();
         s.target = target;
         s.cancel.notify_one();
     }
 
-    /// Snapshot the target to bring up and install a fresh cancel scoped to it.
-    /// A `switch` racing this call lands its permit on the fresh cancel, so a
-    /// switch is never lost between profiles.
-    fn begin(&self) -> (ServerTarget, Arc<Notify>) {
+    /// Replace the session body and fire the cancel: the loop tears the
+    /// running body down and brings the new one up against the same target.
+    pub fn set_mode(&self, mode: RunMode) {
+        let mut s = self.state.lock().unwrap();
+        s.mode = mode;
+        s.cancel.notify_one();
+    }
+
+    /// Stop the named pppoe session, falling back to `base`. Fires the cancel
+    /// only when that session is the active body; returns whether it did.
+    pub fn stop_pppoe(&self, name: &str, base: RunMode) -> bool {
+        let mut s = self.state.lock().unwrap();
+        match &s.mode {
+            RunMode::Pppoe { name: active, .. } if active == name => {
+                s.mode = base;
+                s.cancel.notify_one();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Redial the forwards session so the reconnect re-announces per-forward
+    /// options. A no-op in any other mode: an option edit must not drop an
+    /// unrelated pppoe or device body, and the next forwards bringup reads the
+    /// updated set anyway.
+    pub fn kick_if_forwards(&self) {
+        let s = self.state.lock().unwrap();
+        if matches!(s.mode, RunMode::Forwards) {
+            s.cancel.notify_one();
+        }
+    }
+
+    /// Snapshot the target and body to bring up and install a fresh cancel
+    /// scoped to them. A mutation racing this call lands its permit on the
+    /// fresh cancel, so a switch is never lost between profiles.
+    fn begin(&self) -> (ServerTarget, RunMode, Arc<Notify>) {
         let mut s = self.state.lock().unwrap();
         s.cancel = Arc::new(Notify::new());
-        (s.target.clone(), s.cancel.clone())
+        (s.target.clone(), s.mode.clone(), s.cancel.clone())
     }
 
     /// Name of the profile the reconnect loop is running (or about to bring
-    /// up). Read-only: takes the lock briefly and never touches the cancel.
-    pub fn active_name(&self) -> String {
-        self.state.lock().unwrap().target.name.clone()
+    /// up) and its session mode. Read-only: takes the lock briefly and never
+    /// touches the cancel.
+    pub fn admin_view(&self) -> (String, SessionMode) {
+        let s = self.state.lock().unwrap();
+        (s.target.name.clone(), s.mode.session_mode())
     }
 }
 
@@ -339,7 +536,7 @@ pub async fn run(
     udp: Vec<Forward>,
     transport: Transport,
     tap: Option<TapConfig>,
-    tun: Option<TunConfig>,
+    tun: Option<ClientTun>,
     pppoe: Option<PppoeRunConfig>,
     id_prefix: Option<String>,
     control: Option<ControlPath>,
@@ -350,65 +547,140 @@ pub async fn run(
         secret,
         transport,
     };
-    run_switchable(
-        ActiveTarget::new(target),
+    // A CLI-declared pppoe session gets a fixed handle so admin can name it.
+    let autostart = pppoe.as_ref().map(|_| "cli".to_string());
+    let settings = ClientSettings {
+        servers: vec![target.clone()],
+        tcp,
+        udp,
+        tap,
+        tun,
+        pppoe: pppoe
+            .map(|config| PppoeSession {
+                name: "cli".into(),
+                config,
+            })
+            .into_iter()
+            .collect(),
+        autostart,
+        id_prefix,
+        control,
+        config: None,
+    };
+    run_switchable(ActiveTarget::new(target), settings).await
+}
+
+/// One named pppoe session the admin can spawn at runtime.
+pub struct PppoeSession {
+    pub name: String,
+    pub config: PppoeRunConfig,
+}
+
+/// Everything `run_switchable` runs from besides the active target: the
+/// selectable server profiles, the session bodies the client can run, and the
+/// persistence target for admin mutations.
+pub struct ClientSettings {
+    /// Profiles `SelectServer` may switch to. The boot profile is the one the
+    /// caller put into the `ActiveTarget`.
+    pub servers: Vec<ServerTarget>,
+    pub tcp: Vec<Forward>,
+    pub udp: Vec<Forward>,
+    pub tap: Option<TapConfig>,
+    pub tun: Option<ClientTun>,
+    /// Spawnable pppoe sessions, keyed by name.
+    pub pppoe: Vec<PppoeSession>,
+    /// Name of the pppoe session to boot when no forwards are declared.
+    pub autostart: Option<String>,
+    pub id_prefix: Option<String>,
+    pub control: Option<ControlPath>,
+    /// Admin-mutation persistence: the config file and its parsed contents.
+    /// `None` on a runtime-only client, whose mutations stay in memory.
+    pub config: Option<(PathBuf, ClientConfig)>,
+}
+
+/// The concrete session body brought up for the active profile, holding what
+/// the per-attempt task needs: the opened device for `Device`, the credentials
+/// for `Pppoe`.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+enum Body {
+    Forwards,
+    Device(Arc<TapDevice>),
+    Pppoe(Arc<PppoeRunConfig>),
+}
+
+/// Like `run`, but dialing whatever `active` currently points at and running
+/// whatever session body it names. A switch or mode change tears the in-flight
+/// session down and brings the next body up against the (possibly new) target,
+/// with per-server backoff and UDP-health state starting fresh. When
+/// `settings.control` is set and its path binds (see [`ControlPath::bind`] for
+/// the failure policy), an admin socket serves snapshots and mutations for as
+/// long as this future runs.
+pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> Result<()> {
+    let ClientSettings {
+        servers,
         tcp,
         udp,
         tap,
         tun,
         pppoe,
+        autostart,
         id_prefix,
         control,
-    )
-    .await
-}
-
-/// Like `run`, but dialing whatever `active` currently points at. A `switch`
-/// tears the in-flight session down and brings the same session body (forwards
-/// control loop, tap/tun, or pppoe) up against the new target, with per-server
-/// backoff and UDP-health state starting fresh. When `control` is set and its
-/// path binds (see [`ControlPath::bind`] for the failure policy), an admin
-/// socket serves snapshots for as long as this future runs.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_switchable(
-    active: ActiveTarget,
-    tcp: Vec<Forward>,
-    udp: Vec<Forward>,
-    tap: Option<TapConfig>,
-    tun: Option<TunConfig>,
-    pppoe: Option<PppoeRunConfig>,
-    id_prefix: Option<String>,
-    control: Option<ControlPath>,
-) -> Result<()> {
+        config,
+    } = settings;
     let client_id = crate::identity::derive_client_id(id_prefix.as_deref());
-    let by_port = |fwds: Vec<Forward>| -> HashMap<u16, ForwardTarget> {
-        fwds.into_iter()
-            .map(|f| {
-                (
-                    f.port,
-                    ForwardTarget {
-                        target: f.target,
-                        proxy: f.proxy,
-                        idle: f.idle,
-                    },
-                )
-            })
-            .collect()
-    };
-    let tcp = by_port(tcp);
-    let udp = by_port(udp);
     #[cfg(not(target_os = "linux"))]
     if tap.is_some() || tun.is_some() {
         return Err("L2/L3 tunnel modes (--tap/--tun) are only supported on Linux".into());
     }
     #[cfg(not(target_os = "linux"))]
-    if pppoe.is_some() {
-        return Err("--pppoe is only supported on Linux".into());
+    if !pppoe.is_empty() {
+        return Err("pppoe is only supported on Linux".into());
     }
 
-    // Held for the loop's lifetime: the per-attempt datapath borrows these
-    // credential bytes across the await, so the config must outlive every attempt.
-    let pppoe = pppoe.map(Arc::new);
+    let forwards_declared = !tcp.is_empty() || !udp.is_empty();
+    let forwards = SharedForwards::new(tcp, udp);
+    // Held for the loop's lifetime: a pppoe attempt's datapath borrows the
+    // credential bytes across the await, so every session's config must
+    // outlive every attempt.
+    let pppoe: Vec<(String, Arc<PppoeRunConfig>)> = pppoe
+        .into_iter()
+        .map(|p| (p.name, Arc::new(p.config)))
+        .collect();
+    let device = match (tun, tap) {
+        (Some(cfg), _) => Some(DeviceConfig::Tun(cfg)),
+        (None, Some(cfg)) => Some(DeviceConfig::Tap(cfg)),
+        (None, None) => None,
+    };
+
+    // Boot body: forwards when any are declared, else the autostart pppoe,
+    // else the device, else idle with only the admin socket up. `StopSession`
+    // falls back to the forwards/idle base.
+    let base_mode = if forwards_declared {
+        RunMode::Forwards
+    } else {
+        RunMode::Idle
+    };
+    let boot_mode = if forwards_declared {
+        RunMode::Forwards
+    } else if let Some(name) = autostart {
+        let config = pppoe
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, c)| c.clone())
+            .ok_or_else(|| -> crate::Error {
+                format!("autostart pppoe `{name}` is not a configured session").into()
+            })?;
+        RunMode::Pppoe { name, config }
+    } else if let Some(device) = device {
+        RunMode::Device(device)
+    } else {
+        RunMode::Idle
+    };
+    active.init_mode(boot_mode);
+
+    let ppp = PppStatus::default();
 
     // The admin socket lives exactly as long as this future: the guard aborts
     // the accept loop when the future is dropped, and dropping the listener
@@ -419,33 +691,15 @@ pub async fn run_switchable(
     };
     let _control = match listener {
         Some(listener) => {
-            let mode = if pppoe.is_some() {
-                SessionMode::Pppoe
-            } else if tap.is_some() || tun.is_some() {
-                SessionMode::Device
-            } else if !tcp.is_empty() || !udp.is_empty() {
-                SessionMode::Forwards
-            } else {
-                SessionMode::Idle
-            };
-            let mut forwards: Vec<ClientForwardEntry> = Vec::new();
-            for (proto, map) in [(Proto::Tcp, &tcp), (Proto::Udp, &udp)] {
-                for (&port, f) in map {
-                    forwards.push(ClientForwardEntry {
-                        proto,
-                        port,
-                        target: f.target.clone(),
-                        proxy: f.proxy,
-                        idle_secs: f.idle.map(|d| d.as_secs() as u32).unwrap_or(0),
-                    });
-                }
-            }
-            forwards.sort_by_key(|e| (e.proto == Proto::Udp, e.port));
             crate::elog!("admin socket at {}", listener.path().display());
             let state = ControlState {
                 active: active.clone(),
-                mode,
-                forwards,
+                forwards: forwards.clone(),
+                ppp: ppp.clone(),
+                servers,
+                pppoe,
+                base_mode,
+                persist: config.map(|(path, cfg)| Persist::new(path, cfg)),
             };
             Some(AbortOnDrop(tokio::spawn(listener.serve(state))))
         }
@@ -454,9 +708,20 @@ pub async fn run_switchable(
 
     let mut dial: HashMap<String, DialState> = HashMap::new();
 
-    // One iteration per active profile; only a switch moves to the next one.
+    // One iteration per active profile/body; only a mutation moves to the
+    // next one.
     loop {
-        let (target, cancel) = active.begin();
+        let (target, mode, cancel) = active.begin();
+        if !matches!(mode, RunMode::Pppoe { .. }) {
+            // Only a live pppoe body reports a phase.
+            ppp.set(PppPhase::None);
+        }
+        // An idle profile runs no session body; the admin socket stays up and
+        // a mutation fires the cancel to bring the next body up.
+        if matches!(mode, RunMode::Idle) {
+            cancel.notified().await;
+            continue;
+        }
         let state = match dial.entry(target.name.clone()) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => e.insert(DialState {
@@ -464,18 +729,21 @@ pub async fn run_switchable(
                 discovery: Discovery::new(&target.addr, &target.secret)?,
             }),
         };
-        // TAP and TUN share the same device I/O and tunnel datapath; only the open
-        // (L2 bridge vs L3 address) differs. Either becomes the single bridge
-        // device. Opened per profile: the binding is iteration-local and device
-        // release is synchronous in Drop, so the previous profile's device is
-        // closed before this open runs.
+        // TAP and TUN share the same device I/O and tunnel datapath; only the
+        // open (L2 bridge vs L3 address) differs. Either becomes the single
+        // bridge device. Opened per profile: the binding is iteration-local
+        // and device release is synchronous in Drop, so the previous profile's
+        // device is closed before this open runs.
         #[cfg(target_os = "linux")]
-        let tap_dev = if let Some(cfg) = &tun {
-            Some(Arc::new(TapDevice::open_tun(cfg)?))
-        } else if let Some(cfg) = &tap {
-            Some(Arc::new(TapDevice::open(cfg)?))
-        } else {
-            None
+        let body = match &mode {
+            RunMode::Device(DeviceConfig::Tun(cfg)) => {
+                Body::Device(Arc::new(TapDevice::open_tun(&cfg.resolve(&target.secret))?))
+            }
+            RunMode::Device(DeviceConfig::Tap(cfg)) => {
+                Body::Device(Arc::new(TapDevice::open(cfg)?))
+            }
+            RunMode::Pppoe { config, .. } => Body::Pppoe(config.clone()),
+            RunMode::Forwards | RunMode::Idle => Body::Forwards,
         };
 
         let mut udp_health = UdpHealth::default();
@@ -511,12 +779,15 @@ pub async fn run_switchable(
                     }
                 },
             };
+            // The forward maps are re-read per attempt, so an option edit made
+            // while another body ran is live on the next forwards bringup.
+            let (tcp, udp) = forwards.maps();
             let client = Arc::new(Client {
                 server: addr,
                 psk: state.psk,
                 client_id: client_id.clone(),
-                tcp: tcp.clone(),
-                udp: udp.clone(),
+                tcp,
+                udp,
                 transport: target.transport,
             });
             // Auto only: skip the UDP probe while a flap cooldown is active. Forced
@@ -527,20 +798,16 @@ pub async fn run_switchable(
             // mid-flight. The guard covers the other direction: a caller
             // dropping this future takes the session down with it instead of
             // detaching it (a detached pppoe session would keep the hijacked
-            // default route and rewritten resolv.conf applied). The
-            // (Some(tap), Some(pppoe)) case is impossible: the exclusion
-            // checks reject --pppoe with --tap/--tun before the loop. Match
-            // tap first so the precedence is deterministic without an
-            // unreachable! arm.
+            // default route and rewritten resolv.conf applied).
             #[cfg(target_os = "linux")]
             let mut session_task = {
-                let tap_dev = tap_dev.clone();
-                let pppoe = pppoe.clone();
+                let body = body.clone();
+                let ppp = ppp.clone();
                 AbortOnDrop(tokio::spawn(async move {
-                    match (&tap_dev, &pppoe) {
-                        (Some(tap), _) => bridge_session(client, tap.clone(), try_udp).await,
-                        (None, Some(pp)) => pppoe_session(client, pp.clone(), try_udp).await,
-                        (None, None) => session(client, try_udp).await,
+                    match body {
+                        Body::Device(tap) => bridge_session(client, tap, try_udp).await,
+                        Body::Pppoe(pp) => pppoe_session(client, pp, ppp, try_udp).await,
+                        Body::Forwards => session(client, try_udp).await,
                     }
                 }))
             };
@@ -566,6 +833,12 @@ pub async fn run_switchable(
                 // surface it exactly as the inline await it replaced would have.
                 Some(Err(e)) => std::panic::resume_unwind(e.into_panic()),
             };
+            // The pppoe datapath stops writing its phase once the session task
+            // exits; mark the link dead so snapshots during the redial backoff
+            // do not keep serving the last live phase.
+            if matches!(mode, RunMode::Pppoe { .. }) {
+                ppp.set(PppPhase::Dead);
+            }
             if target.transport == Transport::Auto && outcome != UdpOutcome::Skipped {
                 record(
                     &mut udp_health,
@@ -768,15 +1041,16 @@ const PPPOE_MAX_ATTEMPTS: u32 = 5;
 async fn pppoe_session(
     client: Arc<Client>,
     pp: Arc<PppoeRunConfig>,
+    status: PppStatus,
     try_udp: bool,
 ) -> (Result<()>, UdpOutcome, bool) {
     let mode = client.transport;
     if mode == Transport::Tcp || (mode == Transport::Auto && !try_udp) {
-        let (result, established) = pppoe_tcp(client, pp).await;
+        let (result, established) = pppoe_tcp(client, pp, status).await;
         return (result, UdpOutcome::Skipped, established);
     }
     let started = Instant::now();
-    match pppoe_udp(client.clone(), pp.clone()).await {
+    match pppoe_udp(client.clone(), pp.clone(), status.clone()).await {
         (Ok(()), established) => {
             let healthy = started.elapsed() >= UDP_MIN_HEALTHY;
             let outcome = if healthy {
@@ -791,7 +1065,7 @@ async fn pppoe_session(
                 return (Err(e), UdpOutcome::Skipped, established);
             }
             crate::elog!("udp transport unavailable ({e}); falling back to tcp");
-            let (result, tcp_established) = pppoe_tcp(client, pp).await;
+            let (result, tcp_established) = pppoe_tcp(client, pp, status).await;
             (
                 result,
                 UdpOutcome::Unhealthy,
@@ -844,6 +1118,7 @@ fn server_v4(server: &str) -> Option<std::net::Ipv4Addr> {
 fn bringup<'a>(
     server_ip: Option<std::net::Ipv4Addr>,
     pp: &'a PppoeRunConfig,
+    status: PppStatus,
 ) -> crate::pppoe::tunnel::ZpppBringup<'a> {
     crate::pppoe::tunnel::ZpppBringup {
         tun_name: &pp.tun_name,
@@ -854,6 +1129,7 @@ fn bringup<'a>(
             dns: pp.request_dns,
         },
         server_ip,
+        status,
     }
 }
 
@@ -861,7 +1137,11 @@ fn bringup<'a>(
 /// datagram channel. The bool is whether the handshake established before the
 /// datapath ran or failed.
 #[cfg(target_os = "linux")]
-async fn pppoe_udp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>, bool) {
+async fn pppoe_udp(
+    client: Arc<Client>,
+    pp: Arc<PppoeRunConfig>,
+    status: PppStatus,
+) -> (Result<()>, bool) {
     let dp = match build_datapath(&pp) {
         Ok(dp) => dp,
         Err(e) => return (Err(e), false),
@@ -893,7 +1173,7 @@ async fn pppoe_udp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>,
     let server_ip = server_v4(&client.server);
     let result = crate::pppoe::tunnel::run_dgram(
         dp,
-        bringup(server_ip, &pp),
+        bringup(server_ip, &pp, status),
         rx,
         tx,
         cancel,
@@ -906,7 +1186,11 @@ async fn pppoe_udp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>,
 /// In-process PPPoE over the TCP fallback: PPPoE frames ride a reliable Noise
 /// stream. The bool is whether the handshake established before the datapath ran.
 #[cfg(target_os = "linux")]
-async fn pppoe_tcp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>, bool) {
+async fn pppoe_tcp(
+    client: Arc<Client>,
+    pp: Arc<PppoeRunConfig>,
+    status: PppStatus,
+) -> (Result<()>, bool) {
     let dp = match build_datapath(&pp) {
         Ok(dp) => dp,
         Err(e) => return (Err(e), false),
@@ -933,7 +1217,7 @@ async fn pppoe_tcp(client: Arc<Client>, pp: Arc<PppoeRunConfig>) -> (Result<()>,
     let server_ip = peer.and_then(peer_v4);
     let result = crate::pppoe::tunnel::run_stream(
         dp,
-        bringup(server_ip, &pp),
+        bringup(server_ip, &pp, status),
         nr,
         nw,
         Arc::new(Notify::new()),
@@ -1398,15 +1682,140 @@ mod tests {
     async fn switch_is_never_lost_across_begin() {
         let active = ActiveTarget::new(target("a"));
         active.switch(target("b"));
-        let (t, cancel) = active.begin();
+        let (t, _mode, cancel) = active.begin();
         assert_eq!(t.name, "b");
 
         active.switch(target("c"));
         tokio_timeout(Duration::from_secs(1), cancel.notified())
             .await
             .expect("switch did not fire the profile cancel");
-        let (t, _cancel) = active.begin();
+        let (t, _mode, _cancel) = active.begin();
         assert_eq!(t.name, "c");
+    }
+
+    /// A `[tun]` without an explicit address follows the active server's
+    /// secret; a pinned address never moves.
+    #[test]
+    fn tun_address_follows_the_secret_unless_pinned() {
+        let derived = ClientTun {
+            name: "zn0".into(),
+            mtu: 1400,
+            address: None,
+        };
+        let a = derived.resolve("secret-a");
+        let b = derived.resolve("secret-b");
+        assert_eq!(a.prefix_len, 24);
+        let base = crate::identity::derive_tun_subnet("secret-a");
+        assert_eq!(a.addr, Ipv4Addr::new(base[0], base[1], base[2], 2));
+        assert_ne!(a.addr, b.addr, "distinct secrets derive distinct subnets");
+
+        let pinned = ClientTun {
+            name: "zn0".into(),
+            mtu: 1400,
+            address: Some((Ipv4Addr::new(192, 168, 7, 1), 30)),
+        };
+        let p = pinned.resolve("secret-a");
+        assert_eq!(p.addr, Ipv4Addr::new(192, 168, 7, 1));
+        assert_eq!(p.prefix_len, 30);
+        assert_eq!(pinned.resolve("secret-b").addr, p.addr);
+    }
+
+    fn pppoe_mode(name: &str) -> RunMode {
+        RunMode::Pppoe {
+            name: name.into(),
+            config: Arc::new(PppoeRunConfig {
+                username: b"u".to_vec(),
+                password: b"p".to_vec(),
+                service_name: Vec::new(),
+                ac_name: None,
+                tun_name: "zppp0".into(),
+                effective_mtu: 1400,
+                default_route: false,
+                clamp_mss: None,
+                request_dns: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn stop_pppoe_matches_only_the_active_session() {
+        let active = ActiveTarget::new(target("a"));
+        active.init_mode(RunMode::Forwards);
+        // Not a pppoe body: nothing to stop.
+        assert!(!active.stop_pppoe("wan", RunMode::Forwards));
+        assert_eq!(active.admin_view().1, SessionMode::Forwards);
+
+        active.set_mode(pppoe_mode("wan"));
+        assert_eq!(active.admin_view().1, SessionMode::Pppoe);
+        // Wrong name: the running session stays.
+        assert!(!active.stop_pppoe("dsl", RunMode::Forwards));
+        assert_eq!(active.admin_view().1, SessionMode::Pppoe);
+        // Right name: back to the base mode.
+        assert!(active.stop_pppoe("wan", RunMode::Forwards));
+        assert_eq!(active.admin_view().1, SessionMode::Forwards);
+    }
+
+    // A switch keeps the session body; only set_mode/stop_pppoe change it.
+    #[test]
+    fn switch_preserves_the_session_mode() {
+        let active = ActiveTarget::new(target("a"));
+        active.init_mode(pppoe_mode("wan"));
+        active.switch(target("b"));
+        let (t, mode, _cancel) = active.begin();
+        assert_eq!(t.name, "b");
+        assert_eq!(mode.session_mode(), SessionMode::Pppoe);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kick_fires_only_in_forwards_mode() {
+        let active = ActiveTarget::new(target("a"));
+        active.init_mode(RunMode::Forwards);
+        let (_t, _m, cancel) = active.begin();
+        active.kick_if_forwards();
+        tokio_timeout(Duration::from_secs(1), cancel.notified())
+            .await
+            .expect("kick must fire the cancel in forwards mode");
+
+        active.set_mode(pppoe_mode("wan"));
+        let (_t, _m, cancel) = active.begin();
+        active.kick_if_forwards();
+        assert!(
+            tokio_timeout(Duration::from_secs(1), cancel.notified())
+                .await
+                .is_err(),
+            "kick must not drop a non-forwards body"
+        );
+    }
+
+    #[test]
+    fn set_options_edits_existing_forwards_only() {
+        let fwds = SharedForwards::new(
+            vec![Forward {
+                port: 443,
+                target: "127.0.0.1:8443".into(),
+                proxy: false,
+                idle: None,
+            }],
+            vec![Forward {
+                port: 53,
+                target: "127.0.0.1:5353".into(),
+                proxy: false,
+                idle: Some(Duration::from_secs(9)),
+            }],
+        );
+        assert!(!fwds.set_options(Proto::Tcp, 80, true, None));
+        assert!(!fwds.set_options(Proto::Udp, 443, false, None));
+
+        assert!(fwds.set_options(Proto::Tcp, 443, true, Some(Duration::from_secs(600))));
+        assert!(fwds.set_options(Proto::Udp, 53, false, None)); // clears the idle window
+
+        let entries = fwds.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].proto, Proto::Tcp);
+        assert!(entries[0].proxy);
+        assert_eq!(entries[0].idle_secs, 600);
+        assert_eq!(entries[1].proto, Proto::Udp);
+        assert_eq!(entries[1].idle_secs, 0);
     }
 
     // A path that completes the TCP handshake but never sends Noise msg2 must
