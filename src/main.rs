@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use zeronat::clientcfg::{CfgForward, CfgPppoe, CfgServer, ClientConfig};
 use zeronat::proto::{Proto, Source};
 use zeronat::tap::TapConfig;
-use zeronat::{admin, client, server, Result};
+use zeronat::{admin, client, client_admin, server, Result};
 
 const DEFAULT_TAP_MTU: usize = 1400;
 const DEFAULT_TUN_NAME: &str = "zn0";
@@ -79,6 +79,16 @@ client options:
   --pppoe-dns         Apply IPCP-provided DNS to /etc/resolv.conf (fragile under
                       Docker; the servers are also logged)
 
+client admin options:
+  (no command)        Open the interactive console on a terminal; prints a
+                      one-shot snapshot when piped or redirected
+  show                Print the running client's status and exit
+  select-server <NAME> Switch the active server profile
+  spawn-pppoe <NAME>  Bring up the named PPPoE session
+  stop-pppoe <NAME>   Stop the named PPPoE session and return to the base mode
+  --socket <PATH>     Admin socket path (default: /run/zeronat/client.sock,
+                      else $XDG_RUNTIME_DIR/zeronat/client.sock)
+
 admin options:
   (no command)        Open the interactive console on a terminal; prints a
                       one-shot snapshot when piped or redirected
@@ -137,6 +147,11 @@ enum Cmd {
         pppoe_dns: bool,
         config: Option<std::path::PathBuf>,
     },
+    ClientAdmin {
+        command: Option<ClientAdminCmd>,
+        socket: Option<std::path::PathBuf>,
+        interactive: bool,
+    },
     Admin {
         server: String,
         secret: String,
@@ -145,6 +160,13 @@ enum Cmd {
     Upgrade {
         check: bool,
     },
+}
+
+enum ClientAdminCmd {
+    Show,
+    SelectServer(String),
+    SpawnPppoe(String),
+    StopPppoe(String),
 }
 
 /// Whether `admin` with no command should open the interactive console: only
@@ -370,7 +392,69 @@ fn parse_args() -> Result<Cmd> {
         }
     }
 
+    // `client admin` drives a running client; everything else under `client`
+    // runs one.
+    let client_admin = subcmd == "client" && tokens.first().is_some_and(|t| t == "admin");
+
     let mut iter = tokens.into_iter();
+
+    if client_admin {
+        iter.next();
+        let mut command: Option<String> = None;
+        let mut name: Option<String> = None;
+        let mut socket: Option<std::path::PathBuf> = None;
+
+        while let Some(flag) = iter.next() {
+            match flag.as_str() {
+                "-h" | "--help" => {
+                    print!("{USAGE}");
+                    std::process::exit(0);
+                }
+                "--socket" => {
+                    socket = Some(iter.next().ok_or("--socket requires a value")?.into());
+                }
+                other if other.starts_with('-') => {
+                    eprintln!("error: unknown flag '{other}'");
+                    std::process::exit(1);
+                }
+                other => {
+                    if command.is_none() {
+                        command = Some(other.to_string());
+                    } else if name.is_none() {
+                        name = Some(other.to_string());
+                    } else {
+                        return Err(format!("unexpected argument '{other}'").into());
+                    }
+                }
+            }
+        }
+
+        let named = |name: Option<String>, cmd: &str| -> Result<String> {
+            name.ok_or_else(|| format!("{cmd} requires a name").into())
+        };
+        let command = match command.as_deref() {
+            None => None,
+            Some("show") => {
+                if let Some(name) = name {
+                    return Err(format!("unexpected argument '{name}'").into());
+                }
+                Some(ClientAdminCmd::Show)
+            }
+            Some("select-server") => {
+                Some(ClientAdminCmd::SelectServer(named(name, "select-server")?))
+            }
+            Some("spawn-pppoe") => Some(ClientAdminCmd::SpawnPppoe(named(name, "spawn-pppoe")?)),
+            Some("stop-pppoe") => Some(ClientAdminCmd::StopPppoe(named(name, "stop-pppoe")?)),
+            Some(other) => return Err(format!("unknown client admin command '{other}'").into()),
+        };
+
+        let interactive = command.is_none() && interactive_default();
+        return Ok(Cmd::ClientAdmin {
+            command,
+            socket,
+            interactive,
+        });
+    }
 
     if subcmd == "server" {
         let mut bind: Option<Ipv4Addr> = None;
@@ -1335,6 +1419,30 @@ async fn run(cmd: Cmd) -> Result<()> {
                     server, secret, tcp, udp, transport, tap, tun, pppoe, id_prefix, control,
                 )
                 .await
+            }
+        }
+        Cmd::ClientAdmin {
+            command,
+            socket,
+            interactive,
+        } => {
+            #[cfg(all(feature = "tui", unix))]
+            if interactive {
+                return zeronat::tui::run_client(socket).await;
+            }
+            let _ = interactive;
+            let socket = socket.as_deref();
+            match command {
+                None | Some(ClientAdminCmd::Show) => client_admin::show(socket).await,
+                Some(ClientAdminCmd::SelectServer(name)) => {
+                    client_admin::select_server(socket, name).await
+                }
+                Some(ClientAdminCmd::SpawnPppoe(name)) => {
+                    client_admin::spawn_pppoe(socket, name).await
+                }
+                Some(ClientAdminCmd::StopPppoe(name)) => {
+                    client_admin::stop_pppoe(socket, name).await
+                }
             }
         }
         Cmd::Admin {
