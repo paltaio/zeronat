@@ -10,6 +10,7 @@ use zeronat::proto::{Msg, Proto, Source};
 use zeronat::server::{ListenerSpec, ServerSettings};
 
 const SECRET: &str = "integration-test-secret";
+const SECRET_B: &str = "integration-test-secret-b";
 
 /// Build a `ServerSettings` for a config-less (runtime-only) server: localhost
 /// bind, removable runtime-sourced listeners, no routes, no config file. The
@@ -60,20 +61,43 @@ fn fwd(port: u16, target: u16) -> zeronat::client::Forward {
     }
 }
 
+/// Claim a port for this test run. The probe socket closes before the caller
+/// binds the port, so the kernel can re-issue it to a concurrent test; deduping
+/// keeps two tests from ever being given the same port.
+fn claim_port(port: u16) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static TAKEN: OnceLock<Mutex<std::collections::HashSet<u16>>> = OnceLock::new();
+    TAKEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(port)
+}
+
 fn free_tcp_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if claim_port(port) {
+            return port;
+        }
+    }
 }
 
 fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    loop {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if claim_port(port) {
+            return port;
+        }
+    }
 }
 
 /// Echoes back every chunk it receives on a local TCP port.
@@ -1417,6 +1441,64 @@ async fn proxy_forward_refuses_headerless_open() {
     timeout(Duration::from_secs(30), body)
         .await
         .expect("headerless-open refusal did not complete within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_switch_moves_session() {
+    let body = async {
+        let control_a = free_tcp_port();
+        let control_b = free_tcp_port();
+        let public_a = free_tcp_port();
+        let public_b = free_tcp_port();
+        let local_echo = free_tcp_port();
+        tokio::spawn(tcp_echo(local_echo));
+
+        // Two independent servers with distinct secrets, each exposing its own
+        // public port.
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control_a,
+            vec![public_a],
+            vec![],
+        )));
+        let mut settings_b = cli_settings(control_b, vec![public_b], vec![]);
+        settings_b.secret = SECRET_B.into();
+        tokio::spawn(zeronat::server::run(settings_b));
+
+        // One client dialing A, carrying forwards for both servers' public
+        // ports so the same forward set serves whichever server is active.
+        let target = |name: &str, control: u16, secret: &str| zeronat::client::ServerTarget {
+            name: name.into(),
+            addr: format!("127.0.0.1:{control}"),
+            secret: secret.into(),
+            transport: zeronat::client::Transport::Tcp,
+        };
+        let active = zeronat::client::ActiveTarget::new(target("a", control_a, SECRET));
+        tokio::spawn(zeronat::client::run_switchable(
+            active.clone(),
+            vec![fwd(public_a, local_echo), fwd(public_b, local_echo)],
+            vec![],
+            None,
+            None,
+            None,
+            Some("sw".into()),
+        ));
+
+        // Session up against A: traffic round-trips through A's public port.
+        let mut conn = wait_tcp_path(public_a).await;
+
+        // Switch to B. The in-flight session against A must be torn down, which
+        // cuts the established relay through A...
+        active.switch(target("b", control_b, SECRET_B));
+        wait_tcp_cut(&mut conn).await;
+
+        // ...and the same session body comes up against B under B's secret:
+        // traffic round-trips through B's public port.
+        let _conn_b = wait_tcp_path(public_b).await;
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("server switch did not complete within 30s");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

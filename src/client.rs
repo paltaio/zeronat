@@ -256,6 +256,69 @@ impl Discovery {
     }
 }
 
+/// One dialable server profile: address (`"dht"` or `host:port`), the secret
+/// that authenticates it, and the transport policy. `name` keys the per-server
+/// PSK/discovery memoization across switches.
+#[derive(Clone)]
+pub struct ServerTarget {
+    pub name: String,
+    pub addr: String,
+    pub secret: String,
+    pub transport: Transport,
+}
+
+/// Per-server dial state kept across switches, so returning to a server reuses
+/// its derived PSK and its discovery (whose DHT identity carries the resolver
+/// cache) instead of rederiving them.
+struct DialState {
+    psk: [u8; 32],
+    discovery: Discovery,
+}
+
+/// The server the reconnect loop should be running, shared between the loop
+/// and whoever drives a switch. Also holds the cancel scoped to the profile
+/// currently up: `switch` replaces the target and fires that cancel; the loop
+/// installs a fresh one each time it brings a profile up.
+#[derive(Clone)]
+pub struct ActiveTarget {
+    state: Arc<std::sync::Mutex<ActiveState>>,
+}
+
+struct ActiveState {
+    target: ServerTarget,
+    cancel: Arc<Notify>,
+}
+
+impl ActiveTarget {
+    pub fn new(target: ServerTarget) -> Self {
+        ActiveTarget {
+            state: Arc::new(std::sync::Mutex::new(ActiveState {
+                target,
+                cancel: Arc::new(Notify::new()),
+            })),
+        }
+    }
+
+    /// Retarget the client: replace the shared target and fire the current
+    /// profile's cancel. The loop aborts the in-flight session task, awaits its
+    /// teardown, and brings the same session body up against the new target; the
+    /// brief link drop is inherent to the teardown-then-bringup.
+    pub fn switch(&self, target: ServerTarget) {
+        let mut s = self.state.lock().unwrap();
+        s.target = target;
+        s.cancel.notify_one();
+    }
+
+    /// Snapshot the target to bring up and install a fresh cancel scoped to it.
+    /// A `switch` racing this call lands its permit on the fresh cancel, so a
+    /// switch is never lost between profiles.
+    fn begin(&self) -> (ServerTarget, Arc<Notify>) {
+        let mut s = self.state.lock().unwrap();
+        s.cancel = Arc::new(Notify::new());
+        (s.target.clone(), s.cancel.clone())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     server: String,
@@ -268,7 +331,37 @@ pub async fn run(
     pppoe: Option<PppoeRunConfig>,
     id_prefix: Option<String>,
 ) -> Result<()> {
-    let psk = crate::noise::derive_psk(&secret);
+    let target = ServerTarget {
+        name: server.clone(),
+        addr: server,
+        secret,
+        transport,
+    };
+    run_switchable(
+        ActiveTarget::new(target),
+        tcp,
+        udp,
+        tap,
+        tun,
+        pppoe,
+        id_prefix,
+    )
+    .await
+}
+
+/// Like `run`, but dialing whatever `active` currently points at. A `switch`
+/// tears the in-flight session down and brings the same session body (forwards
+/// control loop, tap/tun, or pppoe) up against the new target, with per-server
+/// backoff and UDP-health state starting fresh.
+pub async fn run_switchable(
+    active: ActiveTarget,
+    tcp: Vec<Forward>,
+    udp: Vec<Forward>,
+    tap: Option<TapConfig>,
+    tun: Option<TunConfig>,
+    pppoe: Option<PppoeRunConfig>,
+    id_prefix: Option<String>,
+) -> Result<()> {
     let client_id = crate::identity::derive_client_id(id_prefix.as_deref());
     let by_port = |fwds: Vec<Forward>| -> HashMap<u16, ForwardTarget> {
         fwds.into_iter()
@@ -286,17 +379,6 @@ pub async fn run(
     };
     let tcp = by_port(tcp);
     let udp = by_port(udp);
-    let discovery = Discovery::new(&server, &secret)?;
-    // TAP and TUN share the same device I/O and tunnel datapath; only the open
-    // (L2 bridge vs L3 address) differs. Either becomes the single bridge device.
-    #[cfg(target_os = "linux")]
-    let tap = if let Some(cfg) = &tun {
-        Some(Arc::new(TapDevice::open_tun(cfg)?))
-    } else if let Some(cfg) = &tap {
-        Some(Arc::new(TapDevice::open(cfg)?))
-    } else {
-        None
-    };
     #[cfg(not(target_os = "linux"))]
     if tap.is_some() || tun.is_some() {
         return Err("L2/L3 tunnel modes (--tap/--tun) are only supported on Linux".into());
@@ -310,79 +392,144 @@ pub async fn run(
     // credential bytes across the await, so the config must outlive every attempt.
     let pppoe = pppoe.map(Arc::new);
 
-    let mut udp_health = UdpHealth::default();
-    let mut backoff = Backoff::default();
-    // Last address we successfully resolved to. A transient DHT gap (the server
-    // republishes on an interval) must not knock a working client offline, so an
-    // empty or failed lookup falls back to this until the DHT yields a new value.
-    let mut last_addr: Option<String> = None;
+    let mut dial: HashMap<String, DialState> = HashMap::new();
 
+    // One iteration per active profile; only a switch moves to the next one.
     loop {
-        let addr = match discovery.resolve().await {
-            Ok(a) => {
-                last_addr = Some(a.clone());
-                a
-            }
-            Err(e) => match &last_addr {
-                Some(a) => {
-                    crate::elog!("server discovery failed: {e}; keeping last known server {a}");
-                    a.clone()
-                }
-                None => {
-                    crate::elog!("server discovery failed: {e}");
-                    sleep(backoff.delay()).await;
-                    backoff.fail();
-                    continue;
-                }
-            },
+        let (target, cancel) = active.begin();
+        let state = match dial.entry(target.name.clone()) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(DialState {
+                psk: crate::noise::derive_psk(&target.secret),
+                discovery: Discovery::new(&target.addr, &target.secret)?,
+            }),
         };
-        let client = Arc::new(Client {
-            server: addr,
-            psk,
-            client_id: client_id.clone(),
-            tcp: tcp.clone(),
-            udp: udp.clone(),
-            transport,
-        });
-        // Auto only: skip the UDP probe while a flap cooldown is active. Forced
-        // Udp/Tcp ignore `try_udp` and keep their fixed path.
-        let try_udp = transport != Transport::Auto || choose_udp(&udp_health, Instant::now());
-        // The (Some(tap), Some(pppoe)) case is impossible: the run() exclusion
-        // check rejects --pppoe with --tap/--tun before the loop. Match tap first
-        // so the precedence is deterministic without an unreachable! arm.
+        // TAP and TUN share the same device I/O and tunnel datapath; only the open
+        // (L2 bridge vs L3 address) differs. Either becomes the single bridge
+        // device. Opened per profile: the binding is iteration-local and device
+        // release is synchronous in Drop, so the previous profile's device is
+        // closed before this open runs.
         #[cfg(target_os = "linux")]
-        let (result, outcome, established) = match (&tap, &pppoe) {
-            (Some(tap), _) => bridge_session(client.clone(), tap.clone(), try_udp).await,
-            (None, Some(pp)) => pppoe_session(client.clone(), pp.clone(), try_udp).await,
-            (None, None) => session(client.clone(), try_udp).await,
+        let tap_dev = if let Some(cfg) = &tun {
+            Some(Arc::new(TapDevice::open_tun(cfg)?))
+        } else if let Some(cfg) = &tap {
+            Some(Arc::new(TapDevice::open(cfg)?))
+        } else {
+            None
         };
-        #[cfg(not(target_os = "linux"))]
-        let (result, outcome, established) = session(client.clone(), try_udp).await;
-        if transport == Transport::Auto && outcome != UdpOutcome::Skipped {
-            record(
-                &mut udp_health,
-                outcome == UdpOutcome::Healthy,
-                Instant::now(),
-            );
-        }
-        if let Err(e) = result {
-            crate::elog!("connection lost: {e}");
-            // Only a failure to establish against the cached address invalidates
-            // it; a long-lived session dying from a transient blip keeps the cache
-            // so the redial stays off the DHT. If the IP truly moved, the next
-            // redial fails to establish and that clears it.
-            if !established {
-                discovery.invalidate();
+
+        let mut udp_health = UdpHealth::default();
+        let mut backoff = Backoff::default();
+        // Last address we successfully resolved to. A transient DHT gap (the server
+        // republishes on an interval) must not knock a working client offline, so an
+        // empty or failed lookup falls back to this until the DHT yields a new value.
+        let mut last_addr: Option<String> = None;
+
+        loop {
+            let resolved = tokio::select! {
+                _ = cancel.notified() => break,
+                r = state.discovery.resolve() => r,
+            };
+            let addr = match resolved {
+                Ok(a) => {
+                    last_addr = Some(a.clone());
+                    a
+                }
+                Err(e) => match &last_addr {
+                    Some(a) => {
+                        crate::elog!("server discovery failed: {e}; keeping last known server {a}");
+                        a.clone()
+                    }
+                    None => {
+                        crate::elog!("server discovery failed: {e}");
+                        tokio::select! {
+                            _ = cancel.notified() => break,
+                            _ = sleep(backoff.delay()) => {}
+                        }
+                        backoff.fail();
+                        continue;
+                    }
+                },
+            };
+            let client = Arc::new(Client {
+                server: addr,
+                psk: state.psk,
+                client_id: client_id.clone(),
+                tcp: tcp.clone(),
+                udp: udp.clone(),
+                transport: target.transport,
+            });
+            // Auto only: skip the UDP probe while a flap cooldown is active. Forced
+            // Udp/Tcp ignore `try_udp` and keep their fixed path.
+            let try_udp =
+                target.transport != Transport::Auto || choose_udp(&udp_health, Instant::now());
+            // The session body runs in its own task so a switch can abort it
+            // mid-flight. The (Some(tap), Some(pppoe)) case is impossible: the
+            // exclusion checks reject --pppoe with --tap/--tun before the loop.
+            // Match tap first so the precedence is deterministic without an
+            // unreachable! arm.
+            #[cfg(target_os = "linux")]
+            let mut session_task = {
+                let tap_dev = tap_dev.clone();
+                let pppoe = pppoe.clone();
+                tokio::spawn(async move {
+                    match (&tap_dev, &pppoe) {
+                        (Some(tap), _) => bridge_session(client, tap.clone(), try_udp).await,
+                        (None, Some(pp)) => pppoe_session(client, pp.clone(), try_udp).await,
+                        (None, None) => session(client, try_udp).await,
+                    }
+                })
+            };
+            #[cfg(not(target_os = "linux"))]
+            let mut session_task = tokio::spawn(session(client, try_udp));
+            let joined = tokio::select! {
+                _ = cancel.notified() => None,
+                r = &mut session_task => Some(r),
+            };
+            let (result, outcome, established) = match joined {
+                None => {
+                    // Teardown half of the switch: abort the session and await its
+                    // exit so every handle it holds (the device included) is gone
+                    // before the next profile's bringup opens its own.
+                    session_task.abort();
+                    let _ = session_task.await;
+                    break;
+                }
+                Some(Ok(v)) => v,
+                // Only the switch arm above aborts this task, so a join error
+                // here is a panic in the session body; surface it exactly as the
+                // inline await it replaced would have.
+                Some(Err(e)) => std::panic::resume_unwind(e.into_panic()),
+            };
+            if target.transport == Transport::Auto && outcome != UdpOutcome::Skipped {
+                record(
+                    &mut udp_health,
+                    outcome == UdpOutcome::Healthy,
+                    Instant::now(),
+                );
+            }
+            if let Err(e) = result {
+                crate::elog!("connection lost: {e}");
+                // Only a failure to establish against the cached address invalidates
+                // it; a long-lived session dying from a transient blip keeps the cache
+                // so the redial stays off the DHT. If the IP truly moved, the next
+                // redial fails to establish and that clears it.
+                if !established {
+                    state.discovery.invalidate();
+                }
+            }
+            // A cycle that brought the control channel up is a fresh start; one that
+            // never established (down server, failed handshake) widens the redial gap.
+            if established {
+                backoff.reset();
+            } else {
+                backoff.fail();
+            }
+            tokio::select! {
+                _ = cancel.notified() => break,
+                _ = sleep(backoff.delay()) => {}
             }
         }
-        // A cycle that brought the control channel up is a fresh start; one that
-        // never established (down server, failed handshake) widens the redial gap.
-        if established {
-            backoff.reset();
-        } else {
-            backoff.fail();
-        }
-        sleep(backoff.delay()).await;
     }
 }
 
@@ -871,17 +1018,20 @@ async fn control_loop(
             .ok();
     }
 
+    // Every task this session spawns is held through an AbortOnDrop guard, so
+    // both a normal teardown and a server switch aborting the whole session
+    // task reap them instead of leaving them running against a dead server.
     let mut w = w;
-    let writer = tokio::spawn(async move {
+    let _writer = AbortOnDrop(tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
             if w.send(&bytes).await.is_err() {
                 break;
             }
         }
-    });
+    }));
 
     let ping_tx = tx.clone();
-    let pinger = tokio::spawn(async move {
+    let _pinger = AbortOnDrop(tokio::spawn(async move {
         let mut tick = interval(PING_INTERVAL);
         tick.tick().await;
         loop {
@@ -890,13 +1040,13 @@ async fn control_loop(
                 break;
             }
         }
-    });
+    }));
 
     // Fail loud at setup for proxy-enabled forwards: they never fall back to a
     // headerless relay, so a server that does not ack the options (an older
     // release ignores the frame) leaves those ports refusing every connection.
     // Say so once, loudly, instead of letting each open fail quietly.
-    let watchdog = {
+    let _watchdog = {
         let mut proxied: Vec<u16> = client
             .tcp
             .iter()
@@ -913,7 +1063,7 @@ async fn control_loop(
                 .collect::<Vec<_>>()
                 .join(", ");
             let ack = ack.clone();
-            Some(tokio::spawn(async move {
+            Some(AbortOnDrop(tokio::spawn(async move {
                 sleep(FWD_OPTIONS_ACK_TIMEOUT).await;
                 if !ack.load(Ordering::Relaxed) {
                     crate::elog!(
@@ -922,15 +1072,15 @@ async fn control_loop(
                          server to a release that supports +proxy"
                     );
                 }
-            }))
+            })))
         }
     };
 
-    // Handles of in-flight forward tasks spawned for this control session, so a
-    // teardown can abort black-holed forwards instead of leaking them.
-    let mut forwards: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Guards for in-flight forward tasks spawned for this control session, so a
+    // teardown aborts black-holed forwards instead of leaking them.
+    let mut forwards: Vec<AbortOnDrop> = Vec::new();
 
-    let result = loop {
+    loop {
         // Any inbound frame (Pong from our ping, or an Open) resets the deadline.
         // No frame for the whole window means the link is a black hole with no
         // FIN/RST; return Err so the outer reconnect loop re-resolves and redials.
@@ -971,28 +1121,16 @@ async fn control_loop(
         if let Some((proto, port, id, proxy_addrs)) = open {
             let client = client.clone();
             let link = link.clone();
-            // Drop handles of forwards that already finished so the tracking
+            // Drop guards of forwards that already finished so the tracking
             // vector stays bounded over a long healthy session.
-            forwards.retain(|h| !h.is_finished());
-            forwards.push(tokio::spawn(async move {
+            forwards.retain(|h| !h.0.is_finished());
+            forwards.push(AbortOnDrop(tokio::spawn(async move {
                 if let Err(e) = handle_open(client, link, proto, port, id, proxy_addrs).await {
                     crate::elog!("stream {id} ({proto:?} :{port}) failed: {e}");
                 }
-            }));
+            })));
         }
-    };
-
-    writer.abort();
-    pinger.abort();
-    if let Some(h) = watchdog {
-        h.abort();
     }
-    // Tear down forwards tied to this dead control session; abort is a no-op on
-    // tasks that already completed, so this never races into a panic.
-    for h in forwards {
-        h.abort();
-    }
-    result
 }
 
 /// Wire entries for every forward carrying a non-default option; empty when the
@@ -1177,6 +1315,33 @@ mod tests {
         record(&mut s, false, t0);
         assert!(s.cooldown_until.is_none());
         assert!(choose_udp(&s, t0));
+    }
+
+    fn target(name: &str) -> ServerTarget {
+        ServerTarget {
+            name: name.into(),
+            addr: "127.0.0.1:1".into(),
+            secret: "s".into(),
+            transport: Transport::Tcp,
+        }
+    }
+
+    // A switch must never be lost, wherever it lands relative to a profile
+    // bringup: before `begin` the snapshot already carries the new target, and
+    // after `begin` the permit sits on that profile's own cancel.
+    #[tokio::test]
+    async fn switch_is_never_lost_across_begin() {
+        let active = ActiveTarget::new(target("a"));
+        active.switch(target("b"));
+        let (t, cancel) = active.begin();
+        assert_eq!(t.name, "b");
+
+        active.switch(target("c"));
+        tokio_timeout(Duration::from_secs(1), cancel.notified())
+            .await
+            .expect("switch did not fire the profile cancel");
+        let (t, _cancel) = active.begin();
+        assert_eq!(t.name, "c");
     }
 
     // A path that completes the TCP handshake but never sends Noise msg2 must
