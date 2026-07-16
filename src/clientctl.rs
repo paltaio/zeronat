@@ -15,7 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::client::{ActiveTarget, PppoeRunConfig, RunMode, ServerTarget, SharedForwards};
 use crate::clientcfg::{serialize_client, ClientConfig};
-use crate::clientproto::{ClientMsg, ClientSnapshotBody, PppStatus};
+use crate::clientproto::{ClientMsg, ClientServerEntry, ClientSnapshotBody, PppStatus};
 use crate::proto::{proto_name, Proto};
 use crate::Result;
 
@@ -268,13 +268,25 @@ async fn handle(stream: UnixStream, state: &ControlState) -> Result<()> {
 }
 
 fn snapshot(state: &ControlState) -> ClientSnapshotBody {
-    let (active, mode) = state.active.admin_view();
+    let (active, mode, session) = state.active.admin_view();
     ClientSnapshotBody {
         version: crate::identity::PROTO_VERSION,
         active,
         mode,
         phase: state.ppp.get(),
         forwards: state.forwards.entries(),
+        // Config fields only; the per-server secret stays behind.
+        servers: state
+            .servers
+            .iter()
+            .map(|s| ClientServerEntry {
+                name: s.name.clone(),
+                addr: s.addr.clone(),
+                transport: s.transport,
+            })
+            .collect(),
+        pppoe: state.pppoe.iter().map(|(name, _)| name.clone()).collect(),
+        session,
     }
 }
 
@@ -489,6 +501,13 @@ mod tests {
         state.servers = vec![server_target("a", 1), server_target("b", 2)];
         state.persist = Some(Persist::new(path.clone(), cfg));
 
+        // The snapshot lists the selectable profiles by their config fields.
+        let snap = snapshot(&state);
+        let names: Vec<&str> = snap.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(snap.servers[0].addr, "127.0.0.1:1");
+        assert_eq!(snap.servers[0].transport, Transport::Tcp);
+
         let (ok, msg) = mutate(
             &state,
             ClientMsg::SelectServer {
@@ -625,6 +644,9 @@ mod tests {
         let (ok, msg) = mutate(&state, ClientMsg::SpawnPppoe { name: "wan".into() }).await;
         assert!(ok, "{msg}");
         assert_eq!(state.active.admin_view().1, SessionMode::Pppoe);
+        let snap = snapshot(&state);
+        assert_eq!(snap.pppoe, ["wan"]);
+        assert_eq!(snap.session, "wan");
 
         let (ok, _) = mutate(
             &state,
@@ -639,6 +661,7 @@ mod tests {
         let (ok, msg) = mutate(&state, ClientMsg::StopSession { name: "wan".into() }).await;
         assert!(ok, "{msg}");
         assert_eq!(state.active.admin_view().1, SessionMode::Idle);
+        assert_eq!(snapshot(&state).session, "");
     }
 
     #[test]

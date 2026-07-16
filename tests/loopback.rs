@@ -1674,6 +1674,13 @@ async fn client_admin_socket_serves_snapshot() {
         assert_eq!(f.target, format!("127.0.0.1:{local_tcp}"));
         assert!(!f.proxy);
         assert_eq!(f.idle_secs, 0);
+        // A CLI-shaped client's one profile is its server address; there are
+        // no pppoe sessions to list and no live one to name.
+        assert_eq!(snap.servers.len(), 1);
+        assert_eq!(snap.servers[0].name, format!("127.0.0.1:{control}"));
+        assert_eq!(snap.servers[0].addr, format!("127.0.0.1:{control}"));
+        assert!(snap.pppoe.is_empty());
+        assert_eq!(snap.session, "");
 
         // Mode 1 carries one mutation and gets a result on the same
         // connection; a CLI client's only profile is its server address, so
@@ -1843,6 +1850,9 @@ async fn select_server_moves_session_and_persists() {
         let snap = client_snapshot(&sock).await;
         assert_eq!(snap.active, "a");
         assert_eq!(snap.mode, SessionMode::Forwards);
+        // The snapshot lists the selectable profiles by their config fields.
+        let names: Vec<&str> = snap.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
 
         // Selecting b through the one-shot moves the session: the relay
         // through a is cut and traffic round-trips through b's public port
@@ -2067,10 +2077,12 @@ async fn spawn_and_stop_pppoe_swap_the_session_body() {
         zeronat::client_admin::spawn_pppoe(Some(&sock), "wan".into())
             .await
             .expect("spawn pppoe");
-        wait_client_snapshot(&sock, |s| {
+        let snap = wait_client_snapshot(&sock, |s| {
             s.mode == SessionMode::Pppoe && s.phase != PppPhase::None
         })
         .await;
+        assert_eq!(snap.pppoe, ["wan"]);
+        assert_eq!(snap.session, "wan");
 
         // A forward edit while the pppoe body runs lands in memory but must
         // not drop the unrelated session.

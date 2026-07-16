@@ -520,11 +520,16 @@ impl ActiveTarget {
     }
 
     /// Name of the profile the reconnect loop is running (or about to bring
-    /// up) and its session mode. Read-only: takes the lock briefly and never
-    /// touches the cancel.
-    pub fn admin_view(&self) -> (String, SessionMode) {
+    /// up), its session mode, and the live pppoe session's name (empty in any
+    /// other mode). Read-only: takes the lock briefly and never touches the
+    /// cancel.
+    pub fn admin_view(&self) -> (String, SessionMode, String) {
         let s = self.state.lock().unwrap();
-        (s.target.name.clone(), s.mode.session_mode())
+        let session = match &s.mode {
+            RunMode::Pppoe { name, .. } => name.clone(),
+            _ => String::new(),
+        };
+        (s.target.name.clone(), s.mode.session_mode(), session)
     }
 }
 

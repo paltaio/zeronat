@@ -36,6 +36,13 @@ libc = "0.2"
 snow = "0.9"
 tokio = { version = "1", features = ["test-util"] }
 
+# Drives the interactive consoles over a pseudo-terminal; needs its own main
+# so the same binary can re-execute itself as the console child.
+[[test]]
+name = "console_pty"
+harness = false
+required-features = ["tui"]
+
 [profile.release]
 opt-level = "z"
 lto = true

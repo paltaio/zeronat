@@ -297,6 +297,9 @@ mod tests {
                 entry(Proto::Udp, 51820, "10.0.0.5:51820", false, 300),
                 entry(Proto::Tcp, 443, "127.0.0.1:8443", false, 0),
             ],
+            servers: Vec::new(),
+            pppoe: Vec::new(),
+            session: String::new(),
         };
         let s = render(&snap);
         assert!(s.contains("active  home"));
@@ -316,6 +319,9 @@ mod tests {
             mode: SessionMode::Pppoe,
             phase: PppPhase::Established,
             forwards: Vec::new(),
+            servers: Vec::new(),
+            pppoe: Vec::new(),
+            session: "wan".into(),
         };
         let s = render(&snap);
         assert!(s.contains("mode    pppoe"));

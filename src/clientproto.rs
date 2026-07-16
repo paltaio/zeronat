@@ -6,6 +6,7 @@
 //! integers, u16-length-prefixed UTF-8 strings, exact-length validation) and
 //! ride the Noise framing unchanged.
 
+use crate::client::Transport;
 use crate::proto::{proto_byte, proto_from_byte, put_str, take_str, Proto};
 use crate::Result;
 
@@ -48,6 +49,23 @@ fn mode_from_byte(n: u8) -> Result<SessionMode> {
         2 => Ok(SessionMode::Device),
         3 => Ok(SessionMode::Pppoe),
         n => Err(format!("unknown session mode byte {n}").into()),
+    }
+}
+
+fn transport_byte(t: Transport) -> u8 {
+    match t {
+        Transport::Auto => 0,
+        Transport::Udp => 1,
+        Transport::Tcp => 2,
+    }
+}
+
+fn transport_from_byte(n: u8) -> Result<Transport> {
+    match n {
+        0 => Ok(Transport::Auto),
+        1 => Ok(Transport::Udp),
+        2 => Ok(Transport::Tcp),
+        n => Err(format!("unknown transport byte {n}").into()),
     }
 }
 
@@ -104,6 +122,17 @@ pub struct ClientForwardEntry {
     pub idle_secs: u32,
 }
 
+/// A configured server profile as reported in a `ClientSnapshot`: the
+/// dialable config fields only. The per-server secret never leaves the
+/// client; redaction is structural.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientServerEntry {
+    pub name: String,
+    /// `"dht"` or `host:port`.
+    pub addr: String,
+    pub transport: Transport,
+}
+
 /// A point-in-time view of one running client, returned to admin on request.
 /// Carries no secret field: server secrets and PPPoE credentials stay out of
 /// the snapshot by construction.
@@ -115,6 +144,12 @@ pub struct ClientSnapshotBody {
     pub mode: SessionMode,
     pub phase: PppPhase,
     pub forwards: Vec<ClientForwardEntry>,
+    /// Configured server profiles `SelectServer` may name.
+    pub servers: Vec<ClientServerEntry>,
+    /// Configured pppoe session names `SpawnPppoe` may name.
+    pub pppoe: Vec<String>,
+    /// Name of the live pppoe session body; empty in any other mode.
+    pub session: String,
 }
 
 /// Messages exchanged over a client's admin socket.
@@ -176,6 +211,19 @@ impl ClientMsg {
                     b.push(u8::from(f.proxy));
                     b.extend_from_slice(&f.idle_secs.to_be_bytes());
                 }
+                let count = snap.servers.len().min(u16::MAX as usize);
+                b.extend_from_slice(&(count as u16).to_be_bytes());
+                for s in &snap.servers[..count] {
+                    put_str(&mut b, &s.name);
+                    put_str(&mut b, &s.addr);
+                    b.push(transport_byte(s.transport));
+                }
+                let count = snap.pppoe.len().min(u16::MAX as usize);
+                b.extend_from_slice(&(count as u16).to_be_bytes());
+                for name in &snap.pppoe[..count] {
+                    put_str(&mut b, name);
+                }
+                put_str(&mut b, &snap.session);
                 b
             }
             ClientMsg::MutationResult { ok, msg } => {
@@ -267,6 +315,36 @@ impl ClientMsg {
                         idle_secs,
                     });
                 }
+                if at + 2 > b.len() {
+                    return Err("truncated client snapshot server list".into());
+                }
+                let count = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
+                at += 2;
+                let mut servers = Vec::new();
+                for _ in 0..count {
+                    let name = take_str(b, &mut at)?;
+                    let addr = take_str(b, &mut at)?;
+                    if at >= b.len() {
+                        return Err("truncated server entry".into());
+                    }
+                    let transport = transport_from_byte(b[at])?;
+                    at += 1;
+                    servers.push(ClientServerEntry {
+                        name,
+                        addr,
+                        transport,
+                    });
+                }
+                if at + 2 > b.len() {
+                    return Err("truncated client snapshot pppoe list".into());
+                }
+                let count = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
+                at += 2;
+                let mut pppoe = Vec::new();
+                for _ in 0..count {
+                    pppoe.push(take_str(b, &mut at)?);
+                }
+                let session = take_str(b, &mut at)?;
                 if at != b.len() {
                     return Err("trailing bytes in client snapshot".into());
                 }
@@ -276,6 +354,9 @@ impl ClientMsg {
                     mode,
                     phase,
                     forwards,
+                    servers,
+                    pppoe,
+                    session,
                 }))
             }
             Some(3) => {
@@ -386,6 +467,20 @@ mod tests {
                     idle_secs: 0,
                 },
             ],
+            servers: vec![
+                ClientServerEntry {
+                    name: "home".into(),
+                    addr: "dht".into(),
+                    transport: Transport::Auto,
+                },
+                ClientServerEntry {
+                    name: "away".into(),
+                    addr: "198.51.100.7:9000".into(),
+                    transport: Transport::Tcp,
+                },
+            ],
+            pppoe: vec!["wan".into(), "dsl".into()],
+            session: String::new(),
         }
     }
 
@@ -403,6 +498,9 @@ mod tests {
             mode: SessionMode::Pppoe,
             phase: PppPhase::Established,
             forwards: Vec::new(),
+            servers: Vec::new(),
+            pppoe: Vec::new(),
+            session: "wan".into(),
         };
         match roundtrip(&ClientMsg::ClientSnapshot(empty.clone())) {
             ClientMsg::ClientSnapshot(decoded) => assert_eq!(decoded, empty),
@@ -432,6 +530,9 @@ mod tests {
                     mode,
                     phase,
                     forwards: Vec::new(),
+                    servers: Vec::new(),
+                    pppoe: Vec::new(),
+                    session: String::new(),
                 };
                 match roundtrip(&ClientMsg::ClientSnapshot(body.clone())) {
                     ClientMsg::ClientSnapshot(decoded) => assert_eq!(decoded, body),
@@ -445,8 +546,11 @@ mod tests {
     #[test]
     fn snapshot_rejects_malformed() {
         // One single-char string each, so the byte offsets below are fixed:
-        // 0 tag, 1 version, 2-4 active ("a"), 5 mode, 6 phase, 7-8 count,
-        // 9 proto, 10-11 port, 12-14 target ("t"), 15 proxy, 16-19 idle.
+        // 0 tag, 1 version, 2-4 active ("a"), 5 mode, 6 phase, 7-8 fwd count,
+        // 9 proto, 10-11 port, 12-14 target ("t"), 15 proxy, 16-19 idle,
+        // 20-21 server count, 22-24 name ("s"), 25-27 addr ("d"),
+        // 28 transport, 29-30 pppoe count, 31-33 name ("w"),
+        // 34-36 session ("x").
         let good = ClientMsg::ClientSnapshot(ClientSnapshotBody {
             version: 1,
             active: "a".into(),
@@ -459,9 +563,16 @@ mod tests {
                 proxy: true,
                 idle_secs: 600,
             }],
+            servers: vec![ClientServerEntry {
+                name: "s".into(),
+                addr: "d".into(),
+                transport: Transport::Tcp,
+            }],
+            pppoe: vec!["w".into()],
+            session: "x".into(),
         })
         .encode();
-        assert_eq!(good.len(), 20);
+        assert_eq!(good.len(), 37);
         // Any truncation errors, never panics.
         for cut in 1..good.len() {
             assert!(
@@ -473,13 +584,18 @@ mod tests {
         let mut junk = good.clone();
         junk.push(0x00);
         assert!(ClientMsg::decode(&junk).is_err());
-        // A forward count larger than the remaining bytes.
-        let mut big = good.clone();
-        big[7] = 0xff;
-        big[8] = 0xff;
-        assert!(ClientMsg::decode(&big).is_err());
-        // Unknown mode, phase, proto, and proxy bytes.
-        for (at, bad) in [(5, 4u8), (6, 6u8), (9, 9u8), (15, 2u8)] {
+        // Forward and server counts larger than the remaining bytes.
+        for at in [7usize, 20] {
+            let mut big = good.clone();
+            big[at] = 0xff;
+            big[at + 1] = 0xff;
+            assert!(
+                ClientMsg::decode(&big).is_err(),
+                "count at {at} should error"
+            );
+        }
+        // Unknown mode, phase, proto, proxy, and transport bytes.
+        for (at, bad) in [(5, 4u8), (6, 6u8), (9, 9u8), (15, 2u8), (28, 3u8)] {
             let mut corrupt = good.clone();
             corrupt[at] = bad;
             assert!(
