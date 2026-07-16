@@ -173,14 +173,14 @@ pub enum Msg {
     },
 }
 
-fn proto_byte(p: Proto) -> u8 {
+pub(crate) fn proto_byte(p: Proto) -> u8 {
     match p {
         Proto::Tcp => 1,
         Proto::Udp => 2,
     }
 }
 
-fn proto_from_byte(n: u8) -> Result<Proto> {
+pub(crate) fn proto_from_byte(n: u8) -> Result<Proto> {
     match n {
         1 => Ok(Proto::Tcp),
         2 => Ok(Proto::Udp),
@@ -215,7 +215,7 @@ pub(crate) fn proto_name(p: Proto) -> &'static str {
 
 /// Append a u16-length-prefixed UTF-8 string. Ids are short, well under
 /// u16::MAX; the debug assert guards against a future caller violating that.
-fn put_str(b: &mut Vec<u8>, s: &str) {
+pub(crate) fn put_str(b: &mut Vec<u8>, s: &str) {
     debug_assert!(s.len() <= u16::MAX as usize);
     b.extend_from_slice(&(s.len() as u16).to_be_bytes());
     b.extend_from_slice(s.as_bytes());
@@ -223,7 +223,7 @@ fn put_str(b: &mut Vec<u8>, s: &str) {
 
 /// Read a u16-length-prefixed UTF-8 string at `*at`, advancing the cursor.
 /// Bounds-checks both the length prefix and the body, and validates UTF-8.
-fn take_str(b: &[u8], at: &mut usize) -> Result<String> {
+pub(crate) fn take_str(b: &[u8], at: &mut usize) -> Result<String> {
     if *at + 2 > b.len() {
         return Err("truncated string length".into());
     }

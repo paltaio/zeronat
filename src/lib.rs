@@ -5,6 +5,8 @@ pub mod admin;
 pub mod bridge;
 pub mod client;
 pub mod clientcfg;
+pub mod clientctl;
+pub mod clientproto;
 pub mod config;
 pub mod dgram;
 #[cfg(feature = "dht")]

@@ -13,6 +13,8 @@ use tokio::time::timeout as tokio_timeout;
 use tokio::time::{interval, sleep};
 
 use crate::bridge;
+use crate::clientctl::{ControlPath, ControlState};
+use crate::clientproto::{ClientForwardEntry, SessionMode};
 use crate::dgram::{DgramRx, DgramTx};
 use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT};
 #[cfg(target_os = "linux")]
@@ -321,6 +323,12 @@ impl ActiveTarget {
         s.cancel = Arc::new(Notify::new());
         (s.target.clone(), s.cancel.clone())
     }
+
+    /// Name of the profile the reconnect loop is running (or about to bring
+    /// up). Read-only: takes the lock briefly and never touches the cancel.
+    pub fn active_name(&self) -> String {
+        self.state.lock().unwrap().target.name.clone()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -334,6 +342,7 @@ pub async fn run(
     tun: Option<TunConfig>,
     pppoe: Option<PppoeRunConfig>,
     id_prefix: Option<String>,
+    control: Option<ControlPath>,
 ) -> Result<()> {
     let target = ServerTarget {
         name: server.clone(),
@@ -349,6 +358,7 @@ pub async fn run(
         tun,
         pppoe,
         id_prefix,
+        control,
     )
     .await
 }
@@ -356,7 +366,10 @@ pub async fn run(
 /// Like `run`, but dialing whatever `active` currently points at. A `switch`
 /// tears the in-flight session down and brings the same session body (forwards
 /// control loop, tap/tun, or pppoe) up against the new target, with per-server
-/// backoff and UDP-health state starting fresh.
+/// backoff and UDP-health state starting fresh. When `control` is set and its
+/// path binds (see [`ControlPath::bind`] for the failure policy), an admin
+/// socket serves snapshots for as long as this future runs.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_switchable(
     active: ActiveTarget,
     tcp: Vec<Forward>,
@@ -365,6 +378,7 @@ pub async fn run_switchable(
     tun: Option<TunConfig>,
     pppoe: Option<PppoeRunConfig>,
     id_prefix: Option<String>,
+    control: Option<ControlPath>,
 ) -> Result<()> {
     let client_id = crate::identity::derive_client_id(id_prefix.as_deref());
     let by_port = |fwds: Vec<Forward>| -> HashMap<u16, ForwardTarget> {
@@ -395,6 +409,48 @@ pub async fn run_switchable(
     // Held for the loop's lifetime: the per-attempt datapath borrows these
     // credential bytes across the await, so the config must outlive every attempt.
     let pppoe = pppoe.map(Arc::new);
+
+    // The admin socket lives exactly as long as this future: the guard aborts
+    // the accept loop when the future is dropped, and dropping the listener
+    // inside it removes the socket file.
+    let listener = match control {
+        Some(ctl) => ctl.bind()?,
+        None => None,
+    };
+    let _control = match listener {
+        Some(listener) => {
+            let mode = if pppoe.is_some() {
+                SessionMode::Pppoe
+            } else if tap.is_some() || tun.is_some() {
+                SessionMode::Device
+            } else if !tcp.is_empty() || !udp.is_empty() {
+                SessionMode::Forwards
+            } else {
+                SessionMode::Idle
+            };
+            let mut forwards: Vec<ClientForwardEntry> = Vec::new();
+            for (proto, map) in [(Proto::Tcp, &tcp), (Proto::Udp, &udp)] {
+                for (&port, f) in map {
+                    forwards.push(ClientForwardEntry {
+                        proto,
+                        port,
+                        target: f.target.clone(),
+                        proxy: f.proxy,
+                        idle_secs: f.idle.map(|d| d.as_secs() as u32).unwrap_or(0),
+                    });
+                }
+            }
+            forwards.sort_by_key(|e| (e.proto == Proto::Udp, e.port));
+            crate::elog!("admin socket at {}", listener.path().display());
+            let state = ControlState {
+                active: active.clone(),
+                mode,
+                forwards,
+            };
+            Some(AbortOnDrop(tokio::spawn(listener.serve(state))))
+        }
+        None => None,
+    };
 
     let mut dial: HashMap<String, DialState> = HashMap::new();
 

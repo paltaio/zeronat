@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::{sleep, timeout};
 
+use zeronat::clientproto::{ClientMsg, SessionMode};
 use zeronat::proto::{Msg, Proto, Source};
 use zeronat::server::{ListenerSpec, ServerSettings};
 
@@ -197,6 +198,7 @@ async fn start_tagged_pair(
             None,
             None,
             Some(name.into()),
+            None,
         ));
     }
 
@@ -250,6 +252,7 @@ fn start_tunnel(transport: zeronat::client::Transport) -> Tunnel {
         None,
         None,
         Some("rpi".into()),
+        None,
     ));
 
     Tunnel {
@@ -879,6 +882,7 @@ async fn reconnect_same_id_supersede() {
             None,
             None,
             Some("dup".into()),
+            None,
         ));
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
@@ -890,6 +894,7 @@ async fn reconnect_same_id_supersede() {
             None,
             None,
             Some("dup".into()),
+            None,
         ));
 
         // Wait until at least one client has registered, then prove the map never
@@ -960,6 +965,7 @@ async fn config_autosave_persists_route() {
             None,
             None,
             Some("rpi".into()),
+            None,
         ));
 
         let snap = wait_clients(control, 1).await;
@@ -1046,6 +1052,7 @@ async fn cli_listener_remove_refused() {
             None,
             None,
             Some("rpi".into()),
+            None,
         ));
         wait_clients(control, 1).await;
 
@@ -1100,6 +1107,7 @@ async fn runtime_node_does_not_persist() {
             None,
             None,
             Some("rpi".into()),
+            None,
         ));
 
         let snap = wait_clients(control, 1).await;
@@ -1211,6 +1219,7 @@ async fn run_proxy_header_test(transport: zeronat::client::Transport) {
         None,
         None,
         Some("rpi".into()),
+        None,
     ));
 
     let payload = b"proxied-payload";
@@ -1409,6 +1418,7 @@ async fn proxy_forward_refuses_headerless_open() {
             None,
             None,
             Some("rpi".into()),
+            None,
         ));
 
         // Wait until the fake server has actually seen the ClientHello and
@@ -1481,6 +1491,7 @@ async fn server_switch_moves_session() {
             None,
             None,
             Some("sw".into()),
+            None,
         ));
 
         // Session up against A: traffic round-trips through A's public port.
@@ -1526,6 +1537,7 @@ async fn dropping_client_future_aborts_session() {
             None,
             None,
             Some("drop".into()),
+            None,
         ));
 
         let mut conn = wait_tcp_path(public_tcp).await;
@@ -1539,6 +1551,109 @@ async fn dropping_client_future_aborts_session() {
     timeout(Duration::from_secs(30), body)
         .await
         .expect("dropped client future did not cut the session within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_admin_socket_serves_snapshot() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let local_tcp = free_tcp_port();
+        tokio::spawn(tcp_echo(local_tcp));
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control,
+            vec![public_tcp],
+            vec![],
+        )));
+
+        let dir = temp_config_dir("adminsock");
+        let sock = dir.join("client.sock");
+        tokio::spawn(zeronat::client::run(
+            format!("127.0.0.1:{control}"),
+            SECRET.into(),
+            vec![fwd(public_tcp, local_tcp)],
+            vec![],
+            zeronat::client::Transport::Tcp,
+            None,
+            None,
+            None,
+            Some("adm".into()),
+            Some(zeronat::clientctl::ControlPath::Explicit(sock.clone())),
+        ));
+
+        // The admin socket comes up with the client; retry until the whole
+        // snapshot exchange completes.
+        let psk = zeronat::clientctl::admin_psk();
+        let snap = loop {
+            if let Ok(stream) = tokio::net::UnixStream::connect(&sock).await {
+                if let Ok((mut r, mut w)) = zeronat::noise::client_handshake(stream, &psk).await {
+                    w.send(
+                        &ClientMsg::ClientAdminHello {
+                            version: zeronat::identity::PROTO_VERSION,
+                            mode: 0,
+                        }
+                        .encode(),
+                    )
+                    .await
+                    .unwrap();
+                    let frame = r.recv().await.unwrap();
+                    match ClientMsg::decode(&frame).unwrap() {
+                        ClientMsg::ClientSnapshot(snap) => break snap,
+                        other => panic!("expected client snapshot, got {other:?}"),
+                    }
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(snap.version, zeronat::identity::PROTO_VERSION);
+        assert_eq!(snap.active, format!("127.0.0.1:{control}"));
+        assert_eq!(snap.mode, SessionMode::Forwards);
+        assert_eq!(snap.forwards.len(), 1);
+        let f = &snap.forwards[0];
+        assert_eq!(f.proto, Proto::Tcp);
+        assert_eq!(f.port, public_tcp);
+        assert_eq!(f.target, format!("127.0.0.1:{local_tcp}"));
+        assert!(!f.proxy);
+        assert_eq!(f.idle_secs, 0);
+
+        // Mode 1 carries one mutation and gets a result on the same
+        // connection.
+        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (mut r, mut w) = zeronat::noise::client_handshake(stream, &psk)
+            .await
+            .unwrap();
+        w.send(
+            &ClientMsg::ClientAdminHello {
+                version: zeronat::identity::PROTO_VERSION,
+                mode: 1,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        w.send(
+            &ClientMsg::SelectServer {
+                name: "other".into(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        let frame = r.recv().await.unwrap();
+        match ClientMsg::decode(&frame).unwrap() {
+            ClientMsg::MutationResult { ok, msg } => {
+                assert!(!ok);
+                assert_eq!(msg, "not implemented");
+            }
+            other => panic!("expected mutation result, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(20), body)
+        .await
+        .expect("client admin socket did not answer within 20s");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

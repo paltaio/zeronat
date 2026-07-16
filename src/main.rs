@@ -1062,6 +1062,17 @@ async fn run(cmd: Cmd) -> Result<()> {
             }
             let id_prefix = file.id.clone().or(id_prefix);
 
+            // Admin socket path: the file value when set (that path must
+            // work), else the default under /run/zeronat, falling back to
+            // $XDG_RUNTIME_DIR/zeronat and then to no admin socket at all;
+            // the tunnel never depends on it.
+            let control = match &file.control {
+                Some(path) => Some(zeronat::clientctl::ControlPath::Explicit(
+                    std::path::PathBuf::from(path),
+                )),
+                None => zeronat::clientctl::default_control(),
+            };
+
             let (server, secret, tcp, udp, transport, tap, tun, pppoe) = if declares_shape(&file) {
                 if let Some(v) = &server {
                     zeronat::elog!("config overrides --server '{v}'");
@@ -1298,7 +1309,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 ),
             }
             client::run(
-                server, secret, tcp, udp, transport, tap, tun, pppoe, id_prefix,
+                server, secret, tcp, udp, transport, tap, tun, pppoe, id_prefix, control,
             )
             .await
         }
