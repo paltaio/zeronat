@@ -208,37 +208,19 @@ entryPoints:
           <tr><td>Client disconnected</td><td>Connection refused</td><td>TCP: accepted then closed; UDP: silently dropped</td></tr>
         </tbody>
       </table>
-      <p>Without <code>+proxy</code>, the target sees the source the client dialed from: on a Docker network
-      the bridge gateway, on a plain host the loopback or LAN address. UDP peer
-      addresses are never preserved in per-port mode: the client opens one local socket per public source
-      and there is no PROXY protocol for UDP; <code>--tun</code> preserves real sources when a UDP service
-      needs them. The destination the target sees is the forward's target (<code>127.0.0.1:PORT</code> or
-      the spec's <code>HOST:PORT</code>), not the public listener; with <code>+proxy</code> the header's
-      destination field carries the public listener address and port, so a parsing target recovers it.</p>
-      <p>Relayed bytes are opaque payload: TLS certificates, ALPN, and SNI pass through byte for byte, and
-      the tunnel's Noise encryption is a separate layer invisible to both the public peer and the target.
-      Any close, orderly or not, reaches the far side as a plain EOF on both directions, so software
-      cannot distinguish a clean shutdown from an abort through the relay.</p>
-      <p>A healthy but idle TCP stream survives indefinitely: both relay ends exchange encrypted keepalive
-      probes every half idle window, and the window (default 120s, tunable per forward with
-      <code>+idle=SECS</code>) reaps only a stream whose path has black-holed: no frames at all,
-      probes included, for a full window. For UDP forwards, the server also tracks each public source and
-      forgets it after max(180s, idle + 60s) without an inbound datagram; the next datagram re-establishes
-      the flow through a fresh client-side socket, so the target sees a new source port. Raising
-      <code>+idle</code> extends both the tunnel window and the source lifetime.</p>
-      <p>Public listeners are IPv4-only: <code>--bind</code> takes an IPv4 address. The PROXY v2 header
-      encoding handles IPv6 and IPv4-mapped addresses, but no IPv6 traffic reaches the listeners.</p>
-      <p>Over the UDP transport, each forwarded datagram rides in one tunnel packet with 30 bytes of framing
-      (1 class + 4 tag + 8 nonce + 1 kind + 16 AEAD tag bytes) plus the tunnel packet's own IPv4 and UDP
-      headers (28 bytes); on a 1500-byte path, 1500 - 28 - 30 = 1442, and a larger datagram produces an
-      oversized tunnel packet that fragments or is dropped depending on the path. A WireGuard peer dialing a
-      forwarded UDP port adds 32 bytes of its own framing, so keep the WireGuard interface MTU at 1410 or
-      lower on a 1500-byte path (1442 - 32 = 1410). Over the TCP transport there is no per-datagram limit
-      below 65 KB, but loss on the tunnel path becomes retransmission delay instead of a dropped
-      datagram.</p>
-      <p>While no client is connected, TCP listeners stay bound and keep accepting, closing each connection
-      immediately; a direct service that is down refuses instead, so health checks that distinguish refused
-      from closed see different results. UDP datagrams are silently dropped.</p>
+      <p>With <code>+proxy</code>, the PROXY v2 header carries the real peer and the public listener
+      address, so a parsing target recovers both. There is no PROXY protocol for UDP; when a UDP service
+      needs real peer addresses, use <code>--tun</code>.</p>
+      <p>Both relay ends probe every half idle window, so a healthy idle stream lives until its path goes
+      fully silent, probes included, for a whole window (default 120s, <code>+idle=SECS</code> per
+      forward). <code>+idle</code> also extends the UDP source lifetime; a forgotten source returns
+      through a fresh client socket, so the target sees a new source port.</p>
+      <p>The 1442-byte UDP limit is a 1500-byte path minus IPv4/UDP headers and tunnel framing. A
+      WireGuard peer behind a forwarded port adds 32 more bytes: keep its MTU at 1410 or lower. The TCP
+      transport has no per-datagram limit below 64 KB; loss becomes retransmission delay instead of
+      drops.</p>
+      <p>Health checks: with no client connected, a TCP listener accepts and immediately closes, while a
+      down service refuses.</p>
     </section>
 
     <section id="transport">
