@@ -110,8 +110,8 @@
 
     <section id="overview">
       <h2>Overview</h2>
-      <p>You have a service behind CG-NAT (home or office) and a cheap cloud VM with a public IP. zeronat
-      exposes your local ports through the VM without accounts or third-party services, just a VPS.</p>
+      <p>zeronat exposes ports on a machine behind CG-NAT through a VM with a public IP, without
+      accounts or third-party services.</p>
       <p>The server runs on the public host. The client runs behind NAT, dials out, and holds one control
       connection. Traffic hitting a public port on the server is forwarded to the matching local service on
       the client. Every connection is authenticated and encrypted with Noise (<code>NNpsk0</code>, X25519 +
@@ -135,8 +135,7 @@ ZERONAT_SECRET=somelongsecret zeronat server \
 <span class="c"># On the host behind CG-NAT:</span>
 ZERONAT_SECRET=somelongsecret zeronat client \
   --server &lt;public-ip&gt;:2222 --tcp 443 --tcp 80 --udp 51820</code></pre>
-      <p>The secret can be passed with <code>--secret</code> instead of the env var. Open the control port
-      (2222, both UDP and TCP) on the server's firewall.</p>
+      <p>Open the control port (2222, both UDP and TCP) on the server's firewall.</p>
     </section>
 
     <section id="forwarding">
@@ -240,7 +239,7 @@ entryPoints:
       <p>Multiple clients can connect to one server. A route maps a listener (<code>bind_ip</code>,
       <code>proto</code>, <code>port</code>) to a client id. New connections go to the routed client;
       connections already open on the previous client drain until they close. There is no round-robin,
-      health checking, or failover. The switch is a deliberate config change.</p>
+      health checking, or failover.</p>
       <p>A client id is the <code>--id</code> prefix (default: short hostname) plus a short derived suffix,
       for example <code>rpi-2-ab12</code>.</p>
       <p>Load listeners, routes, and identity from a file with <code>--config</code>:</p>
@@ -261,8 +260,7 @@ proto = "tcp"
 port = 8080
 client = "rpi-2-ab12"</code></pre>
       <p>CLI <code>--tcp</code>/<code>--udp</code> forwards merge with the file's listeners. To change the
-      topology, edit the file and restart the server. A malformed config aborts startup rather than
-      booting half-configured.</p>
+      topology, edit the file and restart the server. A malformed config aborts startup.</p>
     </section>
 
     <section id="clientconfig">
@@ -305,16 +303,15 @@ password_file = "/etc/zeronat/wan.pass"</code></pre>
       exclusive with forwards and PPPoE.</p>
       <p>A file that declares any servers, forwards, PPPoE sessions, or a device is authoritative for
       the whole client shape: the matching CLI flags are ignored, each with a log line. A file that
-      declares none leaves the CLI flags in charge, so an existing command line keeps working next to
-      <code>--config</code>. Scalars apply either way; the file's <code>id</code> overrides
-      <code>--id</code>.</p>
+      declares none leaves the CLI flags in charge. Scalars apply either way; the file's <code>id</code>
+      overrides <code>--id</code>.</p>
       <p>A missing file is a normal first boot. A file that fails to parse is moved aside to
       <code>&lt;name&gt;.corrupt-&lt;timestamp&gt;</code> and the client starts from the command line. A
       file that parses but contradicts itself (an <code>active</code> naming no server, duplicate server
       names, duplicate <code>proto</code>/<code>port</code> forwards, two <code>autostart</code> entries)
-      aborts startup for you to fix in place, as does an unreadable file.</p>
+      aborts startup, as does an unreadable file.</p>
       <p>The file carries the per-server secrets; keep it mode 600. <code>password_file</code> keeps the
-      PPPoE password out of the config itself.</p>
+      PPPoE password out of the config.</p>
     </section>
 
     <section id="admin">
@@ -337,7 +334,7 @@ zeronat client admin spawn-pppoe wan</code></pre>
       can open it drives the client; no secret is needed.</p>
       <p>The console lists the configured server profiles, the active session (mode and, for PPPoE, the
       link phase), and the forwards with their options. Selecting a server tears the current session
-      down and redials it against the new one, with a brief link drop while it switches.
+      down and redials it against the new one, with a brief link drop.
       <code>select-server</code> and forward-option edits persist to the config file when the client
       booted from one; <code>spawn-pppoe</code>/<code>stop-pppoe</code> are runtime-only and do not
       survive a restart.</p>
@@ -355,9 +352,9 @@ ZERONAT_SECRET=s zeronat server --control 2222 --tun --except 22
 
 <span class="c"># Client (behind CG-NAT): local services receive on the same port:</span>
 ZERONAT_SECRET=s zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
-      <p>Every port except the control port routes to the client, including the server's own SSH; keep it
-      reachable with <code>--except &lt;ssh-port&gt;</code> (repeatable). The client needs no NAT: local services
-      receive the traffic on the same port, so they must listen on <code>0.0.0.0</code> or the tunnel address.</p>
+      <p>Forwarded traffic includes the server's own SSH; keep it reachable with
+      <code>--except &lt;ssh-port&gt;</code> (repeatable). The client needs no NAT: local services receive
+      the traffic on the same port and must listen on <code>0.0.0.0</code> or the tunnel address.</p>
       <p>Linux only. The server needs root or <code>CAP_NET_ADMIN</code>, <code>/dev/net/tun</code>, and
       <code>nft</code> or <code>iptables</code> to program the NAT.</p>
     </section>
@@ -377,18 +374,18 @@ pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
       sets the MTU (default 1400). Linux only. Needs <code>CAP_NET_ADMIN</code>: root,
       <code>setcap cap_net_admin+ep zeronat</code>, or Docker
       <code>--cap-add NET_ADMIN --device /dev/net/tun</code> (plus <code>--device /dev/ppp</code> for pppd).</p>
-      <p>The installer can build that bridge for you on netplan or systemd-networkd hosts: pass
+      <p>The installer can build that bridge on netplan or systemd-networkd hosts: pass
       <code>--bridge-nic &lt;iface&gt;</code> (or pick the interface in the wizard) and it creates the bridge,
-      enslaves the NIC, and persists the change so it survives reboot. On a single-NIC server, where the
-      uplink itself must join the bridge, it moves that interface's address onto the bridge and waits for you
-      to confirm you still have access, reverting automatically within ~30s if you do not.</p>
+      enslaves the NIC, and persists the change. On a single-NIC server, where the uplink itself must join
+      the bridge, it moves that interface's address onto the bridge and waits for you to confirm you still
+      have access, reverting within ~30s if you do not.</p>
     </section>
 
     <section id="dht">
       <h2>DHT discovery</h2>
       <p>For a server on a dynamic IP, <code>--server dht</code> publishes its address to the BitTorrent
-      Mainline DHT and the client looks it up. The lookup key is derived from the shared secret, so no extra
-      configuration is needed and the published address is signed and encrypted.</p>
+      Mainline DHT and the client looks it up. The lookup key is derived from the shared secret; the
+      published address is signed and encrypted.</p>
 <pre><code><span class="c"># Server publishes its address; IP is auto-detected from the DHT:</span>
 ZERONAT_SECRET=s zeronat server --server dht --tcp 443
 
