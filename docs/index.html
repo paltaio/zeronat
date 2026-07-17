@@ -334,7 +334,8 @@ password_file = "/etc/zeronat/wan.pass"</code></pre>
       <p>Each <code>[[servers]]</code> entry is a named profile with its own address, secret, and
       <code>transport</code>; <code>[client].active</code> picks the one to dial (default: the first).
       <code>[[forwards]]</code> entries take the same options as the CLI specs: <code>proxy</code> is
-      TCP-only, <code>idle</code> is whole seconds. A <code>[[pppoe]]</code> entry names a session that
+      TCP-only, <code>idle</code> is whole seconds. <code>enabled = false</code> keeps a forward in the
+      config but stops serving it (default true). A <code>[[pppoe]]</code> entry names a session that
       can be spawned at runtime; one may set <code>autostart = true</code> to dial at boot when no
       forwards are declared. <code>[tap]</code> or <code>[tun]</code> declares a device mode instead,
       exclusive with forwards and PPPoE.</p>
@@ -365,22 +366,36 @@ docker exec -it zeronat /zeronat admin --server &lt;public-ip&gt;:2222 show</cod
 <pre class="v-cli"><code>zeronat client admin                       <span class="c"># interactive console on a terminal</span>
 zeronat client admin show                  <span class="c"># print status and exit</span>
 zeronat client admin select-server backup
+zeronat client admin disable-forward tcp:443
+zeronat client admin add-server backup2 203.0.113.9:2222   <span class="c"># secret from stdin</span>
 zeronat client admin spawn-pppoe wan</code></pre>
 <pre class="v-docker"><code>docker exec -it zeronat /zeronat client admin           <span class="c"># interactive console</span>
 docker exec -it zeronat /zeronat client admin show      <span class="c"># print status and exit</span>
 docker exec -it zeronat /zeronat client admin select-server backup
+docker exec -it zeronat /zeronat client admin disable-forward tcp:443
+docker exec -it zeronat /zeronat client admin add-server backup2 203.0.113.9:2222
 docker exec -it zeronat /zeronat client admin spawn-pppoe wan</code></pre>
       <p>The socket is <code>/run/zeronat/client.sock</code>, or
       <code>$XDG_RUNTIME_DIR/zeronat/client.sock</code> when the client cannot create
       <code>/run/zeronat</code>; <code>--socket</code> overrides it and <code>[client].control</code>
       pins it. Access control is the filesystem: the socket is mode 600 in a 700 directory, so whoever
       can open it drives the client; no secret is needed.</p>
-      <p>The console lists the configured server profiles, the active session (mode and, for PPPoE, the
-      link phase), and the forwards with their options. Selecting a server tears the current session
-      down and redials it against the new one, with a brief link drop.
-      <code>select-server</code> and forward-option edits persist to the config file when the client
-      booted from one; <code>spawn-pppoe</code>/<code>stop-pppoe</code> are runtime-only and do not
-      survive a restart.</p>
+      <p>The console lists the configured server profiles with the link state on the active one, the
+      active session (mode and, for PPPoE, the link phase), and the forwards with their options.
+      Selecting a server tears the current session down and redials it against the new one, with a
+      brief link drop. <code>select-server</code>, server-list edits, and forward edits persist to the
+      config file when the client booted from one; <code>spawn-pppoe</code>/<code>stop-pppoe</code> are
+      runtime-only and do not survive a restart.</p>
+      <p><code>add-server</code> and <code>remove-server</code> edit the server list on a running
+      client. The secret is read from stdin, prompted with echo off on a terminal, never taken on the
+      command line. Removing the active profile is refused; select another first.
+      <code>enable-forward</code> and <code>disable-forward</code> flip one forward without removing
+      it: a disabled forward stays in the config and the status listing but refuses connections until
+      re-enabled.</p>
+      <p><code>disconnect</code> parks the client offline: the session tears down, nothing is dialed,
+      and only the admin socket stays up. <code>connect</code> brings the boot-declared session back,
+      optionally naming another server, and reports the resulting mode. Offline is never persisted; a
+      restarted client serves what the file declares.</p>
     </section>
 
     <section id="allports">
@@ -533,6 +548,12 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
         <tbody>
           <tr><td><code>show</code></td><td>Print the running client's status (default command)</td></tr>
           <tr><td><code>select-server &lt;NAME&gt;</code></td><td>Switch the active server profile</td></tr>
+          <tr><td><code>add-server &lt;NAME&gt; &lt;ADDR&gt;</code></td><td>Add a server profile, secret from stdin; <code>--transport auto|udp|tcp</code></td></tr>
+          <tr><td><code>remove-server &lt;NAME&gt;</code></td><td>Remove a server profile; the active one is refused</td></tr>
+          <tr><td><code>enable-forward &lt;PROTO:PORT&gt;</code></td><td>Enable a forward, e.g. <code>tcp:443</code></td></tr>
+          <tr><td><code>disable-forward &lt;PROTO:PORT&gt;</code></td><td>Disable a forward without removing it</td></tr>
+          <tr><td><code>connect [NAME]</code></td><td>Leave offline mode and bring up the boot session</td></tr>
+          <tr><td><code>disconnect</code></td><td>Tear the session down; nothing dials until <code>connect</code></td></tr>
           <tr><td><code>spawn-pppoe &lt;NAME&gt;</code></td><td>Bring up the named PPPoE session</td></tr>
           <tr><td><code>stop-pppoe &lt;NAME&gt;</code></td><td>Stop the named PPPoE session and return to the base mode</td></tr>
           <tr><td><code>--socket &lt;PATH&gt;</code></td><td>Admin socket path</td></tr>
