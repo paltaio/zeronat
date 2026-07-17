@@ -84,6 +84,13 @@ client admin options:
                       status and exits when piped or redirected
   show                Print the running client's status and exit
   select-server <NAME> Switch the active server profile
+  add-server <NAME> <ADDR> [--transport auto|udp|tcp]
+                      Add a server profile; the secret is read from stdin
+  remove-server <NAME> Remove a server profile (the active one is refused)
+  enable-forward <PROTO:PORT>  Enable a forward, e.g. tcp:443
+  disable-forward <PROTO:PORT> Disable a forward without removing it
+  connect [NAME]      Leave offline mode and bring up the boot session body
+  disconnect          Tear the session down; nothing dials until connect
   spawn-pppoe <NAME>  Bring up the named PPPoE session
   stop-pppoe <NAME>   Stop the named PPPoE session and return to the base mode
   --socket <PATH>     Admin socket path (default: /run/zeronat/client.sock,
@@ -165,6 +172,16 @@ enum Cmd {
 enum ClientAdminCmd {
     Show,
     SelectServer(String),
+    AddServer {
+        name: String,
+        addr: String,
+        transport: client::Transport,
+    },
+    RemoveServer(String),
+    EnableForward(String),
+    DisableForward(String),
+    Connect(Option<String>),
+    Disconnect,
     SpawnPppoe(String),
     StopPppoe(String),
 }
@@ -190,6 +207,16 @@ fn onoff(b: bool) -> &'static str {
         "on"
     } else {
         "off"
+    }
+}
+
+/// `--transport` value to transport mode; `None` means auto.
+fn parse_transport(v: Option<&str>) -> Result<client::Transport> {
+    match v.unwrap_or("auto") {
+        "auto" => Ok(client::Transport::Auto),
+        "udp" => Ok(client::Transport::Udp),
+        "tcp" => Ok(client::Transport::Tcp),
+        other => Err(format!("invalid --transport '{other}' (expected auto|udp|tcp)").into()),
     }
 }
 
@@ -403,8 +430,9 @@ fn parse_args() -> Result<Cmd> {
     if client_admin {
         iter.next();
         let mut command: Option<String> = None;
-        let mut name: Option<String> = None;
+        let mut pos: Vec<String> = Vec::new();
         let mut socket: Option<std::path::PathBuf> = None;
+        let mut transport: Option<String> = None;
 
         while let Some(flag) = iter.next() {
             match flag.as_str() {
@@ -415,6 +443,9 @@ fn parse_args() -> Result<Cmd> {
                 "--socket" => {
                     socket = Some(iter.next().ok_or("--socket requires a value")?.into());
                 }
+                "--transport" => {
+                    transport = Some(iter.next().ok_or("--transport requires a value")?);
+                }
                 other if other.starts_with('-') => {
                     eprintln!("error: unknown flag '{other}'");
                     std::process::exit(1);
@@ -422,33 +453,62 @@ fn parse_args() -> Result<Cmd> {
                 other => {
                     if command.is_none() {
                         command = Some(other.to_string());
-                    } else if name.is_none() {
-                        name = Some(other.to_string());
                     } else {
-                        return Err(format!("unexpected argument '{other}'").into());
+                        pos.push(other.to_string());
                     }
                 }
             }
         }
+        if transport.is_some() && command.as_deref() != Some("add-server") {
+            return Err("--transport only applies to add-server".into());
+        }
 
-        let named = |name: Option<String>, cmd: &str| -> Result<String> {
-            name.ok_or_else(|| format!("{cmd} requires a name").into())
+        let mut pos = pos.into_iter();
+        let named = |pos: &mut std::vec::IntoIter<String>, cmd: &str| -> Result<String> {
+            pos.next()
+                .ok_or_else(|| format!("{cmd} requires a name").into())
         };
         let command = match command.as_deref() {
             None => None,
-            Some("show") => {
-                if let Some(name) = name {
-                    return Err(format!("unexpected argument '{name}'").into());
-                }
-                Some(ClientAdminCmd::Show)
+            Some("show") => Some(ClientAdminCmd::Show),
+            Some("select-server") => Some(ClientAdminCmd::SelectServer(named(
+                &mut pos,
+                "select-server",
+            )?)),
+            Some("add-server") => {
+                let name = named(&mut pos, "add-server")?;
+                let addr = pos
+                    .next()
+                    .ok_or("add-server requires a name and an address")?;
+                Some(ClientAdminCmd::AddServer {
+                    name,
+                    addr,
+                    transport: parse_transport(transport.as_deref())?,
+                })
             }
-            Some("select-server") => {
-                Some(ClientAdminCmd::SelectServer(named(name, "select-server")?))
+            Some("remove-server") => Some(ClientAdminCmd::RemoveServer(named(
+                &mut pos,
+                "remove-server",
+            )?)),
+            Some("enable-forward") => Some(ClientAdminCmd::EnableForward(named(
+                &mut pos,
+                "enable-forward",
+            )?)),
+            Some("disable-forward") => Some(ClientAdminCmd::DisableForward(named(
+                &mut pos,
+                "disable-forward",
+            )?)),
+            Some("connect") => Some(ClientAdminCmd::Connect(pos.next())),
+            Some("disconnect") => Some(ClientAdminCmd::Disconnect),
+            Some("spawn-pppoe") => {
+                Some(ClientAdminCmd::SpawnPppoe(named(&mut pos, "spawn-pppoe")?))
             }
-            Some("spawn-pppoe") => Some(ClientAdminCmd::SpawnPppoe(named(name, "spawn-pppoe")?)),
-            Some("stop-pppoe") => Some(ClientAdminCmd::StopPppoe(named(name, "stop-pppoe")?)),
+            Some("stop-pppoe") => Some(ClientAdminCmd::StopPppoe(named(&mut pos, "stop-pppoe")?)),
             Some(other) => return Err(format!("unknown client admin command '{other}'").into()),
         };
+        if let Some(extra) = pos.next() {
+            return Err(format!("unexpected argument '{extra}'").into());
+        }
 
         let interactive = command.is_none() && interactive_default();
         return Ok(Cmd::ClientAdmin {
@@ -1394,17 +1454,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                     .iter()
                     .map(|s| parse_forward(s, Proto::Udp))
                     .collect::<Result<Vec<_>>>()?;
-                let transport = match transport.as_deref().unwrap_or("auto") {
-                    "auto" => client::Transport::Auto,
-                    "udp" => client::Transport::Udp,
-                    "tcp" => client::Transport::Tcp,
-                    other => {
-                        return Err(format!(
-                            "invalid --transport '{other}' (expected auto|udp|tcp)"
-                        )
-                        .into())
-                    }
-                };
+                let transport = parse_transport(transport.as_deref())?;
                 let v = env!("CARGO_PKG_VERSION");
                 let tl = transport_label(transport);
                 match &pppoe {
@@ -1439,6 +1489,22 @@ async fn run(cmd: Cmd) -> Result<()> {
                 Some(ClientAdminCmd::SelectServer(name)) => {
                     client_admin::select_server(socket, name).await
                 }
+                Some(ClientAdminCmd::AddServer {
+                    name,
+                    addr,
+                    transport,
+                }) => client_admin::add_server(socket, name, addr, transport).await,
+                Some(ClientAdminCmd::RemoveServer(name)) => {
+                    client_admin::remove_server(socket, name).await
+                }
+                Some(ClientAdminCmd::EnableForward(spec)) => {
+                    client_admin::set_forward_enabled(socket, &spec, true).await
+                }
+                Some(ClientAdminCmd::DisableForward(spec)) => {
+                    client_admin::set_forward_enabled(socket, &spec, false).await
+                }
+                Some(ClientAdminCmd::Connect(name)) => client_admin::connect(socket, name).await,
+                Some(ClientAdminCmd::Disconnect) => client_admin::disconnect(socket).await,
                 Some(ClientAdminCmd::SpawnPppoe(name)) => {
                     client_admin::spawn_pppoe(socket, name).await
                 }

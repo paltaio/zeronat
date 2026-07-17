@@ -327,9 +327,9 @@ mod pty {
             .build()
             .expect("driver runtime");
         rt.block_on(async {
-            timeout(Duration::from_secs(180), scenario())
+            timeout(Duration::from_secs(240), scenario())
                 .await
-                .expect("console pty scenario did not complete within 180s");
+                .expect("console pty scenario did not complete within 240s");
         });
     }
 
@@ -452,12 +452,13 @@ mod pty {
         );
 
         // Rows: home(0), away(1), tcp forward(2), udp forward(3). Open the
-        // tcp forward's option editor and flip proxy on, idle 600.
+        // tcp forward's option editor and flip proxy on, idle 600. The form
+        // leads with the enabled toggle, so proxy is one tab in.
         send(&mut master, b"\x1b[B\x1b[B\r");
         wait_screen(&out, "the forward editor", 10, |s| {
             row_containing(s, &format!("edit forward  tcp:{public_tcp}")).is_some()
         });
-        send(&mut master, b" "); // toggle proxy on
+        send(&mut master, b"\t "); // to proxy, toggle on
         wait_screen(&out, "proxy toggled on", 10, |s| {
             row_containing(s, "proxy").is_some_and(|r| r.contains(" on "))
         });
@@ -525,7 +526,7 @@ mod pty {
         wait_screen(&out, "the udp forward editor", 10, |s| {
             row_containing(s, &format!("edit forward  udp:{public_udp}")).is_some()
         });
-        send(&mut master, b" \r");
+        send(&mut master, b"\t \r");
         wait_screen(&out, "the refusal toast", 10, |s| {
             row_containing(s, "is not supported on udp forwards").is_some()
         });
@@ -543,7 +544,7 @@ mod pty {
         wait_screen(&out, "the tcp editor again", 10, |s| {
             row_containing(s, &format!("edit forward  tcp:{public_tcp}")).is_some()
         });
-        send(&mut master, b"\t\x7f\x7f\x7f\r");
+        send(&mut master, b"\t\t\x7f\x7f\x7f\r");
         wait_screen(&out, "the cleared-idle toast", 10, |s| {
             row_containing(s, &format!("set tcp:{public_tcp} +proxy"))
                 .is_some_and(|r| !r.contains("idle"))
@@ -564,6 +565,89 @@ mod pty {
             .expect("tcp forward on disk");
         assert!(entry.proxy);
         assert_eq!(entry.idle, None);
+
+        // Space on a forward row is the enable toggle: the udp forward goes
+        // off in the daemon and on disk, and its row gains the off marker.
+        send(&mut master, b"\x1b[B "); // down to the udp row, toggle
+        wait_screen(&out, "the disable toast", 10, |s| {
+            row_containing(s, &format!("disabled udp:{public_udp}")).is_some()
+        });
+        let snap = snapshot(&sock).await;
+        let f = snap
+            .forwards
+            .iter()
+            .find(|f| f.proto == Proto::Udp && f.port == public_udp)
+            .expect("udp forward in snapshot");
+        assert!(!f.enabled, "the toggle must disable the forward");
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        let entry = on_disk
+            .forwards
+            .iter()
+            .find(|f| f.proto == Proto::Udp && f.port == public_udp)
+            .expect("udp forward on disk");
+        assert!(!entry.enabled);
+        wait_screen(&out, "the off marker", 10, |s| {
+            row_containing(s, &format!("-> 127.0.0.1:{local_udp}"))
+                .is_some_and(|r| r.contains(" off"))
+        });
+
+        // Space again re-enables; the full-state frame preserved the options.
+        send(&mut master, b" ");
+        wait_screen(&out, "the enable toast", 10, |s| {
+            row_containing(s, &format!("enabled udp:{public_udp}")).is_some()
+        });
+        let snap = snapshot(&sock).await;
+        let f = snap
+            .forwards
+            .iter()
+            .find(|f| f.proto == Proto::Udp && f.port == public_udp)
+            .expect("udp forward in snapshot");
+        assert!(f.enabled);
+
+        // The add-server form masks the secret: one * per typed character,
+        // and the typed text never reaches the screen.
+        send(&mut master, b"a");
+        wait_screen(&out, "the add-server form", 10, |s| {
+            row_containing(s, "add server").is_some()
+        });
+        send(&mut master, b"\t\t\thunter2"); // to the secret field, type
+        wait_screen(&out, "the masked secret", 10, |s| {
+            row_containing(s, "*******").is_some()
+        });
+        let screen = out.screen();
+        assert!(
+            row_containing(&screen, "hunter2").is_none(),
+            "secret text leaked to the screen"
+        );
+        send(&mut master, b"\x1b");
+        wait_screen(&out, "the form closed", 10, |s| {
+            row_containing(s, "add server").is_none()
+        });
+
+        // d confirms and parks the client offline: the mode row flips, the
+        // daemon reports it, and the active row's link goes offline.
+        send(&mut master, b"d");
+        wait_screen(&out, "the disconnect confirm", 10, |s| {
+            row_containing(s, "disconnect and stay offline").is_some()
+        });
+        send(&mut master, b"y");
+        wait_screen(&out, "the offline mode", 15, |s| {
+            row_containing(s, "mode").is_some_and(|r| r.contains("offline"))
+        });
+        let snap = snapshot(&sock).await;
+        assert_eq!(snap.mode, zeronat::clientproto::SessionMode::Offline);
+
+        // c is the park's exit: the boot-derived forwards body comes back and
+        // the tunnel really redials, shown by the link on the active row.
+        send(&mut master, b"c");
+        wait_screen(&out, "the forwards mode again", 15, |s| {
+            row_containing(s, "mode").is_some_and(|r| r.contains("forwards"))
+        });
+        wait_screen(&out, "the reconnected link", 30, |s| {
+            row_containing(s, "● active").is_some_and(|r| r.contains("connected"))
+        });
+        let snap = snapshot(&sock).await;
+        assert_eq!(snap.mode, zeronat::clientproto::SessionMode::Forwards);
 
         // Quit cleanly.
         send(&mut master, b"q");

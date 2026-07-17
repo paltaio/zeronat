@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use crate::client::Transport;
 use crate::client_admin;
 use crate::clientproto::{
-    ClientForwardEntry, ClientMsg, ClientServerEntry, ClientSnapshotBody, PppPhase, SessionMode,
+    ClientForwardEntry, ClientMsg, ClientServerEntry, ClientSnapshotBody, LinkStatus, PppPhase,
+    ServerSecret, SessionMode,
 };
 use crate::proto::{proto_name, Proto};
 use crate::Result;
@@ -90,8 +91,7 @@ enum Overlay {
         name: String,
     },
     /// Full option state for one forward; submit always sends every field.
-    /// `enabled` is carried from the row's snapshot state so the full-state
-    /// frame preserves it; the form edits only `proxy` and `idle`.
+    /// Fields in form order: enabled, proxy, idle.
     FwdForm {
         proto: Proto,
         port: u16,
@@ -100,6 +100,21 @@ enum Overlay {
         idle: String,
         field: u8,
     },
+    /// The add-server form. The secret lives only here and renders masked;
+    /// no toast or error ever echoes it.
+    AddServer {
+        name: String,
+        addr: String,
+        transport: Transport,
+        secret: String,
+        field: u8,
+    },
+    /// Removing a profile is a config edit; it needs a deliberate yes.
+    ConfirmRemove {
+        name: String,
+    },
+    /// Disconnecting parks the client offline; it needs a deliberate yes.
+    ConfirmDisconnect,
     PppoePicker {
         names: Vec<String>,
         sel: usize,
@@ -204,6 +219,9 @@ impl App {
             Overlay::None => self.on_key_normal(k).await,
             Overlay::ConfirmSelect { .. } => self.on_key_confirm_select(k).await,
             Overlay::FwdForm { .. } => self.on_key_form(k).await,
+            Overlay::AddServer { .. } => self.on_key_add_server(k).await,
+            Overlay::ConfirmRemove { .. } => self.on_key_confirm_remove(k).await,
+            Overlay::ConfirmDisconnect => self.on_key_confirm_disconnect(k).await,
             Overlay::PppoePicker { .. } => self.on_key_picker(k).await,
             Overlay::ConfirmStop { .. } => self.on_key_confirm_stop(k).await,
         }
@@ -248,6 +266,56 @@ impl App {
                     };
                 }
             }
+            Key::Char('a') => {
+                self.overlay = Overlay::AddServer {
+                    name: String::new(),
+                    addr: String::new(),
+                    transport: Transport::Auto,
+                    secret: String::new(),
+                    field: 0,
+                };
+            }
+            Key::Char('x') => {
+                let servers = self.servers();
+                if let Some(s) = servers.get(self.sel) {
+                    self.overlay = Overlay::ConfirmRemove {
+                        name: s.name.clone(),
+                    };
+                }
+            }
+            Key::Char(' ') => {
+                let servers = self.servers();
+                if self.sel >= servers.len() {
+                    if let Some(f) = self.forwards().get(self.sel - servers.len()) {
+                        // Full-state replace: the row's own snapshot state
+                        // supplies proxy/idle, only the flag flips.
+                        let req = ClientMsg::SetForwardOptions {
+                            proto: f.proto,
+                            port: f.port,
+                            enabled: !f.enabled,
+                            proxy: f.proxy,
+                            idle_secs: f.idle_secs,
+                        };
+                        let verb = if f.enabled { "disabled" } else { "enabled" };
+                        let msg = format!("{verb} {}:{}", proto_name(f.proto), f.port);
+                        self.apply(req, msg).await;
+                    }
+                }
+            }
+            // Connect is the offline park's exit; while anything else runs,
+            // select-server is the retarget verb and the key does nothing.
+            Key::Char('c') if self.mode() == Some(SessionMode::Offline) => {
+                self.apply(
+                    ClientMsg::Connect {
+                        name: String::new(),
+                    },
+                    "connecting: bringing up the boot session body".to_string(),
+                )
+                .await;
+            }
+            Key::Char('d') if self.mode().is_some_and(|m| m != SessionMode::Offline) => {
+                self.overlay = Overlay::ConfirmDisconnect;
+            }
             Key::Char('p') => {
                 let names = self
                     .snap
@@ -268,6 +336,10 @@ impl App {
             _ => {}
         }
         Flow::Continue
+    }
+
+    fn mode(&self) -> Option<SessionMode> {
+        self.snap.as_ref().map(|s| s.mode)
     }
 
     /// Name of the live pppoe session body, when there is one to stop.
@@ -303,28 +375,41 @@ impl App {
     async fn on_key_form(&mut self, k: Key) -> Flow {
         match k {
             Key::Esc => self.overlay = Overlay::None,
-            Key::Tab | Key::Up | Key::Down => {
+            Key::Tab | Key::Down => {
                 if let Overlay::FwdForm { field, .. } = &mut self.overlay {
-                    *field = (*field + 1) % 2;
+                    *field = (*field + 1) % 3;
+                }
+            }
+            Key::Up => {
+                if let Overlay::FwdForm { field, .. } = &mut self.overlay {
+                    *field = (*field + 2) % 3;
                 }
             }
             Key::Left | Key::Right | Key::Char(' ') => {
-                if let Overlay::FwdForm { field, proxy, .. } = &mut self.overlay {
-                    if *field == 0 {
-                        *proxy = !*proxy;
+                if let Overlay::FwdForm {
+                    field,
+                    enabled,
+                    proxy,
+                    ..
+                } = &mut self.overlay
+                {
+                    match field {
+                        0 => *enabled = !*enabled,
+                        1 => *proxy = !*proxy,
+                        _ => {}
                     }
                 }
             }
             Key::Backspace => {
                 if let Overlay::FwdForm { field, idle, .. } = &mut self.overlay {
-                    if *field == 1 {
+                    if *field == 2 {
                         idle.pop();
                     }
                 }
             }
             Key::Char(c) if c.is_ascii_digit() => {
                 if let Overlay::FwdForm { field, idle, .. } = &mut self.overlay {
-                    if *field == 1 && idle.len() < 9 {
+                    if *field == 2 && idle.len() < 9 {
                         idle.push(c);
                     }
                 }
@@ -363,12 +448,160 @@ impl App {
         self.apply(
             req,
             format!(
-                "set {}:{port} {}",
+                "set {}:{port} {}{}",
                 proto_name(proto),
-                crate::admin::fwd_opts(proxy, idle_secs)
+                crate::admin::fwd_opts(proxy, idle_secs),
+                if enabled { "" } else { "  off" }
             ),
         )
         .await;
+        Flow::Continue
+    }
+
+    async fn on_key_add_server(&mut self, k: Key) -> Flow {
+        match k {
+            Key::Esc => self.overlay = Overlay::None,
+            Key::Tab | Key::Down => {
+                if let Overlay::AddServer { field, .. } = &mut self.overlay {
+                    *field = (*field + 1) % 4;
+                }
+            }
+            Key::Up => {
+                if let Overlay::AddServer { field, .. } = &mut self.overlay {
+                    *field = (*field + 3) % 4;
+                }
+            }
+            Key::Left => {
+                if let Overlay::AddServer {
+                    field, transport, ..
+                } = &mut self.overlay
+                {
+                    if *field == 2 {
+                        *transport = match transport {
+                            Transport::Auto => Transport::Tcp,
+                            Transport::Udp => Transport::Auto,
+                            Transport::Tcp => Transport::Udp,
+                        };
+                    }
+                }
+            }
+            Key::Right => {
+                if let Overlay::AddServer {
+                    field, transport, ..
+                } = &mut self.overlay
+                {
+                    if *field == 2 {
+                        *transport = match transport {
+                            Transport::Auto => Transport::Udp,
+                            Transport::Udp => Transport::Tcp,
+                            Transport::Tcp => Transport::Auto,
+                        };
+                    }
+                }
+            }
+            Key::Backspace => {
+                if let Overlay::AddServer {
+                    field,
+                    name,
+                    addr,
+                    secret,
+                    ..
+                } = &mut self.overlay
+                {
+                    match field {
+                        0 => {
+                            name.pop();
+                        }
+                        1 => {
+                            addr.pop();
+                        }
+                        3 => {
+                            secret.pop();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // The daemon refuses control characters; keeping them out of the
+            // form spares a doomed round trip.
+            Key::Char(c) if !c.is_control() => {
+                if let Overlay::AddServer {
+                    field,
+                    name,
+                    addr,
+                    secret,
+                    ..
+                } = &mut self.overlay
+                {
+                    match field {
+                        0 => name.push(c),
+                        1 => addr.push(c),
+                        3 => secret.push(c),
+                        _ => {}
+                    }
+                }
+            }
+            Key::Enter => return self.submit_add_server().await,
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    async fn submit_add_server(&mut self) -> Flow {
+        let (name, addr, transport, secret) = match &self.overlay {
+            Overlay::AddServer {
+                name,
+                addr,
+                transport,
+                secret,
+                ..
+            } => (name.clone(), addr.clone(), *transport, secret.clone()),
+            _ => return Flow::Continue,
+        };
+        self.overlay = Overlay::None;
+        // The ok toast names the profile only; the secret is never echoed.
+        let req = ClientMsg::AddServer {
+            name: name.clone(),
+            addr,
+            secret: ServerSecret(secret),
+            transport,
+        };
+        self.apply(req, format!("added {name}")).await;
+        Flow::Continue
+    }
+
+    async fn on_key_confirm_remove(&mut self, k: Key) -> Flow {
+        match k {
+            Key::Char('y') | Key::Enter => {
+                if let Overlay::ConfirmRemove { name } = &self.overlay {
+                    let name = name.clone();
+                    self.overlay = Overlay::None;
+                    self.apply(
+                        ClientMsg::RemoveServer { name: name.clone() },
+                        format!("removed {name}"),
+                    )
+                    .await;
+                }
+            }
+            Key::Char('n') | Key::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    async fn on_key_confirm_disconnect(&mut self, k: Key) -> Flow {
+        match k {
+            Key::Char('y') | Key::Enter => {
+                self.overlay = Overlay::None;
+                self.apply(
+                    ClientMsg::Disconnect,
+                    "disconnected: nothing dials until connect".to_string(),
+                )
+                .await;
+            }
+            Key::Char('n') | Key::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
         Flow::Continue
     }
 
@@ -527,8 +760,12 @@ impl App {
         if is_active {
             l.add(GOOD, "● active");
             // Reachability renders only on this row: the client never probes
-            // a server it is not dialing. Only a pppoe body reports a phase.
+            // a server it is not dialing. The link is the tunnel dial itself;
+            // only a pppoe body also reports a PPP phase.
             if let Some(snap) = &self.snap {
+                let (txt, style) = link_status_view(snap.link);
+                l.add(MUTED, "  ");
+                l.add(style, txt);
                 if snap.mode == SessionMode::Pppoe {
                     let (txt, style) = phase_view(snap.phase);
                     l.add(MUTED, "  ");
@@ -592,6 +829,9 @@ impl App {
             MUTED,
             &format!("  {}", crate::admin::fwd_opts(f.proxy, f.idle_secs)),
         );
+        if !f.enabled {
+            l.add(BAD, "  off");
+        }
         l
     }
 
@@ -616,10 +856,20 @@ impl App {
                 hint(&mut l, "↑↓", "move");
                 if self.item_count() > 0 {
                     if self.sel < server_count {
-                        hint(&mut l, "⏎", "select server");
+                        hint(&mut l, "⏎", "select");
+                        hint(&mut l, "x", "remove");
                     } else {
-                        hint(&mut l, "⏎", "edit forward");
+                        hint(&mut l, "⏎", "edit");
+                        hint(&mut l, "␣", "toggle");
                     }
+                }
+                hint(&mut l, "a", "add");
+                // Connect is offered only while offline; disconnect while
+                // anything (a body or the idle dial) is up.
+                match self.mode() {
+                    Some(SessionMode::Offline) => hint(&mut l, "c", "connect"),
+                    Some(_) => hint(&mut l, "d", "disconnect"),
+                    None => {}
                 }
                 if self.snap.as_ref().is_some_and(|s| !s.pppoe.is_empty()) {
                     hint(&mut l, "p", "pppoe");
@@ -636,12 +886,21 @@ impl App {
                 hint(&mut l, "⏎", "apply");
                 hint(&mut l, "esc", "cancel");
             }
+            Overlay::AddServer { .. } => {
+                hint(&mut l, "tab", "field");
+                hint(&mut l, "←→", "transport");
+                hint(&mut l, "⏎", "add");
+                hint(&mut l, "esc", "cancel");
+            }
             Overlay::PppoePicker { .. } => {
                 hint(&mut l, "↑↓", "choose");
                 hint(&mut l, "⏎", "spawn");
                 hint(&mut l, "esc", "cancel");
             }
-            Overlay::ConfirmSelect { .. } | Overlay::ConfirmStop { .. } => {
+            Overlay::ConfirmSelect { .. }
+            | Overlay::ConfirmRemove { .. }
+            | Overlay::ConfirmDisconnect
+            | Overlay::ConfirmStop { .. } => {
                 hint(&mut l, "y", "confirm");
                 hint(&mut l, "n", "cancel");
             }
@@ -670,7 +929,7 @@ impl App {
             Overlay::FwdForm {
                 proto,
                 port,
-                enabled: _,
+                enabled,
                 proxy,
                 idle,
                 field,
@@ -680,12 +939,61 @@ impl App {
                     w,
                     &format!("edit forward  {}:{}", proto_name(*proto), port),
                 ));
-                p.push(frame::row(w, form_bool("proxy", *proxy, *field == 0)));
-                p.push(frame::row(w, form_text("idle", idle, *field == 1)));
+                p.push(frame::row(w, form_bool("enabled", *enabled, *field == 0)));
+                p.push(frame::row(w, form_bool("proxy", *proxy, *field == 1)));
+                p.push(frame::row(w, form_text("idle", idle, *field == 2)));
                 p.push(frame::row(
                     w,
                     muted_line("  idle in seconds; empty clears the override"),
                 ));
+                p.push(frame::divider(w));
+                p
+            }
+            Overlay::AddServer {
+                name,
+                addr,
+                transport,
+                secret,
+                field,
+            } => {
+                let mut p = vec![frame::divider(w)];
+                p.push(frame::panel_title(w, "add server"));
+                p.push(frame::row(w, form_text("name", name, *field == 0)));
+                p.push(frame::row(w, form_text("addr", addr, *field == 1)));
+                p.push(frame::row(
+                    w,
+                    form_pick("transport", transport_label(*transport), *field == 2),
+                ));
+                // One * per typed character; the secret itself never renders.
+                p.push(frame::row(
+                    w,
+                    form_text("secret", &"*".repeat(secret.chars().count()), *field == 3),
+                ));
+                p.push(frame::row(
+                    w,
+                    muted_line("  addr is \"dht\" or host:port; the secret is sent, never shown"),
+                ));
+                p.push(frame::divider(w));
+                p
+            }
+            Overlay::ConfirmRemove { name } => {
+                let mut p = vec![frame::divider(w)];
+                p.push(frame::panel_title(w, "confirm"));
+                let mut l = Line::new();
+                l.add(
+                    WARN,
+                    &format!("remove server {} from the config?", sanitize(name)),
+                );
+                p.push(frame::row_center(w, l));
+                p.push(frame::divider(w));
+                p
+            }
+            Overlay::ConfirmDisconnect => {
+                let mut p = vec![frame::divider(w)];
+                p.push(frame::panel_title(w, "confirm"));
+                let mut l = Line::new();
+                l.add(WARN, "disconnect and stay offline until connect?");
+                p.push(frame::row_center(w, l));
                 p.push(frame::divider(w));
                 p
             }
@@ -773,6 +1081,17 @@ fn phase_view(p: PppPhase) -> (&'static str, Style) {
     }
 }
 
+/// The tunnel dial toward the active server, rendered on its row. Distinct
+/// from [`link_view`], which folds the PPP layer of a pppoe body.
+fn link_status_view(l: LinkStatus) -> (&'static str, Style) {
+    match l {
+        LinkStatus::Offline => ("offline", MUTED),
+        LinkStatus::Dialing => ("dialing", WARN),
+        LinkStatus::Connected => ("connected", GOOD),
+        LinkStatus::Backoff => ("backoff", BAD),
+    }
+}
+
 /// The PPP link, folded to up/down for the sessions panel.
 fn link_view(p: PppPhase) -> (&'static str, Style) {
     match p {
@@ -817,7 +1136,7 @@ fn muted_line(text: &str) -> Line {
 fn form_bool(label: &str, value: bool, focused: bool) -> Line {
     let mut l = Line::new();
     caret(&mut l, focused);
-    l.add(MUTED, &format!("{label:<7}"));
+    l.add(MUTED, &format!("{label:<10}"));
     l.add(
         if focused { BOLD.reverse() } else { BOLD },
         if value { " on " } else { " off " },
@@ -825,10 +1144,21 @@ fn form_bool(label: &str, value: bool, focused: bool) -> Line {
     l
 }
 
+fn form_pick(label: &str, value: &str, focused: bool) -> Line {
+    let mut l = Line::new();
+    caret(&mut l, focused);
+    l.add(MUTED, &format!("{label:<10}"));
+    l.add(
+        if focused { BOLD.reverse() } else { BOLD },
+        &format!(" {value} "),
+    );
+    l
+}
+
 fn form_text(label: &str, value: &str, focused: bool) -> Line {
     let mut l = Line::new();
     caret(&mut l, focused);
-    l.add(MUTED, &format!("{label:<7}"));
+    l.add(MUTED, &format!("{label:<10}"));
     l.add(PLAIN, value);
     if focused {
         l.add(ACCENT, "_");
@@ -1062,6 +1392,147 @@ mod tests {
             }
             _ => panic!("expected the forward editor"),
         }
+    }
+
+    #[tokio::test]
+    async fn add_form_masks_the_secret() {
+        let mut app = app_with(snap());
+        app.on_key(Key::Char('a')).await;
+        assert!(matches!(app.overlay, Overlay::AddServer { .. }));
+        for _ in 0..3 {
+            app.on_key(Key::Tab).await;
+        }
+        for c in "hunter2".chars() {
+            app.on_key(Key::Char(c)).await;
+        }
+        let rows = plain_view(&app);
+        assert!(
+            rows.iter().any(|r| r.contains("*******")),
+            "expected one * per typed char:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("hunter2")),
+            "the secret text must never render"
+        );
+        // The toggles walk the transport picker without touching the secret.
+        app.on_key(Key::Up).await;
+        app.on_key(Key::Right).await;
+        match &app.overlay {
+            Overlay::AddServer {
+                transport, secret, ..
+            } => {
+                assert_eq!(*transport, Transport::Udp);
+                assert_eq!(secret, "hunter2");
+            }
+            _ => panic!("expected the add-server form"),
+        }
+        // Submit against a dead socket: the error toast and status row must
+        // not echo the secret either.
+        app.socket = std::env::temp_dir().join("zeronat-console-test-none.sock");
+        app.on_key(Key::Enter).await;
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.toast.is_some(), "the failed submit must toast");
+        let rows = plain_view(&app);
+        assert!(
+            !rows.iter().any(|r| r.contains("hunter2")),
+            "the secret text must never render:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_confirms_on_a_server_row_only() {
+        let mut app = app_with(snap());
+        app.sel = 1;
+        app.on_key(Key::Char('x')).await;
+        assert!(matches!(&app.overlay, Overlay::ConfirmRemove { name } if name == "away"));
+        app.on_key(Key::Char('n')).await;
+        assert!(matches!(app.overlay, Overlay::None));
+
+        // On a forward row the key does nothing.
+        app.sel = 2;
+        app.on_key(Key::Char('x')).await;
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    /// `d` and `c` key off the snapshot mode, never off any message text:
+    /// disconnect is offered whenever the client is not already offline,
+    /// connect only while it is.
+    #[tokio::test]
+    async fn disconnect_and_connect_key_on_the_snapshot_mode() {
+        let mut app = app_with(snap());
+        app.on_key(Key::Char('d')).await;
+        assert!(matches!(app.overlay, Overlay::ConfirmDisconnect));
+        app.on_key(Key::Esc).await;
+        assert!(matches!(app.overlay, Overlay::None));
+
+        // While a body is up, `c` is inert: no overlay, no mutation sent.
+        app.on_key(Key::Char('c')).await;
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.toast.is_none());
+
+        // While offline, `d` is inert.
+        let mut s = snap();
+        s.mode = SessionMode::Offline;
+        let mut app = app_with(s);
+        app.on_key(Key::Char('d')).await;
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.toast.is_none());
+    }
+
+    /// The forward form's first field is the enabled toggle; space flips it
+    /// and tab moves on to proxy.
+    #[tokio::test]
+    async fn forward_form_leads_with_the_enabled_toggle() {
+        let mut app = app_with(snap());
+        app.sel = 2;
+        app.on_key(Key::Enter).await;
+        app.on_key(Key::Char(' ')).await;
+        app.on_key(Key::Tab).await;
+        app.on_key(Key::Char(' ')).await;
+        match &app.overlay {
+            Overlay::FwdForm {
+                enabled,
+                proxy,
+                field,
+                ..
+            } => {
+                assert!(!*enabled);
+                assert!(!*proxy, "space after tab must hit the proxy field");
+                assert_eq!(*field, 1);
+            }
+            _ => panic!("expected the forward editor"),
+        }
+    }
+
+    #[test]
+    fn link_and_disabled_states_render() {
+        // The link renders on the active row only, beside the marker.
+        let mut s = snap();
+        s.link = LinkStatus::Backoff;
+        s.forwards[1].enabled = false;
+        let rows = plain_view(&app_with(s));
+        let home = row_containing(&rows, "dht");
+        assert!(home.contains("● active"), "{home}");
+        assert!(home.contains("backoff"), "{home}");
+        let away = row_containing(&rows, "198.51.100.7:9000");
+        assert!(!away.contains("backoff"), "{away}");
+        // A disabled forward keeps its row and gains the off marker.
+        let udp = row_containing(&rows, ":53");
+        assert!(udp.contains("-> 10.0.0.5:53"), "{udp}");
+        assert!(udp.contains("off"), "{udp}");
+        let tcp = row_containing(&rows, ":443");
+        assert!(!tcp.contains("off"), "{tcp}");
+
+        // The operator park is its own mode, not idle.
+        let mut s = snap();
+        s.mode = SessionMode::Offline;
+        let rows = plain_view(&app_with(s));
+        let mode = row_containing(&rows, "mode");
+        assert!(mode.contains("offline"), "{mode}");
+        assert!(mode.contains("nothing is dialed until connect"), "{mode}");
+        assert!(!mode.contains("idle"), "{mode}");
     }
 
     #[tokio::test]

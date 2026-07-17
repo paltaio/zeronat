@@ -304,6 +304,9 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
             let Some(target) = state.servers.get(&name) else {
                 return (false, format!("no configured server named `{name}`"));
             };
+            if let Some(msg) = undialable(&target, cfg!(feature = "dht")) {
+                return (false, msg);
+            }
             // One call updates the target and fires the cancel; the session
             // body is preserved and comes back up against the new server. An
             // offline client just re-parks retargeted, nothing is dialed.
@@ -394,11 +397,17 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
             }
             // The config lexer rejects control characters in strings, so a
             // value carrying one could never be saved and read back.
-            if [&name, &addr, &secret.0]
-                .iter()
-                .any(|s| s.chars().any(char::is_control))
-            {
-                return (false, "control characters are not allowed".into());
+            for (field, value) in [
+                ("name", name.as_str()),
+                ("addr", addr.as_str()),
+                ("secret", secret.0.as_str()),
+            ] {
+                if value.chars().any(char::is_control) {
+                    return (
+                        false,
+                        format!("server `{field}` must not contain control characters"),
+                    );
+                }
             }
             if addr == "dht" {
                 if cfg!(not(feature = "dht")) {
@@ -457,6 +466,11 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                     None => return (false, format!("no configured server named `{name}`")),
                 }
             };
+            if let Some(t) = &target {
+                if let Some(msg) = undialable(t, cfg!(feature = "dht")) {
+                    return (false, msg);
+                }
+            }
             let named = target.is_some();
             if !state.active.connect(target, state.boot_mode.clone()) {
                 return (
@@ -482,6 +496,20 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
         }
         other => (false, format!("expected a mutation, got {other:?}")),
     }
+}
+
+/// Refusal for a profile this build cannot dial. Dialing a `"dht"` profile
+/// without dht support is a fatal discovery error in the reconnect loop, which
+/// would kill the daemon after the acceptance reply; refusing the retarget
+/// here keeps the loop away from it. Config-declared profiles hit this too:
+/// boot only dials the active profile, so the others were never checked.
+fn undialable(target: &ServerTarget, dht_supported: bool) -> Option<String> {
+    (target.addr == "dht" && !dht_supported).then(|| {
+        format!(
+            "`{}` is a dht profile and this build has no dht support",
+            target.name
+        )
+    })
 }
 
 /// `host:port` with a non-empty host and a non-zero port. Hostnames resolve
@@ -792,14 +820,19 @@ mod tests {
             add_server("b", ":1", "t"),
             add_server("b", "127.0.0.1:0", "t"),
             add_server("b", "127.0.0.1:99999", "t"),
-            add_server("b\n", "127.0.0.1:2", "t"),
-            add_server("b", "127.0.0.1:2", "se\ncret"),
         ];
         for req in refused {
             let desc = format!("{req:?}");
             let (ok, msg) = mutate(&state, req).await;
             assert!(!ok, "expected a refusal for {desc}: {msg}");
         }
+        // A control character is refused with the offending field named.
+        let (ok, msg) = mutate(&state, add_server("b\n", "127.0.0.1:2", "t")).await;
+        assert!(!ok);
+        assert!(msg.contains("`name`"), "{msg}");
+        let (ok, msg) = mutate(&state, add_server("b", "127.0.0.1:2", "se\ncret")).await;
+        assert!(!ok);
+        assert!(msg.contains("`secret`"), "{msg}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         assert_eq!(snapshot(&state).servers.len(), 1);
 
@@ -818,6 +851,100 @@ mod tests {
         assert_eq!(on_disk.servers[1].secret.0, "t");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `"dht"` profile is dialable exactly when the build carries dht
+    /// support; the refusal message names the profile.
+    #[test]
+    fn undialable_keys_on_dht_support() {
+        let dht = ServerTarget {
+            name: "roam".into(),
+            addr: "dht".into(),
+            secret: "s".into(),
+            transport: Transport::Auto,
+        };
+        assert!(undialable(&dht, true).is_none());
+        let msg = undialable(&dht, false).unwrap();
+        assert!(msg.contains("`roam`"), "{msg}");
+        assert!(msg.contains("dht"), "{msg}");
+        assert!(undialable(&server_target("a", 1), false).is_none());
+        assert!(undialable(&server_target("a", 1), true).is_none());
+    }
+
+    /// Retargeting to a config-declared dht profile must not reach the
+    /// reconnect loop on a build that cannot dial it: the dispatcher refuses
+    /// both `SelectServer` and `Connect` and nothing changes.
+    #[cfg(not(feature = "dht"))]
+    #[tokio::test]
+    async fn select_and_connect_refuse_a_dht_profile_without_dht_support() {
+        let mut state = idle_state("a");
+        let dht = ServerTarget {
+            name: "roam".into(),
+            addr: "dht".into(),
+            secret: "s".into(),
+            transport: Transport::Auto,
+        };
+        state.servers = SharedServers::new(vec![server_target("a", 1), dht]);
+        state.boot_mode = RunMode::Forwards;
+
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::SelectServer {
+                name: "roam".into(),
+            },
+        )
+        .await;
+        assert!(!ok);
+        assert!(msg.contains("dht"), "{msg}");
+        assert_eq!(state.active.admin_view().0, "a");
+
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::Connect {
+                name: "roam".into(),
+            },
+        )
+        .await;
+        assert!(!ok);
+        assert!(msg.contains("dht"), "{msg}");
+        assert_eq!(snapshot(&state).mode, SessionMode::Idle);
+    }
+
+    /// On a dht build the same retargets are accepted.
+    #[cfg(feature = "dht")]
+    #[tokio::test]
+    async fn select_and_connect_accept_a_dht_profile_with_dht_support() {
+        let mut state = idle_state("a");
+        let dht = ServerTarget {
+            name: "roam".into(),
+            addr: "dht".into(),
+            secret: "s".into(),
+            transport: Transport::Auto,
+        };
+        state.servers = SharedServers::new(vec![server_target("a", 1), dht]);
+        state.boot_mode = RunMode::Forwards;
+
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::SelectServer {
+                name: "roam".into(),
+            },
+        )
+        .await;
+        assert!(ok, "{msg}");
+        assert_eq!(state.active.admin_view().0, "roam");
+
+        let (ok, _) = mutate(&state, ClientMsg::Disconnect).await;
+        assert!(ok);
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::Connect {
+                name: "roam".into(),
+            },
+        )
+        .await;
+        assert!(ok, "{msg}");
+        assert_eq!(snapshot(&state).mode, SessionMode::Forwards);
     }
 
     #[tokio::test]

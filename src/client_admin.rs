@@ -3,15 +3,17 @@
 //!
 //! Each call is a complete connect/handshake/exchange over the Unix stream:
 //! hello mode 0 fetches one snapshot, mode 1 carries one mutation and returns
-//! the client's verdict. The CLI commands (`show`, `select_server`, `spawn_pppoe`,
-//! `stop_pppoe`) wrap those exchanges; a mutation command returns
-//! as soon as the client accepts it, never waiting on the teardown or bringup
-//! it triggers.
+//! the client's verdict. The CLI commands wrap those exchanges; a mutation
+//! command returns as soon as the client accepts it, never waiting on the
+//! teardown or bringup it triggers.
 
 use std::path::{Path, PathBuf};
 
-use crate::clientproto::{ClientMsg, ClientSnapshotBody, PppPhase, SessionMode};
-use crate::proto::proto_name;
+use crate::client::Transport;
+use crate::clientproto::{
+    ClientMsg, ClientSnapshotBody, LinkStatus, PppPhase, ServerSecret, SessionMode,
+};
+use crate::proto::{proto_name, Proto};
 use crate::Result;
 
 /// The control socket to talk to: an explicit path is used as given; otherwise
@@ -52,7 +54,7 @@ fn default_socket(primary: &Path, runtime_dir: Option<&Path>) -> Result<PathBuf>
 }
 
 /// Connect to the control socket at `path` and run the admin handshake.
-pub async fn connect(path: &Path) -> Result<crate::noise::Noise> {
+async fn handshake(path: &Path) -> Result<crate::noise::Noise> {
     let stream = tokio::net::UnixStream::connect(path)
         .await
         .map_err(|e| -> crate::Error {
@@ -64,7 +66,7 @@ pub async fn connect(path: &Path) -> Result<crate::noise::Noise> {
 /// Request one snapshot and return it. A complete connect/handshake/exchange,
 /// so callers hold no long-lived state.
 pub async fn snapshot(path: &Path) -> Result<ClientSnapshotBody> {
-    let (mut r, mut w) = connect(path).await?;
+    let (mut r, mut w) = handshake(path).await?;
     w.send(&hello(0)).await?;
     let frame = r.recv().await?;
     match ClientMsg::decode(&frame)? {
@@ -78,7 +80,7 @@ pub async fn snapshot(path: &Path) -> Result<ClientSnapshotBody> {
 /// errors propagate as `Err`; a refused mutation comes back as
 /// `Ok((false, reason))`.
 pub async fn mutate(path: &Path, req: ClientMsg) -> Result<(bool, String)> {
-    let (mut r, mut w) = connect(path).await?;
+    let (mut r, mut w) = handshake(path).await?;
     w.send(&hello(1)).await?;
     w.send(&req.encode()).await?;
     let frame = r.recv().await?;
@@ -106,23 +108,105 @@ pub async fn show(socket: Option<&Path>) -> Result<()> {
 
 /// `select-server NAME`: switch the active server profile.
 pub async fn select_server(socket: Option<&Path>, name: String) -> Result<()> {
-    one_shot(socket, ClientMsg::SelectServer { name }).await
+    command(socket, ClientMsg::SelectServer { name }).await
 }
 
 /// `spawn-pppoe NAME`: bring up the named PPPoE session.
 pub async fn spawn_pppoe(socket: Option<&Path>, name: String) -> Result<()> {
-    one_shot(socket, ClientMsg::SpawnPppoe { name }).await
+    command(socket, ClientMsg::SpawnPppoe { name }).await
 }
 
 /// `stop-pppoe NAME`: stop the named PPPoE session and fall back to
 /// the client's base mode.
 pub async fn stop_pppoe(socket: Option<&Path>, name: String) -> Result<()> {
-    one_shot(socket, ClientMsg::StopSession { name }).await
+    command(socket, ClientMsg::StopSession { name }).await
+}
+
+/// `add-server NAME ADDR [--transport MODE]`: append a server profile. The
+/// secret comes from stdin, never from argv, which leaks through the process
+/// list.
+pub async fn add_server(
+    socket: Option<&Path>,
+    name: String,
+    addr: String,
+    transport: Transport,
+) -> Result<()> {
+    let secret = ServerSecret(read_secret()?);
+    command(
+        socket,
+        ClientMsg::AddServer {
+            name,
+            addr,
+            secret,
+            transport,
+        },
+    )
+    .await
+}
+
+/// `remove-server NAME`: remove a server profile. The active profile is
+/// refused; select another or disconnect first.
+pub async fn remove_server(socket: Option<&Path>, name: String) -> Result<()> {
+    command(socket, ClientMsg::RemoveServer { name }).await
+}
+
+/// `enable-forward PROTO:PORT` / `disable-forward PROTO:PORT`: flip one
+/// forward's `enabled` flag. `SetForwardOptions` is full-state, so a snapshot
+/// supplies the forward's current `proxy`/`idle` and only the flag changes.
+pub async fn set_forward_enabled(socket: Option<&Path>, spec: &str, enabled: bool) -> Result<()> {
+    let (proto, port) = parse_proto_port(spec)?;
+    let path = resolve_socket(socket)?;
+    let snap = snapshot(&path).await?;
+    let f = snap
+        .forwards
+        .iter()
+        .find(|f| f.proto == proto && f.port == port)
+        .ok_or_else(|| -> crate::Error {
+            format!("no {} forward on port {port}", proto_name(proto)).into()
+        })?;
+    let req = ClientMsg::SetForwardOptions {
+        proto,
+        port,
+        enabled,
+        proxy: f.proxy,
+        idle_secs: f.idle_secs,
+    };
+    let (ok, msg) = mutate(&path, req).await?;
+    if ok {
+        println!("ok");
+        Ok(())
+    } else {
+        Err(msg.into())
+    }
+}
+
+/// `connect [NAME]`: leave the offline park and bring up the boot-derived
+/// session body, retargeting first when named. Reports the mode a follow-up
+/// snapshot shows, so a connect on an idle-boot client truthfully answers
+/// `idle`.
+pub async fn connect(socket: Option<&Path>, name: Option<String>) -> Result<()> {
+    let path = resolve_socket(socket)?;
+    let req = ClientMsg::Connect {
+        name: name.unwrap_or_default(),
+    };
+    let (ok, msg) = mutate(&path, req).await?;
+    if !ok {
+        return Err(msg.into());
+    }
+    let snap = snapshot(&path).await?;
+    println!("mode {}", mode_name(snap.mode));
+    Ok(())
+}
+
+/// `disconnect`: tear the session body down and park offline; nothing is
+/// dialed until `connect`.
+pub async fn disconnect(socket: Option<&Path>) -> Result<()> {
+    command(socket, ClientMsg::Disconnect).await
 }
 
 /// Send one mutation and report the verdict: `ok` on stdout when the client
 /// accepts, its refusal message as the error otherwise.
-async fn one_shot(socket: Option<&Path>, req: ClientMsg) -> Result<()> {
+async fn command(socket: Option<&Path>, req: ClientMsg) -> Result<()> {
     let path = resolve_socket(socket)?;
     let (ok, msg) = mutate(&path, req).await?;
     if ok {
@@ -130,6 +214,89 @@ async fn one_shot(socket: Option<&Path>, req: ClientMsg) -> Result<()> {
         Ok(())
     } else {
         Err(msg.into())
+    }
+}
+
+/// A `PROTO:PORT` forward key, e.g. `tcp:443`.
+fn parse_proto_port(spec: &str) -> Result<(Proto, u16)> {
+    let (proto, port) = spec
+        .split_once(':')
+        .ok_or_else(|| -> crate::Error { format!("expected PROTO:PORT, got `{spec}`").into() })?;
+    let proto = match proto {
+        "tcp" => Proto::Tcp,
+        "udp" => Proto::Udp,
+        other => return Err(format!("proto must be tcp or udp, got `{other}`").into()),
+    };
+    let port: u16 = port
+        .parse()
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| -> crate::Error { format!("invalid port `{port}`").into() })?;
+    Ok((proto, port))
+}
+
+/// Read the secret from stdin: prompted with echo off on a terminal, read
+/// plainly when piped. One line, without the trailing newline.
+fn read_secret() -> Result<String> {
+    use std::io::BufRead;
+    let tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+    if tty {
+        eprint!("secret: ");
+    }
+    let mut line = String::new();
+    {
+        let _echo_off = if tty { Some(EchoOff::set()?) } else { None };
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| -> crate::Error {
+                format!("reading the secret from stdin: {e}").into()
+            })?;
+    }
+    if tty {
+        eprintln!();
+    }
+    let secret = line.trim_end_matches(['\r', '\n']).to_string();
+    if secret.is_empty() {
+        return Err("the secret on stdin is empty".into());
+    }
+    Ok(secret)
+}
+
+/// Echo-off guard for the secret prompt: clears ECHO but keeps canonical mode,
+/// so the read still ends at newline; `Drop` restores the saved settings.
+struct EchoOff(libc::termios);
+
+impl EchoOff {
+    fn set() -> Result<EchoOff> {
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0 {
+                return Err(format!(
+                    "reading terminal settings: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            let saved = t;
+            t.c_lflag &= !libc::ECHO;
+            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t) != 0 {
+                return Err(format!(
+                    "disabling terminal echo: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            Ok(EchoOff(saved))
+        }
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0);
+        }
     }
 }
 
@@ -154,6 +321,15 @@ fn phase_name(phase: PppPhase) -> &'static str {
     }
 }
 
+fn link_name(link: LinkStatus) -> &'static str {
+    match link {
+        LinkStatus::Offline => "offline",
+        LinkStatus::Dialing => "dialing",
+        LinkStatus::Connected => "connected",
+        LinkStatus::Backoff => "backoff",
+    }
+}
+
 /// Render a client snapshot to a human-readable report. The PPP phase appears
 /// only under a pppoe body, where it means something.
 pub fn render(snap: &ClientSnapshotBody) -> String {
@@ -162,6 +338,7 @@ pub fn render(snap: &ClientSnapshotBody) -> String {
     out.push_str("Client\n");
     out.push_str(&format!("  active  {}\n", snap.active));
     out.push_str(&format!("  mode    {}\n", mode_name(snap.mode)));
+    out.push_str(&format!("  link    {}\n", link_name(snap.link)));
     if snap.mode == SessionMode::Pppoe {
         out.push_str(&format!("  phase   {}\n", phase_name(snap.phase)));
     }
@@ -172,11 +349,12 @@ pub fn render(snap: &ClientSnapshotBody) -> String {
     } else {
         for f in &snap.forwards {
             out.push_str(&format!(
-                "  {}:{} -> {}  {}\n",
+                "  {}:{} -> {}  {}{}\n",
                 proto_name(f.proto),
                 f.port,
                 f.target,
                 crate::admin::fwd_opts(f.proxy, f.idle_secs),
+                if f.enabled { "" } else { "  off" },
             ));
         }
     }
@@ -288,6 +466,8 @@ mod tests {
 
     #[test]
     fn render_lists_forwards_with_their_options() {
+        let mut disabled = entry(Proto::Udp, 51820, "10.0.0.5:51820", false, 300);
+        disabled.enabled = false;
         let snap = ClientSnapshotBody {
             version: 1,
             active: "home".into(),
@@ -295,7 +475,7 @@ mod tests {
             phase: PppPhase::None,
             forwards: vec![
                 entry(Proto::Tcp, 8080, "127.0.0.1:80", true, 600),
-                entry(Proto::Udp, 51820, "10.0.0.5:51820", false, 300),
+                disabled,
                 entry(Proto::Tcp, 443, "127.0.0.1:8443", false, 0),
             ],
             servers: Vec::new(),
@@ -306,11 +486,40 @@ mod tests {
         let s = render(&snap);
         assert!(s.contains("active  home"));
         assert!(s.contains("mode    forwards"));
-        assert!(s.contains("tcp:8080 -> 127.0.0.1:80  +proxy+idle=600"));
-        assert!(s.contains("udp:51820 -> 10.0.0.5:51820  +idle=300"));
-        assert!(s.contains("tcp:443 -> 127.0.0.1:8443  -"));
+        assert!(s.contains("link    connected"));
+        assert!(s.contains("tcp:8080 -> 127.0.0.1:80  +proxy+idle=600\n"));
+        // A disabled forward stays listed, flagged.
+        assert!(s.contains("udp:51820 -> 10.0.0.5:51820  +idle=300  off\n"));
+        assert!(s.contains("tcp:443 -> 127.0.0.1:8443  -\n"));
         // No pppoe body, no phase line.
         assert!(!s.contains("phase"));
+    }
+
+    #[test]
+    fn render_names_the_offline_link() {
+        let snap = ClientSnapshotBody {
+            version: 1,
+            active: "home".into(),
+            mode: SessionMode::Offline,
+            phase: PppPhase::None,
+            forwards: Vec::new(),
+            servers: Vec::new(),
+            pppoe: Vec::new(),
+            session: String::new(),
+            link: LinkStatus::Offline,
+        };
+        let s = render(&snap);
+        assert!(s.contains("mode    offline"));
+        assert!(s.contains("link    offline"));
+    }
+
+    #[test]
+    fn proto_port_specs_parse_or_name_the_fault() {
+        assert_eq!(parse_proto_port("tcp:443").unwrap(), (Proto::Tcp, 443));
+        assert_eq!(parse_proto_port("udp:53").unwrap(), (Proto::Udp, 53));
+        for bad in ["443", "tcp", "icmp:1", "tcp:0", "tcp:70000", "tcp:x"] {
+            assert!(parse_proto_port(bad).is_err(), "{bad} should not parse");
+        }
     }
 
     #[test]
