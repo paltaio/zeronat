@@ -65,6 +65,21 @@
   .foot{margin-top:48px;padding-top:18px;border-top:1px solid var(--border);
     color:var(--muted);font-size:13.5px}
 
+  .ex-toggle{display:none;width:max-content;margin:0 0 20px;
+    border:1px solid var(--border);border-radius:5px;overflow:hidden}
+  html[data-js] .ex-toggle{display:inline-flex}
+  .ex-btn{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    font-size:12px;font-weight:600;line-height:1;padding:7px 13px;border:0;
+    background:none;color:var(--muted);cursor:pointer}
+  .ex-btn:hover{color:var(--fg)}
+  .ex-btn+.ex-btn{border-left:1px solid var(--border)}
+  .ex-btn:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  html:not([data-ex="docker"]) .ex-btn[data-v="cli"],
+  html[data-ex="docker"] .ex-btn[data-v="docker"]{background:var(--accent-soft);color:var(--accent)}
+  pre.v-docker{display:none}
+  html[data-ex="docker"] pre.v-docker{display:block}
+  html[data-ex="docker"] pre.v-cli{display:none}
+
   @media (max-width:800px){
     .layout{flex-direction:column;gap:0;padding:0 22px}
     .sidebar{position:static;height:auto;width:auto;padding:24px 0 14px;
@@ -77,6 +92,12 @@
     .content{padding:26px 0 56px}
   }
 </style>
+<script>
+  document.documentElement.dataset.js = '';
+  try {
+    if (localStorage.getItem('zn-ex') === 'docker') document.documentElement.dataset.ex = 'docker';
+  } catch (e) {}
+</script>
 </head>
 <body>
 
@@ -84,6 +105,10 @@
   <aside class="sidebar">
     <h1 class="brand">zeronat</h1>
     <div class="brand-sub">encrypted reverse tunnel for CG-NAT</div>
+    <div class="ex-toggle" role="group" aria-label="example style">
+      <button class="ex-btn" data-v="cli" aria-pressed="true">cli</button>
+      <button class="ex-btn" data-v="docker" aria-pressed="false">docker</button>
+    </div>
     <nav class="nav-list">
       <a class="nav-link" href="#overview">Overview</a>
       <a class="nav-link" href="#install">Install</a>
@@ -128,13 +153,22 @@
 
     <section id="start">
       <h2>Quick start</h2>
-<pre><code><span class="c"># On the public host (VPS):</span>
+<pre class="v-cli"><code><span class="c"># On the public host (VPS):</span>
 ZERONAT_SECRET=somelongsecret zeronat server \
   --control 2222 --tcp 443 --tcp 80 --udp 51820
 
 <span class="c"># On the host behind CG-NAT:</span>
 ZERONAT_SECRET=somelongsecret zeronat client \
   --server &lt;public-ip&gt;:2222 --tcp 443 --tcp 80 --udp 51820</code></pre>
+<pre class="v-docker"><code><span class="c"># On the public host (VPS):</span>
+docker run -d --name zeronat --restart unless-stopped --network host \
+  -e ZERONAT_SECRET=somelongsecret ghcr.io/paltaio/zeronat \
+  server --control 2222 --tcp 443 --tcp 80 --udp 51820
+
+<span class="c"># On the host behind CG-NAT; with --network host, 127.0.0.1 targets are host services:</span>
+docker run -d --name zeronat --restart unless-stopped --network host \
+  -e ZERONAT_SECRET=somelongsecret ghcr.io/paltaio/zeronat \
+  client --server &lt;public-ip&gt;:2222 --tcp 443 --tcp 80 --udp 51820</code></pre>
       <p>Open the control port (2222, both UDP and TCP) on the server's firewall.</p>
     </section>
 
@@ -243,7 +277,10 @@ entryPoints:
       <p>A client id is the <code>--id</code> prefix (default: short hostname) plus a short derived suffix,
       for example <code>rpi-2-ab12</code>.</p>
       <p>Load listeners, routes, and identity from a file with <code>--config</code>:</p>
-<pre><code>zeronat server --config /etc/zeronat/server.toml</code></pre>
+<pre class="v-cli"><code>zeronat server --config /etc/zeronat/server.toml</code></pre>
+<pre class="v-docker"><code>docker run -d --name zeronat --restart unless-stopped --network host \
+  -v /etc/zeronat/data:/etc/zeronat/data --env-file /etc/zeronat/.env \
+  ghcr.io/paltaio/zeronat server --config /etc/zeronat/data/server.toml</code></pre>
 <pre><code><span class="c"># server.toml</span>
 [server]
 id = "zn01"
@@ -317,16 +354,22 @@ password_file = "/etc/zeronat/wan.pass"</code></pre>
     <section id="admin">
       <h2>Admin</h2>
       <p>Inspect a running server's topology over the control port (read-only):</p>
-<pre><code>ZERONAT_SECRET=$SECRET zeronat admin --server &lt;public-ip&gt;:2222 show</code></pre>
+<pre class="v-cli"><code>ZERONAT_SECRET=$SECRET zeronat admin --server &lt;public-ip&gt;:2222 show</code></pre>
+<pre class="v-docker"><code><span class="c"># The secret comes from the container's env:</span>
+docker exec -it zeronat /zeronat admin --server &lt;public-ip&gt;:2222 show</code></pre>
       <p>It prints the server, its routes, connected clients, and active listeners. Each client lists
       the forwards it announced with non-default options (<code>tcp:443  +proxy+idle=600</code>), and a
       route shows its forward's options in the OPTIONS column.</p>
       <h3>Client admin</h3>
       <p>Drive a running client over its local admin socket:</p>
-<pre><code>zeronat client admin                       <span class="c"># interactive console on a terminal</span>
+<pre class="v-cli"><code>zeronat client admin                       <span class="c"># interactive console on a terminal</span>
 zeronat client admin show                  <span class="c"># print status and exit</span>
 zeronat client admin select-server backup
 zeronat client admin spawn-pppoe wan</code></pre>
+<pre class="v-docker"><code>docker exec -it zeronat /zeronat client admin           <span class="c"># interactive console</span>
+docker exec -it zeronat /zeronat client admin show      <span class="c"># print status and exit</span>
+docker exec -it zeronat /zeronat client admin select-server backup
+docker exec -it zeronat /zeronat client admin spawn-pppoe wan</code></pre>
       <p>The socket is <code>/run/zeronat/client.sock</code>, or
       <code>$XDG_RUNTIME_DIR/zeronat/client.sock</code> when the client cannot create
       <code>/run/zeronat</code>; <code>--socket</code> overrides it and <code>[client].control</code>
@@ -347,11 +390,20 @@ zeronat client admin spawn-pppoe wan</code></pre>
       ports) to the client and source-NATs the replies; the tunnel subnet is derived from the shared secret.
       Both ends need <code>--tun</code>; it cannot be combined with <code>--tcp</code>/<code>--udp</code> or
       <code>--tap</code>.</p>
-<pre><code><span class="c"># Server (VPS): forward every port to the client, keep SSH on 22:</span>
+<pre class="v-cli"><code><span class="c"># Server (VPS): forward every port to the client, keep SSH on 22:</span>
 ZERONAT_SECRET=s zeronat server --control 2222 --tun --except 22
 
 <span class="c"># Client (behind CG-NAT): local services receive on the same port:</span>
 ZERONAT_SECRET=s zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
+<pre class="v-docker"><code><span class="c"># Server (VPS): forward every port to the client, keep SSH on 22:</span>
+docker run -d --name zeronat --restart unless-stopped --network host \
+  --cap-add NET_ADMIN --device /dev/net/tun \
+  -e ZERONAT_SECRET=s ghcr.io/paltaio/zeronat server --control 2222 --tun --except 22
+
+<span class="c"># Client (behind CG-NAT): local services receive on the same port:</span>
+docker run -d --name zeronat --restart unless-stopped --network host \
+  --cap-add NET_ADMIN --device /dev/net/tun \
+  -e ZERONAT_SECRET=s ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
       <p>Forwarded traffic includes the server's own SSH; keep it reachable with
       <code>--except &lt;ssh-port&gt;</code> (repeatable). The client needs no NAT: local services receive
       the traffic on the same port and must listen on <code>0.0.0.0</code> or the tunnel address.</p>
@@ -364,11 +416,21 @@ ZERONAT_SECRET=s zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pr
       <p><code>--tap</code> relays raw Ethernet frames over the tunnel, joining a TAP on each end into one L2
       segment. It carries anything Ethernet, including PPPoE. Both ends need <code>--tap</code>; it cannot be
       combined with <code>--tcp</code>/<code>--udp</code>.</p>
-<pre><code><span class="c"># Near the target segment (e.g. the PPPoE concentrator):</span>
+<pre class="v-cli"><code><span class="c"># Near the target segment (e.g. the PPPoE concentrator):</span>
 ZERONAT_SECRET=s zeronat server --control 2222 --tap zn0 --bridge br0
 
 <span class="c"># Behind CG-NAT, then run e.g. pppd on zn0:</span>
 ZERONAT_SECRET=s zeronat client --server &lt;public-ip&gt;:2222 --tap zn0
+pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
+<pre class="v-docker"><code><span class="c"># Near the target segment (e.g. the PPPoE concentrator):</span>
+docker run -d --name zeronat --restart unless-stopped --network host \
+  --cap-add NET_ADMIN --device /dev/net/tun \
+  -e ZERONAT_SECRET=s ghcr.io/paltaio/zeronat server --control 2222 --tap zn0 --bridge br0
+
+<span class="c"># Behind CG-NAT; zn0 lands in the host netns, run pppd on the host:</span>
+docker run -d --name zeronat --restart unless-stopped --network host \
+  --cap-add NET_ADMIN --device /dev/net/tun \
+  -e ZERONAT_SECRET=s ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tap zn0
 pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
       <p><code>--bridge &lt;name&gt;</code> enslaves the TAP to an existing bridge; <code>--tap-mtu &lt;n&gt;</code>
       sets the MTU (default 1400). Linux only. Needs <code>CAP_NET_ADMIN</code>: root,
@@ -517,6 +579,23 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
   activate();
   addEventListener('scroll', activate, { passive: true });
   addEventListener('resize', activate);
+
+  const root = document.documentElement;
+  const exBtns = [...document.querySelectorAll('.ex-btn')];
+  const syncEx = () => {
+    const v = root.dataset.ex === 'docker' ? 'docker' : 'cli';
+    for (const b of exBtns) b.setAttribute('aria-pressed', String(b.dataset.v === v));
+  };
+  for (const b of exBtns) {
+    b.addEventListener('click', () => {
+      if (b.dataset.v === 'docker') root.dataset.ex = 'docker';
+      else delete root.dataset.ex;
+      try { localStorage.setItem('zn-ex', b.dataset.v); } catch (e) {}
+      syncEx();
+      activate();
+    });
+  }
+  syncEx();
 </script>
 </body>
 </html>
