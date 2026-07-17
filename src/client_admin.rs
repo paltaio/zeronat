@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::client::Transport;
+use crate::client::{Forward, Transport};
 use crate::clientproto::{
     ClientMsg, ClientSnapshotBody, LinkStatus, PppPhase, ServerSecret, SessionMode,
 };
@@ -178,6 +178,31 @@ pub async fn set_forward_enabled(socket: Option<&Path>, spec: &str, enabled: boo
     } else {
         Err(msg.into())
     }
+}
+
+/// `add-forward PROTO:SPEC`: append one forward. The caller parses the spec
+/// (the `--tcp`/`--udp` grammar) into a forward with a resolved target, so
+/// the daemon never sees an empty one.
+pub async fn add_forward(socket: Option<&Path>, proto: Proto, fwd: Forward) -> Result<()> {
+    command(
+        socket,
+        ClientMsg::AddForward {
+            proto,
+            port: fwd.port,
+            target: fwd.target,
+            proxy: fwd.proxy,
+            idle_secs: fwd.idle.map(|d| d.as_secs() as u32).unwrap_or(0),
+            enabled: fwd.enabled,
+        },
+    )
+    .await
+}
+
+/// `remove-forward PROTO:PORT`: remove one forward. Removing a live
+/// forward's port drops its open connections on the redial.
+pub async fn remove_forward(socket: Option<&Path>, spec: &str) -> Result<()> {
+    let (proto, port) = parse_proto_port(spec)?;
+    command(socket, ClientMsg::RemoveForward { proto, port }).await
 }
 
 /// `connect [NAME]`: leave the offline park and bring up the boot-derived

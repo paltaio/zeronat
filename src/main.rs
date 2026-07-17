@@ -89,6 +89,9 @@ client admin options:
   remove-server <NAME> Remove a server profile (the active one is refused)
   enable-forward <PROTO:PORT>  Enable a forward, e.g. tcp:443
   disable-forward <PROTO:PORT> Disable a forward without removing it
+  add-forward <PROTO:SPEC>  Add an enabled forward; SPEC as in --tcp/--udp,
+                      e.g. tcp:443:10.0.0.5:8443+proxy+idle=600
+  remove-forward <PROTO:PORT>  Remove a forward, e.g. tcp:443
   connect [NAME]      Leave offline mode and bring up the boot session body
   disconnect          Tear the session down; nothing dials until connect
   spawn-pppoe <NAME>  Bring up the named PPPoE session
@@ -180,6 +183,8 @@ enum ClientAdminCmd {
     RemoveServer(String),
     EnableForward(String),
     DisableForward(String),
+    AddForward(String),
+    RemoveForward(String),
     Connect(Option<String>),
     Disconnect,
     SpawnPppoe(String),
@@ -295,6 +300,20 @@ fn parse_forward(spec: &str, proto: Proto) -> Result<client::Forward> {
         idle,
         enabled: true,
     })
+}
+
+/// An admin `PROTO:SPEC` forward: the proto prefix picks the forward map, the
+/// rest is the same spec grammar `--tcp`/`--udp` take, defaults included.
+fn parse_proto_forward(spec: &str) -> Result<(Proto, client::Forward)> {
+    let (proto, rest) = spec
+        .split_once(':')
+        .ok_or_else(|| -> zeronat::Error { format!("expected PROTO:SPEC, got '{spec}'").into() })?;
+    let proto = match proto {
+        "tcp" => Proto::Tcp,
+        "udp" => Proto::Udp,
+        other => return Err(format!("proto must be tcp or udp, got '{other}'").into()),
+    };
+    Ok((proto, parse_forward(rest, proto)?))
 }
 
 /// Whether the config file declares any list-shaped setting. Declaring even one
@@ -497,6 +516,13 @@ fn parse_args() -> Result<Cmd> {
             Some("disable-forward") => Some(ClientAdminCmd::DisableForward(named(
                 &mut pos,
                 "disable-forward",
+            )?)),
+            Some("add-forward") => {
+                Some(ClientAdminCmd::AddForward(named(&mut pos, "add-forward")?))
+            }
+            Some("remove-forward") => Some(ClientAdminCmd::RemoveForward(named(
+                &mut pos,
+                "remove-forward",
             )?)),
             Some("connect") => Some(ClientAdminCmd::Connect(pos.next())),
             Some("disconnect") => Some(ClientAdminCmd::Disconnect),
@@ -1503,6 +1529,13 @@ async fn run(cmd: Cmd) -> Result<()> {
                 Some(ClientAdminCmd::DisableForward(spec)) => {
                     client_admin::set_forward_enabled(socket, &spec, false).await
                 }
+                Some(ClientAdminCmd::AddForward(spec)) => {
+                    let (proto, fwd) = parse_proto_forward(&spec)?;
+                    client_admin::add_forward(socket, proto, fwd).await
+                }
+                Some(ClientAdminCmd::RemoveForward(spec)) => {
+                    client_admin::remove_forward(socket, &spec).await
+                }
                 Some(ClientAdminCmd::Connect(name)) => client_admin::connect(socket, name).await,
                 Some(ClientAdminCmd::Disconnect) => client_admin::disconnect(socket).await,
                 Some(ClientAdminCmd::SpawnPppoe(name)) => {
@@ -1637,6 +1670,20 @@ mod tests {
         assert!(parse_forward("443+nope", Proto::Tcp).is_err());
         assert!(parse_forward("443+", Proto::Tcp).is_err());
         assert!(parse_forward("443+PROXY", Proto::Tcp).is_err());
+    }
+
+    #[test]
+    fn proto_forward_specs_reuse_the_forward_grammar() {
+        let (proto, f) = parse_proto_forward("tcp:443:10.0.0.5:8443+proxy+idle=600").unwrap();
+        assert_eq!(proto, Proto::Tcp);
+        assert_eq!(f, fwd(443, "10.0.0.5:8443", true, Some(600)));
+        // The bare form resolves the default target, as the flags do.
+        let (proto, f) = parse_proto_forward("udp:53").unwrap();
+        assert_eq!(proto, Proto::Udp);
+        assert_eq!(f, fwd(53, "127.0.0.1:53", false, None));
+        for bad in ["443", "icmp:1", "udp:53+proxy", "tcp:a:b:c:d", "tcp:"] {
+            assert!(parse_proto_forward(bad).is_err(), "{bad} should not parse");
+        }
     }
 
     fn cfg_server(name: &str) -> CfgServer {

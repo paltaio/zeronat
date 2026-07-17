@@ -2081,6 +2081,331 @@ async fn set_forward_options_redials_and_persists() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_and_remove_forward_move_live_traffic() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_a = free_tcp_port();
+        let public_b = free_tcp_port();
+        let public_udp = free_udp_port();
+        let local_echo = free_tcp_port();
+        let local_udp = free_udp_port();
+        tokio::spawn(tcp_echo(local_echo));
+        tokio::spawn(udp_echo(local_udp));
+        // Both tcp listeners exist up front; only public_a has a forward at
+        // boot, so public_b serves exactly when the added forward is live.
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control,
+            vec![public_a, public_b],
+            vec![public_udp],
+        )));
+
+        let dir = temp_config_dir("addfwd");
+        let path = dir.join("client.toml");
+        let sock = dir.join("client.sock");
+        let text = format!(
+            "[[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
+             [[forwards]]\nproto = \"tcp\"\nport = {public_a}\ntarget = \"127.0.0.1:{local_echo}\"\n\
+             [[forwards]]\nproto = \"udp\"\nport = {public_udp}\ntarget = \"127.0.0.1:{local_udp}\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
+        cfg.validate().unwrap();
+
+        let mut settings = client_settings(
+            vec![server_target("home", control, SECRET)],
+            vec![fwd(public_a, local_echo)],
+            "afw",
+            Some(&sock),
+        );
+        settings.udp = vec![fwd(public_udp, local_udp)];
+        settings.config = Some((path.clone(), cfg));
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("home", control, SECRET)),
+            settings,
+        ));
+
+        let _conn_a = wait_tcp_path(public_a).await;
+
+        // Refusals change nothing, on disk or in memory: a duplicate key,
+        // proxy on udp, and a shapeless target.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let forwards_before = client_snapshot(&sock).await.forwards;
+        let refused = [
+            ClientMsg::AddForward {
+                proto: Proto::Tcp,
+                port: public_a,
+                target: String::new(),
+                proxy: false,
+                idle_secs: 0,
+                enabled: true,
+            },
+            ClientMsg::AddForward {
+                proto: Proto::Udp,
+                port: public_b,
+                target: String::new(),
+                proxy: true,
+                idle_secs: 0,
+                enabled: true,
+            },
+            ClientMsg::AddForward {
+                proto: Proto::Tcp,
+                port: public_b,
+                target: "no-port".into(),
+                proxy: false,
+                idle_secs: 0,
+                enabled: true,
+            },
+        ];
+        for req in refused {
+            let desc = format!("{req:?}");
+            let (ok, msg) = client_mutate(&sock, req).await;
+            assert!(!ok, "expected a refusal for {desc}: {msg}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(client_snapshot(&sock).await.forwards, forwards_before);
+
+        // add-forward through the admin helper: the new public port starts
+        // serving real traffic, and the entry persists with its options.
+        zeronat::client_admin::add_forward(
+            Some(&sock),
+            Proto::Tcp,
+            zeronat::client::Forward {
+                port: public_b,
+                target: format!("127.0.0.1:{local_echo}"),
+                proxy: false,
+                idle: Some(Duration::from_secs(600)),
+                enabled: true,
+            },
+        )
+        .await
+        .expect("add forward");
+        let mut conn_b = wait_tcp_path(public_b).await;
+        let snap = client_snapshot(&sock).await;
+        let f = snap
+            .forwards
+            .iter()
+            .find(|f| f.proto == Proto::Tcp && f.port == public_b)
+            .expect("added forward in snapshot");
+        assert_eq!(f.target, format!("127.0.0.1:{local_echo}"));
+        assert_eq!(f.idle_secs, 600);
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        let entry = on_disk
+            .forwards
+            .iter()
+            .find(|f| f.proto == Proto::Tcp && f.port == public_b)
+            .expect("added forward on disk");
+        assert_eq!(entry.target, format!("127.0.0.1:{local_echo}"));
+        assert_eq!(entry.idle, Some(600));
+        assert!(entry.enabled);
+
+        // remove-forward drops the port: the established relay is cut, fresh
+        // probes get no echo, and the other tcp forward keeps serving.
+        zeronat::client_admin::remove_forward(Some(&sock), &format!("tcp:{public_b}"))
+            .await
+            .expect("remove forward");
+        timeout(Duration::from_secs(15), wait_tcp_cut(&mut conn_b))
+            .await
+            .expect("remove did not cut the established relay");
+        let _conn_a = wait_tcp_path(public_a).await;
+        if let Ok(Some(reply)) = timeout(Duration::from_secs(2), probe_tcp(public_b)).await {
+            panic!("removed forward still echoes: {reply:?}");
+        }
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert!(!on_disk
+            .forwards
+            .iter()
+            .any(|f| f.proto == Proto::Tcp && f.port == public_b));
+
+        // A second removal of the same key is a no-such-forward refusal.
+        let err = zeronat::client_admin::remove_forward(Some(&sock), &format!("tcp:{public_b}"))
+            .await
+            .expect_err("removing a removed forward must be refused");
+        assert!(err.to_string().contains("no tcp forward"), "{err}");
+
+        // Removing every remaining forward leaves the live body running as a
+        // bare control session: the snapshot still answers, the mode stays
+        // forwards, and the dial stays connected.
+        zeronat::client_admin::remove_forward(Some(&sock), &format!("tcp:{public_a}"))
+            .await
+            .expect("remove the tcp forward");
+        zeronat::client_admin::remove_forward(Some(&sock), &format!("udp:{public_udp}"))
+            .await
+            .expect("remove the udp forward");
+        wait_client_snapshot(&sock, |s| {
+            s.forwards.is_empty()
+                && s.mode == SessionMode::Forwards
+                && s.link == LinkStatus::Connected
+        })
+        .await;
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert!(on_disk.forwards.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(90), body)
+        .await
+        .expect("add/remove forward flow did not complete within 90s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_first_forward_promotes_an_idle_client() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let local_echo = free_tcp_port();
+        tokio::spawn(tcp_echo(local_echo));
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control,
+            vec![public_tcp],
+            vec![],
+        )));
+
+        // A config declaring servers but no forwards boots idle: nothing is
+        // dialed, only the admin socket is up.
+        let dir = temp_config_dir("promote");
+        let path = dir.join("client.toml");
+        let sock = dir.join("client.sock");
+        let text = format!(
+            "[client]\nactive = \"home\"\n\
+             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
+        cfg.validate().unwrap();
+
+        let mut settings = client_settings(
+            vec![server_target("home", control, SECRET)],
+            vec![],
+            "pro",
+            Some(&sock),
+        );
+        settings.config = Some((path.clone(), cfg));
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("home", control, SECRET)),
+            settings,
+        ));
+
+        let snap = client_snapshot(&sock).await;
+        assert_eq!(snap.mode, SessionMode::Idle);
+        assert!(snap.forwards.is_empty());
+
+        // The first add promotes the idle client to the forwards body and it
+        // starts serving: real traffic round-trips through the new port.
+        zeronat::client_admin::add_forward(
+            Some(&sock),
+            Proto::Tcp,
+            zeronat::client::Forward {
+                port: public_tcp,
+                target: format!("127.0.0.1:{local_echo}"),
+                proxy: false,
+                idle: None,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("add the first forward");
+        wait_client_snapshot(&sock, |s| s.mode == SessionMode::Forwards).await;
+        let _conn = wait_tcp_path(public_tcp).await;
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.forwards.len(), 1);
+        assert_eq!(on_disk.forwards[0].port, public_tcp);
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("idle promotion did not complete within 60s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offline_add_forward_lands_after_connect() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let local_echo = free_tcp_port();
+        tokio::spawn(tcp_echo(local_echo));
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control,
+            vec![public_tcp],
+            vec![],
+        )));
+
+        let dir = temp_config_dir("offlineadd");
+        let path = dir.join("client.toml");
+        let sock = dir.join("client.sock");
+        let text = format!(
+            "[client]\nactive = \"home\"\n\
+             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
+        cfg.validate().unwrap();
+
+        let mut settings = client_settings(
+            vec![server_target("home", control, SECRET)],
+            vec![],
+            "ofa",
+            Some(&sock),
+        );
+        settings.config = Some((path.clone(), cfg));
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("home", control, SECRET)),
+            settings,
+        ));
+
+        let (ok, msg) = client_mutate(&sock, ClientMsg::Disconnect).await;
+        assert!(ok, "disconnect failed: {msg}");
+        wait_client_snapshot(&sock, |s| s.mode == SessionMode::Offline).await;
+
+        // While offline, the add edits memory and file only: the park holds.
+        zeronat::client_admin::add_forward(
+            Some(&sock),
+            Proto::Tcp,
+            zeronat::client::Forward {
+                port: public_tcp,
+                target: format!("127.0.0.1:{local_echo}"),
+                proxy: false,
+                idle: None,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("add a forward while offline");
+        let snap = client_snapshot(&sock).await;
+        assert_eq!(snap.mode, SessionMode::Offline);
+        assert_eq!(snap.forwards.len(), 1);
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.forwards.len(), 1);
+
+        // Connect installs the freshly derived body: the boot derivation now
+        // says forwards, and the added port serves.
+        let (ok, msg) = client_mutate(
+            &sock,
+            ClientMsg::Connect {
+                name: String::new(),
+            },
+        )
+        .await;
+        assert!(ok, "connect failed: {msg}");
+        wait_client_snapshot(&sock, |s| s.mode == SessionMode::Forwards).await;
+        let _conn = wait_tcp_path(public_tcp).await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("offline add did not land after connect within 60s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnect_parks_offline_and_connect_restores() {
     let body = async {
         let control = free_tcp_port();

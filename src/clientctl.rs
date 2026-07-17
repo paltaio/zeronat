@@ -14,9 +14,10 @@ use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::client::{
-    ActiveTarget, PppoeRunConfig, RunMode, ServerTarget, SharedForwards, SharedServers,
+    derive_mode, ActiveTarget, Forward, PppoeRunConfig, RunMode, ServerTarget, SharedForwards,
+    SharedServers,
 };
-use crate::clientcfg::{serialize_client, CfgServer, ClientConfig};
+use crate::clientcfg::{serialize_client, CfgForward, CfgServer, ClientConfig};
 use crate::clientproto::{ClientMsg, ClientSnapshotBody, LinkCell, PppStatus};
 use crate::proto::{proto_name, Proto};
 use crate::Result;
@@ -160,14 +161,28 @@ pub struct ControlState {
     pub servers: SharedServers,
     /// Sessions `SpawnPppoe` may bring up, by name.
     pub pppoe: Vec<(String, Arc<PppoeRunConfig>)>,
-    /// The body `StopSession` falls back to: forwards when any are declared,
-    /// idle otherwise.
-    pub base_mode: RunMode,
-    /// The boot-derived body `Connect` installs, so disconnect-then-connect
-    /// restores the declared boot shape rather than whatever ran last.
-    pub boot_mode: RunMode,
+    /// The boot chain minus its forwards arm, fixed at boot: the autostart
+    /// pppoe, else the device, else idle. The bodies `Connect` and
+    /// `StopSession` install are derived at use from the declared forward
+    /// set, so runtime forward edits move them; only `Connect` falls through
+    /// to this chain.
+    pub fallback_mode: RunMode,
     /// `None` on a runtime-only client; mutations then stay in memory.
     pub persist: Option<Persist>,
+}
+
+impl ControlState {
+    /// The boot-derived body `Connect` installs, so disconnect-then-connect
+    /// restores the currently declared boot shape, not whatever ran last.
+    fn boot_mode(&self) -> RunMode {
+        derive_mode(&self.forwards, &self.fallback_mode)
+    }
+
+    /// The body `StopSession` falls back to: forwards when any are declared,
+    /// idle otherwise.
+    fn base_mode(&self) -> RunMode {
+        derive_mode(&self.forwards, &RunMode::Idle)
+    }
 }
 
 /// The bound admin socket. Dropping it removes the socket file, so an aborted
@@ -373,8 +388,8 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
         }
         ClientMsg::StopSession { name } => {
             // Runtime-only, valid only against the running pppoe body; the
-            // loop falls back to the boot-derived base mode.
-            if state.active.stop_pppoe(&name, state.base_mode.clone()) {
+            // loop falls back to the derived base mode.
+            if state.active.stop_pppoe(&name, state.base_mode()) {
                 (true, String::new())
             } else {
                 (false, format!("no active pppoe session named `{name}`"))
@@ -472,7 +487,7 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                 }
             }
             let named = target.is_some();
-            if !state.active.connect(target, state.boot_mode.clone()) {
+            if !state.active.connect(target, state.boot_mode()) {
                 return (
                     false,
                     "a session is already up; select-server retargets a running client".into(),
@@ -493,6 +508,94 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
             } else {
                 (false, "already offline".into())
             }
+        }
+        ClientMsg::AddForward {
+            proto,
+            port,
+            target,
+            proxy,
+            idle_secs,
+            enabled,
+        } => {
+            // The empty target is the wire's config-default sentinel; resolve
+            // it before validation and persistence, exactly as the config
+            // parser fills a missing `target` key.
+            let target = if target.is_empty() {
+                format!("127.0.0.1:{port}")
+            } else {
+                target
+            };
+            // Mirror the parser and validate, so the applied entry is exactly
+            // what the persisted file parses back to.
+            if proxy && proto == Proto::Udp {
+                return (false, "`proxy` is not supported on udp forwards".into());
+            }
+            if !valid_host_port(&target) {
+                return (false, format!("target must be host:port, got `{target}`"));
+            }
+            // The config lexer rejects control characters in strings, so a
+            // value carrying one could never be saved and read back.
+            if target.chars().any(char::is_control) {
+                return (
+                    false,
+                    "forward `target` must not contain control characters".into(),
+                );
+            }
+            // A device-bound client cannot serve forwards, and validate
+            // refuses the combination, so persisting it would save a file
+            // boot rejects.
+            if matches!(state.fallback_mode, RunMode::Device(_)) {
+                return (false, "[tap]/[tun] cannot be combined with forwards".into());
+            }
+            // Wire 0 means no idle override; the config value is therefore
+            // never Some(0), which the parser would reject.
+            let idle = (idle_secs != 0).then(|| Duration::from_secs(u64::from(idle_secs)));
+            let fwd = Forward {
+                port,
+                target: target.clone(),
+                proxy,
+                idle,
+                enabled,
+            };
+            if !state.forwards.add(proto, fwd) {
+                return (
+                    false,
+                    format!(
+                        "a {} forward on port {port} already exists",
+                        proto_name(proto)
+                    ),
+                );
+            }
+            let saved = persist(state, move |cfg| {
+                cfg.forwards.push(CfgForward {
+                    proto,
+                    port,
+                    target,
+                    proxy,
+                    idle: (idle_secs != 0).then_some(idle_secs),
+                    enabled,
+                })
+            })
+            .await;
+            state.active.serve_forwards();
+            saved
+        }
+        ClientMsg::RemoveForward { proto, port } => {
+            if !state.forwards.remove(proto, port) {
+                return (
+                    false,
+                    format!("no {} forward on port {port}", proto_name(proto)),
+                );
+            }
+            let saved = persist(state, move |cfg| {
+                cfg.forwards
+                    .retain(|f| !(f.proto == proto && f.port == port))
+            })
+            .await;
+            // Never demotes the mode: removing the last forward leaves a live
+            // forwards body running as the bare control session.
+            state.active.kick_if_forwards();
+            saved
         }
         other => (false, format!("expected a mutation, got {other:?}")),
     }
@@ -590,8 +693,7 @@ mod tests {
             link: LinkCell::default(),
             servers: SharedServers::new(Vec::new()),
             pppoe: Vec::new(),
-            base_mode: RunMode::Idle,
-            boot_mode: RunMode::Idle,
+            fallback_mode: RunMode::Idle,
             persist: None,
         }
     }
@@ -788,6 +890,228 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn add_forward(proto: Proto, port: u16, target: &str) -> ClientMsg {
+        ClientMsg::AddForward {
+            proto,
+            port,
+            target: target.into(),
+            proxy: false,
+            idle_secs: 0,
+            enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn add_forward_validates_persists_and_promotes() {
+        let dir = temp_dir("addfwd");
+        let path = dir.join("client.toml");
+        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\
+                    [[forwards]]\nproto = \"tcp\"\nport = 443\ntarget = \"127.0.0.1:444\"\n";
+        std::fs::write(&path, text).unwrap();
+        let mut state = idle_state("a");
+        state.forwards = SharedForwards::new(vec![tcp_fwd(443)], Vec::new());
+        state.persist = Some(Persist::new(
+            path.clone(),
+            crate::clientcfg::parse_client(text).unwrap(),
+        ));
+        state.active.set_mode(RunMode::Forwards);
+
+        // Each refusal mirrors a parser/validate rule and changes nothing:
+        // a duplicate key, proxy on udp, a shapeless target, and a target
+        // carrying a control character.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let entries_before = state.forwards.entries();
+        let refused = [
+            add_forward(Proto::Tcp, 443, "127.0.0.1:80"),
+            ClientMsg::AddForward {
+                proto: Proto::Udp,
+                port: 53,
+                target: String::new(),
+                proxy: true,
+                idle_secs: 0,
+                enabled: true,
+            },
+            add_forward(Proto::Tcp, 80, "no-port"),
+            add_forward(Proto::Tcp, 80, ":80"),
+            add_forward(Proto::Tcp, 80, "127.0.0.1:0"),
+            add_forward(Proto::Tcp, 80, "10.0.0.5\n:80"),
+        ];
+        for req in refused {
+            let desc = format!("{req:?}");
+            let (ok, msg) = mutate(&state, req).await;
+            assert!(!ok, "expected a refusal for {desc}: {msg}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(state.forwards.entries(), entries_before);
+
+        // The empty target resolves to the config default before persistence,
+        // and idle rides the wire in whole seconds.
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::AddForward {
+                proto: Proto::Udp,
+                port: 53,
+                target: String::new(),
+                proxy: false,
+                idle_secs: 300,
+                enabled: false,
+            },
+        )
+        .await;
+        assert!(ok, "{msg}");
+        let snap = snapshot(&state);
+        let f = snap
+            .forwards
+            .iter()
+            .find(|f| f.proto == Proto::Udp && f.port == 53)
+            .expect("added forward in the snapshot");
+        assert_eq!(f.target, "127.0.0.1:53");
+        assert_eq!(f.idle_secs, 300);
+        assert!(!f.enabled);
+        // Persisted: the file parses back, passes the boot validation, and
+        // carries the resolved target.
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        let entry = on_disk
+            .forwards
+            .iter()
+            .find(|f| f.proto == Proto::Udp && f.port == 53)
+            .expect("added forward on disk");
+        assert_eq!(entry.target, "127.0.0.1:53");
+        assert_eq!(entry.idle, Some(300));
+        assert!(!entry.enabled);
+
+        // The forwards body was live, so the add kicked rather than moved it.
+        assert_eq!(snap.mode, SessionMode::Forwards);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The first add on an idle client installs the forwards body; a
+    /// device-bound client refuses the add outright.
+    #[tokio::test]
+    async fn add_forward_promotes_idle_and_refuses_a_device_client() {
+        let state = idle_state("a");
+        assert_eq!(snapshot(&state).mode, SessionMode::Idle);
+        let (ok, msg) = mutate(&state, add_forward(Proto::Tcp, 443, "")).await;
+        assert!(ok, "{msg}");
+        assert_eq!(snapshot(&state).mode, SessionMode::Forwards);
+
+        let mut device = idle_state("a");
+        device.fallback_mode =
+            RunMode::Device(crate::client::DeviceConfig::Tap(crate::tap::TapConfig {
+                name: "ztap0".into(),
+                mtu: 1400,
+                bridge: None,
+            }));
+        let (ok, msg) = mutate(&device, add_forward(Proto::Tcp, 443, "")).await;
+        assert!(!ok);
+        assert!(msg.contains("[tap]/[tun]"), "{msg}");
+        assert!(snapshot(&device).forwards.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_forward_refuses_unknown_and_persists_the_rest() {
+        let dir = temp_dir("rmfwd");
+        let path = dir.join("client.toml");
+        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\
+                    [[forwards]]\nproto = \"tcp\"\nport = 443\ntarget = \"127.0.0.1:444\"\n\
+                    [[forwards]]\nproto = \"udp\"\nport = 53\ntarget = \"127.0.0.1:54\"\n";
+        std::fs::write(&path, text).unwrap();
+        let mut state = idle_state("a");
+        state.forwards = SharedForwards::new(
+            vec![tcp_fwd(443)],
+            vec![Forward {
+                port: 53,
+                target: "127.0.0.1:54".into(),
+                proxy: false,
+                idle: None,
+                enabled: true,
+            }],
+        );
+        state.persist = Some(Persist::new(
+            path.clone(),
+            crate::clientcfg::parse_client(text).unwrap(),
+        ));
+        state.active.set_mode(RunMode::Forwards);
+
+        // No such key: the port on the wrong proto, and a port never declared.
+        let before = std::fs::read_to_string(&path).unwrap();
+        for (proto, port) in [(Proto::Udp, 443u16), (Proto::Tcp, 80)] {
+            let (ok, msg) = mutate(&state, ClientMsg::RemoveForward { proto, port }).await;
+            assert!(!ok, "expected a refusal: {msg}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(snapshot(&state).forwards.len(), 2);
+
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::RemoveForward {
+                proto: Proto::Tcp,
+                port: 443,
+            },
+        )
+        .await;
+        assert!(ok, "{msg}");
+        let snap = snapshot(&state);
+        assert_eq!(snap.forwards.len(), 1);
+        assert_eq!(snap.forwards[0].proto, Proto::Udp);
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.forwards.len(), 1);
+        assert_eq!(on_disk.forwards[0].proto, Proto::Udp);
+
+        // Removing the last forward never demotes the live body.
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::RemoveForward {
+                proto: Proto::Udp,
+                port: 53,
+            },
+        )
+        .await;
+        assert!(ok, "{msg}");
+        let snap = snapshot(&state);
+        assert!(snap.forwards.is_empty());
+        assert_eq!(snap.mode, SessionMode::Forwards);
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        assert!(on_disk.forwards.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The derived bodies track the declared set: adding a forward under an
+    /// autostart-pppoe fallback moves both `Connect`'s body and
+    /// `StopSession`'s fallback to forwards; removing it moves them back.
+    #[tokio::test]
+    async fn derived_modes_follow_forward_edits() {
+        let mut state = idle_state("a");
+        state.fallback_mode = RunMode::Pppoe {
+            name: "wan".into(),
+            config: pppoe_config(),
+        };
+        assert_eq!(state.boot_mode().session_mode(), SessionMode::Pppoe);
+        assert_eq!(state.base_mode().session_mode(), SessionMode::Idle);
+
+        let (ok, msg) = mutate(&state, add_forward(Proto::Tcp, 443, "")).await;
+        assert!(ok, "{msg}");
+        assert_eq!(state.boot_mode().session_mode(), SessionMode::Forwards);
+        assert_eq!(state.base_mode().session_mode(), SessionMode::Forwards);
+
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::RemoveForward {
+                proto: Proto::Tcp,
+                port: 443,
+            },
+        )
+        .await;
+        assert!(ok, "{msg}");
+        assert_eq!(state.boot_mode().session_mode(), SessionMode::Pppoe);
+        assert_eq!(state.base_mode().session_mode(), SessionMode::Idle);
+    }
+
     fn add_server(name: &str, addr: &str, secret: &str) -> ClientMsg {
         ClientMsg::AddServer {
             name: name.into(),
@@ -885,7 +1209,6 @@ mod tests {
             transport: Transport::Auto,
         };
         state.servers = SharedServers::new(vec![server_target("a", 1), dht]);
-        state.boot_mode = RunMode::Forwards;
 
         let (ok, msg) = mutate(
             &state,
@@ -922,7 +1245,7 @@ mod tests {
             transport: Transport::Auto,
         };
         state.servers = SharedServers::new(vec![server_target("a", 1), dht]);
-        state.boot_mode = RunMode::Forwards;
+        state.forwards = SharedForwards::new(vec![tcp_fwd(443)], Vec::new());
 
         let (ok, msg) = mutate(
             &state,
@@ -992,7 +1315,7 @@ mod tests {
         let mut state = idle_state("a");
         state.servers = SharedServers::new(vec![server_target("a", 1), server_target("b", 2)]);
         state.pppoe = vec![("wan".into(), pppoe_config())];
-        state.boot_mode = RunMode::Forwards;
+        state.forwards = SharedForwards::new(vec![tcp_fwd(443)], Vec::new());
         // Idle runs no session body, so connect is the park's exit there too:
         // it installs the boot-derived forwards body.
         let (ok, _) = mutate(

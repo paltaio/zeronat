@@ -109,9 +109,28 @@ enum Overlay {
         secret: String,
         field: u8,
     },
+    /// The add-forward form. A blank target is sent as the empty sentinel the
+    /// daemon resolves to `127.0.0.1:PORT`; picking udp clears the proxy
+    /// toggle, a state the daemon always refuses. Fields in form order:
+    /// proto, port, target, proxy, enabled, idle.
+    AddForward {
+        proto: Proto,
+        port: String,
+        target: String,
+        proxy: bool,
+        enabled: bool,
+        idle: String,
+        field: u8,
+    },
     /// Removing a profile is a config edit; it needs a deliberate yes.
     ConfirmRemove {
         name: String,
+    },
+    /// Removing a forward drops its open connections; it needs a deliberate
+    /// yes.
+    ConfirmRemoveForward {
+        proto: Proto,
+        port: u16,
     },
     /// Disconnecting parks the client offline; it needs a deliberate yes.
     ConfirmDisconnect,
@@ -220,7 +239,9 @@ impl App {
             Overlay::ConfirmSelect { .. } => self.on_key_confirm_select(k).await,
             Overlay::FwdForm { .. } => self.on_key_form(k).await,
             Overlay::AddServer { .. } => self.on_key_add_server(k).await,
+            Overlay::AddForward { .. } => self.on_key_add_forward(k).await,
             Overlay::ConfirmRemove { .. } => self.on_key_confirm_remove(k).await,
+            Overlay::ConfirmRemoveForward { .. } => self.on_key_confirm_remove_forward(k).await,
             Overlay::ConfirmDisconnect => self.on_key_confirm_disconnect(k).await,
             Overlay::PppoePicker { .. } => self.on_key_picker(k).await,
             Overlay::ConfirmStop { .. } => self.on_key_confirm_stop(k).await,
@@ -275,11 +296,29 @@ impl App {
                     field: 0,
                 };
             }
+            Key::Char('f') => {
+                self.overlay = Overlay::AddForward {
+                    proto: Proto::Tcp,
+                    port: String::new(),
+                    target: String::new(),
+                    proxy: false,
+                    enabled: true,
+                    idle: String::new(),
+                    field: 0,
+                };
+            }
+            // One delete verb across the index space: server rows confirm a
+            // profile removal, forward rows a forward removal.
             Key::Char('x') => {
                 let servers = self.servers();
                 if let Some(s) = servers.get(self.sel) {
                     self.overlay = Overlay::ConfirmRemove {
                         name: s.name.clone(),
+                    };
+                } else if let Some(f) = self.forwards().get(self.sel - servers.len()) {
+                    self.overlay = Overlay::ConfirmRemoveForward {
+                        proto: f.proto,
+                        port: f.port,
                     };
                 }
             }
@@ -567,6 +606,178 @@ impl App {
             transport,
         };
         self.apply(req, format!("added {name}")).await;
+        Flow::Continue
+    }
+
+    async fn on_key_add_forward(&mut self, k: Key) -> Flow {
+        match k {
+            Key::Esc => self.overlay = Overlay::None,
+            Key::Tab | Key::Down => {
+                if let Overlay::AddForward { field, .. } = &mut self.overlay {
+                    *field = (*field + 1) % 6;
+                }
+            }
+            Key::Up => {
+                if let Overlay::AddForward { field, .. } = &mut self.overlay {
+                    *field = (*field + 5) % 6;
+                }
+            }
+            Key::Left | Key::Right => {
+                if let Overlay::AddForward { field, .. } = &mut self.overlay {
+                    let field = *field;
+                    self.toggle_add_forward(field);
+                }
+            }
+            Key::Backspace => {
+                if let Overlay::AddForward {
+                    field,
+                    port,
+                    target,
+                    idle,
+                    ..
+                } = &mut self.overlay
+                {
+                    match field {
+                        1 => {
+                            port.pop();
+                        }
+                        2 => {
+                            target.pop();
+                        }
+                        5 => {
+                            idle.pop();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Key::Enter => return self.submit_add_forward().await,
+            Key::Char(c) => {
+                let toggled = if let Overlay::AddForward {
+                    field,
+                    port,
+                    target,
+                    idle,
+                    ..
+                } = &mut self.overlay
+                {
+                    match field {
+                        1 if c.is_ascii_digit() && port.len() < 5 => {
+                            port.push(c);
+                            None
+                        }
+                        // The daemon refuses control characters; space stays
+                        // typeable, the toggle fields own it elsewhere.
+                        2 if !c.is_control() => {
+                            target.push(c);
+                            None
+                        }
+                        5 if c.is_ascii_digit() && idle.len() < 9 => {
+                            idle.push(c);
+                            None
+                        }
+                        f if c == ' ' => Some(*f),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(field) = toggled {
+                    self.toggle_add_forward(field);
+                }
+            }
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    /// Flip the add-forward form's picker or toggle at `field`. Moving the
+    /// picker to udp clears the proxy toggle, and the proxy toggle is inert
+    /// while udp is picked: the daemon refuses proxy on udp.
+    fn toggle_add_forward(&mut self, field: u8) {
+        if let Overlay::AddForward {
+            proto,
+            proxy,
+            enabled,
+            ..
+        } = &mut self.overlay
+        {
+            match field {
+                0 => {
+                    *proto = match proto {
+                        Proto::Tcp => Proto::Udp,
+                        Proto::Udp => Proto::Tcp,
+                    };
+                    if *proto == Proto::Udp {
+                        *proxy = false;
+                    }
+                }
+                3 if *proto == Proto::Tcp => *proxy = !*proxy,
+                4 => *enabled = !*enabled,
+                _ => {}
+            }
+        }
+    }
+
+    async fn submit_add_forward(&mut self) -> Flow {
+        let (proto, port, target, proxy, enabled, idle) = match &self.overlay {
+            Overlay::AddForward {
+                proto,
+                port,
+                target,
+                proxy,
+                enabled,
+                idle,
+                ..
+            } => (
+                *proto,
+                port.clone(),
+                target.clone(),
+                *proxy,
+                *enabled,
+                idle.clone(),
+            ),
+            _ => return Flow::Continue,
+        };
+        // A submit without a usable port keeps the form open to fix it.
+        let Some(port) = port.parse::<u16>().ok().filter(|p| *p != 0) else {
+            self.set_toast("port must be 1-65535".to_string(), true);
+            return Flow::Continue;
+        };
+        // The digits-only, length-capped idle field parses whenever non-empty;
+        // empty means no override.
+        let idle_secs: u32 = idle.parse().unwrap_or(0);
+        self.overlay = Overlay::None;
+        // A blank target rides as the empty sentinel; the daemon resolves the
+        // 127.0.0.1:PORT default the form displayed.
+        let req = ClientMsg::AddForward {
+            proto,
+            port,
+            target,
+            proxy,
+            idle_secs,
+            enabled,
+        };
+        self.apply(req, format!("added {}:{port}", proto_name(proto)))
+            .await;
+        Flow::Continue
+    }
+
+    async fn on_key_confirm_remove_forward(&mut self, k: Key) -> Flow {
+        match k {
+            Key::Char('y') | Key::Enter => {
+                if let Overlay::ConfirmRemoveForward { proto, port } = self.overlay {
+                    self.overlay = Overlay::None;
+                    self.apply(
+                        ClientMsg::RemoveForward { proto, port },
+                        format!("removed {}:{port}", proto_name(proto)),
+                    )
+                    .await;
+                }
+            }
+            Key::Char('n') | Key::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
         Flow::Continue
     }
 
@@ -861,9 +1072,11 @@ impl App {
                     } else {
                         hint(&mut l, "⏎", "edit");
                         hint(&mut l, "␣", "toggle");
+                        hint(&mut l, "x", "remove");
                     }
                 }
                 hint(&mut l, "a", "add");
+                hint(&mut l, "f", "add fwd");
                 // Connect is offered only while offline; disconnect while
                 // anything (a body or the idle dial) is up.
                 match self.mode() {
@@ -892,6 +1105,12 @@ impl App {
                 hint(&mut l, "⏎", "add");
                 hint(&mut l, "esc", "cancel");
             }
+            Overlay::AddForward { .. } => {
+                hint(&mut l, "tab", "field");
+                hint(&mut l, "←→", "toggle");
+                hint(&mut l, "⏎", "add");
+                hint(&mut l, "esc", "cancel");
+            }
             Overlay::PppoePicker { .. } => {
                 hint(&mut l, "↑↓", "choose");
                 hint(&mut l, "⏎", "spawn");
@@ -899,6 +1118,7 @@ impl App {
             }
             Overlay::ConfirmSelect { .. }
             | Overlay::ConfirmRemove { .. }
+            | Overlay::ConfirmRemoveForward { .. }
             | Overlay::ConfirmDisconnect
             | Overlay::ConfirmStop { .. } => {
                 hint(&mut l, "y", "confirm");
@@ -976,6 +1196,42 @@ impl App {
                 p.push(frame::divider(w));
                 p
             }
+            Overlay::AddForward {
+                proto,
+                port,
+                target,
+                proxy,
+                enabled,
+                idle,
+                field,
+            } => {
+                let mut p = vec![frame::divider(w)];
+                p.push(frame::panel_title(w, "add forward"));
+                p.push(frame::row(
+                    w,
+                    form_pick("proto", proto_name(*proto), *field == 0),
+                ));
+                p.push(frame::row(w, form_text("port", port, *field == 1)));
+                // A blank target renders as the default it resolves to.
+                let default = if port.is_empty() {
+                    "127.0.0.1:PORT".to_string()
+                } else {
+                    format!("127.0.0.1:{port}")
+                };
+                p.push(frame::row(
+                    w,
+                    form_text_default("target", target, &default, *field == 2),
+                ));
+                p.push(frame::row(w, form_bool("proxy", *proxy, *field == 3)));
+                p.push(frame::row(w, form_bool("enabled", *enabled, *field == 4)));
+                p.push(frame::row(w, form_text("idle", idle, *field == 5)));
+                p.push(frame::row(
+                    w,
+                    muted_line("  blank target means the 127.0.0.1:PORT default; idle in seconds"),
+                ));
+                p.push(frame::divider(w));
+                p
+            }
             Overlay::ConfirmRemove { name } => {
                 let mut p = vec![frame::divider(w)];
                 p.push(frame::panel_title(w, "confirm"));
@@ -983,6 +1239,21 @@ impl App {
                 l.add(
                     WARN,
                     &format!("remove server {} from the config?", sanitize(name)),
+                );
+                p.push(frame::row_center(w, l));
+                p.push(frame::divider(w));
+                p
+            }
+            Overlay::ConfirmRemoveForward { proto, port } => {
+                let mut p = vec![frame::divider(w)];
+                p.push(frame::panel_title(w, "confirm"));
+                let mut l = Line::new();
+                l.add(
+                    WARN,
+                    &format!(
+                        "remove forward {}:{port} and drop its connections?",
+                        proto_name(*proto)
+                    ),
                 );
                 p.push(frame::row_center(w, l));
                 p.push(frame::divider(w));
@@ -1160,6 +1431,22 @@ fn form_text(label: &str, value: &str, focused: bool) -> Line {
     caret(&mut l, focused);
     l.add(MUTED, &format!("{label:<10}"));
     l.add(PLAIN, value);
+    if focused {
+        l.add(ACCENT, "_");
+    }
+    l
+}
+
+/// A text field whose empty value renders the default it resolves to, muted.
+fn form_text_default(label: &str, value: &str, default: &str, focused: bool) -> Line {
+    let mut l = Line::new();
+    caret(&mut l, focused);
+    l.add(MUTED, &format!("{label:<10}"));
+    if value.is_empty() {
+        l.add(MUTED, default);
+    } else {
+        l.add(PLAIN, value);
+    }
     if focused {
         l.add(ACCENT, "_");
     }
@@ -1442,7 +1729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_confirms_on_a_server_row_only() {
+    async fn remove_confirms_by_row_kind() {
         let mut app = app_with(snap());
         app.sel = 1;
         app.on_key(Key::Char('x')).await;
@@ -1450,10 +1737,113 @@ mod tests {
         app.on_key(Key::Char('n')).await;
         assert!(matches!(app.overlay, Overlay::None));
 
-        // On a forward row the key does nothing.
+        // On a forward row the same key confirms a forward removal, keyed by
+        // the row's own (proto, port).
         app.sel = 2;
         app.on_key(Key::Char('x')).await;
+        assert!(matches!(
+            app.overlay,
+            Overlay::ConfirmRemoveForward {
+                proto: Proto::Tcp,
+                port: 443,
+            }
+        ));
+        app.on_key(Key::Esc).await;
         assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    /// The add-forward form opens on `f`, walks its fields, and the udp pick
+    /// clears (and then pins) the proxy toggle the daemon would refuse.
+    #[tokio::test]
+    async fn add_forward_form_pins_proxy_off_on_udp() {
+        let mut app = app_with(snap());
+        app.on_key(Key::Char('f')).await;
+        assert!(matches!(app.overlay, Overlay::AddForward { .. }));
+
+        // Port digits, then proxy on (tcp allows it).
+        app.on_key(Key::Tab).await;
+        for c in "8443".chars() {
+            app.on_key(Key::Char(c)).await;
+        }
+        app.on_key(Key::Tab).await;
+        app.on_key(Key::Tab).await;
+        app.on_key(Key::Char(' ')).await;
+        match &app.overlay {
+            Overlay::AddForward { port, proxy, .. } => {
+                assert_eq!(port, "8443");
+                assert!(*proxy);
+            }
+            _ => panic!("expected the add-forward form"),
+        }
+
+        // Flipping the picker to udp clears proxy; toggling proxy while udp
+        // is picked does nothing; back on tcp it toggles again.
+        for _ in 0..3 {
+            app.on_key(Key::Up).await;
+        }
+        app.on_key(Key::Right).await;
+        match &app.overlay {
+            Overlay::AddForward { proto, proxy, .. } => {
+                assert_eq!(*proto, Proto::Udp);
+                assert!(!*proxy, "the udp pick must clear the proxy toggle");
+            }
+            _ => panic!("expected the add-forward form"),
+        }
+        app.on_key(Key::Tab).await;
+        app.on_key(Key::Tab).await;
+        app.on_key(Key::Tab).await;
+        app.on_key(Key::Char(' ')).await;
+        match &app.overlay {
+            Overlay::AddForward { proxy, .. } => {
+                assert!(!*proxy, "proxy must stay off while udp is picked");
+            }
+            _ => panic!("expected the add-forward form"),
+        }
+    }
+
+    /// A blank target renders the daemon's default; typed text replaces it.
+    #[tokio::test]
+    async fn add_forward_form_renders_the_default_target() {
+        let mut app = app_with(snap());
+        app.on_key(Key::Char('f')).await;
+        let rows = plain_view(&app);
+        assert!(rows.iter().any(|r| r.contains("127.0.0.1:PORT")));
+
+        app.on_key(Key::Tab).await;
+        for c in "8443".chars() {
+            app.on_key(Key::Char(c)).await;
+        }
+        let rows = plain_view(&app);
+        assert!(rows.iter().any(|r| r.contains("127.0.0.1:8443")));
+
+        app.on_key(Key::Tab).await;
+        for c in "10.0.0.5:80".chars() {
+            app.on_key(Key::Char(c)).await;
+        }
+        let rows = plain_view(&app);
+        assert!(rows.iter().any(|r| r.contains("10.0.0.5:80")));
+        assert!(!rows.iter().any(|r| r.contains("127.0.0.1:8443")));
+    }
+
+    /// Submitting without a usable port keeps the form open with an error
+    /// toast, so the typed fields are not thrown away.
+    #[tokio::test]
+    async fn add_forward_submit_requires_a_port() {
+        let mut app = app_with(snap());
+        app.on_key(Key::Char('f')).await;
+        app.on_key(Key::Enter).await;
+        assert!(matches!(app.overlay, Overlay::AddForward { .. }));
+        let (msg, is_err, _) = app.toast.clone().expect("a refusal toast");
+        assert!(is_err);
+        assert!(msg.contains("port"), "{msg}");
+
+        // An out-of-range port is refused the same way.
+        app.on_key(Key::Tab).await;
+        for c in "99999".chars() {
+            app.on_key(Key::Char(c)).await;
+        }
+        app.on_key(Key::Enter).await;
+        assert!(matches!(app.overlay, Overlay::AddForward { .. }));
     }
 
     /// `d` and `c` key off the snapshot mode, never off any message text:

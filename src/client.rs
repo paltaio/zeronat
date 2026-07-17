@@ -222,6 +222,46 @@ impl SharedForwards {
         }
     }
 
+    /// Whether any forward is declared, enabled or not: disabled entries
+    /// still shape the session mode, exactly as they shape a boot.
+    pub(crate) fn any_declared(&self) -> bool {
+        let m = self.inner.lock().unwrap();
+        !m.tcp.is_empty() || !m.udp.is_empty()
+    }
+
+    /// Append the `(proto, port)` forward. The duplicate check and the insert
+    /// are one locked step; `false` (and no change) when the key is taken.
+    pub(crate) fn add(&self, proto: Proto, fwd: Forward) -> bool {
+        let mut m = self.inner.lock().unwrap();
+        let map = match proto {
+            Proto::Tcp => &mut m.tcp,
+            Proto::Udp => &mut m.udp,
+        };
+        match map.entry(fwd.port) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(ForwardTarget {
+                    target: fwd.target,
+                    proxy: fwd.proxy,
+                    idle: fwd.idle,
+                    enabled: fwd.enabled,
+                });
+                true
+            }
+        }
+    }
+
+    /// Remove the `(proto, port)` forward; `false` when no such forward
+    /// exists.
+    pub(crate) fn remove(&self, proto: Proto, port: u16) -> bool {
+        let mut m = self.inner.lock().unwrap();
+        let map = match proto {
+            Proto::Tcp => &mut m.tcp,
+            Proto::Udp => &mut m.udp,
+        };
+        map.remove(&port).is_some()
+    }
+
     /// Per-attempt copy for a `Client`, disabled forwards left out; an edit
     /// after this lands on the next connection attempt.
     fn maps(&self) -> (HashMap<u16, ForwardTarget>, HashMap<u16, ForwardTarget>) {
@@ -537,6 +577,18 @@ pub enum RunMode {
     Offline,
 }
 
+/// The session body the declared forward set selects: `Forwards` when any
+/// forward is declared (enabled or not), else `fallback`. Boot, `Connect`,
+/// and `StopSession` all derive through here at use, so the body each
+/// installs tracks runtime forward edits.
+pub(crate) fn derive_mode(forwards: &SharedForwards, fallback: &RunMode) -> RunMode {
+    if forwards.any_declared() {
+        RunMode::Forwards
+    } else {
+        fallback.clone()
+    }
+}
+
 impl RunMode {
     pub fn session_mode(&self) -> SessionMode {
         match self {
@@ -644,6 +696,25 @@ impl ActiveTarget {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Apply an added forward to the running body. An idle client promotes to
+    /// the forwards body and fires the cancel: its boot derivation now says
+    /// `Forwards`, and a client that accepted the add must serve it rather
+    /// than sit silent until a reconnect. A live forwards body is kicked so
+    /// the redial re-announces the new entry. Any other body, the offline
+    /// park included, is left untouched; the forward lands at the next
+    /// forwards bringup.
+    pub fn serve_forwards(&self) {
+        let mut s = self.state.lock().unwrap();
+        match s.mode {
+            RunMode::Idle => {
+                s.mode = RunMode::Forwards;
+                s.cancel.notify_one();
+            }
+            RunMode::Forwards => s.cancel.notify_one(),
+            _ => {}
         }
     }
 
@@ -792,7 +863,6 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         return Err("pppoe is only supported on Linux".into());
     }
 
-    let forwards_declared = !tcp.is_empty() || !udp.is_empty();
     let forwards = SharedForwards::new(tcp, udp);
     // Held for the loop's lifetime: a pppoe attempt's datapath borrows the
     // credential bytes across the await, so every session's config must
@@ -807,17 +877,11 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         (None, None) => None,
     };
 
-    // Boot body: forwards when any are declared, else the autostart pppoe,
-    // else the device, else idle with only the admin socket up. `StopSession`
-    // falls back to the forwards/idle base.
-    let base_mode = if forwards_declared {
-        RunMode::Forwards
-    } else {
-        RunMode::Idle
-    };
-    let boot_mode = if forwards_declared {
-        RunMode::Forwards
-    } else if let Some(name) = autostart {
+    // The boot chain minus its forwards arm, fixed for the loop's lifetime:
+    // the autostart pppoe, else the device, else idle with only the admin
+    // socket up. The boot body itself is derived from this plus the declared
+    // forward set, through the same helper `Connect` and `StopSession` use.
+    let fallback_mode = if let Some(name) = autostart {
         let config = pppoe
             .iter()
             .find(|(n, _)| *n == name)
@@ -831,7 +895,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
     } else {
         RunMode::Idle
     };
-    active.init_mode(boot_mode.clone());
+    active.init_mode(derive_mode(&forwards, &fallback_mode));
 
     let ppp = PppStatus::default();
     // Written by this loop (park, dial, backoff) and by the session bodies
@@ -856,8 +920,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 link: link.clone(),
                 servers: servers.clone(),
                 pppoe,
-                base_mode,
-                boot_mode,
+                fallback_mode,
                 persist: config.map(|(path, cfg)| Persist::new(path, cfg)),
             };
             Some(AbortOnDrop(tokio::spawn(listener.serve(state))))
@@ -2055,6 +2118,153 @@ mod tests {
                 .is_err(),
             "kick must not drop a non-forwards body"
         );
+    }
+
+    fn one_tcp_forward(enabled: bool) -> SharedForwards {
+        SharedForwards::new(
+            vec![Forward {
+                port: 443,
+                target: "127.0.0.1:8443".into(),
+                proxy: false,
+                idle: None,
+                enabled,
+            }],
+            vec![],
+        )
+    }
+
+    // The derived body keys on declared forwards, enabled or not; only an
+    // empty declared set falls through to the fallback.
+    #[test]
+    fn derive_mode_keys_on_declared_forwards() {
+        let empty = SharedForwards::new(vec![], vec![]);
+        for fallback in [RunMode::Idle, pppoe_mode("wan")] {
+            assert_eq!(
+                derive_mode(&empty, &fallback).session_mode(),
+                fallback.session_mode()
+            );
+            assert_eq!(
+                derive_mode(&one_tcp_forward(true), &fallback).session_mode(),
+                SessionMode::Forwards
+            );
+            // A disabled entry still shapes the mode, as it shapes a boot.
+            assert_eq!(
+                derive_mode(&one_tcp_forward(false), &fallback).session_mode(),
+                SessionMode::Forwards
+            );
+        }
+        // Adding then removing the only forward moves the derivation with the
+        // declared set: what Connect installs and what StopSession falls back
+        // to track the current set, not the boot-time one.
+        let fwds = SharedForwards::new(vec![], vec![]);
+        let fallback = pppoe_mode("wan");
+        assert_eq!(
+            derive_mode(&fwds, &fallback).session_mode(),
+            SessionMode::Pppoe
+        );
+        assert!(fwds.add(
+            Proto::Udp,
+            Forward {
+                port: 53,
+                target: "127.0.0.1:5353".into(),
+                proxy: false,
+                idle: None,
+                enabled: false,
+            }
+        ));
+        assert_eq!(
+            derive_mode(&fwds, &fallback).session_mode(),
+            SessionMode::Forwards
+        );
+        assert_eq!(
+            derive_mode(&fwds, &RunMode::Idle).session_mode(),
+            SessionMode::Forwards
+        );
+        assert!(fwds.remove(Proto::Udp, 53));
+        assert_eq!(
+            derive_mode(&fwds, &fallback).session_mode(),
+            SessionMode::Pppoe
+        );
+        assert_eq!(
+            derive_mode(&fwds, &RunMode::Idle).session_mode(),
+            SessionMode::Idle
+        );
+    }
+
+    #[test]
+    fn add_and_remove_edit_the_forward_maps() {
+        let fwds = one_tcp_forward(true);
+        assert!(fwds.any_declared());
+        // A duplicate (proto, port) is refused without touching the entry.
+        assert!(!fwds.add(
+            Proto::Tcp,
+            Forward {
+                port: 443,
+                target: "10.0.0.9:1".into(),
+                proxy: true,
+                idle: None,
+                enabled: true,
+            }
+        ));
+        assert_eq!(fwds.entries()[0].target, "127.0.0.1:8443");
+        // The same port on the other proto is its own key.
+        assert!(fwds.add(
+            Proto::Udp,
+            Forward {
+                port: 443,
+                target: "127.0.0.1:5353".into(),
+                proxy: false,
+                idle: Some(Duration::from_secs(300)),
+                enabled: false,
+            }
+        ));
+        let entries = fwds.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].proto, Proto::Udp);
+        assert_eq!(entries[1].idle_secs, 300);
+        assert!(!entries[1].enabled);
+
+        assert!(!fwds.remove(Proto::Tcp, 80));
+        assert!(fwds.remove(Proto::Tcp, 443));
+        assert!(fwds.remove(Proto::Udp, 443));
+        assert!(!fwds.remove(Proto::Udp, 443));
+        assert!(!fwds.any_declared());
+        assert!(fwds.entries().is_empty());
+    }
+
+    // The idle-promotion contract: idle installs the forwards body and fires,
+    // a live forwards body is kicked, everything else is left alone.
+    #[tokio::test(start_paused = true)]
+    async fn serve_forwards_promotes_idle_and_kicks_forwards_only() {
+        let active = ActiveTarget::new(target("a"));
+        active.init_mode(RunMode::Idle);
+        let (_t, _m, cancel) = active.begin();
+        active.serve_forwards();
+        tokio_timeout(Duration::from_secs(1), cancel.notified())
+            .await
+            .expect("promotion from idle must fire the cancel");
+        assert_eq!(active.admin_view().1, SessionMode::Forwards);
+
+        let (_t, _m, cancel) = active.begin();
+        active.serve_forwards();
+        tokio_timeout(Duration::from_secs(1), cancel.notified())
+            .await
+            .expect("a live forwards body must be kicked");
+        assert_eq!(active.admin_view().1, SessionMode::Forwards);
+
+        for parked in [pppoe_mode("wan"), RunMode::Offline] {
+            let mode = parked.session_mode();
+            active.set_mode(parked);
+            let (_t, _m, cancel) = active.begin();
+            active.serve_forwards();
+            assert!(
+                tokio_timeout(Duration::from_secs(1), cancel.notified())
+                    .await
+                    .is_err(),
+                "serve_forwards must not touch a {mode:?} body"
+            );
+            assert_eq!(active.admin_view().1, mode);
+        }
     }
 
     #[test]

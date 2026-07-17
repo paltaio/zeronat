@@ -649,6 +649,76 @@ mod pty {
         let snap = snapshot(&sock).await;
         assert_eq!(snap.mode, zeronat::clientproto::SessionMode::Forwards);
 
+        // The f form adds a forward: proto stays on tcp, port typed, target
+        // left blank so the daemon resolves the 127.0.0.1:PORT default. No
+        // server listener exists for it, so the asserts are snapshot-driven.
+        let new_port = loop {
+            let p = free_tcp_port();
+            if p != public_tcp && p != public_udp {
+                break p;
+            }
+        };
+        send(&mut master, b"f");
+        wait_screen(&out, "the add-forward form", 10, |s| {
+            row_containing(s, "add forward").is_some()
+        });
+        send(&mut master, b"\t");
+        send(&mut master, new_port.to_string().as_bytes());
+        // The blank target renders the default it will resolve to.
+        wait_screen(&out, "the rendered default target", 10, |s| {
+            row_containing(s, &format!("127.0.0.1:{new_port}")).is_some()
+        });
+        send(&mut master, b"\r");
+        wait_screen(&out, "the added-forward toast", 10, |s| {
+            row_containing(s, &format!("added tcp:{new_port}")).is_some()
+        });
+        wait_screen(&out, "the new forward row", 10, |s| {
+            row_containing(s, &format!("-> 127.0.0.1:{new_port}")).is_some()
+        });
+        let snap = snapshot(&sock).await;
+        let f = snap
+            .forwards
+            .iter()
+            .find(|f| f.proto == Proto::Tcp && f.port == new_port)
+            .expect("added forward in snapshot");
+        assert_eq!(f.target, format!("127.0.0.1:{new_port}"));
+        assert!(f.enabled);
+        assert_eq!(f.idle_secs, 0);
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        assert!(on_disk
+            .forwards
+            .iter()
+            .any(|f| f.port == new_port && f.target == format!("127.0.0.1:{new_port}")));
+
+        // x on the new forward's row confirms and removes it. Rows are the
+        // two servers, then tcp forwards sorted by port, then the udp one.
+        let tcp_row = 2 + usize::from(new_port > public_tcp);
+        send(
+            &mut master,
+            &[b"\x1b[A".repeat(8), b"\x1b[B".repeat(tcp_row)].concat(),
+        );
+        send(&mut master, b"x");
+        wait_screen(&out, "the remove-forward confirm", 10, |s| {
+            row_containing(s, &format!("remove forward tcp:{new_port}")).is_some()
+        });
+        send(&mut master, b"y");
+        wait_screen(&out, "the removed-forward toast", 10, |s| {
+            row_containing(s, &format!("removed tcp:{new_port}")).is_some()
+        });
+        wait_screen(&out, "the forward row gone", 10, |s| {
+            row_containing(s, &format!("-> 127.0.0.1:{new_port}")).is_none()
+        });
+        let snap = snapshot(&sock).await;
+        assert!(
+            !snap
+                .forwards
+                .iter()
+                .any(|f| f.proto == Proto::Tcp && f.port == new_port),
+            "removed forward still in the snapshot"
+        );
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        assert!(!on_disk.forwards.iter().any(|f| f.port == new_port));
+
         // Quit cleanly.
         send(&mut master, b"q");
         let deadline = Instant::now() + Duration::from_secs(10);

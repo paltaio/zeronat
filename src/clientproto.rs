@@ -273,6 +273,23 @@ pub enum ClientMsg {
     /// Tear the session body down and park offline; nothing is dialed until
     /// `Connect`.
     Disconnect,
+    /// Append a forward, fields in the snapshot entry's order. An empty
+    /// `target` means the config default `127.0.0.1:PORT`, resolved by the
+    /// daemon; a real target is never empty, so the sentinel is free.
+    /// `idle_secs` 0 means no idle override.
+    AddForward {
+        proto: Proto,
+        port: u16,
+        target: String,
+        proxy: bool,
+        idle_secs: u32,
+        enabled: bool,
+    },
+    /// Remove the `(proto, port)` forward.
+    RemoveForward {
+        proto: Proto,
+        port: u16,
+    },
 }
 
 impl ClientMsg {
@@ -383,6 +400,31 @@ impl ClientMsg {
                 b
             }
             ClientMsg::Disconnect => vec![11],
+            ClientMsg::AddForward {
+                proto,
+                port,
+                target,
+                proxy,
+                idle_secs,
+                enabled,
+            } => {
+                let mut b = Vec::new();
+                b.push(12);
+                b.push(proto_byte(*proto));
+                b.extend_from_slice(&port.to_be_bytes());
+                put_str(&mut b, target);
+                b.push(u8::from(*proxy));
+                b.extend_from_slice(&idle_secs.to_be_bytes());
+                b.push(u8::from(*enabled));
+                b
+            }
+            ClientMsg::RemoveForward { proto, port } => {
+                let mut b = Vec::with_capacity(4);
+                b.push(13);
+                b.push(proto_byte(*proto));
+                b.extend_from_slice(&port.to_be_bytes());
+                b
+            }
         }
     }
 
@@ -588,6 +630,45 @@ impl ClientMsg {
                 Ok(ClientMsg::Connect { name })
             }
             Some(11) if b.len() == 1 => Ok(ClientMsg::Disconnect),
+            Some(12) => {
+                if b.len() < 4 {
+                    return Err("truncated add forward".into());
+                }
+                let proto = proto_from_byte(b[1])?;
+                let port = u16::from_be_bytes([b[2], b[3]]);
+                let mut at = 4;
+                let target = take_str(b, &mut at)?;
+                if at + 6 > b.len() {
+                    return Err("truncated add forward options".into());
+                }
+                let proxy = match b[at] {
+                    0 => false,
+                    1 => true,
+                    n => return Err(format!("unknown forward proxy byte {n}").into()),
+                };
+                let idle_secs = u32::from_be_bytes(b[at + 1..at + 5].try_into().unwrap());
+                let enabled = match b[at + 5] {
+                    0 => false,
+                    1 => true,
+                    n => return Err(format!("unknown forward enabled byte {n}").into()),
+                };
+                at += 6;
+                if at != b.len() {
+                    return Err("trailing bytes in add forward".into());
+                }
+                Ok(ClientMsg::AddForward {
+                    proto,
+                    port,
+                    target,
+                    proxy,
+                    idle_secs,
+                    enabled,
+                })
+            }
+            Some(13) if b.len() == 4 => Ok(ClientMsg::RemoveForward {
+                proto: proto_from_byte(b[1])?,
+                port: u16::from_be_bytes([b[2], b[3]]),
+            }),
             _ => Err(format!("malformed client message ({} bytes)", b.len()).into()),
         }
     }
@@ -987,7 +1068,96 @@ mod tests {
         // Unknown tags and the empty frame.
         assert!(ClientMsg::decode(&[]).is_err());
         assert!(ClientMsg::decode(&[0]).is_err());
-        assert!(ClientMsg::decode(&[12]).is_err());
+        assert!(ClientMsg::decode(&[14]).is_err());
+    }
+
+    #[test]
+    fn forward_mutation_roundtrips() {
+        // Every field set, the empty-target sentinel, and a disabled udp
+        // entry with no overrides.
+        let cases = [
+            (Proto::Tcp, 8443u16, "10.0.0.5:443", true, 600u32, true),
+            (Proto::Tcp, 443, "", false, 0, true),
+            (Proto::Udp, 51820, "127.0.0.1:51820", false, 0, false),
+        ];
+        for (proto, port, target, proxy, idle_secs, enabled) in cases {
+            let m = ClientMsg::AddForward {
+                proto,
+                port,
+                target: target.into(),
+                proxy,
+                idle_secs,
+                enabled,
+            };
+            match roundtrip(&m) {
+                ClientMsg::AddForward {
+                    proto: p,
+                    port: pt,
+                    target: t,
+                    proxy: px,
+                    idle_secs: i,
+                    enabled: e,
+                } => {
+                    assert_eq!(p, proto);
+                    assert_eq!(pt, port);
+                    assert_eq!(t, target);
+                    assert_eq!(px, proxy);
+                    assert_eq!(i, idle_secs);
+                    assert_eq!(e, enabled);
+                }
+                other => panic!("expected add forward, got {other:?}"),
+            }
+        }
+
+        for proto in [Proto::Tcp, Proto::Udp] {
+            match roundtrip(&ClientMsg::RemoveForward { proto, port: 443 }) {
+                ClientMsg::RemoveForward { proto: p, port } => {
+                    assert_eq!(p, proto);
+                    assert_eq!(port, 443);
+                }
+                other => panic!("expected remove forward, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn forward_mutations_reject_malformed() {
+        // Byte offsets with the one-char target "t": 0 tag, 1 proto, 2-3
+        // port, 4-6 target, 7 proxy, 8-11 idle, 12 enabled.
+        let add = ClientMsg::AddForward {
+            proto: Proto::Tcp,
+            port: 443,
+            target: "t".into(),
+            proxy: true,
+            idle_secs: 600,
+            enabled: false,
+        }
+        .encode();
+        assert_eq!(add.len(), 13);
+        for cut in 1..add.len() {
+            assert!(
+                ClientMsg::decode(&add[..cut]).is_err(),
+                "cut {cut} should error"
+            );
+        }
+        let mut junk = add.clone();
+        junk.push(0x00);
+        assert!(ClientMsg::decode(&junk).is_err());
+        // Unknown proto, proxy, and enabled bytes.
+        for (at, bad) in [(1, 9u8), (7, 2u8), (12, 2u8)] {
+            let mut corrupt = add.clone();
+            corrupt[at] = bad;
+            assert!(
+                ClientMsg::decode(&corrupt).is_err(),
+                "byte {at} = {bad} should error"
+            );
+        }
+
+        // RemoveForward is a fixed 4-byte frame with a valid proto byte.
+        assert!(ClientMsg::decode(&[13]).is_err());
+        assert!(ClientMsg::decode(&[13, 0, 1]).is_err());
+        assert!(ClientMsg::decode(&[13, 0, 1, 187, 0]).is_err());
+        assert!(ClientMsg::decode(&[13, 9, 1, 187]).is_err());
     }
 
     // The dispatcher formats unexpected messages into logged error strings,
