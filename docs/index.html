@@ -392,6 +392,12 @@ docker exec -it zeronat /zeronat client admin spawn-pppoe wan</code></pre>
       <code>enable-forward</code> and <code>disable-forward</code> flip one forward without removing
       it: a disabled forward stays in the config and the status listing but refuses connections until
       re-enabled.</p>
+      <p><code>add-forward</code> and <code>remove-forward</code> edit the forward list itself.
+      <code>add-forward tcp:8443:10.0.0.5:8443+proxy</code> takes the same spec as
+      <code>--tcp</code>/<code>--udp</code> and starts serving at once, even on a client that booted
+      with no forwards. A running PPPoE session is left alone; the forward starts serving once that
+      session stops. <code>remove-forward tcp:8443</code> drops the port; connections open on it
+      are cut. Changing a target is remove then add.</p>
       <p><code>disconnect</code> parks the client offline: the session tears down, nothing is dialed,
       and only the admin socket stays up. <code>connect</code> brings the boot-declared session back,
       optionally naming another server, and reports the resulting mode. Offline is never persisted; a
@@ -552,6 +558,8 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
           <tr><td><code>remove-server &lt;NAME&gt;</code></td><td>Remove a server profile; the active one is refused</td></tr>
           <tr><td><code>enable-forward &lt;PROTO:PORT&gt;</code></td><td>Enable a forward, e.g. <code>tcp:443</code></td></tr>
           <tr><td><code>disable-forward &lt;PROTO:PORT&gt;</code></td><td>Disable a forward without removing it</td></tr>
+          <tr><td><code>add-forward &lt;PROTO:SPEC&gt;</code></td><td>Add an enabled forward, e.g. <code>tcp:443:10.0.0.5:8443+proxy+idle=600</code></td></tr>
+          <tr><td><code>remove-forward &lt;PROTO:PORT&gt;</code></td><td>Remove a forward; connections open on it are cut</td></tr>
           <tr><td><code>connect [NAME]</code></td><td>Leave offline mode and bring up the boot session</td></tr>
           <tr><td><code>disconnect</code></td><td>Tear the session down; nothing dials until <code>connect</code></td></tr>
           <tr><td><code>spawn-pppoe &lt;NAME&gt;</code></td><td>Bring up the named PPPoE session</td></tr>
