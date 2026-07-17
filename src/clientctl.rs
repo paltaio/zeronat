@@ -13,9 +13,11 @@ use std::time::Duration;
 
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::client::{ActiveTarget, PppoeRunConfig, RunMode, ServerTarget, SharedForwards};
-use crate::clientcfg::{serialize_client, ClientConfig};
-use crate::clientproto::{ClientMsg, ClientServerEntry, ClientSnapshotBody, LinkCell, PppStatus};
+use crate::client::{
+    ActiveTarget, PppoeRunConfig, RunMode, ServerTarget, SharedForwards, SharedServers,
+};
+use crate::clientcfg::{serialize_client, CfgServer, ClientConfig};
+use crate::clientproto::{ClientMsg, ClientSnapshotBody, LinkCell, PppStatus};
 use crate::proto::{proto_name, Proto};
 use crate::Result;
 
@@ -150,16 +152,20 @@ pub struct ControlState {
     /// Live PPP phase, written by the pppoe datapath shell.
     pub ppp: PppStatus,
     /// Link state toward the active server, reported verbatim in snapshots.
-    /// The reconnect loop holds no handle to the cell, so it stays at its
-    /// `Offline` default.
+    /// The reconnect loop writes the park/dial/backoff transitions; the
+    /// session bodies write the connected state.
     pub link: LinkCell,
-    /// Profiles `SelectServer` may switch to.
-    pub servers: Vec<ServerTarget>,
+    /// Profiles `SelectServer` and `Connect` resolve against, edited by
+    /// `AddServer`/`RemoveServer`.
+    pub servers: SharedServers,
     /// Sessions `SpawnPppoe` may bring up, by name.
     pub pppoe: Vec<(String, Arc<PppoeRunConfig>)>,
     /// The body `StopSession` falls back to: forwards when any are declared,
     /// idle otherwise.
     pub base_mode: RunMode,
+    /// The boot-derived body `Connect` installs, so disconnect-then-connect
+    /// restores the declared boot shape rather than whatever ran last.
+    pub boot_mode: RunMode,
     /// `None` on a runtime-only client; mutations then stay in memory.
     pub persist: Option<Persist>,
 }
@@ -279,16 +285,7 @@ fn snapshot(state: &ControlState) -> ClientSnapshotBody {
         mode,
         phase: state.ppp.get(),
         forwards: state.forwards.entries(),
-        // Config fields only; the per-server secret stays behind.
-        servers: state
-            .servers
-            .iter()
-            .map(|s| ClientServerEntry {
-                name: s.name.clone(),
-                addr: s.addr.clone(),
-                transport: s.transport,
-            })
-            .collect(),
+        servers: state.servers.entries(),
         pppoe: state.pppoe.iter().map(|(name, _)| name.clone()).collect(),
         session,
         link: state.link.get(),
@@ -304,12 +301,13 @@ fn snapshot(state: &ControlState) -> ClientSnapshotBody {
 async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
     match msg {
         ClientMsg::SelectServer { name } => {
-            let Some(target) = state.servers.iter().find(|s| s.name == name) else {
+            let Some(target) = state.servers.get(&name) else {
                 return (false, format!("no configured server named `{name}`"));
             };
             // One call updates the target and fires the cancel; the session
-            // body is preserved and comes back up against the new server.
-            state.active.switch(target.clone());
+            // body is preserved and comes back up against the new server. An
+            // offline client just re-parks retargeted, nothing is dialed.
+            state.active.switch(target);
             persist(state, move |cfg| cfg.active = Some(name)).await
         }
         ClientMsg::SetForwardOptions {
@@ -379,11 +377,119 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                 (false, format!("no active pppoe session named `{name}`"))
             }
         }
-        ClientMsg::AddServer { .. }
-        | ClientMsg::RemoveServer { .. }
-        | ClientMsg::Connect { .. }
-        | ClientMsg::Disconnect => (false, "not implemented".to_string()),
+        ClientMsg::AddServer {
+            name,
+            addr,
+            secret,
+            transport,
+        } => {
+            // Mirror the parser and validate plus the checks boot hits at
+            // dial time, so the accepted entry is exactly what the persisted
+            // file parses back to and what the dial loop can use.
+            if name.is_empty() {
+                return (false, "server `name` must not be empty".into());
+            }
+            if secret.0.is_empty() {
+                return (false, "server `secret` must not be empty".into());
+            }
+            // The config lexer rejects control characters in strings, so a
+            // value carrying one could never be saved and read back.
+            if [&name, &addr, &secret.0]
+                .iter()
+                .any(|s| s.chars().any(char::is_control))
+            {
+                return (false, "control characters are not allowed".into());
+            }
+            if addr == "dht" {
+                if cfg!(not(feature = "dht")) {
+                    return (false, "this build has no dht support; use host:port".into());
+                }
+            } else if !valid_host_port(&addr) {
+                return (
+                    false,
+                    format!("addr must be \"dht\" or host:port, got `{addr}`"),
+                );
+            }
+            let target = ServerTarget {
+                name: name.clone(),
+                addr: addr.clone(),
+                secret: secret.0.clone(),
+                transport,
+            };
+            // Name uniqueness also protects the empty-name `Connect` sentinel.
+            if !state.servers.add(target) {
+                return (false, format!("a server named `{name}` already exists"));
+            }
+            persist(state, move |cfg| {
+                cfg.servers.push(CfgServer {
+                    name,
+                    addr,
+                    secret,
+                    transport,
+                })
+            })
+            .await
+        }
+        ClientMsg::RemoveServer { name } => {
+            // The active profile is the one the loop is running or about to
+            // dial (offline included); removing it would strand the runtime
+            // target and, on a file-sourced client, save a config whose
+            // `active` names no entry.
+            if state.active.admin_view().0 == name {
+                return (
+                    false,
+                    format!("`{name}` is the active server; select another first"),
+                );
+            }
+            if !state.servers.remove(&name) {
+                return (false, format!("no configured server named `{name}`"));
+            }
+            persist(state, move |cfg| cfg.servers.retain(|s| s.name != name)).await
+        }
+        ClientMsg::Connect { name } => {
+            // An empty name means the current active target, resolved before
+            // any server-list lookup; a named connect must name a profile.
+            let target = if name.is_empty() {
+                None
+            } else {
+                match state.servers.get(&name) {
+                    Some(t) => Some(t),
+                    None => return (false, format!("no configured server named `{name}`")),
+                }
+            };
+            let named = target.is_some();
+            if !state.active.connect(target, state.boot_mode.clone()) {
+                return (
+                    false,
+                    "a session is already up; select-server retargets a running client".into(),
+                );
+            }
+            if named {
+                persist(state, move |cfg| cfg.active = Some(name)).await
+            } else {
+                (true, String::new())
+            }
+        }
+        ClientMsg::Disconnect => {
+            // Runtime-only, like SpawnPppoe: the offline park is never
+            // persisted, so a reboot comes back serving what the file
+            // declares.
+            if state.active.disconnect() {
+                (true, String::new())
+            } else {
+                (false, "already offline".into())
+            }
+        }
         other => (false, format!("expected a mutation, got {other:?}")),
+    }
+}
+
+/// `host:port` with a non-empty host and a non-zero port. Hostnames resolve
+/// at dial time, so only the shape is checked here.
+fn valid_host_port(addr: &str) -> bool {
+    match addr.rsplit_once(':') {
+        Some((host, port)) => !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0),
+        None => false,
     }
 }
 
@@ -454,9 +560,10 @@ mod tests {
             forwards: SharedForwards::new(Vec::new(), Vec::new()),
             ppp: PppStatus::default(),
             link: LinkCell::default(),
-            servers: Vec::new(),
+            servers: SharedServers::new(Vec::new()),
             pppoe: Vec::new(),
             base_mode: RunMode::Idle,
+            boot_mode: RunMode::Idle,
             persist: None,
         }
     }
@@ -516,7 +623,7 @@ mod tests {
         )
         .unwrap();
         let mut state = idle_state("a");
-        state.servers = vec![server_target("a", 1), server_target("b", 2)];
+        state.servers = SharedServers::new(vec![server_target("a", 1), server_target("b", 2)]);
         state.persist = Some(Persist::new(path.clone(), cfg));
 
         // The snapshot lists the selectable profiles by their config fields.
@@ -653,31 +760,166 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The server-list and connect/disconnect mutations are wire-complete but
-    /// have no dispatcher semantics; each is refused without touching state.
+    fn add_server(name: &str, addr: &str, secret: &str) -> ClientMsg {
+        ClientMsg::AddServer {
+            name: name.into(),
+            addr: addr.into(),
+            secret: ServerSecret(secret.into()),
+            transport: Transport::Tcp,
+        }
+    }
+
     #[tokio::test]
-    async fn unimplemented_mutations_are_refused() {
-        let state = idle_state("a");
-        let reqs = [
-            ClientMsg::AddServer {
-                name: "b".into(),
-                addr: "127.0.0.1:2".into(),
-                secret: ServerSecret("hunter2".into()),
-                transport: Transport::Tcp,
-            },
-            ClientMsg::RemoveServer { name: "b".into() },
+    async fn add_server_validates_and_persists() {
+        let dir = temp_dir("addsrv");
+        let path = dir.join("client.toml");
+        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n";
+        std::fs::write(&path, text).unwrap();
+        let mut state = idle_state("a");
+        state.servers = SharedServers::new(vec![server_target("a", 1)]);
+        state.persist = Some(Persist::new(
+            path.clone(),
+            crate::clientcfg::parse_client(text).unwrap(),
+        ));
+
+        // Each refusal mirrors a parser/validate rule and changes nothing.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let refused = [
+            add_server("", "127.0.0.1:2", "t"),
+            add_server("b", "127.0.0.1:2", ""),
+            add_server("a", "127.0.0.1:2", "t"),
+            add_server("b", "no-port", "t"),
+            add_server("b", ":1", "t"),
+            add_server("b", "127.0.0.1:0", "t"),
+            add_server("b", "127.0.0.1:99999", "t"),
+            add_server("b\n", "127.0.0.1:2", "t"),
+            add_server("b", "127.0.0.1:2", "se\ncret"),
+        ];
+        for req in refused {
+            let desc = format!("{req:?}");
+            let (ok, msg) = mutate(&state, req).await;
+            assert!(!ok, "expected a refusal for {desc}: {msg}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(snapshot(&state).servers.len(), 1);
+
+        let (ok, msg) = mutate(&state, add_server("b", "127.0.0.1:2", "t")).await;
+        assert!(ok, "{msg}");
+        // Live: listed by config fields only and resolvable by name.
+        let snap = snapshot(&state);
+        let names: Vec<&str> = snap.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        // Persisted: the file parses back, passes the boot validation, and
+        // carries the appended entry.
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.servers.len(), 2);
+        assert_eq!(on_disk.servers[1].name, "b");
+        assert_eq!(on_disk.servers[1].secret.0, "t");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn remove_server_refuses_the_active_and_persists_the_rest() {
+        let dir = temp_dir("rmsrv");
+        let path = dir.join("client.toml");
+        let text = "[client]\nactive = \"a\"\n\
+                    [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\
+                    [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"t\"\n";
+        std::fs::write(&path, text).unwrap();
+        let mut state = idle_state("a");
+        state.servers = SharedServers::new(vec![server_target("a", 1), server_target("b", 2)]);
+        state.persist = Some(Persist::new(
+            path.clone(),
+            crate::clientcfg::parse_client(text).unwrap(),
+        ));
+
+        // The profile the loop runs (or would dial next) cannot be removed;
+        // neither can one that does not exist. Nothing changes.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (ok, msg) = mutate(&state, ClientMsg::RemoveServer { name: "a".into() }).await;
+        assert!(!ok);
+        assert!(msg.contains("active"), "unexpected refusal: {msg}");
+        let (ok, _) = mutate(&state, ClientMsg::RemoveServer { name: "c".into() }).await;
+        assert!(!ok);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(snapshot(&state).servers.len(), 2);
+
+        // An inactive profile removes and the file parses back without it.
+        let (ok, msg) = mutate(&state, ClientMsg::RemoveServer { name: "b".into() }).await;
+        assert!(ok, "{msg}");
+        let snap = snapshot(&state);
+        assert_eq!(snap.servers.len(), 1);
+        assert_eq!(snap.servers[0].name, "a");
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.servers.len(), 1);
+        assert_eq!(on_disk.servers[0].name, "a");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn disconnect_parks_and_connect_restores_the_boot_body() {
+        let mut state = idle_state("a");
+        state.servers = SharedServers::new(vec![server_target("a", 1), server_target("b", 2)]);
+        state.pppoe = vec![("wan".into(), pppoe_config())];
+        state.boot_mode = RunMode::Forwards;
+        // Idle runs no session body, so connect is the park's exit there too:
+        // it installs the boot-derived forwards body.
+        let (ok, _) = mutate(
+            &state,
             ClientMsg::Connect {
                 name: String::new(),
             },
-            ClientMsg::Disconnect,
-        ];
-        for req in reqs {
-            let (ok, msg) = mutate(&state, req).await;
-            assert!(!ok);
-            assert_eq!(msg, "not implemented");
-        }
-        assert_eq!(state.active.admin_view().0, "a");
-        assert_eq!(state.active.admin_view().1, SessionMode::Idle);
+        )
+        .await;
+        assert!(ok);
+        assert_eq!(snapshot(&state).mode, SessionMode::Forwards);
+
+        let (ok, _) = mutate(&state, ClientMsg::Disconnect).await;
+        assert!(ok);
+        assert_eq!(snapshot(&state).mode, SessionMode::Offline);
+        let (ok, msg) = mutate(&state, ClientMsg::Disconnect).await;
+        assert!(!ok, "disconnect while offline must be refused");
+        assert_eq!(msg, "already offline");
+
+        // While offline, SelectServer retargets without leaving the park.
+        let (ok, _) = mutate(&state, ClientMsg::SelectServer { name: "b".into() }).await;
+        assert!(ok);
+        let snap = snapshot(&state);
+        assert_eq!(snap.active, "b");
+        assert_eq!(snap.mode, SessionMode::Offline);
+
+        // A connect naming no profile is refused before anything moves; a
+        // named one retargets and installs the boot-derived body.
+        let (ok, _) = mutate(&state, ClientMsg::Connect { name: "c".into() }).await;
+        assert!(!ok);
+        assert_eq!(snapshot(&state).mode, SessionMode::Offline);
+        let (ok, msg) = mutate(&state, ClientMsg::Connect { name: "a".into() }).await;
+        assert!(ok, "{msg}");
+        let snap = snapshot(&state);
+        assert_eq!(snap.active, "a");
+        assert_eq!(snap.mode, SessionMode::Forwards);
+
+        // With the body up, connect is refused whatever the name.
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::Connect {
+                name: String::new(),
+            },
+        )
+        .await;
+        assert!(!ok);
+        assert!(msg.contains("already up"), "unexpected refusal: {msg}");
+
+        // An explicit spawn outranks the park: pppoe comes up from offline.
+        let (ok, _) = mutate(&state, ClientMsg::Disconnect).await;
+        assert!(ok);
+        let (ok, msg) = mutate(&state, ClientMsg::SpawnPppoe { name: "wan".into() }).await;
+        assert!(ok, "{msg}");
+        assert_eq!(snapshot(&state).mode, SessionMode::Pppoe);
     }
 
     #[tokio::test]

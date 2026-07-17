@@ -16,7 +16,9 @@ use tokio::time::{interval, sleep};
 use crate::bridge;
 use crate::clientcfg::ClientConfig;
 use crate::clientctl::{ControlPath, ControlState, Persist};
-use crate::clientproto::{ClientForwardEntry, LinkCell, PppPhase, PppStatus, SessionMode};
+use crate::clientproto::{
+    ClientForwardEntry, ClientServerEntry, LinkCell, LinkStatus, PppPhase, PppStatus, SessionMode,
+};
 use crate::dgram::{DgramRx, DgramTx};
 use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT};
 #[cfg(target_os = "linux")]
@@ -363,8 +365,7 @@ impl Discovery {
 }
 
 /// One dialable server profile: address (`"dht"` or `host:port`), the secret
-/// that authenticates it, and the transport policy. `name` keys the per-server
-/// PSK/discovery memoization across switches.
+/// that authenticates it, and the transport policy.
 #[derive(Clone)]
 pub struct ServerTarget {
     pub name: String,
@@ -373,12 +374,112 @@ pub struct ServerTarget {
     pub transport: Transport,
 }
 
-/// Per-server dial state kept across switches, so returning to a server reuses
-/// its derived PSK and its discovery (whose DHT identity carries the resolver
-/// cache) instead of rederiving them.
+/// The selectable server profiles, shared between the admin dispatcher (which
+/// resolves, appends, and removes them) and snapshot views. Lock-only, like
+/// [`SharedForwards`]: no holder ever awaits with the lock taken.
+#[derive(Clone)]
+pub struct SharedServers {
+    inner: Arc<std::sync::Mutex<Vec<ServerTarget>>>,
+}
+
+impl SharedServers {
+    pub(crate) fn new(servers: Vec<ServerTarget>) -> Self {
+        SharedServers {
+            inner: Arc::new(std::sync::Mutex::new(servers)),
+        }
+    }
+
+    /// The named profile, cloned out so the caller holds no lock.
+    pub(crate) fn get(&self, name: &str) -> Option<ServerTarget> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.name == name)
+            .cloned()
+    }
+
+    /// Append a profile; `false` (and no change) when the name is taken.
+    pub(crate) fn add(&self, target: ServerTarget) -> bool {
+        let mut list = self.inner.lock().unwrap();
+        if list.iter().any(|s| s.name == target.name) {
+            return false;
+        }
+        list.push(target);
+        true
+    }
+
+    /// Remove the named profile; `false` when no such profile exists.
+    pub(crate) fn remove(&self, name: &str) -> bool {
+        let mut list = self.inner.lock().unwrap();
+        let before = list.len();
+        list.retain(|s| s.name != name);
+        list.len() != before
+    }
+
+    /// Whether a profile with exactly these fields is configured.
+    fn contains(&self, name: &str, addr: &str, secret: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.name == name && s.addr == addr && s.secret == secret)
+    }
+
+    /// Snapshot view: config fields only, the per-server secret stays behind.
+    pub(crate) fn entries(&self) -> Vec<ClientServerEntry> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| ClientServerEntry {
+                name: s.name.clone(),
+                addr: s.addr.clone(),
+                transport: s.transport,
+            })
+            .collect()
+    }
+}
+
+/// Per-server dial state: the derived PSK and the discovery, whose DHT
+/// identity carries the resolver cache.
 struct DialState {
     psk: [u8; 32],
     discovery: Discovery,
+}
+
+/// Dial state kept across switches, keyed by the whole `(name, addr, secret)`
+/// triple: returning to an unchanged profile reuses its PSK and discovery,
+/// while a remove-then-add under the same name with a new secret or address
+/// derives fresh state instead of hitting a stale memo. `prune` drops entries
+/// for removed profiles, so the memo stays bounded by the configured set.
+#[derive(Default)]
+struct DialMemo(HashMap<(String, String, String), DialState>);
+
+impl DialMemo {
+    /// Drop entries whose profile is gone, keeping the active target's, so
+    /// remove/add cycles cannot grow the memo past the configured set.
+    fn prune(&mut self, servers: &SharedServers, active: &ServerTarget) {
+        self.0.retain(|(name, addr, secret), _| {
+            (*name == active.name && *addr == active.addr && *secret == active.secret)
+                || servers.contains(name, addr, secret)
+        });
+    }
+
+    fn state(&mut self, target: &ServerTarget) -> Result<&mut DialState> {
+        let key = (
+            target.name.clone(),
+            target.addr.clone(),
+            target.secret.clone(),
+        );
+        match self.0.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
+            std::collections::hash_map::Entry::Vacant(e) => Ok(e.insert(DialState {
+                psk: crate::noise::derive_psk(&target.secret),
+                discovery: Discovery::new(&target.addr, &target.secret)?,
+            })),
+        }
+    }
 }
 
 /// L3 tunnel shape as the client carries it between bringups. The address is
@@ -431,6 +532,9 @@ pub enum RunMode {
         name: String,
         config: Arc<PppoeRunConfig>,
     },
+    /// Parked by `Disconnect`: nothing is dialed until `Connect`. Runtime-only;
+    /// boot never derives it and it is never persisted.
+    Offline,
 }
 
 impl RunMode {
@@ -440,6 +544,7 @@ impl RunMode {
             RunMode::Forwards => SessionMode::Forwards,
             RunMode::Device(_) => SessionMode::Device,
             RunMode::Pppoe { .. } => SessionMode::Pppoe,
+            RunMode::Offline => SessionMode::Offline,
         }
     }
 }
@@ -497,6 +602,35 @@ impl ActiveTarget {
         let mut s = self.state.lock().unwrap();
         s.mode = mode;
         s.cancel.notify_one();
+    }
+
+    /// Park the client offline: replace the session body with the offline
+    /// park and fire the cancel so the loop tears the running body down.
+    /// `false` (and no cancel) when already offline.
+    pub fn disconnect(&self) -> bool {
+        let mut s = self.state.lock().unwrap();
+        if matches!(s.mode, RunMode::Offline) {
+            return false;
+        }
+        s.mode = RunMode::Offline;
+        s.cancel.notify_one();
+        true
+    }
+
+    /// Leave the park and install `boot`, retargeting first when `target` is
+    /// set. `false` (and no change) while a session body is up: connecting is
+    /// the park's exit, never a retarget of a live session.
+    pub fn connect(&self, target: Option<ServerTarget>, boot: RunMode) -> bool {
+        let mut s = self.state.lock().unwrap();
+        if !matches!(s.mode, RunMode::Idle | RunMode::Offline) {
+            return false;
+        }
+        if let Some(t) = target {
+            s.target = t;
+        }
+        s.mode = boot;
+        s.cancel.notify_one();
+        true
     }
 
     /// Stop the named pppoe session, falling back to `base`. Fires the cancel
@@ -697,9 +831,13 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
     } else {
         RunMode::Idle
     };
-    active.init_mode(boot_mode);
+    active.init_mode(boot_mode.clone());
 
     let ppp = PppStatus::default();
+    // Written by this loop (park, dial, backoff) and by the session bodies
+    // (connected); snapshots report it verbatim.
+    let link = LinkCell::default();
+    let servers = SharedServers::new(servers);
 
     // The admin socket lives exactly as long as this future: the guard aborts
     // the accept loop when the future is dropped, and dropping the listener
@@ -715,10 +853,11 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 active: active.clone(),
                 forwards: forwards.clone(),
                 ppp: ppp.clone(),
-                link: LinkCell::default(),
-                servers,
+                link: link.clone(),
+                servers: servers.clone(),
                 pppoe,
                 base_mode,
+                boot_mode,
                 persist: config.map(|(path, cfg)| Persist::new(path, cfg)),
             };
             Some(AbortOnDrop(tokio::spawn(listener.serve(state))))
@@ -726,7 +865,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         None => None,
     };
 
-    let mut dial: HashMap<String, DialState> = HashMap::new();
+    let mut dial = DialMemo::default();
 
     // One iteration per active profile/body; only a mutation moves to the
     // next one.
@@ -736,19 +875,15 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
             // Only a live pppoe body reports a phase.
             ppp.set(PppPhase::None);
         }
-        // An idle profile runs no session body; the admin socket stays up and
-        // a mutation fires the cancel to bring the next body up.
-        if matches!(mode, RunMode::Idle) {
+        // Idle and offline profiles run no session body; the admin socket
+        // stays up and a mutation fires the cancel to bring the next body up.
+        if matches!(mode, RunMode::Idle | RunMode::Offline) {
+            link.set(LinkStatus::Offline);
             cancel.notified().await;
             continue;
         }
-        let state = match dial.entry(target.name.clone()) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => e.insert(DialState {
-                psk: crate::noise::derive_psk(&target.secret),
-                discovery: Discovery::new(&target.addr, &target.secret)?,
-            }),
-        };
+        dial.prune(&servers, &target);
+        let state = dial.state(&target)?;
         // TAP and TUN share the same device I/O and tunnel datapath; only the
         // open (L2 bridge vs L3 address) differs. Either becomes the single
         // bridge device. Opened per profile: the binding is iteration-local
@@ -763,7 +898,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 Body::Device(Arc::new(TapDevice::open(cfg)?))
             }
             RunMode::Pppoe { config, .. } => Body::Pppoe(config.clone()),
-            RunMode::Forwards | RunMode::Idle => Body::Forwards,
+            RunMode::Forwards | RunMode::Idle | RunMode::Offline => Body::Forwards,
         };
 
         let mut udp_health = UdpHealth::default();
@@ -774,6 +909,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         let mut last_addr: Option<String> = None;
 
         loop {
+            link.set(LinkStatus::Dialing);
             let resolved = tokio::select! {
                 _ = cancel.notified() => break,
                 r = state.discovery.resolve() => r,
@@ -790,6 +926,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                     }
                     None => {
                         crate::elog!("server discovery failed: {e}");
+                        link.set(LinkStatus::Backoff);
                         tokio::select! {
                             _ = cancel.notified() => break,
                             _ = sleep(backoff.delay()) => {}
@@ -823,16 +960,18 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
             let mut session_task = {
                 let body = body.clone();
                 let ppp = ppp.clone();
+                let link = link.clone();
                 AbortOnDrop(tokio::spawn(async move {
                     match body {
-                        Body::Device(tap) => bridge_session(client, tap, try_udp).await,
-                        Body::Pppoe(pp) => pppoe_session(client, pp, ppp, try_udp).await,
-                        Body::Forwards => session(client, try_udp).await,
+                        Body::Device(tap) => bridge_session(client, tap, try_udp, link).await,
+                        Body::Pppoe(pp) => pppoe_session(client, pp, ppp, try_udp, link).await,
+                        Body::Forwards => session(client, try_udp, link).await,
                     }
                 }))
             };
             #[cfg(not(target_os = "linux"))]
-            let mut session_task = AbortOnDrop(tokio::spawn(session(client, try_udp)));
+            let mut session_task =
+                AbortOnDrop(tokio::spawn(session(client, try_udp, link.clone())));
             let joined = tokio::select! {
                 _ = cancel.notified() => None,
                 r = &mut session_task.0 => Some(r),
@@ -883,6 +1022,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
             } else {
                 backoff.fail();
             }
+            link.set(LinkStatus::Backoff);
             tokio::select! {
                 _ = cancel.notified() => break,
                 _ = sleep(backoff.delay()) => {}
@@ -900,14 +1040,15 @@ async fn bridge_session(
     client: Arc<Client>,
     tap: Arc<TapDevice>,
     try_udp: bool,
+    link: LinkCell,
 ) -> (Result<()>, UdpOutcome, bool) {
     let mode = client.transport;
     if mode == Transport::Tcp || (mode == Transport::Auto && !try_udp) {
-        let (result, established) = bridge_tcp(client, tap).await;
+        let (result, established) = bridge_tcp(client, tap, &link).await;
         return (result, UdpOutcome::Skipped, established);
     }
     let started = Instant::now();
-    match bridge_udp(client.clone(), tap.clone()).await {
+    match bridge_udp(client.clone(), tap.clone(), &link).await {
         (Ok(()), established) => {
             let healthy = started.elapsed() >= UDP_MIN_HEALTHY;
             let outcome = if healthy {
@@ -924,7 +1065,7 @@ async fn bridge_session(
             // A short-lived bridge_udp returns Err with the handshake never even
             // reached on some paths; treat any UDP failure here as a flap signal.
             crate::elog!("udp transport unavailable ({e}); falling back to tcp");
-            let (result, tcp_established) = bridge_tcp(client, tap).await;
+            let (result, tcp_established) = bridge_tcp(client, tap, &link).await;
             (
                 result,
                 UdpOutcome::Unhealthy,
@@ -987,7 +1128,11 @@ async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop, Arc<
 /// so the reconnect loop can tell a failed connect from an established-then-dead
 /// session.
 #[cfg(target_os = "linux")]
-async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bool) {
+async fn bridge_udp(
+    client: Arc<Client>,
+    tap: Arc<TapDevice>,
+    link: &LinkCell,
+) -> (Result<()>, bool) {
     // `_pump` aborts the session RX pump when this scope ends (handshake failure
     // or bridge teardown), so a reconnect cannot leave the old pump running.
     let (sess, _pump, cancel) = match udp_connect(&client).await {
@@ -1006,6 +1151,7 @@ async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bo
         Err(_) => return (Err("udp handshake timed out".into()), false),
     };
     crate::elog!("bridge connected to {} over udp", client.server);
+    link.set(LinkStatus::Connected);
 
     let noise = Arc::new(noise);
     let (inbound, _guard) = sess.register_dgram(BRIDGE_CONV);
@@ -1022,7 +1168,11 @@ async fn bridge_udp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bo
 /// L2 bridge over the TCP fallback: frames ride a reliable Noise stream. The bool
 /// is whether the handshake established before the bridge ran or failed.
 #[cfg(target_os = "linux")]
-async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bool) {
+async fn bridge_tcp(
+    client: Arc<Client>,
+    tap: Arc<TapDevice>,
+    link: &LinkCell,
+) -> (Result<()>, bool) {
     let ((nr, mut nw), _peer) =
         match connect_and_handshake(&client.server, &client.psk, OPEN_HANDSHAKE_TIMEOUT).await {
             Ok(v) => v,
@@ -1041,6 +1191,7 @@ async fn bridge_tcp(client: Arc<Client>, tap: Arc<TapDevice>) -> (Result<()>, bo
         return (Err(e), true);
     }
     crate::elog!("bridge connected to {} over tcp", client.server);
+    link.set(LinkStatus::Connected);
     bridge::tap_stream(tap, nr, nw, Arc::new(Notify::new())).await;
     (Ok(()), true)
 }
@@ -1063,14 +1214,15 @@ async fn pppoe_session(
     pp: Arc<PppoeRunConfig>,
     status: PppStatus,
     try_udp: bool,
+    link: LinkCell,
 ) -> (Result<()>, UdpOutcome, bool) {
     let mode = client.transport;
     if mode == Transport::Tcp || (mode == Transport::Auto && !try_udp) {
-        let (result, established) = pppoe_tcp(client, pp, status).await;
+        let (result, established) = pppoe_tcp(client, pp, status, &link).await;
         return (result, UdpOutcome::Skipped, established);
     }
     let started = Instant::now();
-    match pppoe_udp(client.clone(), pp.clone(), status.clone()).await {
+    match pppoe_udp(client.clone(), pp.clone(), status.clone(), &link).await {
         (Ok(()), established) => {
             let healthy = started.elapsed() >= UDP_MIN_HEALTHY;
             let outcome = if healthy {
@@ -1085,7 +1237,7 @@ async fn pppoe_session(
                 return (Err(e), UdpOutcome::Skipped, established);
             }
             crate::elog!("udp transport unavailable ({e}); falling back to tcp");
-            let (result, tcp_established) = pppoe_tcp(client, pp, status).await;
+            let (result, tcp_established) = pppoe_tcp(client, pp, status, &link).await;
             (
                 result,
                 UdpOutcome::Unhealthy,
@@ -1161,6 +1313,7 @@ async fn pppoe_udp(
     client: Arc<Client>,
     pp: Arc<PppoeRunConfig>,
     status: PppStatus,
+    link: &LinkCell,
 ) -> (Result<()>, bool) {
     let dp = match build_datapath(&pp) {
         Ok(dp) => dp,
@@ -1182,6 +1335,7 @@ async fn pppoe_udp(
         Err(_) => return (Err("udp handshake timed out".into()), false),
     };
     crate::elog!("pppoe connected to {} over udp", client.server);
+    link.set(LinkStatus::Connected);
 
     let noise = Arc::new(noise);
     let (inbound, _guard) = sess.register_dgram(BRIDGE_CONV);
@@ -1210,6 +1364,7 @@ async fn pppoe_tcp(
     client: Arc<Client>,
     pp: Arc<PppoeRunConfig>,
     status: PppStatus,
+    link: &LinkCell,
 ) -> (Result<()>, bool) {
     let dp = match build_datapath(&pp) {
         Ok(dp) => dp,
@@ -1233,6 +1388,7 @@ async fn pppoe_tcp(
         return (Err(e), true);
     }
     crate::elog!("pppoe connected to {} over tcp", client.server);
+    link.set(LinkStatus::Connected);
     // Pin the IP the tunnel actually connected to (handles a hostname --server).
     let server_ip = peer.and_then(peer_v4);
     let result = crate::pppoe::tunnel::run_stream(
@@ -1267,16 +1423,21 @@ async fn udp_session(
 /// can damp UDP flapping; Auto only, see `UdpHealth`), and whether the control
 /// channel ever established (reaching `control_loop` means connect and handshake
 /// both succeeded; a later death is not a failure to establish).
-async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome, bool) {
+async fn session(
+    client: Arc<Client>,
+    try_udp: bool,
+    link: LinkCell,
+) -> (Result<()>, UdpOutcome, bool) {
     let mode = client.transport;
 
     // Try UDP first for Auto/Udp (unless cooldown skipped it); fall back to TCP
     // for Auto/Tcp.
     let probe_udp = mode != Transport::Tcp && (mode == Transport::Udp || try_udp);
-    let (link, r, w, started) = if probe_udp {
+    let (via, r, w, started) = if probe_udp {
         match udp_session(client.clone()).await {
             Ok((sess, pump, cancel, (r, w))) => {
                 crate::elog!("connected to {} over udp", client.server);
+                link.set(LinkStatus::Connected);
                 (Link::Udp(sess, pump, cancel), r, w, Some(Instant::now()))
             }
             Err(e) => {
@@ -1289,11 +1450,12 @@ async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome,
                 crate::elog!("udp transport unavailable ({e}); falling back to tcp");
                 match tcp_control(client.clone()).await {
                     Ok((r, w)) => {
+                        link.set(LinkStatus::Connected);
                         return (
                             control_loop(client, Link::Tcp, r, w).await,
                             UdpOutcome::Unhealthy,
                             true,
-                        )
+                        );
                     }
                     Err(e) => return (Err(e), UdpOutcome::Unhealthy, false),
                 }
@@ -1301,12 +1463,15 @@ async fn session(client: Arc<Client>, try_udp: bool) -> (Result<()>, UdpOutcome,
         }
     } else {
         match tcp_control(client.clone()).await {
-            Ok((r, w)) => (Link::Tcp, r, w, None),
+            Ok((r, w)) => {
+                link.set(LinkStatus::Connected);
+                (Link::Tcp, r, w, None)
+            }
             Err(e) => return (Err(e), UdpOutcome::Skipped, false),
         }
     };
 
-    let result = control_loop(client, link, r, w).await;
+    let result = control_loop(client, via, r, w).await;
     // Health is measured from when the UDP control channel came up to when it
     // returned; a short-lived UDP session is a flap. TCP-fallback paths report
     // their UDP verdict above, so `started` here is always the UDP case.
@@ -1773,6 +1938,91 @@ mod tests {
         // Right name: back to the base mode.
         assert!(active.stop_pppoe("wan", RunMode::Forwards));
         assert_eq!(active.admin_view().1, SessionMode::Forwards);
+    }
+
+    // A stale memo would keep the old PSK and discovery after a
+    // remove-then-add under the same name; the triple key must miss instead.
+    #[test]
+    fn dial_memo_rekeys_on_addr_or_secret_change() {
+        let mut memo = DialMemo::default();
+        let mut t = target("a");
+        let psk = memo.state(&t).unwrap().psk;
+        // The same triple hits the memo.
+        memo.state(&t).unwrap();
+        assert_eq!(memo.0.len(), 1);
+        // Same name, new secret: a fresh entry with a fresh PSK.
+        t.secret = "s2".into();
+        let rekeyed = memo.state(&t).unwrap().psk;
+        assert_eq!(memo.0.len(), 2);
+        assert_ne!(psk, rekeyed);
+        // Same name and secret, new address: its own entry too.
+        t.addr = "127.0.0.1:2".into();
+        memo.state(&t).unwrap();
+        assert_eq!(memo.0.len(), 3);
+    }
+
+    // A removed profile must not pin its dial state for the process
+    // lifetime; the prune keeps the configured set plus the active target.
+    #[test]
+    fn dial_memo_prunes_unconfigured_entries() {
+        let mut memo = DialMemo::default();
+        let a = target("a");
+        let mut b = target("b");
+        memo.state(&a).unwrap();
+        memo.state(&b).unwrap();
+        // b removed and re-added with a new secret: the stale entry lingers
+        // until the next prune.
+        b.secret = "s2".into();
+        memo.state(&b).unwrap();
+        assert_eq!(memo.0.len(), 3);
+        let servers = SharedServers::new(vec![b.clone()]);
+        memo.prune(&servers, &a);
+        // a survives as the active target, b's stale entry is gone.
+        let keys: Vec<&(String, String, String)> = memo.0.keys().collect();
+        assert_eq!(memo.0.len(), 2, "{keys:?}");
+        assert!(memo
+            .0
+            .contains_key(&(b.name.clone(), b.addr.clone(), b.secret.clone())));
+        assert!(memo
+            .0
+            .contains_key(&(a.name.clone(), a.addr.clone(), a.secret.clone())));
+    }
+
+    // Disconnect parks any body (and only refuses a repeat); connect leaves
+    // the park with the caller's boot body and never touches a live one.
+    #[test]
+    fn disconnect_and_connect_gate_on_the_park() {
+        let active = ActiveTarget::new(target("a"));
+        active.init_mode(RunMode::Forwards);
+        assert!(active.disconnect());
+        assert_eq!(active.admin_view().1, SessionMode::Offline);
+        assert!(!active.disconnect(), "already offline must be refused");
+
+        // A named connect retargets and installs the boot body.
+        assert!(active.connect(Some(target("b")), RunMode::Forwards));
+        let (t, mode, _cancel) = active.begin();
+        assert_eq!(t.name, "b");
+        assert_eq!(mode.session_mode(), SessionMode::Forwards);
+
+        // With a session body up, connect changes nothing.
+        assert!(!active.connect(Some(target("c")), RunMode::Forwards));
+        assert_eq!(active.admin_view().0, "b");
+        assert_eq!(active.admin_view().1, SessionMode::Forwards);
+    }
+
+    #[test]
+    fn shared_servers_add_remove_and_resolve() {
+        let servers = SharedServers::new(vec![target("a")]);
+        assert!(servers.get("a").is_some());
+        assert!(servers.get("b").is_none());
+        assert!(!servers.add(target("a")), "duplicate names must be refused");
+        assert!(servers.add(target("b")));
+        let names: Vec<String> = servers.entries().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert!(!servers.remove("c"));
+        assert!(servers.remove("a"));
+        assert!(servers.get("a").is_none());
+        assert_eq!(servers.entries().len(), 1);
     }
 
     // A switch keeps the session body; only set_mode/stop_pppoe change it.

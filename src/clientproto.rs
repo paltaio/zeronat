@@ -207,8 +207,10 @@ pub struct ClientSnapshotBody {
     pub link: LinkStatus,
 }
 
-/// Server secret carried by `AddServer`; `Debug` prints a placeholder so a
-/// logged frame never exposes the value.
+/// Server secret carried by `AddServer` and held by the parsed client config;
+/// `Debug` prints a placeholder so a logged frame or a debug-printed config
+/// never exposes the value.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ServerSecret(pub String);
 
 impl std::fmt::Debug for ServerSecret {

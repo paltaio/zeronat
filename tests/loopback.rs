@@ -6,7 +6,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::{sleep, timeout};
 
-use zeronat::clientproto::{ClientMsg, ClientSnapshotBody, PppPhase, SessionMode};
+use zeronat::clientproto::{
+    ClientMsg, ClientSnapshotBody, LinkStatus, PppPhase, ServerSecret, SessionMode,
+};
 use zeronat::proto::{Msg, Proto, Source};
 use zeronat::server::{ListenerSpec, ServerSettings};
 
@@ -2078,6 +2080,344 @@ async fn set_forward_options_redials_and_persists() {
         .expect("forward-options flow did not complete within 60s");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disconnect_parks_offline_and_connect_restores() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let local_tcp = free_tcp_port();
+        tokio::spawn(tcp_echo(local_tcp));
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control,
+            vec![public_tcp],
+            vec![],
+        )));
+
+        let dir = temp_config_dir("offline");
+        let sock = dir.join("client.sock");
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("a", control, SECRET)),
+            client_settings(
+                vec![server_target("a", control, SECRET)],
+                vec![fwd(public_tcp, local_tcp)],
+                "off",
+                Some(&sock),
+            ),
+        ));
+
+        let mut conn = wait_tcp_path(public_tcp).await;
+        // While the forwards body is up the snapshot reports the live dial.
+        wait_client_snapshot(&sock, |s| s.link == LinkStatus::Connected).await;
+
+        // Connect is the park's exit only; with a session body up it is
+        // refused.
+        let (ok, msg) = client_mutate(
+            &sock,
+            ClientMsg::Connect {
+                name: String::new(),
+            },
+        )
+        .await;
+        assert!(!ok, "connect must be refused while a session body is up");
+        assert!(msg.contains("already up"), "unexpected refusal: {msg}");
+
+        // Disconnect tears the body down and parks: traffic stops, the
+        // snapshot reports offline, and the control socket keeps answering.
+        let (ok, msg) = client_mutate(&sock, ClientMsg::Disconnect).await;
+        assert!(ok, "disconnect failed: {msg}");
+        timeout(Duration::from_secs(15), wait_tcp_cut(&mut conn))
+            .await
+            .expect("disconnect did not cut the established relay");
+        let snap = wait_client_snapshot(&sock, |s| {
+            s.mode == SessionMode::Offline && s.link == LinkStatus::Offline
+        })
+        .await;
+        assert_eq!(snap.active, "a");
+        assert_eq!(snap.phase, PppPhase::None);
+
+        let (ok, msg) = client_mutate(&sock, ClientMsg::Disconnect).await;
+        assert!(!ok, "disconnect while offline must be refused");
+        assert_eq!(msg, "already offline");
+
+        // Connect restores the boot-derived forwards body: traffic flows and
+        // the link leaves offline.
+        let (ok, msg) = client_mutate(
+            &sock,
+            ClientMsg::Connect {
+                name: String::new(),
+            },
+        )
+        .await;
+        assert!(ok, "connect failed: {msg}");
+        let _conn = wait_tcp_path(public_tcp).await;
+        wait_client_snapshot(&sock, |s| {
+            s.mode == SessionMode::Forwards && s.link == LinkStatus::Connected
+        })
+        .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("offline cycle did not complete within 60s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_named_retargets_and_persists() {
+    let body = async {
+        let control_a = free_tcp_port();
+        let control_b = free_tcp_port();
+        let public_a = free_tcp_port();
+        let public_b = free_tcp_port();
+        let local_echo = free_tcp_port();
+        tokio::spawn(tcp_echo(local_echo));
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control_a,
+            vec![public_a],
+            vec![],
+        )));
+        let mut settings_b = cli_settings(control_b, vec![public_b], vec![]);
+        settings_b.secret = SECRET_B.into();
+        tokio::spawn(zeronat::server::run(settings_b));
+
+        let dir = temp_config_dir("connectnamed");
+        let path = dir.join("client.toml");
+        let sock = dir.join("client.sock");
+        let text = format!(
+            "[client]\nactive = \"a\"\n\
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:{control_a}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
+             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:{control_b}\"\nsecret = \"{SECRET_B}\"\ntransport = \"tcp\"\n\
+             [[forwards]]\nproto = \"tcp\"\nport = {public_a}\ntarget = \"127.0.0.1:{local_echo}\"\n\
+             [[forwards]]\nproto = \"tcp\"\nport = {public_b}\ntarget = \"127.0.0.1:{local_echo}\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
+        cfg.validate().unwrap();
+
+        let mut settings = client_settings(
+            vec![
+                server_target("a", control_a, SECRET),
+                server_target("b", control_b, SECRET_B),
+            ],
+            vec![fwd(public_a, local_echo), fwd(public_b, local_echo)],
+            "cnn",
+            Some(&sock),
+        );
+        settings.config = Some((path.clone(), cfg));
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("a", control_a, SECRET)),
+            settings,
+        ));
+
+        let mut conn = wait_tcp_path(public_a).await;
+
+        // Park, then a named connect: unknown names are refused first.
+        let (ok, msg) = client_mutate(&sock, ClientMsg::Disconnect).await;
+        assert!(ok, "disconnect failed: {msg}");
+        timeout(Duration::from_secs(15), wait_tcp_cut(&mut conn))
+            .await
+            .expect("disconnect did not cut the relay through a");
+        wait_client_snapshot(&sock, |s| s.mode == SessionMode::Offline).await;
+        let (ok, _) = client_mutate(
+            &sock,
+            ClientMsg::Connect {
+                name: "nope".into(),
+            },
+        )
+        .await;
+        assert!(!ok, "an unknown connect target must be refused");
+
+        // Connect b: the boot-derived forwards body comes up against b and
+        // the retarget persists like SelectServer.
+        let (ok, msg) = client_mutate(&sock, ClientMsg::Connect { name: "b".into() }).await;
+        assert!(ok, "connect b failed: {msg}");
+        let mut conn_b = wait_tcp_path(public_b).await;
+        let snap = client_snapshot(&sock).await;
+        assert_eq!(snap.active, "b");
+        assert_eq!(snap.mode, SessionMode::Forwards);
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.active.as_deref(), Some("b"));
+
+        // While offline, SelectServer retargets without dialing (the loop
+        // re-parks) and persists; connect then dials the retargeted profile.
+        let (ok, msg) = client_mutate(&sock, ClientMsg::Disconnect).await;
+        assert!(ok, "second disconnect failed: {msg}");
+        timeout(Duration::from_secs(15), wait_tcp_cut(&mut conn_b))
+            .await
+            .expect("disconnect did not cut the relay through b");
+        wait_client_snapshot(&sock, |s| {
+            s.mode == SessionMode::Offline && s.link == LinkStatus::Offline
+        })
+        .await;
+        let (ok, msg) = client_mutate(&sock, ClientMsg::SelectServer { name: "a".into() }).await;
+        assert!(ok, "select-server while offline failed: {msg}");
+        let snap = wait_client_snapshot(&sock, |s| s.active == "a").await;
+        assert_eq!(
+            snap.mode,
+            SessionMode::Offline,
+            "offline select must not dial"
+        );
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.active.as_deref(), Some("a"));
+        let (ok, msg) = client_mutate(
+            &sock,
+            ClientMsg::Connect {
+                name: String::new(),
+            },
+        )
+        .await;
+        assert!(ok, "connect after the offline retarget failed: {msg}");
+        let _conn = wait_tcp_path(public_a).await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(90), body)
+        .await
+        .expect("named connect flow did not complete within 90s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_server_then_select_moves_traffic() {
+    let body = async {
+        let control_a = free_tcp_port();
+        let control_b = free_tcp_port();
+        let public_a = free_tcp_port();
+        let public_b = free_tcp_port();
+        let local_echo = free_tcp_port();
+        tokio::spawn(tcp_echo(local_echo));
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control_a,
+            vec![public_a],
+            vec![],
+        )));
+        let mut settings_b = cli_settings(control_b, vec![public_b], vec![]);
+        settings_b.secret = SECRET_B.into();
+        tokio::spawn(zeronat::server::run(settings_b));
+
+        // The file (and the client) starts knowing only server a; b joins at
+        // runtime through the admin surface.
+        let dir = temp_config_dir("addserver");
+        let path = dir.join("client.toml");
+        let sock = dir.join("client.sock");
+        let text = format!(
+            "[client]\nactive = \"a\"\n\
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:{control_a}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
+             [[forwards]]\nproto = \"tcp\"\nport = {public_a}\ntarget = \"127.0.0.1:{local_echo}\"\n\
+             [[forwards]]\nproto = \"tcp\"\nport = {public_b}\ntarget = \"127.0.0.1:{local_echo}\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
+        cfg.validate().unwrap();
+
+        let mut settings = client_settings(
+            vec![server_target("a", control_a, SECRET)],
+            vec![fwd(public_a, local_echo), fwd(public_b, local_echo)],
+            "add",
+            Some(&sock),
+        );
+        settings.config = Some((path.clone(), cfg));
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("a", control_a, SECRET)),
+            settings,
+        ));
+
+        let mut conn = wait_tcp_path(public_a).await;
+
+        // Refusals change nothing, in memory or on disk: a duplicate name, an
+        // empty secret, and a malformed address.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let servers_before = client_snapshot(&sock).await.servers;
+        let refused = [
+            ClientMsg::AddServer {
+                name: "a".into(),
+                addr: format!("127.0.0.1:{control_b}"),
+                secret: ServerSecret("x".into()),
+                transport: zeronat::client::Transport::Tcp,
+            },
+            ClientMsg::AddServer {
+                name: "b".into(),
+                addr: format!("127.0.0.1:{control_b}"),
+                secret: ServerSecret(String::new()),
+                transport: zeronat::client::Transport::Tcp,
+            },
+            ClientMsg::AddServer {
+                name: "b".into(),
+                addr: "not-an-addr".into(),
+                secret: ServerSecret("x".into()),
+                transport: zeronat::client::Transport::Tcp,
+            },
+        ];
+        for req in refused {
+            let desc = format!("{req:?}");
+            let (ok, msg) = client_mutate(&sock, req).await;
+            assert!(!ok, "expected a refusal for {desc}: {msg}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(client_snapshot(&sock).await.servers, servers_before);
+
+        // AddServer b: listed by config fields, persisted as a parseable
+        // [[servers]] entry, and the active profile stays a.
+        let (ok, msg) = client_mutate(
+            &sock,
+            ClientMsg::AddServer {
+                name: "b".into(),
+                addr: format!("127.0.0.1:{control_b}"),
+                secret: ServerSecret(SECRET_B.into()),
+                transport: zeronat::client::Transport::Tcp,
+            },
+        )
+        .await;
+        assert!(ok, "add server b failed: {msg}");
+        let snap = client_snapshot(&sock).await;
+        let names: Vec<&str> = snap.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(snap.active, "a");
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.servers.len(), 2);
+        assert_eq!(on_disk.servers[1].secret.0, SECRET_B);
+
+        // The full operator flow: select the added server and live traffic
+        // moves to it under its own secret.
+        let (ok, msg) = client_mutate(&sock, ClientMsg::SelectServer { name: "b".into() }).await;
+        assert!(ok, "select server b failed: {msg}");
+        timeout(Duration::from_secs(15), async {
+            wait_tcp_cut(&mut conn).await;
+            wait_tcp_path(public_b).await;
+        })
+        .await
+        .expect("select-server did not move traffic to the added server");
+
+        // The now-active b cannot be removed; the inactive a removes and the
+        // saved file parses back without it, still passing validation.
+        let (ok, msg) = client_mutate(&sock, ClientMsg::RemoveServer { name: "b".into() }).await;
+        assert!(!ok, "removing the active server must be refused");
+        assert!(msg.contains("active"), "unexpected refusal: {msg}");
+        let (ok, msg) = client_mutate(&sock, ClientMsg::RemoveServer { name: "a".into() }).await;
+        assert!(ok, "removing the inactive server failed: {msg}");
+        let snap = client_snapshot(&sock).await;
+        let names: Vec<&str> = snap.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["b"]);
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.servers.len(), 1);
+        assert_eq!(on_disk.servers[0].name, "b");
+        assert_eq!(on_disk.active.as_deref(), Some("b"));
+        // Removing an inactive profile touches nothing live.
+        let _conn = wait_tcp_path(public_b).await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(90), body)
+        .await
+        .expect("add-server flow did not complete within 90s");
+}
+
 /// Real PPPoE needs an access concentrator on the far side, so this drives
 /// the state machinery as far as the harness allows: the mode swap into and
 /// out of a spawned session, the live discovery phase in snapshots, and the
@@ -2193,6 +2533,87 @@ async fn spawn_and_stop_pppoe_swap_the_session_body() {
     timeout(Duration::from_secs(60), body)
         .await
         .expect("pppoe spawn/stop flow did not complete within 60s");
+}
+
+/// From the offline park, an explicit spawn outranks the park and brings the
+/// client online in pppoe mode, while a forward edit made offline lands in
+/// memory without leaving it. Discovery machinery only, as above.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_pppoe_from_offline_brings_the_client_online() {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let local_tcp = free_tcp_port();
+        tokio::spawn(tcp_echo(local_tcp));
+        tokio::spawn(zeronat::server::run(cli_settings(
+            control,
+            vec![public_tcp],
+            vec![],
+        )));
+
+        let dir = temp_config_dir("pppoeoffline");
+        let sock = dir.join("client.sock");
+        let mut settings = client_settings(
+            vec![server_target("a", control, SECRET)],
+            vec![fwd(public_tcp, local_tcp)],
+            "ppo",
+            Some(&sock),
+        );
+        settings.pppoe = vec![zeronat::client::PppoeSession {
+            name: "wan".into(),
+            config: test_pppoe_config(),
+        }];
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("a", control, SECRET)),
+            settings,
+        ));
+
+        let mut conn = wait_tcp_path(public_tcp).await;
+        let (ok, msg) = client_mutate(&sock, ClientMsg::Disconnect).await;
+        assert!(ok, "disconnect failed: {msg}");
+        timeout(Duration::from_secs(15), wait_tcp_cut(&mut conn))
+            .await
+            .expect("disconnect did not cut the established relay");
+        wait_client_snapshot(&sock, |s| {
+            s.mode == SessionMode::Offline && s.link == LinkStatus::Offline
+        })
+        .await;
+
+        // A forward edit while offline edits memory only: no mode change.
+        let (ok, msg) = client_mutate(
+            &sock,
+            ClientMsg::SetForwardOptions {
+                proto: Proto::Tcp,
+                port: public_tcp,
+                enabled: true,
+                proxy: false,
+                idle_secs: 300,
+            },
+        )
+        .await;
+        assert!(ok, "forward edit while offline failed: {msg}");
+        let snap = client_snapshot(&sock).await;
+        assert_eq!(snap.mode, SessionMode::Offline);
+        assert_eq!(snap.forwards[0].idle_secs, 300);
+
+        // SpawnPppoe is an explicit run-this-session order: the client leaves
+        // the park, dials, and the live datapath reports its phase.
+        let (ok, msg) = client_mutate(&sock, ClientMsg::SpawnPppoe { name: "wan".into() }).await;
+        assert!(ok, "spawn pppoe from offline failed: {msg}");
+        let snap = wait_client_snapshot(&sock, |s| {
+            s.mode == SessionMode::Pppoe && s.phase != PppPhase::None
+        })
+        .await;
+        assert_eq!(snap.session, "wan");
+        wait_client_snapshot(&sock, |s| s.link != LinkStatus::Offline).await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("pppoe-from-offline flow did not complete within 60s");
 }
 
 #[cfg(target_os = "linux")]

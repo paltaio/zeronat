@@ -13,6 +13,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use crate::client::Transport;
+use crate::clientproto::ServerSecret;
 use crate::config::codec::{
     err, parse_bool, parse_int, parse_string, parse_u32, quote, reject_dup, split_kv, strip_comment,
 };
@@ -27,7 +28,7 @@ pub struct CfgServer {
     pub name: String,
     /// `"dht"` or `host:port`.
     pub addr: String,
-    pub secret: String,
+    pub secret: ServerSecret,
     pub transport: Transport,
 }
 
@@ -370,7 +371,7 @@ fn close_record(
             cfg.servers.push(CfgServer {
                 name,
                 addr,
-                secret,
+                secret: ServerSecret(secret),
                 transport: record.transport.take().unwrap_or(Transport::Auto),
             });
         }
@@ -510,7 +511,7 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
         table(&mut out, "[[servers]]");
         out.push_str(&format!("name = {}\n", quote(&s.name)));
         out.push_str(&format!("addr = {}\n", quote(&s.addr)));
-        out.push_str(&format!("secret = {}\n", quote(&s.secret)));
+        out.push_str(&format!("secret = {}\n", quote(&s.secret.0)));
         if s.transport != Transport::Auto {
             out.push_str(&format!(
                 "transport = {}\n",
@@ -596,13 +597,13 @@ mod tests {
                 CfgServer {
                     name: "home".into(),
                     addr: "dht".into(),
-                    secret: "hunter2".into(),
+                    secret: ServerSecret("hunter2".into()),
                     transport: Transport::Auto,
                 },
                 CfgServer {
                     name: "oci".into(),
                     addr: "203.0.113.10:2222".into(),
-                    secret: "hunter3".into(),
+                    secret: ServerSecret("hunter3".into()),
                     transport: Transport::Tcp,
                 },
             ],
@@ -648,13 +649,23 @@ mod tests {
         assert_eq!(parse_client(&serialize_client(&cfg)).unwrap(), cfg);
     }
 
+    // Assertion failures and logged errors debug-print whole configs, so a
+    // debug-printed config must not carry any server secret.
+    #[test]
+    fn cfg_debug_redacts_the_server_secret() {
+        let s = format!("{:?}", sample());
+        assert!(!s.contains("hunter2"), "{s}");
+        assert!(!s.contains("hunter3"), "{s}");
+        assert!(s.contains("home"));
+    }
+
     #[test]
     fn roundtrip_devices() {
         let tap = ClientConfig {
             servers: vec![CfgServer {
                 name: "home".into(),
                 addr: "dht".into(),
-                secret: "s".into(),
+                secret: ServerSecret("s".into()),
                 transport: Transport::Auto,
             }],
             tap: Some(CfgTap {

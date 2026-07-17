@@ -1237,14 +1237,14 @@ async fn run(cmd: Cmd) -> Result<()> {
                     .map(|s| client::ServerTarget {
                         name: s.name.clone(),
                         addr: s.addr.clone(),
-                        secret: s.secret.clone(),
+                        secret: s.secret.0.clone(),
                         transport: s.transport,
                     })
                     .collect();
                 let target = client::ServerTarget {
                     name: srv.name.clone(),
                     addr: srv.addr.clone(),
-                    secret: srv.secret.clone(),
+                    secret: srv.secret.0.clone(),
                     transport: srv.transport,
                 };
 
@@ -1577,7 +1577,7 @@ mod tests {
         CfgServer {
             name: name.into(),
             addr: format!("{name}.example:2222"),
-            secret: "s".into(),
+            secret: zeronat::clientproto::ServerSecret("s".into()),
             transport: zeronat::client::Transport::Auto,
         }
     }
