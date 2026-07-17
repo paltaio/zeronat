@@ -89,10 +89,13 @@ enum Overlay {
     ConfirmSelect {
         name: String,
     },
-    /// Full option state for one forward; submit always sends both fields.
+    /// Full option state for one forward; submit always sends every field.
+    /// `enabled` is carried from the row's snapshot state so the full-state
+    /// frame preserves it; the form edits only `proxy` and `idle`.
     FwdForm {
         proto: Proto,
         port: u16,
+        enabled: bool,
         proxy: bool,
         idle: String,
         field: u8,
@@ -234,6 +237,7 @@ impl App {
                     self.overlay = Overlay::FwdForm {
                         proto: f.proto,
                         port: f.port,
+                        enabled: f.enabled,
                         proxy: f.proxy,
                         idle: if f.idle_secs > 0 {
                             f.idle_secs.to_string()
@@ -332,25 +336,27 @@ impl App {
     }
 
     async fn submit_form(&mut self) -> Flow {
-        let (proto, port, proxy, idle) = match &self.overlay {
+        let (proto, port, enabled, proxy, idle) = match &self.overlay {
             Overlay::FwdForm {
                 proto,
                 port,
+                enabled,
                 proxy,
                 idle,
                 ..
-            } => (*proto, *port, *proxy, idle.clone()),
+            } => (*proto, *port, *enabled, *proxy, idle.clone()),
             _ => return Flow::Continue,
         };
         // Empty clears the idle override; the field is digits-only and
         // length-capped, so any non-empty value parses.
         let idle_secs: u32 = idle.parse().unwrap_or(0);
         self.overlay = Overlay::None;
-        // Full-state replace: both options are always sent, so what lands is
+        // Full-state replace: every option is always sent, so what lands is
         // exactly what the form showed.
         let req = ClientMsg::SetForwardOptions {
             proto,
             port,
+            enabled,
             proxy,
             idle_secs,
         };
@@ -555,6 +561,10 @@ impl App {
                 l.add(BOLD, "pppoe");
                 l.add(ACCENT, &format!("  {}", sanitize(&snap.session)));
             }
+            SessionMode::Offline => {
+                l.add(BOLD, "offline");
+                l.add(MUTED, "  nothing is dialed until connect");
+            }
         }
         let mut v = vec![l];
         if snap.mode == SessionMode::Pppoe {
@@ -660,6 +670,7 @@ impl App {
             Overlay::FwdForm {
                 proto,
                 port,
+                enabled: _,
                 proxy,
                 idle,
                 field,
@@ -853,6 +864,7 @@ fn window(sel: usize, len: usize, max: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clientproto::LinkStatus;
 
     fn server(name: &str, addr: &str, transport: Transport) -> ClientServerEntry {
         ClientServerEntry {
@@ -875,6 +887,7 @@ mod tests {
             target: target.into(),
             proxy,
             idle_secs: idle,
+            enabled: true,
         }
     }
 
@@ -894,6 +907,7 @@ mod tests {
             ],
             pppoe: vec!["wan".into()],
             session: String::new(),
+            link: LinkStatus::Offline,
         }
     }
 
@@ -1034,12 +1048,14 @@ mod tests {
             Overlay::FwdForm {
                 proto,
                 port,
+                enabled,
                 proxy,
                 idle,
                 field,
             } => {
                 assert_eq!(*proto, Proto::Tcp);
                 assert_eq!(*port, 443);
+                assert!(*enabled);
                 assert!(*proxy);
                 assert_eq!(idle, "600");
                 assert_eq!(*field, 0);

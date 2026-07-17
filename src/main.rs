@@ -266,6 +266,7 @@ fn parse_forward(spec: &str, proto: Proto) -> Result<client::Forward> {
         target,
         proxy,
         idle,
+        enabled: true,
     })
 }
 
@@ -301,6 +302,7 @@ fn split_forwards(fwds: &[CfgForward]) -> (Vec<client::Forward>, Vec<client::For
             idle: f
                 .idle
                 .map(|secs| std::time::Duration::from_secs(secs.into())),
+            enabled: f.enabled,
         };
         match f.proto {
             Proto::Tcp => tcp.push(fwd),
@@ -1473,6 +1475,7 @@ mod tests {
             target: target.into(),
             proxy,
             idle: idle.map(Duration::from_secs),
+            enabled: true,
         }
     }
 
@@ -1599,6 +1602,7 @@ mod tests {
                     target: "127.0.0.1:443".into(),
                     proxy: false,
                     idle: None,
+                    enabled: true,
                 }],
                 ..ClientConfig::default()
             },
@@ -1651,6 +1655,7 @@ mod tests {
                 target: "10.0.0.5:8443".into(),
                 proxy: true,
                 idle: Some(600),
+                enabled: true,
             },
             CfgForward {
                 proto: Proto::Udp,
@@ -1658,11 +1663,16 @@ mod tests {
                 target: "127.0.0.1:51820".into(),
                 proxy: false,
                 idle: None,
+                enabled: false,
             },
         ];
         let (tcp, udp) = split_forwards(&fwds);
         assert_eq!(tcp, vec![fwd(443, "10.0.0.5:8443", true, Some(600))]);
-        assert_eq!(udp, vec![fwd(51820, "127.0.0.1:51820", false, None)]);
+        let disabled = Forward {
+            enabled: false,
+            ..fwd(51820, "127.0.0.1:51820", false, None)
+        };
+        assert_eq!(udp, vec![disabled]);
     }
 
     fn cfg_pppoe(default_route: bool) -> zeronat::clientcfg::CfgPppoe {

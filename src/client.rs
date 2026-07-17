@@ -16,7 +16,7 @@ use tokio::time::{interval, sleep};
 use crate::bridge;
 use crate::clientcfg::ClientConfig;
 use crate::clientctl::{ControlPath, ControlState, Persist};
-use crate::clientproto::{ClientForwardEntry, PppPhase, PppStatus, SessionMode};
+use crate::clientproto::{ClientForwardEntry, LinkCell, PppPhase, PppStatus, SessionMode};
 use crate::dgram::{DgramRx, DgramTx};
 use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT};
 #[cfg(target_os = "linux")]
@@ -168,6 +168,9 @@ pub struct Forward {
     pub target: String,
     pub proxy: bool,
     pub idle: Option<Duration>,
+    /// Whether the forward is served; a disabled entry keeps its
+    /// configuration but stays out of the per-attempt maps.
+    pub enabled: bool,
 }
 
 /// A forward as the control loop consults it on each open, keyed by port.
@@ -176,6 +179,7 @@ struct ForwardTarget {
     target: String,
     proxy: bool,
     idle: Option<Duration>,
+    enabled: bool,
 }
 
 /// The live forward set, shared between the reconnect loop (each connection
@@ -202,6 +206,7 @@ impl SharedForwards {
                             target: f.target,
                             proxy: f.proxy,
                             idle: f.idle,
+                            enabled: f.enabled,
                         },
                     )
                 })
@@ -215,11 +220,17 @@ impl SharedForwards {
         }
     }
 
-    /// Per-attempt copy for a `Client`; an edit after this lands on the next
-    /// connection attempt.
+    /// Per-attempt copy for a `Client`, disabled forwards left out; an edit
+    /// after this lands on the next connection attempt.
     fn maps(&self) -> (HashMap<u16, ForwardTarget>, HashMap<u16, ForwardTarget>) {
+        let serving = |map: &HashMap<u16, ForwardTarget>| -> HashMap<u16, ForwardTarget> {
+            map.iter()
+                .filter(|(_, f)| f.enabled)
+                .map(|(&port, f)| (port, f.clone()))
+                .collect()
+        };
         let m = self.inner.lock().unwrap();
-        (m.tcp.clone(), m.udp.clone())
+        (serving(&m.tcp), serving(&m.udp))
     }
 
     /// Replace the full option state of the `(proto, port)` forward. `false`
@@ -228,6 +239,7 @@ impl SharedForwards {
         &self,
         proto: Proto,
         port: u16,
+        enabled: bool,
         proxy: bool,
         idle: Option<Duration>,
     ) -> bool {
@@ -238,6 +250,7 @@ impl SharedForwards {
         };
         match map.get_mut(&port) {
             Some(f) => {
+                f.enabled = enabled;
                 f.proxy = proxy;
                 f.idle = idle;
                 true
@@ -258,6 +271,7 @@ impl SharedForwards {
                     target: f.target.clone(),
                     proxy: f.proxy,
                     idle_secs: f.idle.map(|d| d.as_secs() as u32).unwrap_or(0),
+                    enabled: f.enabled,
                 });
             }
         }
@@ -701,6 +715,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 active: active.clone(),
                 forwards: forwards.clone(),
                 ppp: ppp.clone(),
+                link: LinkCell::default(),
                 servers,
                 pppoe,
                 base_mode,
@@ -1800,27 +1815,76 @@ mod tests {
                 target: "127.0.0.1:8443".into(),
                 proxy: false,
                 idle: None,
+                enabled: true,
             }],
             vec![Forward {
                 port: 53,
                 target: "127.0.0.1:5353".into(),
                 proxy: false,
                 idle: Some(Duration::from_secs(9)),
+                enabled: true,
             }],
         );
-        assert!(!fwds.set_options(Proto::Tcp, 80, true, None));
-        assert!(!fwds.set_options(Proto::Udp, 443, false, None));
+        assert!(!fwds.set_options(Proto::Tcp, 80, true, true, None));
+        assert!(!fwds.set_options(Proto::Udp, 443, true, false, None));
 
-        assert!(fwds.set_options(Proto::Tcp, 443, true, Some(Duration::from_secs(600))));
-        assert!(fwds.set_options(Proto::Udp, 53, false, None)); // clears the idle window
+        assert!(fwds.set_options(Proto::Tcp, 443, false, true, Some(Duration::from_secs(600))));
+        assert!(fwds.set_options(Proto::Udp, 53, true, false, None)); // clears the idle window
 
         let entries = fwds.entries();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].proto, Proto::Tcp);
         assert!(entries[0].proxy);
         assert_eq!(entries[0].idle_secs, 600);
+        assert!(!entries[0].enabled);
         assert_eq!(entries[1].proto, Proto::Udp);
         assert_eq!(entries[1].idle_secs, 0);
+        assert!(entries[1].enabled);
+    }
+
+    // A disabled forward is invisible to the per-attempt maps but keeps its
+    // slot in the snapshot view, and a toggle moves it on the next read.
+    #[test]
+    fn maps_leave_out_disabled_forwards() {
+        let fwds = SharedForwards::new(
+            vec![
+                Forward {
+                    port: 443,
+                    target: "127.0.0.1:8443".into(),
+                    proxy: false,
+                    idle: None,
+                    enabled: true,
+                },
+                Forward {
+                    port: 80,
+                    target: "127.0.0.1:8080".into(),
+                    proxy: false,
+                    idle: None,
+                    enabled: false,
+                },
+            ],
+            vec![Forward {
+                port: 53,
+                target: "127.0.0.1:5353".into(),
+                proxy: false,
+                idle: None,
+                enabled: false,
+            }],
+        );
+
+        let (tcp, udp) = fwds.maps();
+        assert_eq!(tcp.keys().copied().collect::<Vec<_>>(), [443]);
+        assert!(udp.is_empty());
+        let entries = fwds.entries();
+        assert_eq!(entries.len(), 3);
+        assert!(!entries.iter().find(|e| e.port == 80).unwrap().enabled);
+        assert!(!entries.iter().find(|e| e.port == 53).unwrap().enabled);
+
+        assert!(fwds.set_options(Proto::Tcp, 80, true, false, None));
+        assert!(fwds.set_options(Proto::Tcp, 443, false, false, None));
+        let (tcp, _) = fwds.maps();
+        assert_eq!(tcp.keys().copied().collect::<Vec<_>>(), [80]);
+        assert_eq!(fwds.entries().len(), 3);
     }
 
     // A path that completes the TCP handshake but never sends Noise msg2 must

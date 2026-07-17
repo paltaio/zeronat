@@ -40,6 +40,9 @@ pub struct CfgForward {
     pub proxy: bool,
     /// Relay idle window override in whole seconds, minimum 1.
     pub idle: Option<u32>,
+    /// Whether the forward is served; a disabled entry keeps its
+    /// configuration.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +162,7 @@ struct PartialRecord {
     target: Option<String>,
     proxy: Option<bool>,
     idle: Option<u32>,
+    enabled: Option<bool>,
     autostart: Option<bool>,
     username: Option<String>,
     password: Option<String>,
@@ -284,6 +288,7 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
                         }
                         record.idle = Some(secs);
                     }
+                    "enabled" => record.enabled = Some(parse_bool(value, n)?),
                     other => {
                         return Err(err(n, &format!("unknown key `{other}` in [[forwards]]")));
                     }
@@ -388,6 +393,7 @@ fn close_record(
                     .unwrap_or_else(|| format!("127.0.0.1:{port}")),
                 proxy: record.proxy.take().unwrap_or(false),
                 idle: record.idle.take(),
+                enabled: record.enabled.take().unwrap_or(true),
             });
         }
         Section::Pppoe => {
@@ -518,6 +524,9 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
         out.push_str(&format!("proto = {}\n", quote(proto_name(f.proto))));
         out.push_str(&format!("port = {}\n", f.port));
         out.push_str(&format!("target = {}\n", quote(&f.target)));
+        if !f.enabled {
+            out.push_str("enabled = false\n");
+        }
         if f.proxy {
             out.push_str("proxy = true\n");
         }
@@ -604,6 +613,7 @@ mod tests {
                     target: "127.0.0.1:80".into(),
                     proxy: true,
                     idle: Some(600),
+                    enabled: true,
                 },
                 CfgForward {
                     proto: Proto::Udp,
@@ -611,6 +621,7 @@ mod tests {
                     target: "10.0.0.5:51820".into(),
                     proxy: false,
                     idle: None,
+                    enabled: false,
                 },
             ],
             pppoe: vec![CfgPppoe {
@@ -691,6 +702,7 @@ mod tests {
         assert_eq!(f.target, "127.0.0.1:8080");
         assert!(!f.proxy);
         assert_eq!(f.idle, None);
+        assert!(f.enabled);
         let p = &cfg.pppoe[0];
         assert!(!p.autostart);
         assert_eq!(p.password, None);
@@ -712,7 +724,15 @@ mod tests {
         )
         .unwrap();
         let out = serialize_client(&cfg);
-        for key in ["transport", "proxy", "idle", "autostart", "service", "mtu"] {
+        for key in [
+            "transport",
+            "proxy",
+            "idle",
+            "enabled",
+            "autostart",
+            "service",
+            "mtu",
+        ] {
             assert!(
                 !out.contains(key),
                 "default `{key}` must be omitted:\n{out}"
@@ -759,12 +779,15 @@ mod tests {
             "[[forwards]]\nproto = \"tcp\"\nport = 1\nidle = 0\n",
             "[[forwards]]\nproto = \"tcp\"\nport = 1\nidle = \"x\"\n",
             "[[forwards]]\nproto = \"tcp\"\nport = 1\nproxy = 1\n",
+            "[[forwards]]\nproto = \"tcp\"\nport = 1\nenabled = 1\n",
             "[tun]\naddress = \"10.0.0.2\"\n",
             "[tun]\naddress = \"bogus/24\"\n",
             "[tun]\naddress = \"10.0.0.2/33\"\n",
-            // `proxy` belongs to tcp entries only, whatever its value.
+            // `proxy` belongs to tcp entries only, whatever its value and
+            // whatever `enabled` says.
             "[[forwards]]\nproto = \"udp\"\nport = 1\nproxy = true\n",
             "[[forwards]]\nproto = \"udp\"\nport = 1\nproxy = false\n",
+            "[[forwards]]\nproto = \"udp\"\nport = 1\nenabled = false\nproxy = true\n",
             // `clamp_mss = false` without the default-route swap it rides with.
             "[[pppoe]]\nname = \"w\"\nusername = \"u\"\nclamp_mss = false\n",
             // Duplicate keys and singleton tables.

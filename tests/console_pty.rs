@@ -274,6 +274,7 @@ mod pty {
             target: format!("127.0.0.1:{target}"),
             proxy: false,
             idle: None,
+            enabled: true,
         }
     }
 

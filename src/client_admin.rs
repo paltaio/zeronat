@@ -139,6 +139,7 @@ fn mode_name(mode: SessionMode) -> &'static str {
         SessionMode::Forwards => "forwards",
         SessionMode::Device => "device",
         SessionMode::Pppoe => "pppoe",
+        SessionMode::Offline => "offline",
     }
 }
 
@@ -186,7 +187,7 @@ pub fn render(snap: &ClientSnapshotBody) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clientproto::ClientForwardEntry;
+    use crate::clientproto::{ClientForwardEntry, LinkStatus};
     use crate::proto::Proto;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -281,6 +282,7 @@ mod tests {
             target: target.into(),
             proxy,
             idle_secs,
+            enabled: true,
         }
     }
 
@@ -299,6 +301,7 @@ mod tests {
             servers: Vec::new(),
             pppoe: Vec::new(),
             session: String::new(),
+            link: LinkStatus::Connected,
         };
         let s = render(&snap);
         assert!(s.contains("active  home"));
@@ -321,6 +324,7 @@ mod tests {
             servers: Vec::new(),
             pppoe: Vec::new(),
             session: "wan".into(),
+            link: LinkStatus::Connected,
         };
         let s = render(&snap);
         assert!(s.contains("mode    pppoe"));

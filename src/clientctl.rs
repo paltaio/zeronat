@@ -15,7 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::client::{ActiveTarget, PppoeRunConfig, RunMode, ServerTarget, SharedForwards};
 use crate::clientcfg::{serialize_client, ClientConfig};
-use crate::clientproto::{ClientMsg, ClientServerEntry, ClientSnapshotBody, PppStatus};
+use crate::clientproto::{ClientMsg, ClientServerEntry, ClientSnapshotBody, LinkCell, PppStatus};
 use crate::proto::{proto_name, Proto};
 use crate::Result;
 
@@ -149,6 +149,10 @@ pub struct ControlState {
     pub forwards: SharedForwards,
     /// Live PPP phase, written by the pppoe datapath shell.
     pub ppp: PppStatus,
+    /// Link state toward the active server, reported verbatim in snapshots.
+    /// The reconnect loop holds no handle to the cell, so it stays at its
+    /// `Offline` default.
+    pub link: LinkCell,
     /// Profiles `SelectServer` may switch to.
     pub servers: Vec<ServerTarget>,
     /// Sessions `SpawnPppoe` may bring up, by name.
@@ -287,6 +291,7 @@ fn snapshot(state: &ControlState) -> ClientSnapshotBody {
             .collect(),
         pppoe: state.pppoe.iter().map(|(name, _)| name.clone()).collect(),
         session,
+        link: state.link.get(),
     }
 }
 
@@ -310,6 +315,7 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
         ClientMsg::SetForwardOptions {
             proto,
             port,
+            enabled,
             proxy,
             idle_secs,
         } => {
@@ -325,7 +331,10 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
             } else {
                 Some(Duration::from_secs(u64::from(idle_secs)))
             };
-            if !state.forwards.set_options(proto, port, proxy, idle) {
+            if !state
+                .forwards
+                .set_options(proto, port, enabled, proxy, idle)
+            {
                 return (
                     false,
                     format!("no {} forward on port {port}", proto_name(proto)),
@@ -337,6 +346,7 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                     .iter_mut()
                     .find(|f| f.proto == proto && f.port == port)
                 {
+                    f.enabled = enabled;
                     f.proxy = proxy;
                     f.idle = if idle_secs == 0 {
                         None
@@ -369,6 +379,10 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                 (false, format!("no active pppoe session named `{name}`"))
             }
         }
+        ClientMsg::AddServer { .. }
+        | ClientMsg::RemoveServer { .. }
+        | ClientMsg::Connect { .. }
+        | ClientMsg::Disconnect => (false, "not implemented".to_string()),
         other => (false, format!("expected a mutation, got {other:?}")),
     }
 }
@@ -406,7 +420,7 @@ async fn persist(state: &ControlState, edit: impl FnOnce(&mut ClientConfig)) -> 
 mod tests {
     use super::*;
     use crate::client::{Forward, Transport};
-    use crate::clientproto::{PppPhase, SessionMode};
+    use crate::clientproto::{LinkStatus, PppPhase, ServerSecret, SessionMode};
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -439,6 +453,7 @@ mod tests {
             active: ActiveTarget::new(server_target(name, 1)),
             forwards: SharedForwards::new(Vec::new(), Vec::new()),
             ppp: PppStatus::default(),
+            link: LinkCell::default(),
             servers: Vec::new(),
             pppoe: Vec::new(),
             base_mode: RunMode::Idle,
@@ -466,6 +481,7 @@ mod tests {
             target: format!("127.0.0.1:{}", port + 1),
             proxy: false,
             idle: None,
+            enabled: true,
         }
     }
 
@@ -474,6 +490,8 @@ mod tests {
     fn snapshot_reports_the_live_ppp_phase() {
         let state = idle_state("home");
         assert_eq!(snapshot(&state).phase, PppPhase::None);
+        // No writer holds the link cell, so it reports its default.
+        assert_eq!(snapshot(&state).link, LinkStatus::Offline);
         for phase in [
             PppPhase::Discovery,
             PppPhase::Negotiating,
@@ -548,6 +566,7 @@ mod tests {
                 target: "127.0.0.1:54".into(),
                 proxy: false,
                 idle: None,
+                enabled: true,
             }],
         );
         state.persist = Some(Persist::new(
@@ -564,6 +583,7 @@ mod tests {
             ClientMsg::SetForwardOptions {
                 proto: Proto::Udp,
                 port: 53,
+                enabled: true,
                 proxy: true,
                 idle_secs: 0,
             },
@@ -575,6 +595,7 @@ mod tests {
             ClientMsg::SetForwardOptions {
                 proto: Proto::Tcp,
                 port: 80,
+                enabled: true,
                 proxy: false,
                 idle_secs: 5,
             },
@@ -590,6 +611,7 @@ mod tests {
             ClientMsg::SetForwardOptions {
                 proto: Proto::Tcp,
                 port: 443,
+                enabled: false,
                 proxy: true,
                 idle_secs: 600,
             },
@@ -599,10 +621,12 @@ mod tests {
         let snap = snapshot(&state);
         assert!(snap.forwards[0].proxy);
         assert_eq!(snap.forwards[0].idle_secs, 600);
+        assert!(!snap.forwards[0].enabled);
         let on_disk = crate::clientcfg::load(&path).unwrap();
         on_disk.validate().unwrap();
         assert!(on_disk.forwards[0].proxy);
         assert_eq!(on_disk.forwards[0].idle, Some(600));
+        assert!(!on_disk.forwards[0].enabled);
 
         // Wire idle 0 clears the override; the file never carries idle = 0,
         // which the parser would reject.
@@ -611,18 +635,49 @@ mod tests {
             ClientMsg::SetForwardOptions {
                 proto: Proto::Tcp,
                 port: 443,
+                enabled: true,
                 proxy: true,
                 idle_secs: 0,
             },
         )
         .await;
         assert!(ok, "{msg}");
-        assert_eq!(snapshot(&state).forwards[0].idle_secs, 0);
+        let snap = snapshot(&state);
+        assert_eq!(snap.forwards[0].idle_secs, 0);
+        assert!(snap.forwards[0].enabled);
         let on_disk = crate::clientcfg::load(&path).unwrap();
         on_disk.validate().unwrap();
         assert_eq!(on_disk.forwards[0].idle, None);
+        assert!(on_disk.forwards[0].enabled);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The server-list and connect/disconnect mutations are wire-complete but
+    /// have no dispatcher semantics; each is refused without touching state.
+    #[tokio::test]
+    async fn unimplemented_mutations_are_refused() {
+        let state = idle_state("a");
+        let reqs = [
+            ClientMsg::AddServer {
+                name: "b".into(),
+                addr: "127.0.0.1:2".into(),
+                secret: ServerSecret("hunter2".into()),
+                transport: Transport::Tcp,
+            },
+            ClientMsg::RemoveServer { name: "b".into() },
+            ClientMsg::Connect {
+                name: String::new(),
+            },
+            ClientMsg::Disconnect,
+        ];
+        for req in reqs {
+            let (ok, msg) = mutate(&state, req).await;
+            assert!(!ok);
+            assert_eq!(msg, "not implemented");
+        }
+        assert_eq!(state.active.admin_view().0, "a");
+        assert_eq!(state.active.admin_view().1, SessionMode::Idle);
     }
 
     #[tokio::test]

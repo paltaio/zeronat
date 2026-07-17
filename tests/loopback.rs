@@ -59,6 +59,7 @@ fn fwd(port: u16, target: u16) -> zeronat::client::Forward {
         target: format!("127.0.0.1:{target}"),
         proxy: false,
         idle: None,
+        enabled: true,
     }
 }
 
@@ -1938,6 +1939,7 @@ async fn set_forward_options_redials_and_persists() {
             ClientMsg::SetForwardOptions {
                 proto: Proto::Tcp,
                 port: public_tcp,
+                enabled: true,
                 proxy: false,
                 idle_secs: 600,
             },
@@ -1972,6 +1974,7 @@ async fn set_forward_options_redials_and_persists() {
             ClientMsg::SetForwardOptions {
                 proto: Proto::Tcp,
                 port: public_tcp,
+                enabled: true,
                 proxy: false,
                 idle_secs: 0,
             },
@@ -1984,6 +1987,57 @@ async fn set_forward_options_redials_and_persists() {
         on_disk.validate().unwrap();
         assert_eq!(on_disk.forwards[0].idle, None);
 
+        // Disabling the tcp forward drops it from the redialed session's maps:
+        // the port stops serving while the udp forward keeps echoing.
+        let mut conn = wait_tcp_path(public_tcp).await;
+        let (ok, msg) = client_mutate(
+            &sock,
+            ClientMsg::SetForwardOptions {
+                proto: Proto::Tcp,
+                port: public_tcp,
+                enabled: false,
+                proxy: false,
+                idle_secs: 0,
+            },
+        )
+        .await;
+        assert!(ok, "disabling the tcp forward failed: {msg}");
+        timeout(Duration::from_secs(15), wait_tcp_cut(&mut conn))
+            .await
+            .expect("disable did not redial the forwards session");
+        // The udp round-trip proves the new session is up before the tcp probe,
+        // so a dead probe means a disabled forward, not a client mid-redial.
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_sock.connect(("127.0.0.1", public_udp)).await.unwrap();
+        let mut buf = [0u8; 64];
+        loop {
+            udp_sock.send(b"hello-udp").await.unwrap();
+            match timeout(Duration::from_millis(300), udp_sock.recv(&mut buf)).await {
+                Ok(Ok(n)) if &buf[..n] == b"hello-udp" => break,
+                _ => {}
+            }
+        }
+        // The listener still accepts, but the client refuses the open, so the
+        // connection is never bridged and no echo comes back.
+        if let Ok(Some(reply)) = timeout(Duration::from_secs(2), probe_tcp(public_tcp)).await {
+            panic!("disabled forward still echoes: {reply:?}");
+        }
+
+        // Re-enabling puts the forward back in the maps and the port serves.
+        let (ok, msg) = client_mutate(
+            &sock,
+            ClientMsg::SetForwardOptions {
+                proto: Proto::Tcp,
+                port: public_tcp,
+                enabled: true,
+                proxy: false,
+                idle_secs: 0,
+            },
+        )
+        .await;
+        assert!(ok, "re-enabling the tcp forward failed: {msg}");
+        let _conn = wait_tcp_path(public_tcp).await;
+
         // A failing validation persists and applies nothing: the file bytes
         // and the snapshot stay exactly as they were.
         let before = std::fs::read_to_string(&path).unwrap();
@@ -1993,6 +2047,7 @@ async fn set_forward_options_redials_and_persists() {
             ClientMsg::SetForwardOptions {
                 proto: Proto::Udp,
                 port: public_udp,
+                enabled: true,
                 proxy: true,
                 idle_secs: 0,
             },
@@ -2004,6 +2059,7 @@ async fn set_forward_options_redials_and_persists() {
             ClientMsg::SetForwardOptions {
                 proto: Proto::Tcp,
                 port: 9,
+                enabled: true,
                 proxy: false,
                 idle_secs: 5,
             },
@@ -2091,6 +2147,7 @@ async fn spawn_and_stop_pppoe_swap_the_session_body() {
             ClientMsg::SetForwardOptions {
                 proto: Proto::Tcp,
                 port: public_tcp,
+                enabled: true,
                 proxy: false,
                 idle_secs: 300,
             },
