@@ -23,9 +23,9 @@ pub struct CapturedDefault {
 /// choosing the lowest metric (ties broken by file order).
 ///
 /// `/proc/net/route` is whitespace-separated with a header line; the address
-/// columns are little-endian hex. Every field is read through `get` and parsed
-/// with a checked radix parse, so a short or malformed row is skipped rather than
-/// panicking (the release profile is panic=abort).
+/// columns are little-endian hex. Fields are indexed only after a row-length
+/// guard and parsed with a checked radix parse, so a short or malformed row is
+/// skipped rather than panicking (the release profile is panic=abort).
 pub fn parse_proc_route(contents: &str, tun_name: &str) -> Option<CapturedDefault> {
     parse_default(contents, tun_name, true)
 }
@@ -210,8 +210,14 @@ fn modify_route_inner(
         )
     } < 0
     {
+        let os = io::Error::last_os_error();
         let op = if add { "SIOCADDRT" } else { "SIOCDELRT" };
-        return Err(format!("{op} {dst}/{prefix}: {}", io::Error::last_os_error()).into());
+        // Wrapped as an io::Error so callers can match the kind (an
+        // already-present route adds as AlreadyExists).
+        return Err(Box::new(io::Error::new(
+            os.kind(),
+            format!("{op} {dst}/{prefix}: {os}"),
+        )));
     }
     Ok(())
 }

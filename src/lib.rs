@@ -12,6 +12,8 @@ pub mod config;
 pub mod dgram;
 #[cfg(feature = "dht")]
 pub mod dht;
+#[cfg(target_os = "linux")]
+pub mod exitroute;
 pub mod identity;
 pub mod kcp;
 pub mod logging;

@@ -20,6 +20,8 @@ use crate::clientproto::{
     ClientForwardEntry, ClientServerEntry, LinkCell, LinkStatus, PppPhase, PppStatus, SessionMode,
 };
 use crate::dgram::{DgramRx, DgramTx};
+#[cfg(target_os = "linux")]
+use crate::exitroute::ExitRouteGuard;
 use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
@@ -533,6 +535,10 @@ pub struct ClientTun {
     /// Explicitly configured `addr/prefix`, or `None` to derive the client
     /// `.2` on the active secret's `/24` at bringup.
     pub address: Option<(Ipv4Addr, u8)>,
+    /// Route the host's IPv4 traffic through the tunnel: pin the server over
+    /// the uplink and point `0.0.0.0/1`/`128.0.0.0/1` at the device while
+    /// the tun profile is active.
+    pub exit: bool,
 }
 
 impl ClientTun {
@@ -963,6 +969,17 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
             RunMode::Pppoe { config, .. } => Body::Pppoe(config.clone()),
             RunMode::Forwards | RunMode::Idle | RunMode::Offline => Body::Forwards,
         };
+        // Exit routes for a tun body that asked for them. The guard is filled
+        // on the first successful dial preparation and held across redials, so
+        // its lifetime matches the device: both drop when a switch or teardown
+        // ends this iteration, routes first.
+        #[cfg(target_os = "linux")]
+        let exit_tun: Option<String> = match &mode {
+            RunMode::Device(DeviceConfig::Tun(cfg)) if cfg.exit => Some(cfg.name.clone()),
+            _ => None,
+        };
+        #[cfg(target_os = "linux")]
+        let mut exit_routes: Option<ExitRouteGuard> = None;
 
         let mut udp_health = UdpHealth::default();
         let mut backoff = Backoff::default();
@@ -998,6 +1015,28 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                         continue;
                     }
                 },
+            };
+            // A failed exit-route bringup or pin assert keeps the dial from
+            // running (traffic must not fall onto a half-programmed route
+            // set) and backs off like a failed connect.
+            #[cfg(target_os = "linux")]
+            let addr = match &exit_tun {
+                Some(tun_name) => {
+                    match ensure_exit_routes(&mut exit_routes, &addr, tun_name).await {
+                        Ok(target) => target,
+                        Err(e) => {
+                            crate::elog!("exit routes for {addr}: {e}");
+                            link.set(LinkStatus::Backoff);
+                            tokio::select! {
+                                _ = cancel.notified() => break,
+                                _ = sleep(backoff.delay()) => {}
+                            }
+                            backoff.fail();
+                            continue;
+                        }
+                    }
+                }
+                None => addr,
             };
             // The forward maps are re-read per attempt, so an option edit made
             // while another body ran is live on the next forwards bringup.
@@ -1347,6 +1386,58 @@ fn peer_v4(addr: SocketAddr) -> Option<std::net::Ipv4Addr> {
 #[cfg(target_os = "linux")]
 fn server_v4(server: &str) -> Option<std::net::Ipv4Addr> {
     server.parse::<SocketAddr>().ok().and_then(peer_v4)
+}
+
+/// The server's IPv4 address for the exit pin: a literal `ip:port` parses
+/// directly, a hostname is resolved and its first IPv4 answer taken. Exit
+/// mode is IPv4-only, so a server with no IPv4 address is refused.
+#[cfg(target_os = "linux")]
+async fn exit_server_v4(addr: &str) -> Result<Ipv4Addr> {
+    if let Some(ip) = server_v4(addr) {
+        return Ok(ip);
+    }
+    let mut addrs = tokio::net::lookup_host(addr)
+        .await
+        .map_err(|e| -> crate::Error { format!("resolving {addr}: {e}").into() })?;
+    addrs
+        .find_map(peer_v4)
+        .ok_or_else(|| format!("exit mode needs an IPv4 server address; {addr} has none").into())
+}
+
+/// Program or refresh the exit routes ahead of a dial against `addr`, and
+/// return the literal target the dial must use. The first call pins the
+/// resolved server over the uplink and installs the half-defaults via
+/// `tun_name`; every later call re-asserts the /32 pin, moving it when the
+/// resolved address changed.
+#[cfg(target_os = "linux")]
+async fn ensure_exit_routes(
+    guard: &mut Option<ExitRouteGuard>,
+    addr: &str,
+    tun_name: &str,
+) -> Result<String> {
+    let server = exit_server_v4(addr).await?;
+    match guard {
+        Some(g) => g.assert_pin(server)?,
+        None => {
+            let table = std::fs::read_to_string("/proc/net/route")
+                .map_err(|e| -> crate::Error { format!("reading /proc/net/route: {e}").into() })?;
+            let pin = crate::exitroute::plan_server_pin(&table, tun_name, server)?;
+            *guard = Some(ExitRouteGuard::bring_up(pin, tun_name)?);
+        }
+    }
+    exit_dial_target(server, addr)
+}
+
+/// The exit-mode dial target: the pinned server address plus `addr`'s port.
+/// One resolution feeds both the pin and the dial, so a round-robin or
+/// dual-stack DNS answer cannot put the dial on an address the pin does not
+/// cover.
+#[cfg(target_os = "linux")]
+fn exit_dial_target(server: Ipv4Addr, addr: &str) -> Result<String> {
+    let (_, port) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| -> crate::Error { format!("no port in server address {addr}").into() })?;
+    Ok(format!("{server}:{port}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -1949,6 +2040,7 @@ mod tests {
             name: "zn0".into(),
             mtu: 1400,
             address: None,
+            exit: false,
         };
         let a = derived.resolve("secret-a");
         let b = derived.resolve("secret-b");
@@ -1961,11 +2053,42 @@ mod tests {
             name: "zn0".into(),
             mtu: 1400,
             address: Some((Ipv4Addr::new(192, 168, 7, 1), 30)),
+            exit: false,
         };
         let p = pinned.resolve("secret-a");
         assert_eq!(p.addr, Ipv4Addr::new(192, 168, 7, 1));
         assert_eq!(p.prefix_len, 30);
         assert_eq!(pinned.resolve("secret-b").addr, p.addr);
+    }
+
+    /// Exit mode is IPv4-only: a literal v4 target pins directly, a target
+    /// with only an IPv6 address is refused before bringup.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn exit_pin_requires_an_ipv4_server() {
+        assert_eq!(
+            exit_server_v4("203.0.113.9:7000").await.unwrap(),
+            Ipv4Addr::new(203, 0, 113, 9)
+        );
+        let err = exit_server_v4("[2001:db8::1]:7000").await.unwrap_err();
+        assert!(err.to_string().contains("IPv4"), "unexpected error: {err}");
+    }
+
+    /// An exit-mode dial goes to the pinned literal with the target's port,
+    /// never back through the resolver.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exit_dial_targets_the_pinned_literal() {
+        let pin = Ipv4Addr::new(203, 0, 113, 9);
+        assert_eq!(
+            exit_dial_target(pin, "example.com:7000").unwrap(),
+            "203.0.113.9:7000"
+        );
+        assert_eq!(
+            exit_dial_target(pin, "198.51.100.4:9000").unwrap(),
+            "203.0.113.9:9000"
+        );
+        assert!(exit_dial_target(pin, "noport").is_err());
     }
 
     fn pppoe_mode(name: &str) -> RunMode {

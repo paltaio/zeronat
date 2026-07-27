@@ -1345,6 +1345,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                         .unwrap_or_else(|| DEFAULT_TUN_NAME.to_string()),
                     mtu: DEFAULT_TAP_MTU,
                     address: t.address,
+                    exit: false,
                 });
                 // Every [[pppoe]] entry is resolved at boot so the admin can
                 // spawn any of them; run_switchable derives the boot body
@@ -1511,6 +1512,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                         name: DEFAULT_TUN_NAME.to_string(),
                         mtu,
                         address: None,
+                        exit: false,
                     })
                 } else {
                     None
