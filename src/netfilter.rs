@@ -1,10 +1,13 @@
-//! Server-side NAT for TUN all-ports mode. Redirects every inbound port (except
-//! the control port and any operator exclusions) plus ICMP to the single tunnel
-//! client, and source-NATs the forwarded traffic to the server's tunnel address
-//! so the client's replies route back through the tunnel. Programs nftables when
-//! available, else legacy iptables, else degrades to printing the rules for the
-//! operator to apply by hand. All rules live in an owned `zeronat` table (nft) or
-//! carry a `zeronat` comment (iptables) so teardown never touches operator rules.
+//! Server-side NAT for the TUN modes. All-ports mode redirects every inbound
+//! port (except the control port and any operator exclusions) plus ICMP to the
+//! single tunnel client, and source-NATs the forwarded traffic to the server's
+//! tunnel address so the client's replies route back through the tunnel. Exit
+//! mode masquerades tunnel-sourced traffic out the egress interface so the
+//! client can route its internet traffic through the server. Programs nftables
+//! when available, else legacy iptables, else degrades to printing the rules for
+//! the operator to apply by hand. All rules live in an owned `zeronat` table
+//! (nft) or carry a `zeronat` comment (iptables) so teardown never touches
+//! operator rules.
 
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -12,7 +15,9 @@ use std::process::{Command, Stdio};
 
 use crate::Result;
 
-/// The NAT to install for a TUN server.
+/// The NAT to install for a TUN server. `dnat` (inbound all-ports forwarding)
+/// and `egress` (outbound masquerade) are independent; a server can run either
+/// or both.
 pub struct NatPlan {
     pub iface: String,
     /// Tunnel network base, e.g. `10.x.y.0`.
@@ -20,16 +25,25 @@ pub struct NatPlan {
     pub prefix_len: u8,
     /// Server tunnel address (`.1`), used as the SNAT source.
     pub server_ip: Ipv4Addr,
+    /// Tunnel interface MTU, used to clamp forwarded TCP MSS.
+    pub mtu: usize,
+    /// Inbound all-ports DNAT to the tunnel client.
+    pub dnat: Option<DnatPlan>,
+    /// Interface to masquerade tunnel-sourced traffic out of (exit mode).
+    pub egress: Option<String>,
+}
+
+/// Inbound all-ports forwarding: every destination port except the kept ones,
+/// plus ICMP, DNATs to the tunnel client.
+pub struct DnatPlan {
     /// Client tunnel address (`.2`), the DNAT target for every forwarded port.
     pub client_ip: Ipv4Addr,
     pub control_port: u16,
-    /// Tunnel interface MTU, used to clamp forwarded TCP MSS.
-    pub mtu: usize,
     /// Extra TCP/UDP destination ports kept on the host (not forwarded).
     pub except: Vec<u16>,
 }
 
-impl NatPlan {
+impl DnatPlan {
     /// Destination ports that stay on the host: the control port plus any
     /// operator exclusions, de-duplicated and sorted for stable output.
     fn kept_ports(&self) -> Vec<u16> {
@@ -40,7 +54,9 @@ impl NatPlan {
         p.dedup();
         p
     }
+}
 
+impl NatPlan {
     fn cidr(&self) -> String {
         format!("{}/{}", self.subnet, self.prefix_len)
     }
@@ -58,27 +74,39 @@ impl NatPlan {
 fn nft_script(plan: &NatPlan) -> String {
     let iface = &plan.iface;
     let cidr = plan.cidr();
-    let client = plan.client_ip;
-    let server = plan.server_ip;
     let mss = plan.mss();
-    let keep = plan
-        .kept_ports()
-        .iter()
-        .map(|p| p.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
+    let mut s = String::from(
         "add table ip zeronat\n\
-         add chain ip zeronat prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}\n\
-         add chain ip zeronat postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}\n\
-         add chain ip zeronat forward {{ type filter hook forward priority mangle; policy accept; }}\n\
-         add rule ip zeronat prerouting iifname != \"{iface}\" ip daddr != {cidr} tcp dport != {{ {keep} }} dnat to {client}\n\
-         add rule ip zeronat prerouting iifname != \"{iface}\" ip daddr != {cidr} udp dport != {{ {keep} }} dnat to {client}\n\
-         add rule ip zeronat prerouting iifname != \"{iface}\" ip daddr != {cidr} ip protocol icmp dnat to {client}\n\
-         add rule ip zeronat postrouting oifname \"{iface}\" snat to {server}\n\
-         add rule ip zeronat forward oifname \"{iface}\" tcp flags & (syn | rst) == syn tcp option maxseg size set {mss}\n\
+         add chain ip zeronat prerouting { type nat hook prerouting priority dstnat; policy accept; }\n\
+         add chain ip zeronat postrouting { type nat hook postrouting priority srcnat; policy accept; }\n\
+         add chain ip zeronat forward { type filter hook forward priority mangle; policy accept; }\n",
+    );
+    if let Some(dnat) = &plan.dnat {
+        let client = dnat.client_ip;
+        let server = plan.server_ip;
+        let keep = dnat
+            .kept_ports()
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!(
+            "add rule ip zeronat prerouting iifname != \"{iface}\" ip daddr != {cidr} tcp dport != {{ {keep} }} dnat to {client}\n\
+             add rule ip zeronat prerouting iifname != \"{iface}\" ip daddr != {cidr} udp dport != {{ {keep} }} dnat to {client}\n\
+             add rule ip zeronat prerouting iifname != \"{iface}\" ip daddr != {cidr} ip protocol icmp dnat to {client}\n\
+             add rule ip zeronat postrouting oifname \"{iface}\" snat to {server}\n"
+        ));
+    }
+    if let Some(egress) = &plan.egress {
+        s.push_str(&format!(
+            "add rule ip zeronat postrouting oifname \"{egress}\" ip saddr {cidr} masquerade\n"
+        ));
+    }
+    s.push_str(&format!(
+        "add rule ip zeronat forward oifname \"{iface}\" tcp flags & (syn | rst) == syn tcp option maxseg size set {mss}\n\
          add rule ip zeronat forward iifname \"{iface}\" tcp flags & (syn | rst) == syn tcp option maxseg size set {mss}\n"
-    )
+    ));
+    s
 }
 
 /// Tunnel accepts for Docker's DOCKER-USER chain. An accept in zeronat's own
@@ -123,15 +151,13 @@ impl IptRule {
 }
 
 /// The iptables ruleset for `plan`. Mirrors `nft_script`: DNAT every forwarded
-/// port plus ICMP to the client, SNAT egress out the tunnel to the server.
-/// `docker_user` adds tunnel accepts to Docker's DOCKER-USER chain when it
-/// exists, where Docker's FORWARD drop policy cannot override them.
+/// port plus ICMP to the client, SNAT egress out the tunnel to the server, and
+/// masquerade tunnel-sourced traffic out the egress interface. `docker_user`
+/// adds tunnel accepts to Docker's DOCKER-USER chain when it exists, where
+/// Docker's FORWARD drop policy cannot override them.
 fn iptables_rules(plan: &NatPlan, docker_user: bool) -> Vec<IptRule> {
     let iface = plan.iface.clone();
     let cidr = plan.cidr();
-    let client = plan.client_ip.to_string();
-    let server = plan.server_ip.to_string();
-    let keep = plan.kept_ports();
     let comment = || {
         vec![
             "-m".into(),
@@ -141,85 +167,109 @@ fn iptables_rules(plan: &NatPlan, docker_user: bool) -> Vec<IptRule> {
         ]
     };
 
-    // Negated destination-port match: one port uses `! --dport`, several use the
-    // multiport module (`! --dports a,b,c`).
-    let dport_neg = |proto: &str| -> Vec<String> {
-        let mut v = vec!["-p".into(), proto.into()];
-        if keep.len() == 1 {
-            v.extend(["!".into(), "--dport".into(), keep[0].to_string()]);
-        } else {
-            let list = keep
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            v.extend([
-                "-m".into(),
-                "multiport".into(),
-                "!".into(),
-                "--dports".into(),
-                list,
-            ]);
-        }
-        v
-    };
-
     let mut rules = Vec::new();
-    for proto in ["tcp", "udp"] {
-        let mut args = vec![
-            "!".into(),
-            "-i".into(),
-            iface.clone(),
-            "!".into(),
-            "-d".into(),
-            cidr.clone(),
-        ];
-        args.extend(dport_neg(proto));
-        args.extend([
-            "-j".into(),
-            "DNAT".into(),
-            "--to-destination".into(),
-            client.clone(),
-        ]);
-        args.extend(comment());
-        rules.push(IptRule {
-            table: "nat",
-            chain: "PREROUTING",
-            insert: false,
-            args,
-        });
+    if let Some(dnat) = &plan.dnat {
+        let client = dnat.client_ip.to_string();
+        let server = plan.server_ip.to_string();
+        let keep = dnat.kept_ports();
+
+        // Negated destination-port match: one port uses `! --dport`, several use
+        // the multiport module (`! --dports a,b,c`).
+        let dport_neg = |proto: &str| -> Vec<String> {
+            let mut v = vec!["-p".into(), proto.into()];
+            if keep.len() == 1 {
+                v.extend(["!".into(), "--dport".into(), keep[0].to_string()]);
+            } else {
+                let list = keep
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                v.extend([
+                    "-m".into(),
+                    "multiport".into(),
+                    "!".into(),
+                    "--dports".into(),
+                    list,
+                ]);
+            }
+            v
+        };
+
+        for proto in ["tcp", "udp"] {
+            let mut args = vec![
+                "!".into(),
+                "-i".into(),
+                iface.clone(),
+                "!".into(),
+                "-d".into(),
+                cidr.clone(),
+            ];
+            args.extend(dport_neg(proto));
+            args.extend([
+                "-j".into(),
+                "DNAT".into(),
+                "--to-destination".into(),
+                client.clone(),
+            ]);
+            args.extend(comment());
+            rules.push(IptRule {
+                table: "nat",
+                chain: "PREROUTING",
+                insert: false,
+                args,
+            });
+        }
+        {
+            let mut args = vec![
+                "!".into(),
+                "-i".into(),
+                iface.clone(),
+                "!".into(),
+                "-d".into(),
+                cidr.clone(),
+                "-p".into(),
+                "icmp".into(),
+                "-j".into(),
+                "DNAT".into(),
+                "--to-destination".into(),
+                client.clone(),
+            ];
+            args.extend(comment());
+            rules.push(IptRule {
+                table: "nat",
+                chain: "PREROUTING",
+                insert: false,
+                args,
+            });
+        }
+        {
+            let mut args = vec![
+                "-o".into(),
+                iface.clone(),
+                "-j".into(),
+                "SNAT".into(),
+                "--to-source".into(),
+                server,
+            ];
+            args.extend(comment());
+            rules.push(IptRule {
+                table: "nat",
+                chain: "POSTROUTING",
+                insert: false,
+                args,
+            });
+        }
     }
-    {
+    // Masquerade tunnel-sourced traffic out the egress interface (exit mode).
+    if let Some(egress) = &plan.egress {
         let mut args = vec![
-            "!".into(),
-            "-i".into(),
-            iface.clone(),
-            "!".into(),
-            "-d".into(),
+            "-s".into(),
             cidr.clone(),
-            "-p".into(),
-            "icmp".into(),
-            "-j".into(),
-            "DNAT".into(),
-            "--to-destination".into(),
-            client.clone(),
-        ];
-        args.extend(comment());
-        rules.push(IptRule {
-            table: "nat",
-            chain: "PREROUTING",
-            insert: false,
-            args,
-        });
-    }
-    {
-        let mut args = vec![
             "-o".into(),
-            iface.clone(),
+            egress.clone(),
             "-j".into(),
-            "SNAT".into(),
-            "--to-source".into(),
-            server,
+            "MASQUERADE".into(),
         ];
         args.extend(comment());
         rules.push(IptRule {
@@ -392,9 +442,16 @@ pub fn install(plan: &NatPlan) -> Outcome {
 
 /// Operator-facing rules to apply when auto-setup did not run.
 fn manual_instructions(plan: &NatPlan) -> String {
-    let mut s = String::from(
-        "tun all-ports mode is running, but NAT was not programmed automatically.\n\
-         apply these on the server to forward every port to the client:\n\n  \
+    let what = match (&plan.dnat, &plan.egress) {
+        (Some(_), Some(_)) => {
+            "forward every port to the client and masquerade its outbound traffic"
+        }
+        (Some(_), None) => "forward every port to the client",
+        (None, _) => "masquerade the client's outbound traffic",
+    };
+    let mut s = format!(
+        "the tunnel is running, but NAT was not programmed automatically.\n\
+         apply these on the server to {what}:\n\n  \
          sysctl -w net.ipv4.ip_forward=1\n",
     );
     for r in iptables_rules(plan, false) {
@@ -634,21 +691,33 @@ mod tests {
             subnet: Ipv4Addr::new(10, 7, 9, 0),
             prefix_len: 24,
             server_ip: Ipv4Addr::new(10, 7, 9, 1),
-            client_ip: Ipv4Addr::new(10, 7, 9, 2),
-            control_port: 2222,
             mtu: 1400,
-            except: vec![22, 2222], // duplicate of control to exercise dedup
+            dnat: Some(DnatPlan {
+                client_ip: Ipv4Addr::new(10, 7, 9, 2),
+                control_port: 2222,
+                except: vec![22, 2222], // duplicate of control to exercise dedup
+            }),
+            egress: None,
+        }
+    }
+
+    fn exit_only() -> NatPlan {
+        NatPlan {
+            dnat: None,
+            egress: Some("eth0".into()),
+            ..plan()
         }
     }
 
     #[test]
     fn kept_ports_dedup_sorted() {
-        assert_eq!(plan().kept_ports(), vec![22, 2222]);
-        let p = NatPlan {
+        let d = plan().dnat.unwrap();
+        assert_eq!(d.kept_ports(), vec![22, 2222]);
+        let d = DnatPlan {
             except: vec![],
-            ..plan()
+            ..d
         };
-        assert_eq!(p.kept_ports(), vec![2222]);
+        assert_eq!(d.kept_ports(), vec![2222]);
     }
 
     #[test]
@@ -686,6 +755,37 @@ mod tests {
         ));
         // Without Docker, nothing references its table.
         assert!(!s.contains("DOCKER-USER"));
+        // Without an egress interface, no masquerade.
+        assert!(!s.contains("masquerade"));
+    }
+
+    #[test]
+    fn nft_masquerade_alongside_dnat() {
+        let p = NatPlan {
+            egress: Some("eth0".into()),
+            ..plan()
+        };
+        let s = nft_script(&p);
+        assert!(s.contains(
+            "add rule ip zeronat postrouting oifname \"eth0\" ip saddr 10.7.9.0/24 masquerade"
+        ));
+        assert!(s.contains("dnat to 10.7.9.2"));
+        assert!(s.contains("oifname \"zn0\" snat to 10.7.9.1"));
+    }
+
+    #[test]
+    fn nft_exit_only_has_no_dnat() {
+        let s = nft_script(&exit_only());
+        assert!(s.contains("oifname \"eth0\" ip saddr 10.7.9.0/24 masquerade"));
+        assert!(!s.contains("dnat to"));
+        assert!(!s.contains("snat to"));
+        // The MSS clamp still covers both tunnel directions.
+        assert!(s.contains(
+            "oifname \"zn0\" tcp flags & (syn | rst) == syn tcp option maxseg size set 1360"
+        ));
+        assert!(s.contains(
+            "iifname \"zn0\" tcp flags & (syn | rst) == syn tcp option maxseg size set 1360"
+        ));
     }
 
     #[test]
@@ -760,12 +860,60 @@ mod tests {
     #[test]
     fn single_kept_port_uses_dport_not_multiport() {
         let p = NatPlan {
-            except: vec![],
+            dnat: Some(DnatPlan {
+                client_ip: Ipv4Addr::new(10, 7, 9, 2),
+                control_port: 2222,
+                except: vec![],
+            }),
             ..plan()
         };
         let rules = iptables_rules(&p, false);
         let tcp = rules[0].command().join(" ");
         assert!(tcp.contains("-p tcp ! --dport 2222 -j DNAT"));
         assert!(!tcp.contains("multiport"));
+    }
+
+    #[test]
+    fn iptables_masquerade_alongside_dnat() {
+        let p = NatPlan {
+            egress: Some("eth0".into()),
+            ..plan()
+        };
+        let rules = iptables_rules(&p, false);
+        assert_eq!(rules.len(), 9);
+        assert_eq!(
+            rules[4].command().join(" "),
+            "-t nat -A POSTROUTING -s 10.7.9.0/24 -o eth0 -j MASQUERADE -m comment --comment zeronat"
+        );
+    }
+
+    #[test]
+    fn iptables_exit_only_rules() {
+        let rules = iptables_rules(&exit_only(), false);
+        // masquerade + two MSS clamps + two FORWARD accepts
+        assert_eq!(rules.len(), 5);
+        assert!(rules.iter().all(|r| r.chain != "PREROUTING"));
+        assert!(rules[0].command().join(" ").contains("-j MASQUERADE"));
+        assert!(
+            rules
+                .iter()
+                .filter(|r| r.chain == "FORWARD" && r.table == "filter")
+                .count()
+                == 2
+        );
+    }
+
+    #[test]
+    fn every_rule_is_reachable_by_comment_flush() {
+        // Teardown flushes by zeronat comment across IPT_CHAINS; a rule outside
+        // those chains or without the comment would leak on drop.
+        let p = NatPlan {
+            egress: Some("eth0".into()),
+            ..plan()
+        };
+        for r in iptables_rules(&p, true) {
+            assert!(IPT_CHAINS.contains(&(r.table, r.chain)));
+            assert!(r.args.iter().any(|a| a == "zeronat"));
+        }
     }
 }

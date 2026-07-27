@@ -333,10 +333,13 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
             subnet: st.subnet,
             prefix_len: st.device.prefix_len,
             server_ip: st.device.addr,
-            client_ip: st.client_ip,
-            control_port,
             mtu: st.device.mtu,
-            except: st.except.clone(),
+            dnat: Some(netfilter::DnatPlan {
+                client_ip: st.client_ip,
+                control_port,
+                except: st.except.clone(),
+            }),
+            egress: None,
         };
         match netfilter::install(&plan) {
             netfilter::Outcome::Installed(g) => {
