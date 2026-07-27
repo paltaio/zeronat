@@ -36,6 +36,10 @@ server options:
   --tun               L3 all-ports mode (Linux only): forward every port except
                       the control port (and --except) plus ICMP to the client
   --except <PORT>     Port to keep on the host in --tun mode (repeatable)
+  --exit              Exit mode (requires --tun): masquerade the client's
+                      outbound traffic through this host
+  --exit-iface <IF>   Interface --exit masquerades out of (default: the
+                      default-route interface)
   --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
   --tap-mtu <N>       TAP/TUN MTU (default: 1400; alias --tun-mtu)
   --bridge <NAME>     Enslave the TAP to this existing bridge
@@ -127,6 +131,8 @@ enum Cmd {
         tun: bool,
         mtu: usize,
         except: Vec<u16>,
+        exit: bool,
+        exit_iface: Option<String>,
         dht: bool,
         announce_ip: Option<Ipv4Addr>,
         announce_port: Option<u16>,
@@ -556,6 +562,8 @@ fn parse_args() -> Result<Cmd> {
         let mut bridge: Option<String> = None;
         let mut tun = false;
         let mut except: Vec<u16> = Vec::new();
+        let mut exit = false;
+        let mut exit_iface: Option<String> = None;
         let mut dht = false;
         let mut announce_ip: Option<Ipv4Addr> = None;
         let mut announce_port: Option<u16> = None;
@@ -643,6 +651,12 @@ fn parse_args() -> Result<Cmd> {
                     })?;
                     except.push(port);
                 }
+                "--exit" => {
+                    exit = true;
+                }
+                "--exit-iface" => {
+                    exit_iface = Some(iter.next().ok_or("--exit-iface requires a value")?);
+                }
                 other => {
                     eprintln!("error: unknown flag '{other}'");
                     std::process::exit(1);
@@ -670,6 +684,8 @@ fn parse_args() -> Result<Cmd> {
             tun,
             mtu: tap_mtu,
             except,
+            exit,
+            exit_iface,
             dht,
             announce_ip,
             announce_port,
@@ -952,6 +968,8 @@ async fn run(cmd: Cmd) -> Result<()> {
             tun,
             mtu,
             except,
+            exit,
+            exit_iface,
             dht,
             announce_ip,
             announce_port,
@@ -1021,6 +1039,18 @@ async fn run(cmd: Cmd) -> Result<()> {
             }
             let bind_ip = file_ip.or(cli_bind).unwrap_or(Ipv4Addr::UNSPECIFIED);
             let control_port = file_port.or(cli_control).unwrap_or(2222);
+
+            let (cli_exit, cli_exit_iface) = (exit, exit_iface);
+            if file.exit == Some(false) && cli_exit {
+                zeronat::elog!("config [server].exit = false overrides --exit");
+            }
+            let exit = file.exit.unwrap_or(cli_exit);
+            if let (Some(f), Some(c)) = (&file.exit_iface, &cli_exit_iface) {
+                if f != c {
+                    zeronat::elog!("config [server].exit_iface '{f}' overrides --exit-iface '{c}'");
+                }
+            }
+            let exit_iface = file.exit_iface.clone().or(cli_exit_iface);
 
             // Listeners: start from the file's, then fold in CLI forwards. A CLI
             // port that matches a file listener locks that file listener (kept as
@@ -1105,6 +1135,17 @@ async fn run(cmd: Cmd) -> Result<()> {
             if !except.is_empty() && !tun {
                 return Err("--except requires --tun".into());
             }
+            if exit && !tun {
+                return Err("--exit requires --tun".into());
+            }
+            if exit_iface.is_some() && !exit {
+                return Err("--exit-iface requires --exit".into());
+            }
+            if exit_iface.as_deref() == Some(DEFAULT_TUN_NAME) {
+                return Err(
+                    format!("--exit-iface cannot be the tun device {DEFAULT_TUN_NAME}").into(),
+                );
+            }
             if tap.is_some() && !listeners.is_empty() {
                 return Err("--tap cannot be combined with --tcp/--udp forwards".into());
             }
@@ -1127,6 +1168,8 @@ async fn run(cmd: Cmd) -> Result<()> {
                     subnet,
                     client_ip,
                     except,
+                    exit,
+                    exit_iface: exit_iface.clone(),
                 })
             } else {
                 None
@@ -1137,22 +1180,25 @@ async fn run(cmd: Cmd) -> Result<()> {
                 port: announce_port,
             });
             zeronat::elog!(
-                "zeronat {} server: bind={bind_ip} control={control_port} tap={} tun={} dht={}",
+                "zeronat {} server: bind={bind_ip} control={control_port} tap={} tun={} exit={} dht={}",
                 env!("CARGO_PKG_VERSION"),
                 onoff(tap.is_some()),
                 onoff(tun.is_some()),
+                onoff(exit),
                 onoff(dht.is_some())
             );
             // On a self-heal the file lost its [server] table; record the resolved
             // identity so the rewritten file matches the running server and an
             // operator can later drop the CLI flags without a silent change.
-            let (file_id, file_control) = if self_healed {
+            let (file_id, file_control, file_exit, file_exit_iface) = if self_healed {
                 (
                     Some(server_id.clone()),
                     Some(format!("{bind_ip}:{control_port}")),
+                    exit.then_some(true),
+                    exit_iface,
                 )
             } else {
-                (file.id, file.control)
+                (file.id, file.control, file.exit, file.exit_iface)
             };
             server::run(server::ServerSettings {
                 bind: bind_ip,
@@ -1167,6 +1213,8 @@ async fn run(cmd: Cmd) -> Result<()> {
                 config_path: config,
                 file_id,
                 file_control,
+                file_exit,
+                file_exit_iface,
             })
             .await
         }

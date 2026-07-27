@@ -265,6 +265,8 @@ mod pty {
             config_path: None,
             file_id: None,
             file_control: None,
+            file_exit: None,
+            file_exit_iface: None,
         }
     }
 

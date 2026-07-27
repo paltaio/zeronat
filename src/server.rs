@@ -149,11 +149,13 @@ pub(crate) struct Server {
     listeners: Mutex<HashMap<RouteKey, ListenerHandle>>,
     handshakes: Arc<Semaphore>,
     /// Config file backing this server, or `None` for a runtime-only node that
-    /// never writes. `file_id`/`file_control` preserve the loaded `[server]`
-    /// verbatim so an auto-save never bakes CLI-sourced identity into the file.
+    /// never writes. The `file_*` fields preserve the loaded `[server]` table
+    /// verbatim so an auto-save never bakes CLI-sourced settings into the file.
     config_path: Option<PathBuf>,
     file_id: Option<String>,
     file_control: Option<String>,
+    file_exit: Option<bool>,
+    file_exit_iface: Option<String>,
     /// Serializes config writes so two concurrent admin sessions never interleave
     /// a save.
     save_lock: tokio::sync::Mutex<()>,
@@ -274,16 +276,20 @@ pub struct RouteSpec {
 /// TUN all-ports mode. The server forwards every inbound port (except the
 /// control port and `except`) plus ICMP to one client over an L3 tunnel.
 /// `device` is the server's tunnel endpoint (address `.1`); `client_ip` (`.2`)
-/// is the NAT target. `subnet` is the tunnel network base.
+/// is the NAT target. `subnet` is the tunnel network base. `exit` masquerades
+/// the client's outbound traffic out `exit_iface`, or out the default-route
+/// interface when `exit_iface` is unset.
 pub struct ServerTun {
     pub device: TunConfig,
     pub subnet: Ipv4Addr,
     pub client_ip: Ipv4Addr,
     pub except: Vec<u16>,
+    pub exit: bool,
+    pub exit_iface: Option<String>,
 }
 
 /// Everything the server needs to boot. `config_path` is the file to auto-save
-/// mutations into, or `None` for a runtime-only node. `file_id`/`file_control`
+/// mutations into, or `None` for a runtime-only node. The `file_*` fields
 /// carry the loaded `[server]` table so a save preserves it verbatim.
 pub struct ServerSettings {
     pub bind: Ipv4Addr,
@@ -298,6 +304,41 @@ pub struct ServerSettings {
     pub config_path: Option<PathBuf>,
     pub file_id: Option<String>,
     pub file_control: Option<String>,
+    pub file_exit: Option<bool>,
+    pub file_exit_iface: Option<String>,
+}
+
+/// The netfilter plan for the TUN device. With `exit` on, the egress interface
+/// is `exit_iface` when set, else the default-route interface parsed from
+/// `route_table` (`/proc/net/route` contents).
+#[cfg(target_os = "linux")]
+fn tun_nat_plan(
+    st: &ServerTun,
+    control_port: u16,
+    route_table: &str,
+) -> Result<netfilter::NatPlan> {
+    let egress = match (st.exit, &st.exit_iface) {
+        (false, _) => None,
+        (true, Some(iface)) => Some(iface.clone()),
+        (true, None) => Some(
+            crate::pppoe::netcfg::parse_proc_route(route_table, &st.device.name)
+                .map(|d| d.iface)
+                .ok_or("--exit found no default route; pass --exit-iface")?,
+        ),
+    };
+    Ok(netfilter::NatPlan {
+        iface: st.device.name.clone(),
+        subnet: st.subnet,
+        prefix_len: st.device.prefix_len,
+        server_ip: st.device.addr,
+        mtu: st.device.mtu,
+        dnat: Some(netfilter::DnatPlan {
+            client_ip: st.client_ip,
+            control_port,
+            except: st.except.clone(),
+        }),
+        egress,
+    })
 }
 
 pub async fn run(settings: ServerSettings) -> Result<()> {
@@ -314,6 +355,8 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         config_path,
         file_id,
         file_control,
+        file_exit,
+        file_exit_iface,
     } = settings;
 
     // The TUN NAT guard tears the rules down when this future is dropped: on the
@@ -327,20 +370,9 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
     // ports, an L3 device serves exactly one client.
     #[cfg(target_os = "linux")]
     let tap: Option<(Arc<TapDevice>, bool)> = if let Some(st) = &tun {
+        let route_table = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+        let plan = tun_nat_plan(st, control_port, &route_table)?;
         let dev = Arc::new(TapDevice::open_tun(&st.device)?);
-        let plan = netfilter::NatPlan {
-            iface: st.device.name.clone(),
-            subnet: st.subnet,
-            prefix_len: st.device.prefix_len,
-            server_ip: st.device.addr,
-            mtu: st.device.mtu,
-            dnat: Some(netfilter::DnatPlan {
-                client_ip: st.client_ip,
-                control_port,
-                except: st.except.clone(),
-            }),
-            egress: None,
-        };
         match netfilter::install(&plan) {
             netfilter::Outcome::Installed(g) => {
                 let extra = if st.except.is_empty() {
@@ -358,6 +390,12 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
                     crate::elog!(
                         "warning: port 22 (SSH) now routes to the client; pass --except 22 to keep \
                          administering this server over SSH"
+                    );
+                }
+                if let Some(egress) = &plan.egress {
+                    crate::elog!(
+                        "tun {}: masquerading client traffic out {egress}",
+                        st.device.name
                     );
                 }
                 _nat_guard = Some(g);
@@ -426,6 +464,8 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         config_path,
         file_id,
         file_control,
+        file_exit,
+        file_exit_iface,
         save_lock: tokio::sync::Mutex::new(()),
         #[cfg(target_os = "linux")]
         switch,
@@ -824,6 +864,8 @@ impl Server {
         let cfg = config::ServerConfig {
             id: self.file_id.clone(),
             control: self.file_control.clone(),
+            exit: self.file_exit,
+            exit_iface: self.file_exit_iface.clone(),
             listeners,
             routes,
         };
@@ -1528,6 +1570,67 @@ mod tests {
         assert!(tcp.local_addr().is_ok());
     }
 
+    #[cfg(target_os = "linux")]
+    fn test_tun(exit: bool, exit_iface: Option<&str>) -> ServerTun {
+        ServerTun {
+            device: TunConfig {
+                name: "zn0".into(),
+                mtu: 1400,
+                addr: Ipv4Addr::new(10, 9, 8, 1),
+                prefix_len: 24,
+            },
+            subnet: Ipv4Addr::new(10, 9, 8, 0),
+            client_ip: Ipv4Addr::new(10, 9, 8, 2),
+            except: Vec::new(),
+            exit,
+            exit_iface: exit_iface.map(str::to_string),
+        }
+    }
+
+    // One default via eth0 plus a connected route, in /proc/net/route layout.
+    #[cfg(target_os = "linux")]
+    const PROC_ROUTE: &str = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+eth0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
+eth0\t0050A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
+";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_nat_plan_without_exit_has_no_egress() {
+        let plan = tun_nat_plan(&test_tun(false, None), 2222, PROC_ROUTE).unwrap();
+        assert!(plan.egress.is_none());
+        assert!(plan.dnat.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_nat_plan_exit_iface_wins_over_default_route() {
+        let plan = tun_nat_plan(&test_tun(true, Some("wan1")), 2222, PROC_ROUTE).unwrap();
+        assert_eq!(plan.egress.as_deref(), Some("wan1"));
+        // The inbound DNAT rides along untouched: the two are independent.
+        assert!(plan.dnat.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_nat_plan_exit_auto_detects_default_route() {
+        let plan = tun_nat_plan(&test_tun(true, None), 2222, PROC_ROUTE).unwrap();
+        assert_eq!(plan.egress.as_deref(), Some("eth0"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_nat_plan_exit_without_default_route_is_fatal() {
+        // A default route already on the tun device does not count either.
+        let tun_default = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
+";
+        assert!(tun_nat_plan(&test_tun(true, None), 2222, "").is_err());
+        assert!(tun_nat_plan(&test_tun(true, None), 2222, tun_default).is_err());
+    }
+
     fn test_server() -> Arc<Server> {
         Arc::new(Server {
             psk: crate::noise::derive_psk("test-secret"),
@@ -1542,6 +1645,8 @@ mod tests {
             config_path: None,
             file_id: None,
             file_control: None,
+            file_exit: None,
+            file_exit_iface: None,
             save_lock: tokio::sync::Mutex::new(()),
             #[cfg(target_os = "linux")]
             switch: None,

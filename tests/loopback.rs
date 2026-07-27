@@ -50,6 +50,8 @@ fn cli_settings(control: u16, tcp: Vec<u16>, udp: Vec<u16>) -> ServerSettings {
         config_path: None,
         file_id: None,
         file_control: None,
+        file_exit: None,
+        file_exit_iface: None,
     }
 }
 

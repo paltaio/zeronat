@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::str::FromStr;
 
-use codec::{err, parse_int, parse_string, quote, reject_dup, split_kv, strip_comment};
+use codec::{err, parse_bool, parse_int, parse_string, quote, reject_dup, split_kv, strip_comment};
 pub use codec::{quarantine, save_atomic, LoadError};
 
 use crate::proto::Proto;
@@ -37,6 +37,10 @@ pub struct CfgRoute {
 pub struct ServerConfig {
     pub id: Option<String>,
     pub control: Option<String>,
+    /// Exit mode: masquerade the tunnel client's outbound traffic.
+    pub exit: Option<bool>,
+    /// Egress interface for exit mode; unset auto-detects the default route.
+    pub exit_iface: Option<String>,
     pub listeners: Vec<CfgListener>,
     pub routes: Vec<CfgRoute>,
 }
@@ -126,6 +130,8 @@ pub fn parse(text: &str) -> Result<ServerConfig> {
                 match key {
                     "id" => cfg.id = Some(parse_string(value, n)?),
                     "control" => cfg.control = Some(parse_string(value, n)?),
+                    "exit" => cfg.exit = Some(parse_bool(value, n)?),
+                    "exit_iface" => cfg.exit_iface = Some(parse_string(value, n)?),
                     other => {
                         return Err(err(n, &format!("unknown key `{other}` in [server]")));
                     }
@@ -259,13 +265,19 @@ fn parse_ip(value: &str, n: usize) -> Result<Ipv4Addr> {
 pub fn serialize(cfg: &ServerConfig) -> String {
     let mut out = String::new();
 
-    if cfg.id.is_some() || cfg.control.is_some() {
+    if cfg.id.is_some() || cfg.control.is_some() || cfg.exit.is_some() || cfg.exit_iface.is_some() {
         out.push_str("[server]\n");
         if let Some(id) = &cfg.id {
             out.push_str(&format!("id = {}\n", quote(id)));
         }
         if let Some(control) = &cfg.control {
             out.push_str(&format!("control = {}\n", quote(control)));
+        }
+        if let Some(exit) = cfg.exit {
+            out.push_str(&format!("exit = {exit}\n"));
+        }
+        if let Some(iface) = &cfg.exit_iface {
+            out.push_str(&format!("exit_iface = {}\n", quote(iface)));
         }
     }
 
@@ -332,6 +344,8 @@ mod tests {
         ServerConfig {
             id: Some("oci".into()),
             control: Some("0.0.0.0:2222".into()),
+            exit: Some(true),
+            exit_iface: Some("eth0".into()),
             listeners: vec![
                 CfgListener {
                     bind_ip: Ipv4Addr::new(203, 0, 113, 10),
@@ -368,10 +382,28 @@ mod tests {
     }
 
     #[test]
+    fn exit_keys_roundtrip() {
+        // `exit = false` is distinct from an absent key and must survive a save.
+        let cfg = ServerConfig {
+            exit: Some(false),
+            ..ServerConfig::default()
+        };
+        assert_eq!(parse(&serialize(&cfg)).unwrap(), cfg);
+
+        let text = "[server]\nexit = true\nexit_iface = \"eth0\"\n";
+        let cfg = parse(text).unwrap();
+        assert_eq!(cfg.exit, Some(true));
+        assert_eq!(cfg.exit_iface.as_deref(), Some("eth0"));
+        assert_eq!(serialize(&cfg), text);
+    }
+
+    #[test]
     fn serialize_is_sorted_and_deterministic() {
         let cfg = ServerConfig {
             id: None,
             control: None,
+            exit: None,
+            exit_iface: None,
             listeners: vec![
                 CfgListener {
                     bind_ip: Ipv4Addr::new(203, 0, 113, 11),
@@ -404,6 +436,9 @@ mod tests {
             "[[listeners]]\nbind_ip = \"127.0.0.1\"\nproto = \"tcp\"\nport = 99999\n",
             "[[listeners]]\nbind_ip = \"127.0.0.1\"\nproto = \"tcp\"\nport = \"443\"\n",
             "[server]\nid = \"x\n",
+            "[server]\nexit = 1\n",
+            "[server]\nexit = \"true\"\n",
+            "[server]\nexit_iface = true\n",
             "[[listeners]]\nbind_ip = \"127.0.0.1\"\nbind_ip = \"127.0.0.2\"\nproto = \"tcp\"\nport = 1\n",
             "[server]\nid = \"a\"\n[server]\ncontrol = \"b\"\n",
             "[[listeners]]\nbind_ip = \"127.0.0.1\"\nproto = \"tcp\"\n",
