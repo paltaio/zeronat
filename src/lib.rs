@@ -21,6 +21,8 @@ pub mod noise;
 pub mod pppoe;
 pub mod proto;
 pub mod proxyproto;
+#[cfg(target_os = "linux")]
+pub mod route;
 pub mod server;
 pub mod tap;
 #[cfg(all(feature = "tui", unix))]

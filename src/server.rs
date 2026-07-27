@@ -321,9 +321,8 @@ fn tun_nat_plan(
         (false, _) => None,
         (true, Some(iface)) => Some(iface.clone()),
         (true, None) => Some(
-            crate::pppoe::netcfg::parse_proc_route(route_table, &st.device.name)
-                .map(|d| d.iface)
-                .ok_or("--exit found no default route; pass --exit-iface")?,
+            crate::route::default_route_iface(route_table, &st.device.name)
+                .ok_or("--exit could not detect the egress interface; pass --exit-iface")?,
         ),
     };
     Ok(netfilter::NatPlan {
@@ -1617,6 +1616,19 @@ eth0\t0050A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
     fn tun_nat_plan_exit_auto_detects_default_route() {
         let plan = tun_nat_plan(&test_tun(true, None), 2222, PROC_ROUTE).unwrap();
         assert_eq!(plan.egress.as_deref(), Some("eth0"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_nat_plan_exit_auto_detects_gatewayless_default() {
+        // A point-to-point uplink carries the default with no gateway; it is
+        // still the egress interface.
+        let ppp_route = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+ppp0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
+";
+        let plan = tun_nat_plan(&test_tun(true, None), 2222, ppp_route).unwrap();
+        assert_eq!(plan.egress.as_deref(), Some("ppp0"));
     }
 
     #[cfg(target_os = "linux")]
