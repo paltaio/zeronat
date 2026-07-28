@@ -3624,6 +3624,67 @@ async fn assert_control_alive(
     );
 }
 
+/// Both parties' punched links, each with the control channel its punch
+/// reported on, the frames it sent there, and the reader for the rest of the
+/// control session.
+struct PunchedPair {
+    pair_id: u64,
+    c_link: zeronat::punch::PeerLink,
+    c_ctl: tokio::sync::mpsc::Sender<Vec<u8>>,
+    c_seen: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    cr: zeronat::noise::NoiseReader,
+    p_link: zeronat::punch::PeerLink,
+    p_ctl: tokio::sync::mpsc::Sender<Vec<u8>>,
+    p_seen: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    pr: zeronat::noise::NoiseReader,
+    _pumps: (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
+}
+
+/// Punch both parties to a direct session and take the two links, failing the
+/// test if either side settles on the relay. `c_cands` replaces the candidates
+/// the consumer's `PeerInfo` carried, for a test that stands its own paths in
+/// front of the peer.
+async fn punched_links(
+    parties: PunchParties,
+    psk: &[u8; 32],
+    c_cands: Option<Vec<std::net::SocketAddr>>,
+) -> PunchedPair {
+    let pair_id = parties.pair_id;
+    let c_cands = c_cands.unwrap_or(parties.c_cands);
+    let (c_ctl, c_seen) = punch_control(parties.cw);
+    let (p_ctl, p_seen) = punch_control(parties.pw);
+    let (c_out, p_out) = tokio::join!(
+        zeronat::punch::punch(parties.c_sess, &c_cands, pair_id, "c", "prov", psk, &c_ctl),
+        zeronat::punch::punch(
+            parties.p_sess,
+            &parties.p_cands,
+            pair_id,
+            "prov",
+            "c",
+            psk,
+            &p_ctl
+        ),
+    );
+    let (c_link, p_link) = match (c_out, p_out) {
+        (zeronat::punch::PunchOutcome::Direct(c), zeronat::punch::PunchOutcome::Direct(p)) => {
+            (c, p)
+        }
+        _ => panic!("both parties must settle on the direct path"),
+    };
+    PunchedPair {
+        pair_id,
+        c_link,
+        c_ctl,
+        c_seen,
+        cr: parties.cr,
+        p_link,
+        p_ctl,
+        p_seen,
+        pr: parties.pr,
+        _pumps: parties._pumps,
+    }
+}
+
 // A punch over the loopback candidates brings up an authenticated direct
 // session between two clients: the lower client id runs the Noise initiator,
 // frames ride the punched dgram channel both ways, and both parties report
@@ -3634,47 +3695,20 @@ async fn peer_punch_establishes_direct_session() {
         let control = free_tcp_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
-        let mut parties = punch_parties(control).await;
+        let parties = punch_parties(control).await;
+        let mut punched = punched_links(parties, &psk, None).await;
 
-        let (c_ctl, mut c_seen) = punch_control(parties.cw);
-        let (p_ctl, mut p_seen) = punch_control(parties.pw);
-        let (c_out, p_out) = tokio::join!(
-            zeronat::punch::punch(
-                parties.c_sess,
-                &parties.c_cands,
-                parties.pair_id,
-                "c",
-                "prov",
-                &psk,
-                &c_ctl
-            ),
-            zeronat::punch::punch(
-                parties.p_sess,
-                &parties.p_cands,
-                parties.pair_id,
-                "prov",
-                "c",
-                &psk,
-                &p_ctl
-            ),
-        );
-        let (mut c_link, mut p_link) = match (c_out, p_out) {
-            (zeronat::punch::PunchOutcome::Direct(c), zeronat::punch::PunchOutcome::Direct(p)) => {
-                (c, p)
-            }
-            _ => panic!("both parties must settle on the direct path"),
-        };
-        expect_peer_path(&mut c_seen, parties.pair_id, PathStatus::Direct).await;
-        expect_peer_path(&mut p_seen, parties.pair_id, PathStatus::Direct).await;
+        expect_peer_path(&mut punched.c_seen, punched.pair_id, PathStatus::Direct).await;
+        expect_peer_path(&mut punched.p_seen, punched.pair_id, PathStatus::Direct).await;
 
         // The punched session carries frames both ways.
-        c_link.tx.send(b"c-to-prov").await.unwrap();
-        assert_eq!(recv_dgram_frame(&mut p_link.rx).await, b"c-to-prov");
-        p_link.tx.send(b"prov-to-c").await.unwrap();
-        assert_eq!(recv_dgram_frame(&mut c_link.rx).await, b"prov-to-c");
+        punched.c_link.tx.send(b"c-to-prov").await.unwrap();
+        assert_eq!(recv_dgram_frame(&mut punched.p_link.rx).await, b"c-to-prov");
+        punched.p_link.tx.send(b"prov-to-c").await.unwrap();
+        assert_eq!(recv_dgram_frame(&mut punched.c_link.rx).await, b"prov-to-c");
 
-        assert_control_alive(&c_ctl, &mut parties.cr).await;
-        assert_control_alive(&p_ctl, &mut parties.pr).await;
+        assert_control_alive(&punched.c_ctl, &mut punched.cr).await;
+        assert_control_alive(&punched.p_ctl, &mut punched.pr).await;
     };
 
     timeout(Duration::from_secs(60), body)
@@ -3923,55 +3957,26 @@ async fn peer_punch_binds_one_path_across_two_candidates() {
         let (fast_back, _f2) =
             punch_forwarder(target, Duration::from_millis(100), Duration::ZERO, 0).await;
         assert_ne!(fast_out, fast_back);
-        let c_cands = vec![fast_out, fast_back];
-
-        let (c_ctl, mut c_seen) = punch_control(parties.cw);
-        let (p_ctl, mut p_seen) = punch_control(parties.pw);
-        let (c_out, p_out) = tokio::join!(
-            zeronat::punch::punch(
-                parties.c_sess,
-                &c_cands,
-                parties.pair_id,
-                "c",
-                "prov",
-                &psk,
-                &c_ctl
-            ),
-            zeronat::punch::punch(
-                parties.p_sess,
-                &parties.p_cands,
-                parties.pair_id,
-                "prov",
-                "c",
-                &psk,
-                &p_ctl
-            ),
-        );
-        let (mut c_link, mut p_link) = match (c_out, p_out) {
-            (zeronat::punch::PunchOutcome::Direct(c), zeronat::punch::PunchOutcome::Direct(p)) => {
-                (c, p)
-            }
-            _ => panic!("both parties must settle on the direct path"),
-        };
+        let mut punched = punched_links(parties, &psk, Some(vec![fast_out, fast_back])).await;
 
         // Each forwarder carries both directions on one socket, so a pair
         // bound to one path sees that forwarder's address from both ends.
         assert_eq!(
-            c_link.peer, fast_back,
+            punched.c_link.peer, fast_back,
             "the initiator must nominate the candidate its message two came back on"
         );
         assert_eq!(
-            p_link.peer, c_link.peer,
+            punched.p_link.peer, punched.c_link.peer,
             "the responder bound a different path than the initiator nominated"
         );
 
-        c_link.tx.send(b"c-to-prov").await.unwrap();
-        assert_eq!(recv_dgram_frame(&mut p_link.rx).await, b"c-to-prov");
-        p_link.tx.send(b"prov-to-c").await.unwrap();
-        assert_eq!(recv_dgram_frame(&mut c_link.rx).await, b"prov-to-c");
+        punched.c_link.tx.send(b"c-to-prov").await.unwrap();
+        assert_eq!(recv_dgram_frame(&mut punched.p_link.rx).await, b"c-to-prov");
+        punched.p_link.tx.send(b"prov-to-c").await.unwrap();
+        assert_eq!(recv_dgram_frame(&mut punched.c_link.rx).await, b"prov-to-c");
 
-        expect_peer_path(&mut c_seen, parties.pair_id, PathStatus::Direct).await;
-        expect_peer_path(&mut p_seen, parties.pair_id, PathStatus::Direct).await;
+        expect_peer_path(&mut punched.c_seen, punched.pair_id, PathStatus::Direct).await;
+        expect_peer_path(&mut punched.p_seen, punched.pair_id, PathStatus::Direct).await;
     };
 
     timeout(Duration::from_secs(60), body)
@@ -4051,46 +4056,17 @@ async fn peer_punch_survives_a_lost_nomination() {
         // eats the first datagram-channel frame, which is the nomination.
         let target = parties.p_sess.public;
         let (lossy, _fwd) = punch_forwarder(target, Duration::ZERO, Duration::ZERO, 1).await;
-        let c_cands = vec![lossy];
+        let mut punched = punched_links(parties, &psk, Some(vec![lossy])).await;
+        assert_eq!(punched.c_link.peer, lossy);
+        assert_eq!(punched.p_link.peer, lossy);
 
-        let (c_ctl, mut c_seen) = punch_control(parties.cw);
-        let (p_ctl, mut p_seen) = punch_control(parties.pw);
-        let (c_out, p_out) = tokio::join!(
-            zeronat::punch::punch(
-                parties.c_sess,
-                &c_cands,
-                parties.pair_id,
-                "c",
-                "prov",
-                &psk,
-                &c_ctl
-            ),
-            zeronat::punch::punch(
-                parties.p_sess,
-                &parties.p_cands,
-                parties.pair_id,
-                "prov",
-                "c",
-                &psk,
-                &p_ctl
-            ),
-        );
-        let (mut c_link, mut p_link) = match (c_out, p_out) {
-            (zeronat::punch::PunchOutcome::Direct(c), zeronat::punch::PunchOutcome::Direct(p)) => {
-                (c, p)
-            }
-            _ => panic!("a repeated nomination must still settle both ends direct"),
-        };
-        assert_eq!(c_link.peer, lossy);
-        assert_eq!(p_link.peer, lossy);
+        punched.c_link.tx.send(b"c-to-prov").await.unwrap();
+        assert_eq!(recv_dgram_frame(&mut punched.p_link.rx).await, b"c-to-prov");
+        punched.p_link.tx.send(b"prov-to-c").await.unwrap();
+        assert_eq!(recv_dgram_frame(&mut punched.c_link.rx).await, b"prov-to-c");
 
-        c_link.tx.send(b"c-to-prov").await.unwrap();
-        assert_eq!(recv_dgram_frame(&mut p_link.rx).await, b"c-to-prov");
-        p_link.tx.send(b"prov-to-c").await.unwrap();
-        assert_eq!(recv_dgram_frame(&mut c_link.rx).await, b"prov-to-c");
-
-        expect_peer_path(&mut c_seen, parties.pair_id, PathStatus::Direct).await;
-        expect_peer_path(&mut p_seen, parties.pair_id, PathStatus::Direct).await;
+        expect_peer_path(&mut punched.c_seen, punched.pair_id, PathStatus::Direct).await;
+        expect_peer_path(&mut punched.p_seen, punched.pair_id, PathStatus::Direct).await;
     };
 
     timeout(Duration::from_secs(60), body)
@@ -4184,9 +4160,17 @@ async fn dgram_leg(
     control: u16,
     id: u64,
 ) -> (zeronat::client::RelayDgramLeg, tokio::task::JoinHandle<()>) {
+    dgram_leg_via(format!("127.0.0.1:{control}").parse().unwrap(), id).await
+}
+
+/// Open a relay leg on the datagram channel through `server`, which may be a
+/// forwarder standing in front of the control port.
+async fn dgram_leg_via(
+    server: std::net::SocketAddr,
+    id: u64,
+) -> (zeronat::client::RelayDgramLeg, tokio::task::JoinHandle<()>) {
     use zeronat::kcp::{route, session};
     let psk = zeronat::noise::derive_psk(SECRET);
-    let server: std::net::SocketAddr = format!("127.0.0.1:{control}").parse().unwrap();
     let socket = std::sync::Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
     socket.connect(server).await.unwrap();
     let sess = session(socket.clone(), server, 1);
@@ -4428,4 +4412,385 @@ async fn peer_relay_opens_once_for_both_reports() {
     timeout(Duration::from_secs(30), body)
         .await
         .expect("relay dedupe flow did not complete within 30s");
+}
+
+/// Run one frame through a provider that mirrors whatever it receives, and
+/// assert it comes back to the consumer unchanged.
+async fn assert_inner_echo(
+    consumer: &mut zeronat::peer::PeerSession,
+    provider: &mut zeronat::peer::PeerSession,
+    payload: &[u8],
+) {
+    consumer.send(payload).await.expect("consumer send");
+    let got = timeout(Duration::from_secs(10), provider.recv())
+        .await
+        .expect("the provider never saw the frame")
+        .expect("the provider's session is dead");
+    assert_eq!(got, payload);
+    provider.send(&got).await.expect("provider echo");
+    let back = timeout(Duration::from_secs(10), consumer.recv())
+        .await
+        .expect("the echo never came back")
+        .expect("the consumer's session is dead");
+    assert_eq!(back, payload);
+}
+
+/// Bring up both ends of an inner session and echo a few frames through it,
+/// including one at the largest size a frame can carry.
+async fn assert_inner_session(
+    consumer: zeronat::peer::PeerPath,
+    provider: zeronat::peer::PeerPath,
+    pair_id: u64,
+) {
+    let psk = zeronat::noise::derive_psk(SECRET);
+    let ((mut consumer, answer), mut provider) = tokio::try_join!(
+        zeronat::peer::PeerSession::consumer(consumer, &psk, pair_id),
+        zeronat::peer::PeerSession::provider(provider, &psk, pair_id, &[]),
+    )
+    .expect("the inner handshake must complete on both sides");
+    assert!(answer.is_empty(), "an accepting provider answers empty");
+    for payload in [
+        b"one".as_slice(),
+        b"two",
+        &[0u8; 1200],
+        &[7u8; zeronat::peer::MAX_FRAME],
+    ] {
+        assert_inner_echo(&mut consumer, &mut provider, payload).await;
+    }
+    let oversized = vec![0u8; zeronat::peer::MAX_FRAME + 1];
+    assert!(
+        consumer.send(&oversized).await.is_err(),
+        "a frame past the limit crosses neither leg whole, so it must be refused"
+    );
+}
+
+// The inner session over a punched path: the two clients handshake their own
+// NNpsk0 on top of the direct session and echo frames both ways, with nothing
+// but the pair's own keys between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_inner_session_echoes_over_a_punched_path() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let parties = punch_parties(control).await;
+        let punched = punched_links(parties, &psk, None).await;
+
+        assert_inner_session(
+            zeronat::peer::PeerPath::direct(punched.c_link),
+            zeronat::peer::PeerPath::direct(punched.p_link),
+            punched.pair_id,
+        )
+        .await;
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("direct inner session flow did not complete within 60s");
+}
+
+// The same inner session over the relay, with a dgram leg on both sides: the
+// weakest pipe a pair can get, since neither leg promises delivery or order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_inner_session_echoes_over_two_dgram_relay_legs() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let pair = relay_pair(control).await;
+
+        let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
+        let (p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
+        assert_inner_session(
+            zeronat::peer::PeerPath::relay_dgram(c_leg),
+            zeronat::peer::PeerPath::relay_dgram(p_leg),
+            pair.pair_id,
+        )
+        .await;
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("relayed inner session flow did not complete within 60s");
+}
+
+// A pair whose parties arrived on different control transports gets one leg of
+// each kind, so the inner session runs with a stream leg under one end and a
+// dgram leg under the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_inner_session_echoes_over_a_stream_leg_and_a_dgram_leg() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let pair = relay_pair(control).await;
+
+        let c_leg = stream_leg(control, pair.c_leg).await;
+        let (p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
+        assert_inner_session(
+            zeronat::peer::PeerPath::relay_stream(c_leg),
+            zeronat::peer::PeerPath::relay_dgram(p_leg),
+            pair.pair_id,
+        )
+        .await;
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("mixed-leg inner session flow did not complete within 60s");
+}
+
+// Either handshake message can be lost on a dgram leg, so each side repeats
+// its last message: with the first copy of message one and the first copy of
+// message two both eaten, the session still comes up inside its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_inner_handshake_survives_a_lossy_path() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let pair = relay_pair(control).await;
+
+        // Each leg reaches the server through a forwarder that eats its first
+        // datagram-channel frame: message one on the way out of the consumer,
+        // message two on the way out of the provider.
+        let server = format!("127.0.0.1:{control}").parse().unwrap();
+        let (c_via, _f1) = punch_forwarder(server, Duration::ZERO, Duration::ZERO, 1).await;
+        let (p_via, _f2) = punch_forwarder(server, Duration::ZERO, Duration::ZERO, 1).await;
+        let (c_leg, _c_pump) = dgram_leg_via(c_via, pair.c_leg).await;
+        let (p_leg, _p_pump) = dgram_leg_via(p_via, pair.p_leg).await;
+
+        assert_inner_session(
+            zeronat::peer::PeerPath::relay_dgram(c_leg),
+            zeronat::peer::PeerPath::relay_dgram(p_leg),
+            pair.pair_id,
+        )
+        .await;
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("lossy inner handshake flow did not complete within 60s");
+}
+
+// The provider's answer rides message two: whatever it seals there reaches the
+// consumer whole, which is the carrier a refusal needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_inner_handshake_carries_the_providers_answer() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let pair = relay_pair(control).await;
+
+        let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
+        let (p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
+        let ((_consumer, answer), _provider) = tokio::try_join!(
+            zeronat::peer::PeerSession::consumer(
+                zeronat::peer::PeerPath::relay_dgram(c_leg),
+                &psk,
+                pair.pair_id,
+            ),
+            zeronat::peer::PeerSession::provider(
+                zeronat::peer::PeerPath::relay_dgram(p_leg),
+                &psk,
+                pair.pair_id,
+                b"peer_busy",
+            ),
+        )
+        .expect("the inner handshake must complete on both sides");
+        assert_eq!(answer, b"peer_busy");
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("provider answer flow did not complete within 60s");
+}
+
+// A frame that is not a handshake message can reach a party still shaking
+// hands: the peer's adapter speaks the moment its own side completes, and the
+// message two this side waits for was the copy that got lost. The Noise state
+// machine consumes its transcript on whatever it reads first and cannot start
+// over, so the frame byte keeps that traffic away from it and both sides still
+// land inside their deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_inner_handshake_ignores_frames_ahead_of_it() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let pair = relay_pair(control).await;
+
+        let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
+        let (p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
+
+        // Each party's first inbound frame is a session frame from the far
+        // side, under keys neither of them holds yet.
+        let junk = {
+            let mut frame = vec![zeronat::peer::FRAME_SESSION];
+            frame.extend_from_slice(&[0x5a; 64]);
+            frame
+        };
+        c_leg.tx.send(&junk).await.unwrap();
+        p_leg.tx.send(&junk).await.unwrap();
+        // Both copies cross the splice while neither session exists.
+        sleep(Duration::from_millis(300)).await;
+
+        assert_inner_session(
+            zeronat::peer::PeerPath::relay_dgram(c_leg),
+            zeronat::peer::PeerPath::relay_dgram(p_leg),
+            pair.pair_id,
+        )
+        .await;
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("junk-ahead handshake flow did not complete within 60s");
+}
+
+/// Answer an inner handshake by hand on a raw relay leg, holding the keys the
+/// server never gets. Each frame leads with the byte naming what follows, so
+/// the responder feeds its duplex the handshake messages alone.
+async fn raw_inner_responder(
+    leg: &mut zeronat::client::RelayDgramLeg,
+    pair_id: u64,
+) -> zeronat::noise::StatelessNoise {
+    let psk = zeronat::noise::derive_psk(SECRET);
+    let (mine, theirs) = tokio::io::duplex(4096);
+    let (mut r, mut w) = tokio::io::split(mine);
+    let task =
+        tokio::spawn(
+            async move { zeronat::noise::server_handshake_stateless(theirs, &psk, &[]).await },
+        );
+
+    let msg1 = loop {
+        let frame = recv_dgram_frame(&mut leg.rx).await;
+        if let Some((&zeronat::peer::FRAME_HANDSHAKE, msg)) = frame.split_first() {
+            break msg.to_vec();
+        }
+    };
+    w.write_all(&(msg1.len() as u16).to_be_bytes())
+        .await
+        .unwrap();
+    w.write_all(&msg1).await.unwrap();
+    let mut len = [0u8; 2];
+    r.read_exact(&mut len).await.unwrap();
+    let mut msg2 = vec![zeronat::peer::FRAME_HANDSHAKE; 1 + u16::from_be_bytes(len) as usize];
+    r.read_exact(&mut msg2[1..]).await.unwrap();
+    leg.tx.send(&msg2).await.unwrap();
+
+    let (id, noise) = task.await.unwrap().expect("inner responder handshake");
+    assert_eq!(id, pair_id, "the initiator must name its own pair");
+    noise
+}
+
+/// The next session frame on a raw leg, with the ciphertext it arrived as and
+/// what it opens to under the inner keys. Every frame it passes carries bytes:
+/// an empty one vanishes on a stream leg, so the layer must never emit one.
+async fn next_inner_frame(
+    leg: &mut zeronat::client::RelayDgramLeg,
+    noise: &zeronat::noise::StatelessNoise,
+) -> (Vec<u8>, Vec<u8>) {
+    loop {
+        let wire = recv_dgram_frame(&mut leg.rx).await;
+        assert!(!wire.is_empty(), "the inner layer emitted an empty frame");
+        if let Some((&zeronat::peer::FRAME_SESSION, sealed)) = wire.split_first() {
+            let plaintext = noise.open(sealed).expect("a session frame must open");
+            return (wire, plaintext);
+        }
+    }
+}
+
+// The relay moves inner ciphertext: what crosses a leg is sealed under keys
+// the pair made between themselves, so the plaintext is not on the wire the
+// server splices, and no frame the layer emits is empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_inner_frames_cross_the_relay_sealed() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let pair = relay_pair(control).await;
+
+        let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
+        let (mut p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
+        let (consumer, noise) = tokio::join!(
+            zeronat::peer::PeerSession::consumer(
+                zeronat::peer::PeerPath::relay_dgram(c_leg),
+                &psk,
+                pair.pair_id,
+            ),
+            raw_inner_responder(&mut p_leg, pair.pair_id),
+        );
+        let (consumer, _answer) = consumer.expect("the inner handshake must complete");
+
+        const NEEDLE: &[u8] = b"inner-plaintext-needle";
+        consumer.send(NEEDLE).await.unwrap();
+        let (wire, plaintext) = next_inner_frame(&mut p_leg, &noise).await;
+        assert!(
+            !wire.windows(NEEDLE.len()).any(|w| w == NEEDLE),
+            "the leg carried the inner plaintext"
+        );
+        assert!(
+            plaintext.len() == NEEDLE.len() + 1 && plaintext.ends_with(NEEDLE),
+            "the sealed frame must be the kind-tagged inner frame"
+        );
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("inner opacity flow did not complete within 30s");
+}
+
+// The pair owns detecting a dead peer. With the provider's keepalives gone the
+// consumer's session reports itself dead on its own deadline, while both legs
+// and both transports are still up, so the death comes from the pair and not
+// from the idle reap underneath it. Death reaches a write-only owner too: the
+// session stops its writer, so sending fails from then on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_inner_session_dies_on_missed_keepalives() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let pair = relay_pair(control).await;
+
+        let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
+        let (mut p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
+        // The provider answers the handshake by hand and then says nothing at
+        // all, holding its leg open the whole time. The clock starts before
+        // the handshake, since the consumer's deadline starts inside it.
+        let started = std::time::Instant::now();
+        let (consumer, _noise) = tokio::join!(
+            zeronat::peer::PeerSession::consumer(
+                zeronat::peer::PeerPath::relay_dgram(c_leg),
+                &psk,
+                pair.pair_id,
+            ),
+            raw_inner_responder(&mut p_leg, pair.pair_id),
+        );
+        let (mut consumer, _answer) = consumer.expect("the inner handshake must complete");
+
+        let dead = timeout(
+            zeronat::peer::PEER_DEADLINE + zeronat::peer::PEER_KEEPALIVE / 2,
+            consumer.recv(),
+        )
+        .await
+        .expect("the session outlived its own deadline");
+        assert!(dead.is_none(), "a dead session delivers no frame");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= zeronat::peer::PEER_DEADLINE,
+            "the session died after {elapsed:?}, before its deadline"
+        );
+        assert!(
+            elapsed < zeronat::bridge::UDP_IDLE,
+            "the session died after {elapsed:?}, so the transport reaped it first"
+        );
+        assert!(
+            consumer.send(b"after the wake").await.is_err(),
+            "a dead session must refuse to write into the path"
+        );
+    };
+
+    timeout(Duration::from_secs(240), body)
+        .await
+        .expect("inner liveness flow did not complete within 240s");
 }

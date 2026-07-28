@@ -1364,7 +1364,15 @@ pub async fn probe_candidates(
 pub struct RelayDgramLeg {
     pub rx: DgramRx,
     pub tx: DgramTx,
-    _guard: ConvGuard,
+    guard: ConvGuard,
+}
+
+impl RelayDgramLeg {
+    /// Split into the two frame halves and the tag registration they need held
+    /// for the leg's life.
+    pub fn split(self) -> (DgramTx, DgramRx, ConvGuard) {
+        (self.tx, self.rx, self.guard)
+    }
 }
 
 /// Open this party's relay leg over the tcp transport: a fresh data connection
@@ -1405,11 +1413,7 @@ pub async fn relay_leg_dgram(sess: &Session, psk: &[u8; 32], id: u64) -> Result<
     let (inbound, guard) = sess.register_dgram(conv);
     let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
     let rx = DgramRx::new(inbound, noise);
-    Ok(RelayDgramLeg {
-        rx,
-        tx,
-        _guard: guard,
-    })
+    Ok(RelayDgramLeg { rx, tx, guard })
 }
 
 /// L2 bridge over the UDP transport: frames ride the unreliable datagram channel.

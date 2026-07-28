@@ -40,10 +40,25 @@ pub struct PeerLink {
     pub peer: SocketAddr,
     pub tx: DgramTx,
     pub rx: DgramRx,
+    hold: LinkHold,
+}
+
+/// The transport state a punched session needs kept alive: the KCP session and
+/// its datagram registration, the keepalive holding the NAT mapping open, and
+/// the pump draining the probe socket.
+pub struct LinkHold {
     _sess: Arc<Session>,
     _guard: ConvGuard,
     _keepalive: AbortOnDrop,
     _pump: AbortOnDrop,
+}
+
+impl PeerLink {
+    /// Split into the two frame halves and the transport state they ride on,
+    /// so each part can be owned separately for as long as the session lives.
+    pub fn split(self) -> (DgramTx, DgramRx, LinkHold) {
+        (self.tx, self.rx, self.hold)
+    }
 }
 
 /// The path a pair settled on.
@@ -284,10 +299,12 @@ pub async fn punch(
         peer,
         tx,
         rx,
-        _sess: sess,
-        _guard: guard,
-        _keepalive: keepalive,
-        _pump: pump,
+        hold: LinkHold {
+            _sess: sess,
+            _guard: guard,
+            _keepalive: keepalive,
+            _pump: pump,
+        },
     })
 }
 

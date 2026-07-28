@@ -768,7 +768,7 @@ impl Server {
             }
             // A pair that is already spliced holds both its legs, so this one
             // is dropped.
-            state => relay.state = state,
+            state @ RelayState::Spliced { .. } => relay.state = state,
         }
     }
 

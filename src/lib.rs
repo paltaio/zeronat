@@ -20,6 +20,7 @@ pub mod logging;
 #[cfg(target_os = "linux")]
 pub mod netfilter;
 pub mod noise;
+pub mod peer;
 pub mod pppoe;
 pub mod proto;
 pub mod proxyproto;
