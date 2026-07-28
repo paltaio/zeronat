@@ -33,7 +33,8 @@ use crate::noise::{
 use crate::peerslot;
 use crate::peerslot::PeerControl;
 pub use crate::peerslot::{
-    PeerExit, PeerSegment, PeerSlotSession, PeerSlotSpec, ProviderAdapter, SessionSink,
+    ConsumerAdapter, ExitVia, PairPath, PeerExit, PeerSegment, PeerSlotSession, PeerSlotSpec,
+    ProviderAdapter, SessionSink,
 };
 use crate::proto::{decode_sockaddr, encode_sockaddr, FwdOptionEntry, Msg, Proto};
 use crate::tap::TapConfig;
@@ -1805,7 +1806,7 @@ fn server_v4(server: &str) -> Option<std::net::Ipv4Addr> {
 /// directly, a hostname is resolved and its first IPv4 answer taken. Exit
 /// mode is IPv4-only, so a server with no IPv4 address is refused.
 #[cfg(target_os = "linux")]
-async fn exit_server_v4(addr: &str) -> Result<Ipv4Addr> {
+pub(crate) async fn exit_server_v4(addr: &str) -> Result<Ipv4Addr> {
     if let Some(ip) = server_v4(addr) {
         return Ok(ip);
     }
@@ -1837,17 +1838,9 @@ async fn ensure_exit_routes(
         None => {
             let table = std::fs::read_to_string("/proc/net/route")
                 .map_err(|e| -> crate::Error { format!("reading /proc/net/route: {e}").into() })?;
-            let pin = crate::exitroute::plan_server_pin(&table, tun_name, server)?;
-            let original = if strict {
-                let defaults = crate::route::parse_all_defaults(&table, tun_name);
-                if defaults.is_empty() {
-                    return Err("no default route to capture for strict exit".into());
-                }
-                Some(defaults)
-            } else {
-                None
-            };
-            *guard = Some(ExitRoutes::bring_up(pin, tun_name, original)?);
+            *guard = Some(ExitRoutes::bring_up_from_table(
+                &table, tun_name, server, strict,
+            )?);
         }
     }
     exit_dial_target(server, addr)
@@ -2987,12 +2980,20 @@ mod tests {
         }
     }
 
-    fn consumer_slot(peer: &str, device: Option<&str>, default_route: bool) -> PeerSlotSpec {
+    /// An exit consumer, which claims the tun it routes through and, when it
+    /// exits, the host's default routing.
+    fn consumer_slot(peer: &str, device: Option<&str>, exit: bool) -> PeerSlotSpec {
         PeerSlotSpec::Consumer {
             peer_id: peer.into(),
             want: crate::proto::PROVIDES_EXIT,
-            device: device.map(Into::into),
-            default_route,
+            adapter: device.map(|device| {
+                ConsumerAdapter::Exit(ExitVia {
+                    device: device.into(),
+                    mtu: 1400,
+                    exit,
+                    exit_strict: false,
+                })
+            }),
         }
     }
 

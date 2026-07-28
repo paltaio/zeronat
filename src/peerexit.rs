@@ -1,20 +1,23 @@
-//! The L3 adapter an exit provider runs for the pair it serves: a tun device on
-//! the provider's end of the pair's derived subnet, the switch that moves IP
-//! packets between that device and the inner session, and the masquerade that
-//! puts the consumer's traffic on this node's uplink.
+//! The two L3 adapters of an exit pair. The provider opens a tun on its end of
+//! the pair's derived subnet, moves IP packets between that device and the
+//! inner session, and masquerades the consumer's traffic onto this node's
+//! uplink. The consumer opens the other end of the same subnet and, when it
+//! routes through the pair, pins the underlay before the half-default routes
+//! go in.
 //!
-//! Everything the adapter opens lives in the future that runs it, so dropping
-//! that future closes the device and removes the rules. The slot that owns it
-//! is what a profile switch awaits, which is how the next slot set finds the
-//! interface free.
+//! Everything an adapter opens lives in the future that runs it, so dropping
+//! that future closes the device and removes the rules and routes. The slot
+//! that owns it is what a profile switch awaits, which is how the next slot
+//! set finds the interface free.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use crate::bridge::{TapSwitch, TRANSPORT_PEER};
+use crate::exitroute::{plan_underlay_pins, ExitRoutes, PinGuard};
 use crate::netfilter::{self, NatPlan};
 use crate::peer::PeerSession;
-use crate::peerslot::PeerExit;
+use crate::peerslot::{ExitVia, PairPath, PeerExit};
 use crate::tap::{has_net_admin, TapDevice, TunConfig};
 use crate::Result;
 
@@ -35,6 +38,26 @@ pub(crate) fn precheck(exit: &PeerExit) -> Result<()> {
             exit.device
         )
         .into());
+    }
+    Ok(())
+}
+
+/// What a consumer can settle about its bringup before it asks for a pair: the
+/// capability its tun needs, and the route table an exiting consumer plans its
+/// pins from. A consumer that fails here asks for no pair, so a provider is
+/// spared opening its device and taking its exclusive hold for a session this
+/// end drops on arrival.
+pub(crate) fn consumer_precheck(via: &ExitVia) -> Result<()> {
+    if !has_net_admin() {
+        return Err(format!(
+            "this process may not open the tun {}; it holds no CAP_NET_ADMIN",
+            via.device
+        )
+        .into());
+    }
+    if via.exit {
+        std::fs::read_to_string("/proc/net/route")
+            .map_err(|e| -> crate::Error { format!("reading /proc/net/route: {e}").into() })?;
     }
     Ok(())
 }
@@ -98,6 +121,59 @@ async fn run_switch(dev: Arc<TapDevice>, session: PeerSession) {
     tokio::select! {
         _ = switch.clone().read_loop() => {}
         _ = crate::bridge::switch_port_peer(port, session) => {}
+    }
+}
+
+/// Ride one pair as the consumer: bring the tun up on this end of the pair's
+/// subnet, program the host's routing when the slot exits through the pair,
+/// and carry IP packets both ways until the session dies.
+pub(crate) async fn consume(
+    session: PeerSession,
+    via: &ExitVia,
+    secret: &str,
+    path: PairPath,
+    server: &str,
+) -> Result<()> {
+    let cfg = consumer_tun_config(via, secret);
+    let dev = Arc::new(TapDevice::open_tun(&cfg)?);
+    // The routes are programmed after the device opens, since the
+    // half-defaults point at it, and dropped before it closes.
+    let _routes = if via.exit {
+        Some(consumer_routes(&cfg.name, server, path, via.exit_strict).await?)
+    } else {
+        None
+    };
+    run_switch(dev.clone(), session).await;
+    Ok(())
+}
+
+/// The host routing a consumer holds while it exits through the pair: the
+/// underlay pins keeping the path's own traffic on the uplink, then the server
+/// pin and the half-defaults through `tun`. Returned in teardown order, the
+/// half-defaults coming off ahead of the pins.
+async fn consumer_routes(
+    tun: &str,
+    server: &str,
+    path: PairPath,
+    strict: bool,
+) -> Result<(ExitRoutes, PinGuard)> {
+    let server = crate::client::exit_server_v4(server).await?;
+    let table = std::fs::read_to_string("/proc/net/route")
+        .map_err(|e| -> crate::Error { format!("reading /proc/net/route: {e}").into() })?;
+    let pins = PinGuard::bring_up(plan_underlay_pins(&table, tun, &path.punched_v4())?)?;
+    let exit = ExitRoutes::bring_up_from_table(&table, tun, server, strict)?;
+    Ok((exit, pins))
+}
+
+/// The consumer's end of the pair's tunnel, the `.2` the provider's assignment
+/// leaves it.
+fn consumer_tun_config(via: &ExitVia, secret: &str) -> TunConfig {
+    let base = crate::identity::derive_tun_subnet(secret);
+    TunConfig {
+        name: via.device.clone(),
+        mtu: via.mtu,
+        addr: Ipv4Addr::new(base[0], base[1], base[2], 2),
+        prefix_len: TUN_PREFIX_LEN,
     }
 }
 
@@ -180,6 +256,27 @@ eth0\t0050A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
         assert_eq!(cfg.mtu, 1400);
         assert_eq!(cfg.addr, Ipv4Addr::new(base[0], base[1], base[2], 1));
         assert_eq!(cfg.prefix_len, 24);
+    }
+
+    fn via() -> ExitVia {
+        ExitVia {
+            device: "zn0".into(),
+            mtu: 1400,
+            exit: true,
+            exit_strict: false,
+        }
+    }
+
+    #[test]
+    fn the_consumer_takes_the_second_address_of_the_derived_subnet() {
+        let base = crate::identity::derive_tun_subnet(SECRET);
+        let cfg = consumer_tun_config(&via(), SECRET);
+        assert_eq!(cfg.name, "zn0");
+        assert_eq!(cfg.mtu, 1400);
+        assert_eq!(cfg.addr, Ipv4Addr::new(base[0], base[1], base[2], 2));
+        assert_eq!(cfg.prefix_len, 24);
+        // The two ends share the subnet and differ in the host byte alone.
+        assert_eq!(tun_config(&exit(), SECRET).prefix_len, cfg.prefix_len);
     }
 
     #[test]

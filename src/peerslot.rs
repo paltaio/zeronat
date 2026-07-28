@@ -300,10 +300,10 @@ pub enum PeerSlotSpec {
     Consumer {
         peer_id: String,
         want: u8,
-        /// The device the adapter riding this slot opens, when it opens one.
-        device: Option<String>,
-        /// Whether the slot programs the host's default routing.
-        default_route: bool,
+        /// What this consumer opens for the pair it rides. Unset leaves the
+        /// session to the frame seam, which is what the slot set's owner takes
+        /// when it drives the session itself.
+        adapter: Option<ConsumerAdapter>,
     },
     Provider {
         provides: u8,
@@ -321,6 +321,29 @@ pub enum ProviderAdapter {
     Exit(PeerExit),
     /// The bridged TAP a segment provider attaches every consumer to.
     Segment(PeerSegment),
+}
+
+/// The device a consumer opens for the pair it rides, one per capability.
+#[derive(Clone)]
+pub enum ConsumerAdapter {
+    /// The tun a peer-exit consumer sends its IPv4 traffic into.
+    Exit(ExitVia),
+}
+
+/// What a peer-exit consumer opens for the pair it rides.
+#[derive(Clone)]
+pub struct ExitVia {
+    /// The tun device brought up on the consumer's end of the pair's subnet.
+    pub device: String,
+    pub mtu: usize,
+    /// Route the host's IPv4 traffic through the pair: the underlay pins that
+    /// keep the pair's own traffic on the uplink, and the half-defaults
+    /// through the device. Unset, the device comes up for routes the operator
+    /// installs itself.
+    pub exit: bool,
+    /// Exit with no fallback: every original default route is deleted and
+    /// IPv6 blackholed while the pair is up, both restored on teardown.
+    pub exit_strict: bool,
 }
 
 /// What an exit provider opens for the pair it serves.
@@ -342,6 +365,29 @@ pub struct PeerSegment {
     pub mtu: usize,
     /// The bridge the TAP joins, which carries this node's L2 segment.
     pub bridge: String,
+}
+
+impl ConsumerAdapter {
+    /// What this consumer can decide about its bringup with no pair in hand.
+    fn precheck(&self) -> Result<()> {
+        match self {
+            ConsumerAdapter::Exit(via) => exit_consumer_precheck(via),
+        }
+    }
+
+    /// The interfaces this adapter opens, which are the claims its slot holds.
+    fn devices(&self) -> Vec<&str> {
+        match self {
+            ConsumerAdapter::Exit(via) => vec![&via.device],
+        }
+    }
+
+    /// Whether this adapter programs the host's default routing.
+    fn default_route(&self) -> bool {
+        match self {
+            ConsumerAdapter::Exit(via) => via.exit,
+        }
+    }
 }
 
 impl ProviderAdapter {
@@ -388,7 +434,10 @@ impl PeerSlotSpec {
     /// the bridge it joins.
     pub fn devices(&self) -> Vec<&str> {
         match self {
-            PeerSlotSpec::Consumer { device, .. } => device.as_deref().into_iter().collect(),
+            PeerSlotSpec::Consumer { adapter, .. } => adapter
+                .as_ref()
+                .map(ConsumerAdapter::devices)
+                .unwrap_or_default(),
             PeerSlotSpec::Provider { adapter, .. } => adapter
                 .as_ref()
                 .map(ProviderAdapter::devices)
@@ -398,7 +447,9 @@ impl PeerSlotSpec {
 
     pub fn default_route(&self) -> bool {
         match self {
-            PeerSlotSpec::Consumer { default_route, .. } => *default_route,
+            PeerSlotSpec::Consumer { adapter, .. } => {
+                adapter.as_ref().is_some_and(ConsumerAdapter::default_route)
+            }
             PeerSlotSpec::Provider { .. } => false,
         }
     }
@@ -429,6 +480,30 @@ fn provides_name(bit: u8) -> &'static str {
     }
 }
 
+/// Where a pair's frames travel. Direct and relayed are the same thing above
+/// the peer session, except to a consumer programming the host's routing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairPath {
+    /// A punched session, bound to the peer's own address.
+    Direct(SocketAddr),
+    /// A leg spliced through the server.
+    Relayed,
+}
+
+impl PairPath {
+    /// The addresses an exit consumer pins beside the server's, so the tunnel
+    /// it brings up cannot swallow the path carrying it: the punched peer's on
+    /// a direct v4 path, and none on a relayed one, whose frames travel to the
+    /// server the base set pins already. An IPv6 path has no v4 underlay to
+    /// keep off the half-defaults.
+    pub fn punched_v4(&self) -> Vec<std::net::Ipv4Addr> {
+        match self {
+            PairPath::Direct(SocketAddr::V4(addr)) => vec![*addr.ip()],
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// A live slot's frames, handed to whoever owns the slot set: whole frames
 /// from the peer out, whole frames to the peer in. The adapters that ride a
 /// peer session take this seam; until then the frames are the owner's to move.
@@ -437,6 +512,8 @@ pub struct PeerSlotSession {
     pub peer_id: String,
     /// The capability the pair carries.
     pub want: u8,
+    /// The path the pair settled on.
+    pub path: PairPath,
     pub inbound: mpsc::Receiver<Vec<u8>>,
     pub outbound: mpsc::Sender<Vec<u8>>,
 }
@@ -463,9 +540,13 @@ pub(crate) fn spawn(
             let control = control.clone();
             let sink = sink.clone();
             AbortOnDrop(match spec.clone() {
-                PeerSlotSpec::Consumer { peer_id, want, .. } => {
-                    tokio::spawn(consumer_slot(peer_id, want, client_id, control, sink))
-                }
+                PeerSlotSpec::Consumer {
+                    peer_id,
+                    want,
+                    adapter,
+                } => tokio::spawn(consumer_slot(
+                    peer_id, want, adapter, secret, client_id, control, sink,
+                )),
                 PeerSlotSpec::Provider { provides, adapter } => tokio::spawn(provider_slot(
                     provides, adapter, secret, client_id, control, sink,
                 )),
@@ -481,6 +562,8 @@ pub(crate) fn spawn(
 async fn consumer_slot(
     peer_id: String,
     want: u8,
+    adapter: Option<ConsumerAdapter>,
+    secret: String,
     client_id: String,
     control: PeerControl,
     sink: SessionSink,
@@ -489,22 +572,50 @@ async fn consumer_slot(
     let mut backoff = Backoff::default();
     loop {
         let (generation, session) = control.wait_live().await;
-        let paired = {
-            let cycle = pair_as_consumer(&peer_id, want, &client_id, &session, &mut rx, &control);
-            tokio::select! {
-                _ = control.wait_gone(generation) => Err("the control session ended".into()),
-                r = timeout(CYCLE_DEADLINE, cycle) => match r {
-                    Ok(r) => r,
-                    Err(_) => Err("the pairing deadline lapsed".into()),
-                },
+        // A bringup this consumer cannot do refuses before `PeerConnect` goes
+        // out: a provider that answered would open its device and take its
+        // exclusive hold for a pair this end drops, once per backoff interval.
+        let paired = match adapter.as_ref().map(ConsumerAdapter::precheck) {
+            Some(Err(e)) => Err(e),
+            _ => {
+                let cycle =
+                    pair_as_consumer(&peer_id, want, &client_id, &session, &mut rx, &control);
+                tokio::select! {
+                    _ = control.wait_gone(generation) => Err("the control session ended".into()),
+                    r = timeout(CYCLE_DEADLINE, cycle) => match r {
+                        Ok(r) => r,
+                        Err(_) => Err("the pairing deadline lapsed".into()),
+                    },
+                }
             }
         };
         match paired {
-            Ok(peer) => {
+            Ok((peer, path)) => {
                 backoff.reset();
                 crate::elog!("peer {peer_id}: session up");
-                run_session(peer, &peer_id, want, &sink).await;
-                crate::elog!("peer {peer_id}: session ended");
+                let failed = match &adapter {
+                    // The adapter runs on this task, so its device and the
+                    // routes over it are gone before the next pairing programs
+                    // its own, and a profile switch's abort takes them with the
+                    // slot. A bringup it cannot do ends the cycle rather than
+                    // re-pairing at full speed.
+                    Some(ConsumerAdapter::Exit(via)) => {
+                        consume_exit(peer, via, &secret, path, &session.server)
+                            .await
+                            .err()
+                    }
+                    None => {
+                        run_session(peer, &peer_id, want, path, &sink).await;
+                        None
+                    }
+                };
+                match failed {
+                    Some(e) => {
+                        crate::elog!("peer {peer_id}: session ended: {e}");
+                        backoff.fail();
+                    }
+                    None => crate::elog!("peer {peer_id}: session ended"),
+                }
             }
             Err(e) => {
                 crate::elog!("peer {peer_id}: {e}");
@@ -525,7 +636,7 @@ async fn pair_as_consumer(
     session: &ControlSession,
     rx: &mut mpsc::Receiver<Msg>,
     control: &PeerControl,
-) -> Result<PeerSession> {
+) -> Result<(PeerSession, PairPath)> {
     // A frame the last cycle left behind names a pair the server has already
     // dropped, and reading it as this cycle's would follow a dead pair to the
     // deadline.
@@ -557,7 +668,7 @@ async fn pair_as_consumer(
     // authoritative until the inner handshake completes.
     let _pair = control.pair_guard(pair_id);
     let settled = settle_path(pair_id, peer_id, client_id, session, rx).await?;
-    let (peer, answer) =
+    let (peer, answer, path) =
         handshake_under_relay_authority(settled, Side::Consumer, pair_id, session, rx).await?;
     if !answer.is_empty() {
         return Err(format!(
@@ -566,8 +677,41 @@ async fn pair_as_consumer(
         )
         .into());
     }
-    Ok(peer)
+    Ok((peer, path))
 }
+
+/// Ride the pair as its exit consumer until the session dies.
+async fn consume_exit(
+    session: PeerSession,
+    via: &ExitVia,
+    secret: &str,
+    path: PairPath,
+    server: &str,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return crate::peerexit::consume(session, via, secret, path, server).await;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (session, via, secret, path, server);
+        Err(NO_TUN_DEVICE.into())
+    }
+}
+
+/// What a peer-exit consumer can decide about its bringup with no pair in hand.
+fn exit_consumer_precheck(via: &ExitVia) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return crate::peerexit::consumer_precheck(via);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = via;
+        Err(NO_TUN_DEVICE.into())
+    }
+}
+
+/// What a peer-exit consumer off Linux answers with.
+#[cfg(not(target_os = "linux"))]
+const NO_TUN_DEVICE: &str =
+    "a peer exit consumer needs a tun device, which is only supported on Linux";
 
 /// One provider slot: it never initiates. A pair reaches it as the
 /// `PeerProbe` naming the peer and the capability, and every later frame for
@@ -1040,7 +1184,7 @@ async fn provider_pair(
                 None if exclusive && hold.is_none() => REFUSE_BUSY.to_vec(),
                 None => Vec::new(),
             };
-            let (peer, _) = handshake_under_relay_authority(
+            let (peer, _, path) = handshake_under_relay_authority(
                 settled,
                 Side::Provider(&refuse),
                 pair_id,
@@ -1049,7 +1193,7 @@ async fn provider_pair(
             )
             .await?;
             Ok(if refuse.is_empty() {
-                Served::Taken(peer, hold)
+                Served::Taken(peer, path, hold)
             } else {
                 Served::Refused(String::from_utf8_lossy(&refuse).into_owned(), peer)
             })
@@ -1063,7 +1207,7 @@ async fn provider_pair(
         }
     };
     match served {
-        Ok(Served::Taken(peer, hold)) => match &owner.adapter {
+        Ok(Served::Taken(peer, path, hold)) => match &owner.adapter {
             // The adapter runs on the slot task, and the hold rides with it,
             // so this task is done the moment it has handed both over.
             Some(adapter) => {
@@ -1080,7 +1224,7 @@ async fn provider_pair(
             None => {
                 let bit = provides_name(provides);
                 crate::elog!("peer {peer_id}: {bit} pair up");
-                run_session(peer, &peer_id, provides, &owner.sink).await;
+                run_session(peer, &peer_id, provides, path, &owner.sink).await;
                 crate::elog!("peer {peer_id}: {bit} pair ended");
             }
         },
@@ -1100,7 +1244,7 @@ async fn provider_pair(
 enum Served {
     /// The pair is served; the hold keeps an exclusive slot taken until the
     /// session ends, however the pair task exits.
-    Taken(PeerSession, Option<BusyGuard>),
+    Taken(PeerSession, PairPath, Option<BusyGuard>),
     /// The slot could not take the pair; the reason rode message two, and the
     /// session is held open long enough for it to land.
     Refused(String, PeerSession),
@@ -1190,7 +1334,8 @@ async fn settle_path(
     };
     let leg_id = match settled {
         Settled::Punched(PunchOutcome::Direct(link)) => {
-            return Ok(SettledPath::Direct(PeerPath::direct(link)))
+            let peer = link.peer;
+            return Ok(SettledPath::Direct(PeerPath::direct(link), peer));
         }
         Settled::Punched(PunchOutcome::Relay) => wait_relay_open(rx, pair_id).await?,
         Settled::Relay(id) => id,
@@ -1222,23 +1367,28 @@ async fn handshake_under_relay_authority(
     pair_id: u64,
     session: &ControlSession,
     rx: &mut mpsc::Receiver<Msg>,
-) -> Result<(PeerSession, Vec<u8>)> {
-    let direct = match settled {
+) -> Result<(PeerSession, Vec<u8>, PairPath)> {
+    let (direct, peer) = match settled {
         SettledPath::Relayed(path) => {
-            return inner_handshake(side, path, &session.psk, pair_id).await
+            let (peer_session, answer) = inner_handshake(side, path, &session.psk, pair_id).await?;
+            return Ok((peer_session, answer, PairPath::Relayed));
         }
-        SettledPath::Direct(path) => path,
+        SettledPath::Direct(path, peer) => (path, peer),
     };
     let raced = tokio::select! {
         r = inner_handshake(side, direct, &session.psk, pair_id) => Raced::Handshake(r),
         id = wait_relay_open(rx, pair_id) => Raced::Relay(id?),
     };
     match raced {
-        Raced::Handshake(r) => r,
+        Raced::Handshake(r) => {
+            let (peer_session, answer) = r?;
+            Ok((peer_session, answer, PairPath::Direct(peer)))
+        }
         // The direct path went down with the losing future above.
         Raced::Relay(leg_id) => {
             let leg = open_leg(session, leg_id).await?;
-            inner_handshake(side, leg, &session.psk, pair_id).await
+            let (peer_session, answer) = inner_handshake(side, leg, &session.psk, pair_id).await?;
+            Ok((peer_session, answer, PairPath::Relayed))
         }
     }
 }
@@ -1276,7 +1426,8 @@ enum Settled {
 /// The path a pairing settled on, and whether a relay open can still supersede
 /// it.
 enum SettledPath {
-    Direct(PeerPath),
+    /// The punched path, with the peer address its datagrams travel to.
+    Direct(PeerPath, SocketAddr),
     Relayed(PeerPath),
 }
 
@@ -1319,7 +1470,13 @@ async fn next_frame(rx: &mut mpsc::Receiver<Msg>) -> Result<Msg> {
 /// Hold a live session, moving frames to and from whoever owns the slot.
 /// With no owner the session just runs, which is what a slot whose adapter has
 /// not landed does: the pair stays up and its keepalive decides when it dies.
-async fn run_session(mut peer: PeerSession, peer_id: &str, want: u8, sink: &SessionSink) {
+async fn run_session(
+    mut peer: PeerSession,
+    peer_id: &str,
+    want: u8,
+    path: PairPath,
+    sink: &SessionSink,
+) {
     let Some(sink) = sink else {
         while peer.recv().await.is_some() {}
         return;
@@ -1330,6 +1487,7 @@ async fn run_session(mut peer: PeerSession, peer_id: &str, want: u8, sink: &Sess
         .send(PeerSlotSession {
             peer_id: peer_id.to_string(),
             want,
+            path,
             inbound,
             outbound,
         })
@@ -1378,6 +1536,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_a_direct_v4_path_leaves_an_address_to_pin() {
+        let v4 = PairPath::Direct("203.0.113.7:41000".parse().unwrap());
+        assert_eq!(v4.punched_v4(), [std::net::Ipv4Addr::new(203, 0, 113, 7)]);
+        assert!(PairPath::Relayed.punched_v4().is_empty());
+        let v6 = PairPath::Direct("[2001:db8::7]:41000".parse().unwrap());
+        assert!(v6.punched_v4().is_empty());
+    }
+
     /// The peer named by the next `PeerConnect` the slot sends.
     async fn next_connect(rx: &mut mpsc::Receiver<Vec<u8>>) -> String {
         loop {
@@ -1401,6 +1568,8 @@ mod tests {
         let slot = AbortOnDrop(tokio::spawn(consumer_slot(
             "prov".into(),
             PROVIDES_EXIT,
+            None,
+            "secret".into(),
             "c".into(),
             control.clone(),
             None,
@@ -1551,6 +1720,8 @@ mod tests {
         let slot = AbortOnDrop(tokio::spawn(consumer_slot(
             "prov".into(),
             PROVIDES_EXIT,
+            None,
+            "secret".into(),
             "c".into(),
             control.clone(),
             None,

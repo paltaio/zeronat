@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::{sleep, timeout};
 
+use zeronat::client::PairPath;
 use zeronat::clientproto::{
     ClientMsg, ClientSnapshotBody, LinkStatus, PppPhase, ServerSecret, SessionMode,
 };
@@ -4882,8 +4883,9 @@ async fn cross_peer_frame(
 /// its forwards on the server slot plus a peer slot asking a second client for
 /// the exit bit, that second client announcing it with no session body of its
 /// own. Drives a frame each way over the peer session while a forwarded
-/// connection stays open.
-async fn run_two_slot_test(transport: zeronat::client::Transport) {
+/// connection stays open, and checks the path both ends settle on against
+/// `punched`.
+async fn run_two_slot_test(transport: zeronat::client::Transport, punched: bool) {
     let body = async {
         let control = free_tcp_port();
         let public_tcp = free_tcp_port();
@@ -4933,8 +4935,7 @@ async fn run_two_slot_test(transport: zeronat::client::Transport) {
         consumer.peers = vec![zeronat::client::PeerSlotSpec::Consumer {
             peer_id: provider_id.clone(),
             want: PROVIDES_EXIT,
-            device: None,
-            default_route: false,
+            adapter: None,
         }];
         consumer.peer_sessions = Some(cons_tx);
         tokio::spawn(zeronat::client::run_switchable(
@@ -4957,6 +4958,19 @@ async fn run_two_slot_test(transport: zeronat::client::Transport) {
         cross_peer_frame(&consumer_slot, &mut provider_slot, b"consumer-to-provider").await;
         cross_peer_frame(&provider_slot, &mut consumer_slot, b"provider-to-consumer").await;
 
+        // The transport decides the path, and both ends settle on the same one.
+        let direct = matches!(consumer_slot.path, PairPath::Direct(_));
+        assert_eq!(
+            direct, punched,
+            "the pair settled on {:?}",
+            consumer_slot.path
+        );
+        assert_eq!(
+            matches!(provider_slot.path, PairPath::Direct(_)),
+            direct,
+            "the two ends disagree on the path"
+        );
+
         // The forward is untouched by the peer session running beside it.
         forwarded.write_all(b"still-forwarding").await.unwrap();
         let mut buf = [0u8; 64];
@@ -4973,7 +4987,7 @@ async fn run_two_slot_test(transport: zeronat::client::Transport) {
 // the peer session runs over the direct path while the forwards keep flowing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_slot_runs_beside_the_server_slot() {
-    run_two_slot_test(zeronat::client::Transport::Udp).await;
+    run_two_slot_test(zeronat::client::Transport::Udp, true).await;
 }
 
 // The same two slots over the tcp control transport, where neither party
@@ -4981,7 +4995,7 @@ async fn peer_slot_runs_beside_the_server_slot() {
 // server splices.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_slot_pairs_over_the_relay() {
-    run_two_slot_test(zeronat::client::Transport::Tcp).await;
+    run_two_slot_test(zeronat::client::Transport::Tcp, false).await;
 }
 
 // The provider is authoritative for a pair the server has forgotten. A punched
@@ -5022,8 +5036,7 @@ async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
         consumer.peers = vec![zeronat::client::PeerSlotSpec::Consumer {
             peer_id: provider_id.clone(),
             want: PROVIDES_EXIT,
-            device: None,
-            default_route: false,
+            adapter: None,
         }];
         consumer.peer_sessions = Some(cons_tx);
         tokio::spawn(zeronat::client::run_switchable(
@@ -5291,8 +5304,7 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
         consumer.peers = vec![zeronat::client::PeerSlotSpec::Consumer {
             peer_id: "prov".into(),
             want: PROVIDES_EXIT,
-            device: None,
-            default_route: false,
+            adapter: None,
         }];
         consumer.peer_sessions = Some(cons_tx);
         let target = zeronat::client::ServerTarget {

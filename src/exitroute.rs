@@ -39,36 +39,37 @@ pub struct RouteChange {
     pub dev: String,
 }
 
-/// How the /32 server pin reaches the uplink: via the default gateway, or
-/// link-scoped on the default-route interface when the default is gatewayless
-/// (a point-to-point uplink).
+/// How a /32 pin reaches the uplink: via the default gateway, or link-scoped
+/// on the default-route interface when the default is gatewayless (a
+/// point-to-point uplink). The server and every punched peer the consumer
+/// keeps off the half-defaults take the same shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ServerPin {
+pub enum UplinkPin {
     ViaGateway {
-        server: Ipv4Addr,
+        addr: Ipv4Addr,
         gateway: Ipv4Addr,
         iface: String,
     },
     OnLink {
-        server: Ipv4Addr,
+        addr: Ipv4Addr,
         iface: String,
     },
 }
 
-impl ServerPin {
-    /// The pinned server address.
-    pub fn server(&self) -> Ipv4Addr {
+impl UplinkPin {
+    /// The pinned address.
+    pub fn addr(&self) -> Ipv4Addr {
         match self {
-            ServerPin::ViaGateway { server, .. } | ServerPin::OnLink { server, .. } => *server,
+            UplinkPin::ViaGateway { addr, .. } | UplinkPin::OnLink { addr, .. } => *addr,
         }
     }
 
-    /// The same uplink shape pinning a different server address.
-    fn with_server(&self, server: Ipv4Addr) -> ServerPin {
+    /// The same uplink shape pinning a different address.
+    fn with_addr(&self, addr: Ipv4Addr) -> UplinkPin {
         let mut pin = self.clone();
         match &mut pin {
-            ServerPin::ViaGateway { server: s, .. } | ServerPin::OnLink { server: s, .. } => {
-                *s = server;
+            UplinkPin::ViaGateway { addr: a, .. } | UplinkPin::OnLink { addr: a, .. } => {
+                *a = addr;
             }
         }
         pin
@@ -77,20 +78,20 @@ impl ServerPin {
     /// The pin as a route mutation.
     fn change(&self, add: bool) -> RouteChange {
         match self {
-            ServerPin::ViaGateway {
-                server,
+            UplinkPin::ViaGateway {
+                addr,
                 gateway,
                 iface,
             } => RouteChange {
                 add,
-                dst: *server,
+                dst: *addr,
                 prefix: 32,
                 gw: Some(*gateway),
                 dev: iface.clone(),
             },
-            ServerPin::OnLink { server, iface } => RouteChange {
+            UplinkPin::OnLink { addr, iface } => RouteChange {
                 add,
-                dst: *server,
+                dst: *addr,
                 prefix: 32,
                 gw: None,
                 dev: iface.clone(),
@@ -107,18 +108,43 @@ pub fn plan_server_pin(
     proc_route: &str,
     tun_name: &str,
     server: Ipv4Addr,
-) -> crate::Result<ServerPin> {
+) -> crate::Result<UplinkPin> {
     if let Some(d) = route::parse_proc_route(proc_route, tun_name) {
-        return Ok(ServerPin::ViaGateway {
-            server,
+        return Ok(UplinkPin::ViaGateway {
+            addr: server,
             gateway: d.gateway,
             iface: d.iface,
         });
     }
     if let Some(iface) = route::default_route_iface(proc_route, tun_name) {
-        return Ok(ServerPin::OnLink { server, iface });
+        return Ok(UplinkPin::OnLink {
+            addr: server,
+            iface,
+        });
     }
     Err("no default route to pin the server through".into())
+}
+
+/// The /32 pins a peer-exit consumer holds beside the server's while its
+/// half-default routes are up. A peer only the default route reaches would
+/// otherwise have its datagrams swallowed by the half-defaults, and the tunnel
+/// would carry what carries it; the pin takes the shape the current default
+/// route decides, so a gatewayless uplink pins link-scoped as well.
+///
+/// A peer some route already reaches more specifically than a `/1` gets none:
+/// that route beats the half-defaults on its own, and pinning a peer on the LAN
+/// or behind a second interface through the default gateway would route it away
+/// from the interface that reaches it.
+pub fn plan_underlay_pins(
+    proc_route: &str,
+    tun_name: &str,
+    peers: &[Ipv4Addr],
+) -> crate::Result<Vec<UplinkPin>> {
+    peers
+        .iter()
+        .filter(|&&peer| !route::covered_beyond_half(proc_route, tun_name, peer))
+        .map(|&peer| plan_server_pin(proc_route, tun_name, peer))
+        .collect()
 }
 
 /// Whether a route mutation failed only because the route already exists.
@@ -192,7 +218,7 @@ impl StrictOps for SysRouteOps {
 /// on a panic; the kernel drops the tun-device routes with the device, and
 /// the surviving /32 pin is harmless.
 pub struct ExitRouteGuard<S: RouteOps = SysRouteOps> {
-    pin: ServerPin,
+    pin: UplinkPin,
     tun_name: String,
     ops: S,
 }
@@ -200,7 +226,7 @@ pub struct ExitRouteGuard<S: RouteOps = SysRouteOps> {
 impl ExitRouteGuard {
     /// Program the exit routes with the route ioctls and return the guard
     /// that removes them.
-    pub fn bring_up(pin: ServerPin, tun_name: &str) -> crate::Result<Self> {
+    pub fn bring_up(pin: UplinkPin, tun_name: &str) -> crate::Result<Self> {
         Self::bring_up_with(SysRouteOps, pin, tun_name)
     }
 }
@@ -209,7 +235,7 @@ impl<S: RouteOps> ExitRouteGuard<S> {
     /// Program the server pin, then the two half-defaults via the tun device,
     /// pin first so no packet to the server can route into the tun in
     /// between. A failed add removes whatever was already programmed.
-    pub fn bring_up_with(ops: S, pin: ServerPin, tun_name: &str) -> crate::Result<Self> {
+    pub fn bring_up_with(ops: S, pin: UplinkPin, tun_name: &str) -> crate::Result<Self> {
         let mut guard = ExitRouteGuard {
             pin,
             tun_name: tun_name.to_string(),
@@ -228,9 +254,9 @@ impl<S: RouteOps> ExitRouteGuard<S> {
     /// gone). The half-defaults are not re-asserted: the process holds the
     /// tun fd, so that interface cannot flap while the guard lives.
     pub fn assert_pin(&mut self, server: Ipv4Addr) -> crate::Result<()> {
-        if self.pin.server() != server {
+        if self.pin.addr() != server {
             let _ = self.ops.apply(&self.pin.change(false));
-            self.pin = self.pin.with_server(server);
+            self.pin = self.pin.with_addr(server);
         }
         match self.ops.apply(&self.pin.change(true)) {
             Err(e) if !already_exists(&e) => Err(e),
@@ -262,6 +288,50 @@ impl<S: RouteOps> Drop for ExitRouteGuard<S> {
     fn drop(&mut self) {
         for change in self.changes(false).into_iter().rev() {
             let _ = self.ops.apply(&change);
+        }
+    }
+}
+
+/// Holds the underlay pins programmed beside a base set and removes them on
+/// drop. An add answering already-exists counts as held, the way the server
+/// pin's per-dial assert does.
+pub struct PinGuard<S: RouteOps = SysRouteOps> {
+    pins: Vec<UplinkPin>,
+    ops: S,
+}
+
+impl PinGuard {
+    /// Program `pins` with the route ioctls and return the guard that removes
+    /// them.
+    pub fn bring_up(pins: Vec<UplinkPin>) -> crate::Result<Self> {
+        Self::bring_up_with(SysRouteOps, pins)
+    }
+}
+
+impl<S: RouteOps> PinGuard<S> {
+    /// Program each pin in turn. A failed add drops the guard, which removes
+    /// the pins already programmed.
+    pub fn bring_up_with(ops: S, pins: Vec<UplinkPin>) -> crate::Result<Self> {
+        let mut guard = PinGuard {
+            pins: Vec::new(),
+            ops,
+        };
+        for pin in pins {
+            match guard.ops.apply(&pin.change(true)) {
+                Err(e) if !already_exists(&e) => return Err(e),
+                _ => guard.pins.push(pin),
+            }
+        }
+        Ok(guard)
+    }
+}
+
+impl<S: RouteOps> Drop for PinGuard<S> {
+    /// Remove the pins in reverse of the order they went in, best-effort so a
+    /// partially programmed set tears down cleanly.
+    fn drop(&mut self) {
+        for pin in self.pins.iter().rev() {
+            let _ = self.ops.apply(&pin.change(false));
         }
     }
 }
@@ -340,11 +410,34 @@ impl ExitRoutes {
     /// Program the base routes and, when `strict` carries the captured
     /// defaults, the strict set on top of them.
     pub fn bring_up(
-        pin: ServerPin,
+        pin: UplinkPin,
         tun_name: &str,
         strict: Option<Vec<route::CapturedDefault>>,
     ) -> crate::Result<Self> {
         Self::bring_up_with(SysRouteOps, SysRouteOps, pin, tun_name, strict)
+    }
+
+    /// Program the exit routes for `server` over `tun_name` from one read of
+    /// the route table: the pin its default route decides and, in strict mode,
+    /// the defaults captured from that same read. Strict mode with no default
+    /// route to capture is an error.
+    pub fn bring_up_from_table(
+        table: &str,
+        tun_name: &str,
+        server: Ipv4Addr,
+        strict: bool,
+    ) -> crate::Result<Self> {
+        let pin = plan_server_pin(table, tun_name, server)?;
+        let original = if strict {
+            let defaults = route::parse_all_defaults(table, tun_name);
+            if defaults.is_empty() {
+                return Err("no default route to capture for strict exit".into());
+            }
+            Some(defaults)
+        } else {
+            None
+        };
+        Self::bring_up(pin, tun_name, original)
     }
 }
 
@@ -354,7 +447,7 @@ impl<S: RouteOps, T: StrictOps> ExitRoutes<S, T> {
     pub fn bring_up_with(
         ops: S,
         strict_ops: T,
-        pin: ServerPin,
+        pin: UplinkPin,
         tun_name: &str,
         strict: Option<Vec<route::CapturedDefault>>,
     ) -> crate::Result<Self> {
@@ -465,8 +558,8 @@ eth0\t0050A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
     fn pin_goes_via_the_default_gateway() {
         assert_eq!(
             plan_server_pin(GW_ROUTE, "zn0", SERVER).unwrap(),
-            ServerPin::ViaGateway {
-                server: SERVER,
+            UplinkPin::ViaGateway {
+                addr: SERVER,
                 gateway: Ipv4Addr::new(192, 168, 80, 1),
                 iface: "eth0".into(),
             }
@@ -477,8 +570,8 @@ eth0\t0050A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
     fn gatewayless_default_pins_on_link() {
         assert_eq!(
             plan_server_pin(PPP_ROUTE, "zn0", SERVER).unwrap(),
-            ServerPin::OnLink {
-                server: SERVER,
+            UplinkPin::OnLink {
+                addr: SERVER,
                 iface: "ppp0".into(),
             }
         );
@@ -571,7 +664,7 @@ zn0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
         log.borrow_mut().clear();
         let moved = Ipv4Addr::new(198, 51, 100, 4);
         guard.assert_pin(moved).unwrap();
-        let new_pin = pin.with_server(moved);
+        let new_pin = pin.with_addr(moved);
         assert_eq!(*log.borrow(), [pin.change(false), new_pin.change(true)]);
 
         // Teardown removes the current pin, not the original one.
@@ -590,6 +683,112 @@ zn0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
             ..Fault::default()
         });
         assert!(guard.assert_pin(SERVER).is_err());
+    }
+
+    /// The address a punched pair's own datagrams travel to.
+    const PEER: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
+
+    // The pins take the uplink the default route names, and go link-scoped
+    // when that default has no gateway.
+    #[test]
+    fn underlay_pins_take_the_punched_peer_over_the_uplink() {
+        assert_eq!(
+            plan_underlay_pins(GW_ROUTE, "zn0", &[PEER]).unwrap(),
+            [UplinkPin::ViaGateway {
+                addr: PEER,
+                gateway: Ipv4Addr::new(192, 168, 80, 1),
+                iface: "eth0".into(),
+            }]
+        );
+        assert_eq!(
+            plan_underlay_pins(PPP_ROUTE, "zn0", &[PEER]).unwrap(),
+            [UplinkPin::OnLink {
+                addr: PEER,
+                iface: "ppp0".into(),
+            }]
+        );
+        assert!(plan_underlay_pins(GW_ROUTE, "zn0", &[]).unwrap().is_empty());
+        assert!(plan_underlay_pins(NO_DEFAULT, "zn0", &[PEER]).is_err());
+    }
+
+    /// A peer on the LAN the default-route interface is connected to.
+    const ON_LINK_PEER: Ipv4Addr = Ipv4Addr::new(192, 168, 80, 23);
+
+    // The same uplink with a second NIC: its own connected /24, and a host
+    // route for the peer 198.51.100.7.
+    const MULTI_HOMED: &str = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+eth0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
+eth0\t0050A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
+eth1\t00000A0A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
+eth1\t076433C6\t00000000\t0005\t0\t0\t100\tFFFFFFFF\t0\t0\t0
+";
+
+    // A peer the table already reaches keeps the route it has: two clients
+    // behind one NAT punch to a LAN address the uplink is connected to, and a
+    // pin through the default gateway would take that peer off the interface
+    // that reaches it.
+    #[test]
+    fn a_peer_the_table_already_reaches_gets_no_pin() {
+        assert!(plan_underlay_pins(GW_ROUTE, "zn0", &[ON_LINK_PEER])
+            .unwrap()
+            .is_empty());
+        // The second NIC's connected /24 and its host route cover as well.
+        let second_nic = Ipv4Addr::new(10, 10, 0, 5);
+        assert!(
+            plan_underlay_pins(MULTI_HOMED, "zn0", &[second_nic, PEER, ON_LINK_PEER])
+                .unwrap()
+                .is_empty()
+        );
+        // An address only the default route reaches still pins through it.
+        assert_eq!(
+            plan_underlay_pins(MULTI_HOMED, "zn0", &[ON_LINK_PEER, SERVER]).unwrap(),
+            [UplinkPin::ViaGateway {
+                addr: SERVER,
+                gateway: Ipv4Addr::new(192, 168, 80, 1),
+                iface: "eth0".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_pin_guard_programs_every_pin_and_drop_removes_them() {
+        let (rec, log, _fault) = recorder();
+        let pins = plan_underlay_pins(GW_ROUTE, "zn0", &[PEER, SERVER]).unwrap();
+        let guard = PinGuard::bring_up_with(rec, pins.clone()).unwrap();
+        assert_eq!(*log.borrow(), [pins[0].change(true), pins[1].change(true)]);
+
+        log.borrow_mut().clear();
+        drop(guard);
+        assert_eq!(
+            *log.borrow(),
+            [pins[1].change(false), pins[0].change(false)]
+        );
+    }
+
+    // A pin the kernel already holds counts as held, and an add it refuses
+    // takes the pins before it back out.
+    #[test]
+    fn the_pin_guard_holds_an_existing_pin_and_unwinds_a_refused_one() {
+        let (rec, log, fault) = recorder();
+        fault.set(Fault {
+            exists_add: Some(PEER),
+            ..Fault::default()
+        });
+        let pins = plan_underlay_pins(GW_ROUTE, "zn0", &[PEER]).unwrap();
+        let guard = PinGuard::bring_up_with(rec, pins.clone()).unwrap();
+        assert!(log.borrow().is_empty());
+        drop(guard);
+        assert_eq!(*log.borrow(), [pins[0].change(false)]);
+
+        let (rec, log, fault) = recorder();
+        fault.set(Fault {
+            fail_add: Some(SERVER),
+            ..Fault::default()
+        });
+        let pins = plan_underlay_pins(GW_ROUTE, "zn0", &[PEER, SERVER]).unwrap();
+        assert!(PinGuard::bring_up_with(rec, pins.clone()).is_err());
+        assert_eq!(*log.borrow(), [pins[0].change(true), pins[0].change(false)]);
     }
 
     /// One applied change from either seam, so the composed guard's ordering

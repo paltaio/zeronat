@@ -356,12 +356,15 @@ fn peer_slots(cfg: &ClientConfig) -> Result<Vec<client::PeerSlotSpec>> {
             slots.push(client::PeerSlotSpec::Consumer {
                 peer_id: peer_id.clone(),
                 want: zeronat::proto::PROVIDES_EXIT,
-                device: Some(
-                    tun.dev
+                adapter: Some(client::ConsumerAdapter::Exit(client::ExitVia {
+                    device: tun
+                        .dev
                         .clone()
                         .unwrap_or_else(|| DEFAULT_TUN_NAME.to_string()),
-                ),
-                default_route: tun.exit,
+                    mtu: DEFAULT_TAP_MTU,
+                    exit: tun.exit,
+                    exit_strict: tun.exit_strict,
+                })),
             });
         }
     }

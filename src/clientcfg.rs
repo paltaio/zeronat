@@ -160,6 +160,15 @@ impl ClientConfig {
         if self.pppoe.iter().filter(|p| p.autostart).count() > 1 {
             return Err("more than one [[pppoe]] entry sets autostart = true".into());
         }
+        // A pair addresses both its ends off the shared secret, so a consumer
+        // table has no address of its own to take.
+        if self
+            .tun
+            .as_ref()
+            .is_some_and(|t| t.is_peer() && t.address.is_some())
+        {
+            return Err("[tun] `address` cannot be combined with `exit_via`".into());
+        }
         // Device exclusivity keys on the slot a table feeds, not on the table
         // being present: a [tun] naming a peer feeds a consumer slot and
         // leaves the server slot to its forwards, its pppoe sessions, or
@@ -1038,6 +1047,8 @@ mod tests {
             "[tap]\ndev = \"t0\"\n[tun]\n",
             "[tap]\ndev = \"t0\"\n[[forwards]]\nproto = \"tcp\"\nport = 443\n",
             "[tun]\n[[pppoe]]\nname = \"w\"\nusername = \"u\"\n",
+            // A peer pair derives both ends of its subnet from the secret.
+            "[tun]\naddress = \"10.9.0.2/24\"\nexit_via = \"office-b1c2\"\n",
         ];
         for case in cases {
             let cfg = parse_client(case).unwrap_or_else(|e| {

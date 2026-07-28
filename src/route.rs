@@ -102,6 +102,35 @@ fn scan_defaults(contents: &str, skip_iface: &str, require_gateway: bool) -> Vec
     rows
 }
 
+/// Whether any route in `contents` reaches `addr` more specifically than the
+/// `/1` half-defaults do, excluding `skip_iface`. A connected LAN prefix or a
+/// host route already wins over a half-default on prefix length, and a `/32`
+/// pin through the default gateway would displace it.
+pub fn covered_beyond_half(contents: &str, skip_iface: &str, addr: Ipv4Addr) -> bool {
+    let target = u32::from_be_bytes(addr.octets());
+    for line in contents.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        // Iface Destination Gateway Flags RefCnt Use Metric Mask ...
+        if f.len() < 11 {
+            continue;
+        }
+        if f[0] == skip_iface {
+            continue;
+        }
+        let (dest, mask) = match (u32::from_str_radix(f[1], 16), u32::from_str_radix(f[7], 16)) {
+            (Ok(d), Ok(m)) => (
+                u32::from_be_bytes(le_hex_to_ipv4(d).octets()),
+                u32::from_be_bytes(le_hex_to_ipv4(m).octets()),
+            ),
+            _ => continue,
+        };
+        if mask.leading_ones() > 1 && target & mask == dest {
+            return true;
+        }
+    }
+    false
+}
+
 /// `RTF_GATEWAY` as it appears in the `/proc/net/route` Flags column.
 const RTF_GATEWAY_BITS: u32 = 0x0002;
 
@@ -407,6 +436,42 @@ eth0\t0050A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
             ]
         );
         assert!(parse_all_defaults("", "zn0").is_empty());
+    }
+
+    #[test]
+    fn cover_takes_prefixes_longer_than_a_half_default() {
+        // A default, a connected /24, a host route and a `128.0.0.0/1`: only
+        // the middle two reach an address better than a half-default does.
+        let routes = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+eth0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
+eth0\t0050A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
+eth0\t076433C6\t00000000\t0005\t0\t0\t100\tFFFFFFFF\t0\t0\t0
+eth0\t00000080\t00000000\t0001\t0\t0\t100\t00000080\t0\t0\t0
+";
+        assert!(covered_beyond_half(
+            routes,
+            "zn0",
+            Ipv4Addr::new(192, 168, 80, 23)
+        ));
+        assert!(covered_beyond_half(
+            routes,
+            "zn0",
+            Ipv4Addr::new(198, 51, 100, 7)
+        ));
+        assert!(!covered_beyond_half(
+            routes,
+            "zn0",
+            Ipv4Addr::new(198, 51, 100, 8)
+        ));
+        // Rows on the excluded interface do not count, and neither does an
+        // empty table.
+        assert!(!covered_beyond_half(
+            routes,
+            "eth0",
+            Ipv4Addr::new(192, 168, 80, 23)
+        ));
+        assert!(!covered_beyond_half("", "zn0", Ipv4Addr::new(10, 0, 0, 1)));
     }
 
     #[test]
