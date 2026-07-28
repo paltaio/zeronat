@@ -32,7 +32,9 @@ use crate::noise::{
 };
 use crate::peerslot;
 use crate::peerslot::PeerControl;
-pub use crate::peerslot::{PeerExit, PeerSlotSession, PeerSlotSpec, SessionSink};
+pub use crate::peerslot::{
+    PeerExit, PeerSegment, PeerSlotSession, PeerSlotSpec, ProviderAdapter, SessionSink,
+};
 use crate::proto::{decode_sockaddr, encode_sockaddr, FwdOptionEntry, Msg, Proto};
 use crate::tap::TapConfig;
 #[cfg(target_os = "linux")]
@@ -669,7 +671,7 @@ fn peer_claims(specs: &[PeerSlotSpec]) -> Vec<(Claim, String)> {
     let mut out = Vec::new();
     for spec in specs {
         let holder = spec.label();
-        if let Some(dev) = spec.device() {
+        for dev in spec.devices() {
             out.push((Claim::Device(dev.to_string()), holder.clone()));
         }
         if spec.default_route() {
@@ -1042,7 +1044,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         return Err("pppoe is only supported on Linux".into());
     }
     #[cfg(not(target_os = "linux"))]
-    if let Some(spec) = peers.iter().find(|s| s.device().is_some()) {
+    if let Some(spec) = peers.iter().find(|s| !s.devices().is_empty()) {
         return Err(format!(
             "{} opens a network device, which is only supported on Linux",
             spec.label()
@@ -2953,11 +2955,11 @@ mod tests {
         assert_eq!(fwds.entries().len(), 3);
     }
 
-    fn provider_slot(bit: u8, device: Option<&str>) -> PeerSlotSpec {
+    /// A provider whose pairs go to the frame seam, opening nothing.
+    fn provider_slot(bit: u8) -> PeerSlotSpec {
         PeerSlotSpec::Provider {
             provides: bit,
-            device: device.map(Into::into),
-            exit: None,
+            adapter: None,
         }
     }
 
@@ -2965,12 +2967,23 @@ mod tests {
     fn exit_provider_slot(device: &str) -> PeerSlotSpec {
         PeerSlotSpec::Provider {
             provides: crate::proto::PROVIDES_EXIT,
-            device: None,
-            exit: Some(PeerExit {
+            adapter: Some(ProviderAdapter::Exit(PeerExit {
                 device: device.into(),
                 mtu: 1400,
                 iface: None,
-            }),
+            })),
+        }
+    }
+
+    /// A segment provider, which claims its TAP and the bridge it joins.
+    fn segment_provider_slot(device: &str, bridge: &str) -> PeerSlotSpec {
+        PeerSlotSpec::Provider {
+            provides: crate::proto::PROVIDES_SEGMENT,
+            adapter: Some(ProviderAdapter::Segment(PeerSegment {
+                device: device.into(),
+                mtu: 1400,
+                bridge: bridge.into(),
+            })),
         }
     }
 
@@ -2995,11 +3008,14 @@ mod tests {
     // both, and leaves the running slots alone.
     #[test]
     fn a_body_cannot_take_a_device_a_peer_slot_holds() {
-        let peers = peer_claims(&[provider_slot(crate::proto::PROVIDES_SEGMENT, Some("eth1"))]);
+        let peers = peer_claims(&[segment_provider_slot("zns0", "eth1")]);
         let claims = SlotClaims::new(peers).unwrap();
         let err = claims.admit_body(tap_body("eth1").claims()).unwrap_err();
         assert!(err.contains("eth1"), "{err}");
         assert!(err.contains("segment provider"), "{err}");
+        // The tap the provider creates is the other half of its claim.
+        let err = claims.admit_body(tap_body("zns0").claims()).unwrap_err();
+        assert!(err.contains("zns0"), "{err}");
         // An unrelated device is admitted.
         claims.admit_body(tap_body("ztap0").claims()).unwrap();
     }
@@ -3050,7 +3066,7 @@ mod tests {
     fn two_peer_slots_cannot_name_one_interface() {
         let err = SlotClaims::new(peer_claims(&[
             consumer_slot("office", Some("eth1"), false),
-            provider_slot(crate::proto::PROVIDES_SEGMENT, Some("eth1")),
+            segment_provider_slot("zns0", "eth1"),
         ]))
         .unwrap_err();
         assert!(err.contains("eth1"), "{err}");
@@ -3076,13 +3092,13 @@ mod tests {
         .unwrap();
 
         assert!(check_slot_identities(&[
-            provider_slot(crate::proto::PROVIDES_EXIT, None),
-            provider_slot(crate::proto::PROVIDES_EXIT, None),
+            provider_slot(crate::proto::PROVIDES_EXIT),
+            provider_slot(crate::proto::PROVIDES_EXIT),
         ])
         .is_err());
         check_slot_identities(&[
-            provider_slot(crate::proto::PROVIDES_EXIT, None),
-            provider_slot(crate::proto::PROVIDES_SEGMENT, Some("eth1")),
+            provider_slot(crate::proto::PROVIDES_EXIT),
+            segment_provider_slot("zns0", "eth1"),
         ])
         .unwrap();
     }
@@ -3108,7 +3124,7 @@ mod tests {
             id_prefix: Some("t".into()),
             control: None,
             config: None,
-            peers: vec![provider_slot(crate::proto::PROVIDES_SEGMENT, Some("eth1"))],
+            peers: vec![segment_provider_slot("zns0", "eth1")],
             peer_sessions: None,
         };
         let err = run_switchable(ActiveTarget::new(target("a")), settings)

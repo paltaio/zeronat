@@ -23,6 +23,8 @@ pub mod noise;
 pub mod peer;
 #[cfg(target_os = "linux")]
 pub(crate) mod peerexit;
+#[cfg(target_os = "linux")]
+pub(crate) mod peersegment;
 pub mod peerslot;
 pub mod pppoe;
 pub mod proto;

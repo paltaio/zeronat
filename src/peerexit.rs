@@ -11,20 +11,16 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use crate::bridge::TapSwitch;
+use crate::bridge::{TapSwitch, TRANSPORT_PEER};
 use crate::netfilter::{self, NatPlan};
 use crate::peer::PeerSession;
 use crate::peerslot::PeerExit;
-use crate::tap::{TapDevice, TunConfig};
+use crate::tap::{has_net_admin, TapDevice, TunConfig};
 use crate::Result;
 
 /// Prefix length of the tunnel the pair shares, matching the `/24` a server
 /// tun assigns.
 const TUN_PREFIX_LEN: u8 = 24;
-
-/// A peer session is neither of the two control transports the switch records
-/// for its ports, and direct and relayed are the same thing above it.
-const TRANSPORT_PEER: u8 = 0;
 
 /// What the provider can settle about its bringup before a pair arrives: the
 /// interface the pair's traffic would leave by, and the capability opening the
@@ -138,26 +134,6 @@ fn egress_iface(device: &str, iface: Option<&str>, route_table: &str) -> Result<
     }
 }
 
-/// Whether this process holds the capability the tun open needs. A status file
-/// that cannot be read or parsed counts as holding it: the check is here to
-/// name a misconfiguration, not to invent one.
-fn has_net_admin() -> bool {
-    std::fs::read_to_string("/proc/self/status")
-        .map(|status| net_admin_in_status(&status))
-        .unwrap_or(true)
-}
-
-/// Read the effective capability set out of `/proc/self/status` contents and
-/// test the bit `TUNSETIFF` needs.
-fn net_admin_in_status(status: &str) -> bool {
-    const CAP_NET_ADMIN: u32 = 12;
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("CapEff:"))
-        .and_then(|bits| u64::from_str_radix(bits.trim(), 16).ok())
-        .is_none_or(|caps| caps & (1 << CAP_NET_ADMIN) != 0)
-}
-
 /// Masquerade the pair's subnet out `egress`. An exit provider carries the
 /// consumer's outbound traffic and nothing inbound, so the plan has no DNAT.
 fn nat_plan(cfg: &TunConfig, egress: String) -> NatPlan {
@@ -176,10 +152,9 @@ fn nat_plan(cfg: &TunConfig, egress: String) -> NatPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::io::RawFd;
     use std::time::Duration;
 
-    use crate::peer::PeerPath;
+    use crate::tap::{read_device, write_device, DeviceFd};
 
     const PROC_ROUTE: &str = "\
 Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
@@ -245,60 +220,6 @@ eth0\t0050A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
         .is_err());
     }
 
-    // A process without CAP_NET_ADMIN cannot open the tun, and that outlives
-    // every pair. A status file this cannot read counts as holding the
-    // capability, so an unexpected procfs never invents a refusal.
-    #[test]
-    fn missing_net_admin_is_read_off_the_effective_capability_set() {
-        assert!(net_admin_in_status("CapEff:\t000001ffffffffff\n"));
-        assert!(net_admin_in_status(
-            "Name:\tzeronat\nCapEff:\t0000000000001000\n"
-        ));
-        assert!(!net_admin_in_status("CapEff:\t0000000000000ff7\n"));
-        assert!(!net_admin_in_status(
-            "Name:\tzeronat\nCapEff:\t0000000000000000\n"
-        ));
-        assert!(net_admin_in_status(""));
-        assert!(net_admin_in_status("CapEff:\tnot-a-mask\n"));
-    }
-
-    /// Both ends of one inner session, handshaked over a duplex standing in for
-    /// a relay leg.
-    async fn inner_pair() -> (PeerSession, PeerSession) {
-        let psk = crate::noise::derive_psk(SECRET);
-        let (a, b) = tokio::io::duplex(1 << 16);
-        let responder =
-            tokio::spawn(async move { crate::noise::server_handshake(b, &psk).await.unwrap() });
-        let initiator = crate::noise::client_handshake(a, &psk).await.unwrap();
-        let responder = responder.await.unwrap();
-        let ((consumer, answer), provider) = tokio::try_join!(
-            PeerSession::consumer(PeerPath::relay_stream(initiator), &psk, 1),
-            PeerSession::provider(PeerPath::relay_stream(responder), &psk, 1, &[]),
-        )
-        .expect("the inner handshake must complete on both sides");
-        assert!(answer.is_empty());
-        (consumer, provider)
-    }
-
-    /// The next frame the adapter wrote to the device, read off the other end
-    /// of the socketpair standing in for it.
-    async fn read_device(fd: RawFd) -> Vec<u8> {
-        for _ in 0..300 {
-            let mut buf = [0u8; 2048];
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n > 0 {
-                return buf[..n as usize].to_vec();
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("no frame reached the device");
-    }
-
-    fn write_device(fd: RawFd, frame: &[u8]) {
-        let n = unsafe { libc::write(fd, frame.as_ptr() as *const libc::c_void, frame.len()) };
-        assert_eq!(n, frame.len() as isize);
-    }
-
     /// One minimal IPv4 packet with `mark` in its payload.
     fn packet(mark: u8) -> Vec<u8> {
         let mut p = vec![
@@ -309,21 +230,13 @@ eth0\t0050A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
         p
     }
 
-    /// Closes the peer end of the socketpair when the test ends.
-    struct DeviceFd(RawFd);
-    impl Drop for DeviceFd {
-        fn drop(&mut self) {
-            unsafe { libc::close(self.0) };
-        }
-    }
-
     // The adapter's datapath: a packet the consumer sends comes out of the
     // provider's device, and a packet arriving on that device reaches the
     // consumer. The device here is a socketpair rather than a kernel tun, so
     // the test needs no privilege and no routing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ip_packets_cross_between_the_pair_and_the_device() {
-        let (mut consumer, provider) = inner_pair().await;
+        let (mut consumer, provider) = crate::peer::duplex_pair(SECRET, 1).await;
         let (dev, peer) = TapDevice::socketpair_for_test(1500).unwrap();
         let _fd = DeviceFd(peer);
         let adapter = crate::client::AbortOnDrop(tokio::spawn(run_switch(Arc::new(dev), provider)));

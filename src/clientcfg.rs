@@ -98,7 +98,8 @@ pub struct CfgPeer {
     /// Interface the served consumer's traffic masquerades out of; the
     /// default-route interface when unset.
     pub exit_iface: Option<String>,
-    /// Bridge consumers onto this node's L2 segment, naming the NIC.
+    /// Attach consumers to this node's L2 segment, naming the bridge the
+    /// segment's interface belongs to.
     pub segment: Option<String>,
 }
 
@@ -696,8 +697,8 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
         if let Some(iface) = &peer.exit_iface {
             out.push_str(&format!("exit_iface = {}\n", quote(iface)));
         }
-        if let Some(nic) = &peer.segment {
-            out.push_str(&format!("segment = {}\n", quote(nic)));
+        if let Some(bridge) = &peer.segment {
+            out.push_str(&format!("segment = {}\n", quote(bridge)));
         }
     }
 

@@ -11,6 +11,8 @@ const DEFAULT_TUN_NAME: &str = "zn0";
 /// `[tun]` and `[tap]` defaults, since a node can run one of those on the
 /// server slot while providing exit on a peer slot.
 const DEFAULT_PEER_EXIT_NAME: &str = "znx0";
+/// TAP a segment provider opens on the bridge it serves consumers from.
+const DEFAULT_PEER_SEGMENT_NAME: &str = "zns0";
 const TUN_PREFIX_LEN: u8 = 24;
 
 /// The tunnel `/24` for `secret`: `(network base, server .1, client .2)`.
@@ -375,19 +377,28 @@ fn peer_slots(cfg: &ClientConfig) -> Result<Vec<client::PeerSlotSpec>> {
             }
             slots.push(client::PeerSlotSpec::Provider {
                 provides: zeronat::proto::PROVIDES_EXIT,
-                device: None,
-                exit: Some(client::PeerExit {
+                adapter: Some(client::ProviderAdapter::Exit(client::PeerExit {
                     device: DEFAULT_PEER_EXIT_NAME.to_string(),
                     mtu: DEFAULT_TAP_MTU,
                     iface: peer.exit_iface.clone(),
-                }),
+                })),
             });
         }
-        if let Some(nic) = &peer.segment {
+        if let Some(bridge) = &peer.segment {
+            // The tap joins the named bridge, and a device cannot join itself.
+            if bridge == DEFAULT_PEER_SEGMENT_NAME {
+                return Err(format!(
+                    "[peer] segment cannot be the segment provider's own tap {DEFAULT_PEER_SEGMENT_NAME}"
+                )
+                .into());
+            }
             slots.push(client::PeerSlotSpec::Provider {
                 provides: zeronat::proto::PROVIDES_SEGMENT,
-                device: Some(nic.clone()),
-                exit: None,
+                adapter: Some(client::ProviderAdapter::Segment(client::PeerSegment {
+                    device: DEFAULT_PEER_SEGMENT_NAME.to_string(),
+                    mtu: DEFAULT_TAP_MTU,
+                    bridge: bridge.clone(),
+                })),
             });
         }
     }
@@ -1862,8 +1873,31 @@ mod tests {
         for iface in [None, Some("wan0")] {
             let slots = peer_slots(&peer(iface)).unwrap();
             assert_eq!(slots.len(), 1);
-            assert_eq!(slots[0].device(), Some(DEFAULT_PEER_EXIT_NAME));
+            assert_eq!(slots[0].devices(), [DEFAULT_PEER_EXIT_NAME]);
         }
+    }
+
+    // A segment provider opens its own tap and joins it to the named bridge,
+    // claiming both. The tap cannot be the bridge it joins.
+    #[test]
+    fn a_segment_provider_claims_its_tap_and_the_bridge_it_joins() {
+        let peer = |segment: &str| ClientConfig {
+            peer: Some(zeronat::clientcfg::CfgPeer {
+                exit: false,
+                exit_iface: None,
+                segment: Some(segment.into()),
+            }),
+            ..ClientConfig::default()
+        };
+        let slots = peer_slots(&peer("br0")).unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].devices(), [DEFAULT_PEER_SEGMENT_NAME, "br0"]);
+        assert!(!slots[0].default_route());
+
+        let Err(err) = peer_slots(&peer(DEFAULT_PEER_SEGMENT_NAME)) else {
+            panic!("the provider's own tap must be refused as its bridge");
+        };
+        assert!(err.to_string().contains(DEFAULT_PEER_SEGMENT_NAME), "{err}");
     }
 
     #[test]

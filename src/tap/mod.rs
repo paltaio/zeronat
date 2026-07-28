@@ -29,4 +29,6 @@ pub struct TunConfig {
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::TapDevice;
+pub use linux::{has_net_admin, TapDevice};
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use linux::{read_device, write_device, DeviceFd};

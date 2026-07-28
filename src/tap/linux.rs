@@ -205,6 +205,26 @@ fn configure_tun(name: &str, mtu: usize, addr: Ipv4Addr, netmask: Ipv4Addr) -> R
     res
 }
 
+/// Whether this process holds the capability a tun/tap open needs. A status
+/// file that cannot be read or parsed counts as holding it: the check is here
+/// to name a misconfiguration, not to invent one.
+pub fn has_net_admin() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .map(|status| net_admin_in_status(&status))
+        .unwrap_or(true)
+}
+
+/// Read the effective capability set out of `/proc/self/status` contents and
+/// test the bit `TUNSETIFF` needs.
+fn net_admin_in_status(status: &str) -> bool {
+    const CAP_NET_ADMIN: u32 = 12;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|bits| u64::from_str_radix(bits.trim(), 16).ok())
+        .is_none_or(|caps| caps & (1 << CAP_NET_ADMIN) != 0)
+}
+
 /// Owns the tun fd and closes it on drop.
 struct TunFd(RawFd);
 
@@ -392,6 +412,40 @@ impl TapDevice {
     }
 }
 
+/// Closes the peer end of a [`TapDevice::socketpair_for_test`] pair when the
+/// test ends.
+#[cfg(test)]
+pub(crate) struct DeviceFd(pub(crate) RawFd);
+
+#[cfg(test)]
+impl Drop for DeviceFd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// The next frame written to the device, read off the peer end of the
+/// socketpair standing in for it.
+#[cfg(test)]
+pub(crate) async fn read_device(fd: RawFd) -> Vec<u8> {
+    for _ in 0..300 {
+        let mut buf = [0u8; 2048];
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n > 0 {
+            return buf[..n as usize].to_vec();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no frame reached the device");
+}
+
+/// Inject one frame into the device from the peer end of the socketpair.
+#[cfg(test)]
+pub(crate) fn write_device(fd: RawFd, frame: &[u8]) {
+    let n = unsafe { libc::write(fd, frame.as_ptr() as *const libc::c_void, frame.len()) };
+    assert_eq!(n, frame.len() as isize);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +470,24 @@ mod tests {
         assert_eq!(ifr.get_ifindex(), 42);
         ifr.set_mtu(1400);
         assert_eq!(ifr.get_mtu(), 1400);
+    }
+
+    // A process without CAP_NET_ADMIN cannot open a tun or tap device, which
+    // the adapters that need one report before they try. A status file this
+    // cannot read counts as holding the capability, so an unexpected procfs
+    // never invents a refusal.
+    #[test]
+    fn missing_net_admin_is_read_off_the_effective_capability_set() {
+        assert!(net_admin_in_status("CapEff:\t000001ffffffffff\n"));
+        assert!(net_admin_in_status(
+            "Name:\tzeronat\nCapEff:\t0000000000001000\n"
+        ));
+        assert!(!net_admin_in_status("CapEff:\t0000000000000ff7\n"));
+        assert!(!net_admin_in_status(
+            "Name:\tzeronat\nCapEff:\t0000000000000000\n"
+        ));
+        assert!(net_admin_in_status(""));
+        assert!(net_admin_in_status("CapEff:\tnot-a-mask\n"));
     }
 
     #[test]

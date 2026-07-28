@@ -500,3 +500,23 @@ fn take_messages(written: &mut Vec<u8>) -> Vec<Vec<u8>> {
     written.drain(..off);
     out
 }
+
+/// Both ends of one inner session, handshaked over a duplex standing in for a
+/// relay leg. The provider answers with an empty payload, so the pair is one
+/// an adapter can run over.
+#[cfg(test)]
+pub(crate) async fn duplex_pair(secret: &str, pair_id: u64) -> (PeerSession, PeerSession) {
+    let psk = crate::noise::derive_psk(secret);
+    let (a, b) = tokio::io::duplex(1 << 16);
+    let responder =
+        tokio::spawn(async move { crate::noise::server_handshake(b, &psk).await.unwrap() });
+    let initiator = crate::noise::client_handshake(a, &psk).await.unwrap();
+    let responder = responder.await.unwrap();
+    let ((consumer, answer), provider) = tokio::try_join!(
+        PeerSession::consumer(PeerPath::relay_stream(initiator), &psk, pair_id),
+        PeerSession::provider(PeerPath::relay_stream(responder), &psk, pair_id, &[]),
+    )
+    .expect("the inner handshake must complete on both sides");
+    assert!(answer.is_empty());
+    (consumer, provider)
+}

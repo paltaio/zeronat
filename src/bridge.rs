@@ -479,6 +479,11 @@ pub struct TapSwitch {
     /// `true` for an L2 (TAP/Ethernet) device that supports MAC learning across
     /// many ports; `false` for an L3 (TUN) device, which serves one client only.
     is_l2: bool,
+    /// Whether an egress frame is also routed between the switch's own ports.
+    /// The device is one port of a kernel bridge and a bridge never sends a
+    /// frame back out the port it arrived on, so with this set the switch is
+    /// what carries a frame from one attached port to another.
+    port_to_port: bool,
     ports: Mutex<HashMap<u32, SwitchPort>>,
     macs: Mutex<HashMap<[u8; 6], (u32, Instant)>>,
     next_port: AtomicU32,
@@ -526,9 +531,22 @@ impl TapSwitch {
     /// spawned reader keeps its own reference to the device until the runtime
     /// gets around to cancelling it.
     pub fn detached(tap: Arc<TapDevice>, is_l2: bool) -> Arc<Self> {
+        Self::build(tap, is_l2, false)
+    }
+
+    /// Build a detached L2 switch that carries frames between its own ports as
+    /// well as to and from the device. This is the peer segment provider's
+    /// switch: its consumers share one TAP port on the node's bridge, so a
+    /// frame from one consumer to another never comes back from the kernel.
+    pub(crate) fn segment(tap: Arc<TapDevice>) -> Arc<Self> {
+        Self::build(tap, true, true)
+    }
+
+    fn build(tap: Arc<TapDevice>, is_l2: bool, port_to_port: bool) -> Arc<Self> {
         Arc::new(TapSwitch {
             tap,
             is_l2,
+            port_to_port,
             ports: Mutex::new(HashMap::new()),
             macs: Mutex::new(HashMap::new()),
             next_port: AtomicU32::new(0),
@@ -565,10 +583,10 @@ impl TapSwitch {
                 continue;
             }
             match dst_src(&frame) {
-                Some((dst, _)) => self.forward_inbound(dst, frame),
+                Some((dst, src)) => self.forward_inbound(dst, src, frame),
                 // No Ethernet header but more than one port: nothing to address it
                 // to, so flood it to every port.
-                None => self.flood(frame),
+                None => self.flood(&frame),
             }
         }
     }
@@ -576,15 +594,18 @@ impl TapSwitch {
     /// Forward one inbound frame by destination MAC: flood broadcast, multicast,
     /// and unknown unicast to every port; deliver learned unicast to the one
     /// owning port (falling back to a flood if that port has since vanished).
-    fn forward_inbound(&self, dst: [u8; 6], frame: Vec<u8>) {
+    /// The source transmitted on the device's side of the switch, so whatever
+    /// port binding it holds is stale and is dropped.
+    fn forward_inbound(&self, dst: [u8; 6], src: [u8; 6], frame: Vec<u8>) {
+        self.unlearn(src);
         if dst[0] & 1 != 0 {
             // Broadcast or multicast group bit set.
-            self.flood(frame);
+            self.flood(&frame);
             return;
         }
         let owner = self.macs.lock().unwrap().get(&dst).map(|&(p, _)| p);
         let Some(port_id) = owner else {
-            self.flood(frame);
+            self.flood(&frame);
             return;
         };
         let target = self
@@ -600,24 +621,31 @@ impl TapSwitch {
                 }
             }
             // Learned port is gone: flood so the frame is not black-holed.
-            None => self.flood(frame),
+            None => self.flood(&frame),
         }
     }
 
     /// Clone the frame to every attached port. A `Closed` target schedules its own
     /// eviction; a `Full` target drops this frame (one slow client never stalls
     /// the others or the single TAP reader).
-    fn flood(&self, frame: Vec<u8>) {
+    fn flood(&self, frame: &[u8]) {
+        self.flood_except(frame, None);
+    }
+
+    /// Clone the frame to every attached port but `except`, which is the port
+    /// an egress frame arrived on.
+    fn flood_except(&self, frame: &[u8], except: Option<u32>) {
         let targets: Vec<(u32, mpsc::Sender<Vec<u8>>)> = self
             .ports
             .lock()
             .unwrap()
             .iter()
+            .filter(|(&id, _)| Some(id) != except)
             .map(|(&id, p)| (id, p.out.clone()))
             .collect();
         let mut closed = Vec::new();
         for (id, out) in targets {
-            if let Err(mpsc::error::TrySendError::Closed(_)) = out.try_send(frame.clone()) {
+            if let Err(mpsc::error::TrySendError::Closed(_)) = out.try_send(frame.to_vec()) {
                 closed.push(id);
             }
         }
@@ -655,16 +683,69 @@ impl TapSwitch {
         }
     }
 
+    /// Forget whichever port owns `src`. Learning happens on port egress alone,
+    /// so a station that moved to the device's side keeps its old binding until
+    /// this drops it. Skips group/zero sources.
+    fn unlearn(&self, src: [u8; 6]) {
+        if is_group_or_zero(&src) {
+            return;
+        }
+        self.macs.lock().unwrap().remove(&src);
+    }
+
     /// Learn one egress frame's source MAC onto `port`, then write it to the shared
     /// device. The single egress idiom both the UDP and TCP port halves use.
     /// Concurrent writes from N port relays are safe: the device is opened
     /// `IFF_NO_PI`, so one `write()` carries exactly one whole frame and the kernel
     /// serializes writes on the fd atomically per frame.
+    ///
+    /// A `port_to_port` switch routes the frame among its own ports first, and
+    /// writes to the device only when the destination is not a station it has
+    /// learned behind another port.
     async fn learn_and_write_egress(&self, frame: &[u8], port: u32) -> crate::Result<()> {
-        if let Some((_, src)) = dst_src(frame) {
-            self.learn(src, port);
+        let Some((dst, src)) = dst_src(frame) else {
+            return self.tap.write_frame(frame).await;
+        };
+        self.learn(src, port);
+        if self.port_to_port && self.forward_egress(dst, frame, port) {
+            return Ok(());
         }
         self.tap.write_frame(frame).await
+    }
+
+    /// Route one egress frame among the other ports and report whether it is
+    /// delivered. Unicast for a station learned behind another port goes to
+    /// that port alone; broadcast and multicast are copied to every other port
+    /// and still owed to the device. Unknown unicast is owed to the device
+    /// alone: every station behind a port is learned from that port's own
+    /// egress, so an unknown one is out on the segment.
+    fn forward_egress(&self, dst: [u8; 6], frame: &[u8], from: u32) -> bool {
+        if dst[0] & 1 != 0 {
+            self.flood_except(frame, Some(from));
+            return false;
+        }
+        let owner = self.macs.lock().unwrap().get(&dst).map(|&(p, _)| p);
+        let Some(port_id) = owner.filter(|&p| p != from) else {
+            return false;
+        };
+        let target = self
+            .ports
+            .lock()
+            .unwrap()
+            .get(&port_id)
+            .map(|p| p.out.clone());
+        match target {
+            Some(out) => match out.try_send(frame.to_vec()) {
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.evict_port(port_id);
+                    false
+                }
+                // A full port drops this frame rather than stalling the
+                // sender, as the inbound path does.
+                _ => true,
+            },
+            None => false,
+        }
     }
 
     /// Attach a new client. Allocates a PortId, a bounded egress queue, and a
@@ -880,9 +961,15 @@ pub async fn switch_port_stream(mut handle: SwitchHandle, nr: NoiseReader, nw: N
     stream_relay(local_r, local_w, nr, nw, TCP_IDLE, stop).await;
 }
 
+/// A peer session is neither of the two control transports the switch records
+/// for its ports, and direct and relayed are the same thing above it.
+#[cfg(target_os = "linux")]
+pub(crate) const TRANSPORT_PEER: u8 = 0;
+
 /// Per-pair half of the switch over an inner peer session: the exit provider's
-/// side of an L3 pair. A frame from the peer is one IP packet and writes to the
-/// shared device; a frame the switch routed to this port goes out to the peer.
+/// side of an L3 pair, or one consumer's port on a segment provider's L2
+/// switch. A frame from the peer writes to the shared device; a frame the
+/// switch routed to this port goes out to the peer.
 /// The session carries its own keepalive and reaps a silent peer at its own
 /// deadline, so this half keeps no idle window: it ends when the session dies,
 /// when the device write fails, or when the port is cancelled (the device
@@ -906,7 +993,13 @@ pub async fn switch_port_peer(mut handle: SwitchHandle, mut session: crate::peer
             PeerStep::Cancel => false,
             PeerStep::FromPeer(Some(frame)) => {
                 stats.note_rx(frame.len());
-                switch.learn_and_write_egress(&frame, port_id).await.is_ok()
+                match switch.learn_and_write_egress(&frame, port_id).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        crate::elog!("peer port: the device write failed: {e}");
+                        false
+                    }
+                }
             }
             PeerStep::ToPeer(Some(frame)) => {
                 stats.note_tx(frame.len());
@@ -1187,41 +1280,35 @@ mod tests {
     }
 }
 
+/// One Ethernet frame: 6-byte dst, 6-byte src, 2-byte ethertype, payload.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn frame(dst: [u8; 6], src: [u8; 6], payload: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(14 + payload.len());
+    f.extend_from_slice(&dst);
+    f.extend_from_slice(&src);
+    f.extend_from_slice(&[0x08, 0x00]); // IPv4 ethertype
+    f.extend_from_slice(payload);
+    f
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod switch_tests {
     use super::*;
+    use crate::tap::DeviceFd;
 
     const M1: [u8; 6] = [0x02, 0, 0, 0, 0, 0x01];
     const M2: [u8; 6] = [0x02, 0, 0, 0, 0, 0x02];
     const BCAST: [u8; 6] = [0xff; 6];
     const MCAST: [u8; 6] = [0x01, 0, 0x5e, 0, 0, 0x01];
 
-    /// One Ethernet frame: 6-byte dst, 6-byte src, 2-byte ethertype, payload.
-    fn frame(dst: [u8; 6], src: [u8; 6], payload: &[u8]) -> Vec<u8> {
-        let mut f = Vec::with_capacity(14 + payload.len());
-        f.extend_from_slice(&dst);
-        f.extend_from_slice(&src);
-        f.extend_from_slice(&[0x08, 0x00]); // IPv4 ethertype
-        f.extend_from_slice(payload);
-        f
-    }
-
     /// An L2 switch with no live reader, plus the dummy TAP backing it (kept alive
     /// by the returned guard fd so the device is not closed mid-test). The backing
     /// socketpair is `SOCK_DGRAM`, so it models per-frame boundaries; it is not the
     /// real TAP `IFF_NO_PI` fd, only a stand-in the switch logic reads and writes.
-    fn test_switch() -> (Arc<TapSwitch>, TapFdGuard) {
+    fn test_switch() -> (Arc<TapSwitch>, DeviceFd) {
         let (dev, peer) = crate::tap::TapDevice::socketpair_for_test(1500).unwrap();
         let sw = TapSwitch::detached(Arc::new(dev), true);
-        (sw, TapFdGuard(peer))
-    }
-
-    /// Closes the peer socketpair fd when the test ends.
-    struct TapFdGuard(std::os::unix::io::RawFd);
-    impl Drop for TapFdGuard {
-        fn drop(&mut self) {
-            unsafe { libc::close(self.0) };
-        }
+        (sw, DeviceFd(peer))
     }
 
     // A learned unicast destination is delivered only to the port that owns it,
@@ -1235,7 +1322,7 @@ mod switch_tests {
         sw.learn(M1, a.port_id);
 
         let f = frame(M1, M2, b"hi");
-        sw.forward_inbound(M1, f.clone());
+        sw.forward_inbound(M1, M2, f.clone());
 
         assert_eq!(a.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
         assert!(b.out_rx.as_mut().unwrap().try_recv().is_err());
@@ -1248,7 +1335,7 @@ mod switch_tests {
         let mut a = sw.add_port(1, None).unwrap();
         let mut b = sw.add_port(1, None).unwrap();
         let f = frame(BCAST, M1, b"b");
-        sw.forward_inbound(BCAST, f.clone());
+        sw.forward_inbound(BCAST, M1, f.clone());
         assert_eq!(a.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
         assert_eq!(b.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
     }
@@ -1260,7 +1347,7 @@ mod switch_tests {
         let mut a = sw.add_port(1, None).unwrap();
         let mut b = sw.add_port(1, None).unwrap();
         let f = frame(M1, M2, b"u");
-        sw.forward_inbound(M1, f.clone());
+        sw.forward_inbound(M1, M2, f.clone());
         assert_eq!(a.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
         assert_eq!(b.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
     }
@@ -1272,7 +1359,7 @@ mod switch_tests {
         let mut a = sw.add_port(1, None).unwrap();
         let mut b = sw.add_port(1, None).unwrap();
         let f = frame(MCAST, M1, b"m");
-        sw.forward_inbound(MCAST, f.clone());
+        sw.forward_inbound(MCAST, M1, f.clone());
         assert_eq!(a.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
         assert_eq!(b.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
     }
@@ -1311,9 +1398,35 @@ mod switch_tests {
         sw.learn(M1, b.port_id); // M1 moved to port b
 
         let f = frame(M1, M2, b"x");
-        sw.forward_inbound(M1, f.clone());
+        sw.forward_inbound(M1, M2, f.clone());
         assert!(a.out_rx.as_mut().unwrap().try_recv().is_err());
         assert_eq!(b.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
+    }
+
+    // A station that transmits from the device's side loses the port binding it
+    // held, so the next unicast for it from another port goes to the device
+    // instead of the port it left.
+    #[tokio::test]
+    async fn device_inbound_source_unlearns_its_port() {
+        let (dev, peer) = crate::tap::TapDevice::socketpair_for_test(1500).unwrap();
+        let _g = DeviceFd(peer);
+        let sw = TapSwitch::segment(Arc::new(dev));
+        let mut a = sw.add_port(1, None).unwrap();
+        let mut b = sw.add_port(1, None).unwrap();
+        sw.learn(M1, a.port_id);
+        sw.learn(M2, b.port_id);
+
+        // M1 moved: it now transmits on the device's side, addressing M2.
+        let moved = frame(M2, M1, b"moved");
+        sw.forward_inbound(M2, M1, moved.clone());
+        assert_eq!(b.out_rx.as_mut().unwrap().try_recv().unwrap(), moved);
+        assert!(!sw.macs.lock().unwrap().contains_key(&M1));
+
+        // B's unicast for M1 goes to the device, not to A.
+        let after = frame(M1, M2, b"after");
+        sw.learn_and_write_egress(&after, b.port_id).await.unwrap();
+        assert_eq!(crate::tap::read_device(peer).await, after);
+        assert!(a.out_rx.as_mut().unwrap().try_recv().is_err());
     }
 
     // Dropping a SwitchHandle detaches its port and purges every MAC it owned, so a
@@ -1333,7 +1446,7 @@ mod switch_tests {
 
         // Now-unknown M1 floods to the surviving port only.
         let f = frame(M1, M2, b"y");
-        sw.forward_inbound(M1, f.clone());
+        sw.forward_inbound(M1, M2, f.clone());
         assert_eq!(b.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
     }
 
@@ -1459,7 +1572,7 @@ mod switch_tests {
         drop(dead.out_rx.take());
 
         let f = frame(BCAST, M1, b"z");
-        sw.flood(f.clone());
+        sw.flood(&f);
 
         // The live port still got it; the dead port was evicted from `ports`.
         assert_eq!(live.out_rx.as_mut().unwrap().try_recv().unwrap(), f);
@@ -1472,7 +1585,7 @@ mod switch_tests {
     #[tokio::test]
     async fn tun_switch_admits_one_port_l2_admits_many() {
         let (dev, peer) = crate::tap::TapDevice::socketpair_for_test(1500).unwrap();
-        let _g = TapFdGuard(peer);
+        let _g = DeviceFd(peer);
         let tun = TapSwitch::detached(Arc::new(dev), false);
 
         let first = tun.add_port(1, None).expect("first tun port attaches");

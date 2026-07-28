@@ -307,12 +307,20 @@ pub enum PeerSlotSpec {
     },
     Provider {
         provides: u8,
-        /// The interface a segment provider bridges.
-        device: Option<String>,
-        /// The tun and masquerade an exit provider runs for the pair it
-        /// serves; unset on a segment provider.
-        exit: Option<PeerExit>,
+        /// What this provider opens for the pairs it serves. Unset leaves the
+        /// pairs to the frame seam, which is what the slot set's owner takes
+        /// when it drives the sessions itself.
+        adapter: Option<ProviderAdapter>,
     },
+}
+
+/// The device a provider opens for the pairs it serves, one per capability.
+#[derive(Clone)]
+pub enum ProviderAdapter {
+    /// The tun and masquerade an exit provider runs for its one pair.
+    Exit(PeerExit),
+    /// The bridged TAP a segment provider attaches every consumer to.
+    Segment(PeerSegment),
 }
 
 /// What an exit provider opens for the pair it serves.
@@ -324,6 +332,42 @@ pub struct PeerExit {
     /// Interface the pair's traffic masquerades out of; the host's
     /// default-route interface when unset.
     pub iface: Option<String>,
+}
+
+/// What a segment provider opens for the consumers it serves.
+#[derive(Clone)]
+pub struct PeerSegment {
+    /// The TAP device the provider's switch reads and writes.
+    pub device: String,
+    pub mtu: usize,
+    /// The bridge the TAP joins, which carries this node's L2 segment.
+    pub bridge: String,
+}
+
+impl ProviderAdapter {
+    /// What this provider can decide about its bringup with no pair in hand.
+    fn precheck(&self) -> Result<()> {
+        match self {
+            ProviderAdapter::Exit(exit) => exit_precheck(exit),
+            ProviderAdapter::Segment(segment) => segment_precheck(segment),
+        }
+    }
+
+    /// The interfaces this adapter opens, which are the claims its slot holds.
+    fn devices(&self) -> Vec<&str> {
+        match self {
+            ProviderAdapter::Exit(exit) => vec![&exit.device],
+            ProviderAdapter::Segment(segment) => vec![&segment.device, &segment.bridge],
+        }
+    }
+
+    /// How this adapter names itself in a log line.
+    fn kind(&self) -> &'static str {
+        match self {
+            ProviderAdapter::Exit(_) => "exit",
+            ProviderAdapter::Segment(_) => "segment",
+        }
+    }
 }
 
 impl PeerSlotSpec {
@@ -339,16 +383,16 @@ impl PeerSlotSpec {
         }
     }
 
-    /// The interface this slot opens, which is the claim it holds: a
-    /// consumer's tun, an exit provider's tun, or the NIC a segment provider
-    /// bridges.
-    pub fn device(&self) -> Option<&str> {
+    /// The interfaces this slot opens, which are the claims it holds: a
+    /// consumer's tun, an exit provider's tun, or a segment provider's TAP and
+    /// the bridge it joins.
+    pub fn devices(&self) -> Vec<&str> {
         match self {
-            PeerSlotSpec::Consumer { device, .. } => device.as_deref(),
-            PeerSlotSpec::Provider { device, exit, .. } => exit
+            PeerSlotSpec::Consumer { device, .. } => device.as_deref().into_iter().collect(),
+            PeerSlotSpec::Provider { adapter, .. } => adapter
                 .as_ref()
-                .map(|e| e.device.as_str())
-                .or(device.as_deref()),
+                .map(ProviderAdapter::devices)
+                .unwrap_or_default(),
         }
     }
 
@@ -422,8 +466,8 @@ pub(crate) fn spawn(
                 PeerSlotSpec::Consumer { peer_id, want, .. } => {
                     tokio::spawn(consumer_slot(peer_id, want, client_id, control, sink))
                 }
-                PeerSlotSpec::Provider { provides, exit, .. } => tokio::spawn(provider_slot(
-                    provides, exit, secret, client_id, control, sink,
+                PeerSlotSpec::Provider { provides, adapter } => tokio::spawn(provider_slot(
+                    provides, adapter, secret, client_id, control, sink,
                 )),
             })
         })
@@ -529,15 +573,16 @@ async fn pair_as_consumer(
 /// `PeerProbe` naming the peer and the capability, and every later frame for
 /// that pair follows the binding the probe installed. A pair that dies takes
 /// its own session down and, on an exit provider, the adapter this task was
-/// running for it; every other pair is untouched.
+/// running for it; on a segment provider, one switch port. Every other pair is
+/// untouched.
 ///
-/// An exit provider's adapter runs in this task rather than in the pair task
-/// that handshaked it, so the device it opens and the rules it installs are
+/// A provider's adapter runs in this task rather than in the pair task that
+/// handshaked it, so the devices it opens and the rules it installs are
 /// released when this task ends. That is what a profile switch awaits before
 /// the incoming slot set claims anything.
 async fn provider_slot(
     provides: u8,
-    exit: Option<PeerExit>,
+    adapter: Option<ProviderAdapter>,
     secret: String,
     client_id: String,
     control: PeerControl,
@@ -546,21 +591,23 @@ async fn provider_slot(
     let (mut rx, _route) = control.register_provider(provides);
     // Exit is exclusive: the slot serves one pair at a time and refuses a
     // second in its handshake answer, which is the only enforcement left once
-    // a punched pair outlives the server-side state that fast-fails it.
+    // a punched pair outlives the server-side state that fast-fails it. A
+    // segment serves every pair at once and is never busy.
     let busy = Arc::new(AtomicBool::new(false));
     let mut pairs: HashMap<u64, mpsc::Sender<Msg>> = HashMap::new();
     let mut running: Vec<(u64, AbortOnDrop)> = Vec::new();
-    // Where the pair that took the exclusive slot hands its adapter over. One
-    // pair at a time reaches it: the hold rides along, so a second is refused
-    // before it has a session to hand over.
-    let (served_tx, mut served_rx) = mpsc::channel::<ExitAdapter>(1);
-    let owner = exit.map(|exit| ExitOwner {
+    // Where a pair hands its session over once the handshake settles. An
+    // exclusive slot sees one at a time: the hold rides along, so a second is
+    // refused before it has a session to hand over.
+    let (served_tx, mut served_rx) = mpsc::channel::<ServedPair>(1);
+    let owner = adapter.map(|adapter| AdapterOwner {
         served: served_tx,
-        exit,
+        health: Arc::new(AdapterHealth::new(adapter.kind())),
+        adapter,
         secret,
-        health: Arc::new(ExitHealth::default()),
     });
-    let mut adapter: Option<ExitAdapter> = None;
+    let mut exit_adapter: Option<ExitAdapter> = None;
+    let mut segment = SegmentPorts::default();
     loop {
         let step = tokio::select! {
             msg = rx.recv() => match msg {
@@ -570,22 +617,36 @@ async fn provider_slot(
             // The sender lives in `owner`, so a slot with no adapter has
             // nothing to listen for and a slot with one never sees the channel
             // close.
-            served = served_rx.recv(), if owner.is_some() && adapter.is_none() => match served {
+            served = served_rx.recv(), if owner.is_some() && exit_adapter.is_none() => match served {
                 Some(served) => SlotStep::Serve(served),
                 None => break,
             },
-            _ = drive(&mut adapter) => SlotStep::AdapterEnded,
+            _ = drive(&mut exit_adapter) => SlotStep::AdapterEnded,
+            ended = segment.drive() => ended,
         };
         let msg = match step {
             SlotStep::Serve(served) => {
-                crate::elog!("peer {}: exit pair up", served.peer_id);
-                adapter = Some(served);
+                if let Some(owner) = &owner {
+                    serve_pair(owner, &mut exit_adapter, &mut segment, served);
+                }
                 continue;
             }
             SlotStep::AdapterEnded => {
-                if let Some(done) = adapter.take() {
+                if let Some(done) = exit_adapter.take() {
                     crate::elog!("peer {}: exit pair ended", done.peer_id);
                 }
+                continue;
+            }
+            SlotStep::PortEnded(peer_id) => {
+                crate::elog!("peer {peer_id}: segment port closed");
+                continue;
+            }
+            SlotStep::DeviceEnded => {
+                // The reader ends when the device stops reading, which is the
+                // device dying and every port on it with it. Closing here
+                // leaves the next pair to open a fresh one.
+                crate::elog!("peer segment: the device stopped; its consumers are detached");
+                segment.close();
                 continue;
             }
             SlotStep::Control(msg) => msg,
@@ -622,7 +683,7 @@ async fn provider_slot(
                     control.clone(),
                     PairOwner {
                         sink: sink.clone(),
-                        exit: owner.clone(),
+                        adapter: owner.clone(),
                     },
                     busy.clone(),
                 );
@@ -645,24 +706,186 @@ async fn provider_slot(
 /// What moved the provider slot's loop forward.
 enum SlotStep {
     Control(Msg),
-    Serve(ExitAdapter),
+    Serve(ServedPair),
     AdapterEnded,
+    PortEnded(String),
+    DeviceEnded,
+}
+
+/// A pair whose handshake settled, on its way from the pair task to the slot
+/// task that runs its adapter. The exclusive hold rides along, so the slot
+/// holds it for as long as it serves the pair.
+struct ServedPair {
+    peer_id: String,
+    session: PeerSession,
+    hold: Option<BusyGuard>,
+}
+
+/// Hand one settled pair to the adapter its slot runs. A segment that cannot
+/// open its device drops the pair and holds the reason against the pairs that
+/// follow, which is what the exit adapter's own bringup failure does.
+fn serve_pair(
+    owner: &AdapterOwner,
+    exit_adapter: &mut Option<ExitAdapter>,
+    segment: &mut SegmentPorts,
+    served: ServedPair,
+) {
+    match &owner.adapter {
+        ProviderAdapter::Exit(exit) => {
+            crate::elog!("peer {}: exit pair up", served.peer_id);
+            *exit_adapter = Some(ExitAdapter {
+                peer_id: served.peer_id,
+                run: Box::pin(run_exit(
+                    served.session,
+                    served.hold,
+                    exit.clone(),
+                    owner.secret.clone(),
+                    owner.health.clone(),
+                )),
+            });
+        }
+        ProviderAdapter::Segment(cfg) => {
+            match segment.attach(cfg, served.peer_id.clone(), served.session) {
+                Ok(()) => crate::elog!("peer {}: segment port up", served.peer_id),
+                Err(e) => {
+                    owner.health.latch(e.to_string());
+                }
+            }
+        }
+    }
 }
 
 /// One pair's exit adapter: the peer it serves, and the future holding the
 /// device it opened, the rules it installed, and the exclusive hold it took.
-/// Built by the pair task and run by the slot task, so the slot's own end is
-/// what releases all three.
+/// Run by the slot task, so the slot's own end is what releases all three.
 struct ExitAdapter {
     peer_id: String,
-    run: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    run: BoxedRun,
 }
+
+/// A running adapter or port, owned by the slot task that polls it.
+type BoxedRun = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// Poll the running adapter, or wait forever while the slot has none.
 async fn drive(adapter: &mut Option<ExitAdapter>) {
     match adapter {
         Some(a) => a.run.as_mut().await,
         None => std::future::pending().await,
+    }
+}
+
+/// A segment provider's open device and the port it holds for each pair it
+/// serves. All of it lives on the slot task, so the slot's end closes every
+/// port, the device, and the bridge port the device holds.
+#[derive(Default)]
+struct SegmentPorts {
+    device: Option<OpenSegment>,
+    ports: Vec<SegmentPort>,
+}
+
+/// The open device and the reader fanning its frames out to the ports.
+struct OpenSegment {
+    seg: SegmentDevice,
+    reader: BoxedRun,
+}
+
+/// One consumer's port on the switch.
+struct SegmentPort {
+    peer_id: String,
+    run: BoxedRun,
+}
+
+impl SegmentPorts {
+    /// Attach one consumer, opening the device on the first pair that needs
+    /// it. The device stays open for the slot's life, so the consumers that
+    /// follow share one switch and one MAC table.
+    fn attach(&mut self, cfg: &PeerSegment, peer_id: String, session: PeerSession) -> Result<()> {
+        if self.device.is_none() {
+            let seg = open_segment(cfg)?;
+            self.device = Some(OpenSegment {
+                reader: segment_reader(&seg),
+                seg,
+            });
+        }
+        self.add_port(peer_id, session)
+    }
+
+    /// Take one port on the open device for a consumer.
+    fn add_port(&mut self, peer_id: String, session: PeerSession) -> Result<()> {
+        let open = self.device.as_ref().expect("the device is open");
+        self.ports.push(SegmentPort {
+            peer_id,
+            run: segment_attach(&open.seg, session)?,
+        });
+        Ok(())
+    }
+
+    /// Poll the device reader and every port, yielding whichever ended. A port
+    /// that ends is removed and leaves the others running.
+    async fn drive(&mut self) -> SlotStep {
+        std::future::poll_fn(|cx| {
+            if let Some(open) = &mut self.device {
+                if open.reader.as_mut().poll(cx).is_ready() {
+                    return std::task::Poll::Ready(SlotStep::DeviceEnded);
+                }
+            }
+            for i in 0..self.ports.len() {
+                if self.ports[i].run.as_mut().poll(cx).is_ready() {
+                    let done = self.ports.swap_remove(i);
+                    return std::task::Poll::Ready(SlotStep::PortEnded(done.peer_id));
+                }
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    }
+
+    /// Drop every port and the device under them.
+    fn close(&mut self) {
+        self.ports.clear();
+        self.device = None;
+    }
+}
+
+/// A segment provider's open device. Off Linux there is none to open, so the
+/// slot never holds one.
+#[cfg(target_os = "linux")]
+type SegmentDevice = crate::peersegment::Segment;
+#[cfg(not(target_os = "linux"))]
+type SegmentDevice = std::convert::Infallible;
+
+/// What a segment provider off Linux answers every pair with.
+#[cfg(not(target_os = "linux"))]
+const NO_TAP_DEVICE: &str =
+    "an l2 segment provider needs a tap device, which is only supported on Linux";
+
+/// Open the TAP and join it to the configured bridge.
+fn open_segment(cfg: &PeerSegment) -> Result<SegmentDevice> {
+    #[cfg(target_os = "linux")]
+    return crate::peersegment::open(cfg);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cfg;
+        Err(NO_TAP_DEVICE.into())
+    }
+}
+
+/// The device's own half of the switch, which the slot polls for its life.
+fn segment_reader(seg: &SegmentDevice) -> BoxedRun {
+    #[cfg(target_os = "linux")]
+    return Box::pin(seg.reader());
+    #[cfg(not(target_os = "linux"))]
+    match *seg {}
+}
+
+/// One consumer's port on the segment's switch.
+fn segment_attach(seg: &SegmentDevice, session: PeerSession) -> Result<BoxedRun> {
+    #[cfg(target_os = "linux")]
+    return Ok(Box::pin(seg.attach(session)?));
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = session;
+        match *seg {}
     }
 }
 
@@ -674,7 +897,7 @@ async fn run_exit(
     _hold: Option<BusyGuard>,
     exit: PeerExit,
     secret: String,
-    health: Arc<ExitHealth>,
+    health: Arc<AdapterHealth>,
 ) {
     #[cfg(target_os = "linux")]
     if let Err(e) = crate::peerexit::serve(session, &exit, &secret).await {
@@ -684,49 +907,59 @@ async fn run_exit(
     let _ = (session, exit, secret, health);
 }
 
-/// Where a served pair goes: the exit adapter the slot runs, else the frame
-/// seam whoever owns the slot set took.
+/// Where a served pair goes: the adapter the slot runs, else the frame seam
+/// whoever owns the slot set took.
 struct PairOwner {
     sink: SessionSink,
-    exit: Option<ExitOwner>,
+    adapter: Option<AdapterOwner>,
 }
 
-/// What an exit provider's pair needs to hand its adapter to the slot: the
-/// channel the slot listens on, the tun and secret the adapter runs with, and
-/// the bringup state the slot carries between pairs.
+/// What a pair needs to hand its session to the slot: the channel the slot
+/// listens on, what the adapter opens, and the bringup state the slot carries
+/// between pairs.
 #[derive(Clone)]
-struct ExitOwner {
-    served: mpsc::Sender<ExitAdapter>,
-    exit: PeerExit,
+struct AdapterOwner {
+    served: mpsc::Sender<ServedPair>,
+    adapter: ProviderAdapter,
     secret: String,
-    health: Arc<ExitHealth>,
+    health: Arc<AdapterHealth>,
 }
 
-/// An exit provider's bringup state. An adapter that cannot come up refuses
-/// the pair rather than accepting it and hanging up: a completed handshake is
-/// a served session to the consumer, which resets its backoff and re-pairs on
-/// the next cycle for as long as the misconfiguration lasts.
-#[derive(Default)]
-struct ExitHealth(Mutex<Option<String>>);
+/// A provider's bringup state. An adapter that cannot come up refuses the pair
+/// rather than accepting it and hanging up: a completed handshake is a served
+/// session to the consumer, which resets its backoff and re-pairs on the next
+/// cycle for as long as the misconfiguration lasts.
+struct AdapterHealth {
+    /// How the log names this provider.
+    kind: &'static str,
+    held: Mutex<Option<String>>,
+}
 
-impl ExitHealth {
-    /// The refusal this provider owes the pair it is about to answer. What it
-    /// can check without a pair decides it; a bringup that failed for a reason
-    /// those checks cannot see refuses the next pair and then lets the one
-    /// after it try again, so a transient failure recovers on its own.
-    fn refusal(&self, exit: &PeerExit) -> Option<String> {
-        match exit_precheck(exit) {
+impl AdapterHealth {
+    fn new(kind: &'static str) -> Self {
+        AdapterHealth {
+            kind,
+            held: Mutex::new(None),
+        }
+    }
+
+    /// The refusal this provider owes the pair it is about to answer. What the
+    /// adapter can check without a pair decides it; a bringup that failed for a
+    /// reason those checks cannot see refuses the next pair and then lets the
+    /// one after it try again, so a transient failure recovers on its own.
+    fn refusal(&self, adapter: &ProviderAdapter) -> Option<String> {
+        match adapter.precheck() {
             Err(e) => Some(self.latch(e.to_string())),
-            Ok(()) => self.0.lock().unwrap().take(),
+            Ok(()) => self.held.lock().unwrap().take(),
         }
     }
 
     /// Record a bringup failure, naming the cause the first time it appears so
     /// a misconfiguration says why once rather than once per pair.
     fn latch(&self, reason: String) -> String {
-        let mut held = self.0.lock().unwrap();
+        let mut held = self.held.lock().unwrap();
         if held.as_deref() != Some(reason.as_str()) {
-            crate::elog!("peer exit: {reason}");
+            crate::elog!("peer {}: {reason}", self.kind);
         }
         *held = Some(reason.clone());
         reason
@@ -741,6 +974,17 @@ fn exit_precheck(exit: &PeerExit) -> Result<()> {
     {
         let _ = exit;
         Ok(())
+    }
+}
+
+/// What a segment provider can decide about its bringup with no pair in hand.
+fn segment_precheck(segment: &PeerSegment) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return crate::peersegment::precheck(segment);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = segment;
+        Err(NO_TAP_DEVICE.into())
     }
 }
 
@@ -779,9 +1023,9 @@ async fn provider_pair(
             // An adapter that cannot come up refuses before it takes the slot,
             // so a provider stuck on its own config never reads as busy.
             let broken = owner
-                .exit
+                .adapter
                 .as_ref()
-                .and_then(|e| e.health.refusal(&e.exit))
+                .and_then(|owner| owner.health.refusal(&owner.adapter))
                 .map(String::into_bytes);
             // The slot is taken here rather than at the pair's start, so two
             // pairs settling at once cannot both be served: the loser's
@@ -819,20 +1063,16 @@ async fn provider_pair(
         }
     };
     match served {
-        Ok(Served::Taken(peer, hold)) => match &owner.exit {
+        Ok(Served::Taken(peer, hold)) => match &owner.adapter {
             // The adapter runs on the slot task, and the hold rides with it,
             // so this task is done the moment it has handed both over.
-            Some(exit) => {
-                exit.served
-                    .send(ExitAdapter {
+            Some(adapter) => {
+                adapter
+                    .served
+                    .send(ServedPair {
                         peer_id,
-                        run: Box::pin(run_exit(
-                            peer,
-                            hold,
-                            exit.exit.clone(),
-                            exit.secret.clone(),
-                            exit.health.clone(),
-                        )),
+                        session: peer,
+                        hold,
                     })
                     .await
                     .ok();
@@ -1192,27 +1432,82 @@ mod tests {
     // see is handed to one pair and then cleared, so the pair after it tries
     // the bringup again.
     #[test]
-    fn a_provider_that_cannot_bring_its_exit_up_refuses_every_pair() {
-        let exit = PeerExit {
+    fn a_provider_that_cannot_bring_its_adapter_up_refuses_every_pair() {
+        let exit = ProviderAdapter::Exit(PeerExit {
             device: "znx0".into(),
             mtu: 1400,
             // Masquerading onto the tun the pair itself rides is a bringup no
             // pair can make work, and it reads the same on every call.
             iface: Some("znx0".into()),
-        };
-        let health = ExitHealth::default();
+        });
+        let health = AdapterHealth::new(exit.kind());
         let first = health.refusal(&exit).expect("a standing failure refuses");
         assert!(first.contains("znx0"), "{first}");
         assert_eq!(health.refusal(&exit), Some(first));
 
+        // A segment provider answers off the same latch, over the bringup its
+        // own precheck decides: a bridge no interface answers to.
+        #[cfg(target_os = "linux")]
+        {
+            let segment = ProviderAdapter::Segment(PeerSegment {
+                device: "zns0".into(),
+                mtu: 1400,
+                bridge: "zeronat-no-such-bridge".into(),
+            });
+            let health = AdapterHealth::new(segment.kind());
+            let refused = health
+                .refusal(&segment)
+                .expect("a standing failure refuses");
+            assert!(refused.contains("zeronat-no-such-bridge"), "{refused}");
+            assert_eq!(health.refusal(&segment), Some(refused));
+        }
+
         // The held reason is what the log speaks on, so repeating it says
         // nothing new; the next pair takes it and leaves the state clear.
-        let health = ExitHealth::default();
+        let health = AdapterHealth::new("exit");
         let busy = "the device is busy".to_string();
         assert_eq!(health.latch(busy.clone()), busy);
         assert_eq!(health.latch(busy.clone()), busy);
-        assert_eq!(health.0.lock().unwrap().take(), Some(busy));
-        assert!(health.0.lock().unwrap().is_none());
+        assert_eq!(health.held.lock().unwrap().take(), Some(busy));
+        assert!(health.held.lock().unwrap().is_none());
+    }
+
+    // A segment provider holds one port per pair on one switch. A pair that
+    // dies takes its own port and nothing else, and the slot names the peer
+    // whose port went; closing the slot drops the ports and the device under
+    // them.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_segment_slot_loses_one_port_per_dead_pair() {
+        // The device is injected, so the ports open no kernel tap.
+        let (seg, dev_fd) = crate::peersegment::Segment::for_test();
+        let mut segment = SegmentPorts {
+            device: Some(OpenSegment {
+                reader: segment_reader(&seg),
+                seg,
+            }),
+            ports: Vec::new(),
+        };
+        let (a, a_provider) = crate::peer::duplex_pair("segment slot", 1).await;
+        let (b, b_provider) = crate::peer::duplex_pair("segment slot", 2).await;
+        segment.add_port("a".into(), a_provider).unwrap();
+        segment.add_port("b".into(), b_provider).unwrap();
+
+        drop(a);
+        let ended = timeout(Duration::from_secs(20), segment.drive())
+            .await
+            .expect("the dead pair's port never ended");
+        assert!(
+            matches!(&ended, SlotStep::PortEnded(peer) if peer == "a"),
+            "the slot named the wrong port"
+        );
+        assert_eq!(segment.ports.len(), 1);
+        assert_eq!(segment.ports[0].peer_id, "b");
+
+        segment.close();
+        assert!(segment.device.is_none());
+        drop(b);
+        unsafe { libc::close(dev_fd) };
     }
 
     // A provider with no adapter hands no session to its slot task, and the
