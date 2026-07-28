@@ -10,6 +10,11 @@ use tokio::time::Instant;
 pub const CLASS_KCP: u8 = 0x01;
 pub const CLASS_SETUP: u8 = 0x02;
 pub const CLASS_DGRAM: u8 = 0x03;
+/// A punch probe: a one-byte datagram carrying nothing but this class, sent by
+/// a punch responder to open its own NAT mapping. The punch loop takes it off
+/// the probe socket's peer queue and drops it; a copy still in flight once the
+/// direct link is up reaches [`route`], which ignores the class.
+pub const CLASS_PUNCH: u8 = 0x04;
 pub const KCP_MTU: usize = 1350;
 
 /// High bit marking a UDP-forward setup/datagram conv. Auto-allocated stream
@@ -316,6 +321,19 @@ impl Session {
         KcpStream::new(write_tx, read_rx)
     }
 
+    /// Drop every conv and dgram this session carries, ending their drivers on
+    /// the closed channel instead of at the idle deadline. A driver with an
+    /// unacked tail otherwise keeps retransmitting for the whole `CONV_IDLE`
+    /// window, so a caller that already knows its peer is gone closes here.
+    ///
+    /// A closed session must not reopen a conv id it carried: the old driver's
+    /// `ConvGuard` erases that key on exit without checking identity, so it
+    /// would take the replacement's map entry with it.
+    pub fn close(&self) {
+        self.convs.lock().unwrap().clear();
+        self.dgrams.lock().unwrap().clear();
+    }
+
     /// True once the session carries no live conv or dgram (and never did, or all
     /// have ended). A freshly built session reads zero until a conv is opened.
     pub fn is_idle(&self) -> bool {
@@ -533,6 +551,27 @@ mod tests {
             "conv slot still held after stream drop"
         );
         assert!(sess.is_idle(), "live counter must reach zero after reap");
+    }
+
+    // close() ends every live conv at once. The stream stays open and its
+    // write is never acked, so the driver would otherwise retransmit until
+    // CONV_IDLE; only the close can reap it.
+    #[tokio::test(start_paused = true)]
+    async fn close_reaps_convs_with_an_unacked_tail() {
+        use tokio::io::AsyncWriteExt;
+
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = sock.local_addr().unwrap();
+        let sess = session(sock, peer, 1);
+
+        let (conv, mut stream) = sess.open_conv(CLASS_KCP);
+        stream.write_all(b"never acked").await.unwrap();
+        assert!(sess.convs.lock().unwrap().contains_key(&conv));
+
+        sess.close();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(sess.is_idle(), "close must reap the conv driver");
+        drop(stream);
     }
 
     // Data written right before the stream drops must still reach the peer:

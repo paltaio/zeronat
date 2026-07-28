@@ -22,8 +22,8 @@ use crate::noise::{server_handshake, server_handshake_stateless, Noise, Stateles
 #[cfg(target_os = "linux")]
 use crate::proto::BridgeEntry;
 use crate::proto::{
-    proto_name, ClientEntry, FwdOptionEntry, Listener, Msg, PeerStatus, Proto, RouteEntry,
-    SnapshotBody, Source, PROVIDES_EXIT,
+    proto_name, ClientEntry, FwdOptionEntry, Listener, Msg, PathStatus, PeerStatus, Proto,
+    RouteEntry, SnapshotBody, Source, PROVIDES_EXIT,
 };
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
@@ -156,14 +156,17 @@ struct Pair {
     info_sent: bool,
 }
 
-/// One party's probe progress. `probe_id` is assigned when the party can
-/// probe (udp control transport). `candidates` is `None` until the party
-/// settles: the server-observed public mapping plus the party's reported
-/// local candidate, or empty for a relay-only party.
+/// One party's probe progress and settled path. `probe_id` is assigned when
+/// the party can probe (udp control transport). `candidates` is `None` until
+/// the party settles: the server-observed public mapping plus the party's
+/// reported local candidate, or empty for a relay-only party. `path` holds
+/// the party's `PeerPath` report, the only signal the server gets about a
+/// punch that never touches it.
 #[derive(Default)]
 struct PartyProbe {
     probe_id: Option<u64>,
     candidates: Option<Vec<SocketAddr>>,
+    path: Option<PathStatus>,
 }
 
 /// A parked public UDP source, the public socket its replies must go out on, the
@@ -315,6 +318,14 @@ impl Server {
             .is_some_and(|h| h.tx.same_channel(consumer_tx) && h.peer_provides.is_some());
         if !owned {
             return None;
+        }
+        // A party never pairs with itself. The punch elects its roles by
+        // comparing the two client ids, so equal ids leave both ends
+        // responders: neither can send handshake message one, the pair burns
+        // its deadline, and an exclusive provider's one slot is held by a
+        // pair that carries nothing.
+        if provider_id == consumer_id {
+            return Some((0, PeerStatus::UnknownPeer));
         }
         let Some(handle) = clients.get(provider_id) else {
             drop(clients);
@@ -525,6 +536,49 @@ impl Server {
                 .ok();
             }
         }
+    }
+
+    /// Record a party's punch outcome against its pair. The sender must own
+    /// its registry slot, have announced peer support, and be a party of a
+    /// live pair; anything else is dropped. The first report per party wins,
+    /// so a repeat cannot rewrite a settled path. Lock order is clients
+    /// before pairs.
+    fn peer_path(
+        &self,
+        client_id: &str,
+        tx: &mpsc::Sender<Vec<u8>>,
+        pair_id: u64,
+        status: PathStatus,
+    ) {
+        {
+            let clients = self.clients.lock().unwrap();
+            let owned = clients
+                .get(client_id)
+                .is_some_and(|h| h.tx.same_channel(tx) && h.peer_provides.is_some());
+            if !owned {
+                return;
+            }
+            let mut pairs = self.pairs.lock().unwrap();
+            let Some(pair) = pairs.get_mut(&pair_id) else {
+                return;
+            };
+            let party = if pair.consumer_id == client_id {
+                &mut pair.consumer
+            } else if pair.provider_id == client_id {
+                &mut pair.provider
+            } else {
+                return;
+            };
+            if party.path.is_some() {
+                return;
+            }
+            party.path = Some(status);
+        }
+        let name = match status {
+            PathStatus::Direct => "direct",
+            PathStatus::Relay => "relay",
+        };
+        crate::elog!("peer pair {pair_id}: {client_id} reports the {name} path");
     }
 }
 
@@ -959,6 +1013,9 @@ pub(crate) async fn serve_stream(
                                 srv.start_pair_probes(pair_id);
                             }
                         }
+                    }
+                    Ok(Msg::PeerPath { pair_id, status }) => {
+                        srv.peer_path(&client_id, &tx, pair_id, status);
                     }
                     _ => {}
                 }
@@ -2188,6 +2245,20 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             Some((0, PeerStatus::NotProvided))
         );
 
+        // A party naming itself reads as unknown, whether or not it provides
+        // the capability it asks for. The punch elects roles by comparing the
+        // two ids, so a self-pair would leave both ends responders while
+        // holding the provider's exclusive slot.
+        let (self_tx, _self_rx) = register_peer_client(&srv, "solo", Some(PROVIDES_EXIT));
+        assert_eq!(
+            srv.peer_connect("solo", &self_tx, "solo", PROVIDES_EXIT),
+            Some((0, PeerStatus::UnknownPeer))
+        );
+        assert_eq!(
+            srv.peer_connect("c", &c_tx, "c", PROVIDES_EXIT),
+            Some((0, PeerStatus::UnknownPeer))
+        );
+
         assert!(srv.pairs.lock().unwrap().is_empty());
     }
 
@@ -2557,6 +2628,58 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             }
         }
         assert!(srv.probes.lock().unwrap().is_empty());
+    }
+
+    // A punch outcome lands on the pair only when the reporting session owns
+    // its registry slot and is a party to it. A stranger's report, one naming
+    // an unknown pair, a repeat after the first, and one from a session a
+    // reconnect superseded are all dropped.
+    #[test]
+    fn peer_path_records_only_a_live_party() {
+        let srv = test_server();
+        let (p_tx, _p_rx) = register_peer_client(&srv, "prov", Some(PROVIDES_EXIT));
+        let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
+        let (o_tx, _o_rx) = register_peer_client(&srv, "other", Some(0));
+        let (pair_id, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+
+        // Both slots are still empty, so a stranger's report has somewhere to
+        // land if the membership check regresses. A report for a pair id that
+        // does not exist must return rather than panic.
+        srv.peer_path("other", &o_tx, pair_id, PathStatus::Relay);
+        srv.peer_path("c", &c_tx, pair_id + 1000, PathStatus::Relay);
+        {
+            let pairs = srv.pairs.lock().unwrap();
+            let pair = pairs.get(&pair_id).unwrap();
+            assert_eq!(pair.consumer.path, None);
+            assert_eq!(pair.provider.path, None);
+        }
+
+        // Each party's own report lands, and the repeat that follows does not
+        // rewrite it.
+        srv.peer_path("c", &c_tx, pair_id, PathStatus::Direct);
+        srv.peer_path("prov", &p_tx, pair_id, PathStatus::Relay);
+        srv.peer_path("c", &c_tx, pair_id, PathStatus::Relay);
+        {
+            let pairs = srv.pairs.lock().unwrap();
+            let pair = pairs.get(&pair_id).unwrap();
+            assert_eq!(pair.consumer.path, Some(PathStatus::Direct));
+            assert_eq!(pair.provider.path, Some(PathStatus::Relay));
+        }
+
+        // A reconnect under the same id swaps the registry entry, so the
+        // stale session's report lands nowhere.
+        srv.invalidate_pairs("c");
+        let (new_tx, _new_rx) = register_peer_client(&srv, "c", Some(0));
+        let (pair2, status) = srv
+            .peer_connect("c", &new_tx, "prov", PROVIDES_EXIT)
+            .unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        srv.peer_path("c", &c_tx, pair2, PathStatus::Direct);
+        assert_eq!(
+            srv.pairs.lock().unwrap().get(&pair2).unwrap().consumer.path,
+            None
+        );
     }
 
     // Probe state dies with the pair: invalidation drops the outstanding

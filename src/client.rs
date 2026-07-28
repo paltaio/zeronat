@@ -33,7 +33,7 @@ use crate::tap::TapConfig;
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
 
-const PING_INTERVAL: Duration = Duration::from_secs(25);
+pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// Liveness window for the control channel. The server replies Pong to every
 /// Ping, so no inbound frame for a few ping intervals means the link is a black
 /// hole (no FIN/RST on a NAT rebind, WAN re-dial, or silent firewall drop).
@@ -337,7 +337,7 @@ struct Client {
 
 /// Aborts its task when dropped. Ties a spawned task's lifetime to the scope
 /// that owns this guard, so the task cannot outlive the connection it serves.
-struct AbortOnDrop<T = ()>(tokio::task::JoinHandle<T>);
+pub(crate) struct AbortOnDrop<T = ()>(pub(crate) tokio::task::JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
@@ -1233,10 +1233,17 @@ async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop, Arc<
     Ok((sess, AbortOnDrop(pump), cancel))
 }
 
-/// Bound on datagrams queued from non-server sources on a probe socket. Punch
-/// traffic is a handful of small probes; when the queue is full, new
-/// datagrams are dropped so a flood cannot grow it.
-const PROBE_PEER_QUEUE: usize = 64;
+/// Bound on datagrams queued from non-server sources on a probe socket. The
+/// queue carries the punch handshake and, once the punch lands, the direct
+/// session's own traffic, so it is sized to the KCP window. When it is full,
+/// new datagrams are dropped so a flood cannot grow it.
+const PROBE_PEER_QUEUE: usize = 256;
+
+/// Resend cadence for the local-candidate frame. It rides the unreliable
+/// dgram channel, where one lost copy would leave this party relay-only for
+/// the pair's whole life, so it repeats until `PeerInfo` arrives; the server
+/// ignores every copy after the first.
+const LOCAL_CANDIDATE_RESEND: Duration = Duration::from_secs(2);
 
 /// A live punch-probe socket and the candidates learned through it. The
 /// socket stays wildcard-bound and unconnected, and the rx pump owns every
@@ -1252,9 +1259,8 @@ pub struct ProbeSession {
     /// The local candidate: the route-source address toward the server,
     /// paired with the socket's bound port.
     pub local: SocketAddr,
-    /// The peer's candidates from this pair's `PeerInfo`, once known.
-    pub peer_candidates: Option<Vec<SocketAddr>>,
     peer_rx: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+    resend: Option<AbortOnDrop>,
     _sess: Arc<Session>,
     _pump: AbortOnDrop,
 }
@@ -1264,6 +1270,13 @@ impl ProbeSession {
     /// with the address it came from.
     pub async fn recv_peer(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
         self.peer_rx.recv().await
+    }
+
+    /// Stop repeating this party's local candidate to the server. The repeats
+    /// wait on the pair's `PeerInfo`; a punch stops them itself, so this is
+    /// for a caller that abandons the pair without punching.
+    pub fn stop_candidate_resend(&mut self) {
+        self.resend = None;
     }
 }
 
@@ -1322,13 +1335,22 @@ pub async fn probe_candidates(
     .map_err(|_| -> crate::Error { "probe handshake timed out".into() })??;
     let public = decode_sockaddr(&reply)?;
     let tx = DgramTx::new(sess.send_tx(), conv, Arc::new(noise));
-    tx.send(&encode_sockaddr(local)).await?;
+    let body = encode_sockaddr(local);
+    tx.send(&body).await?;
+    let resend = AbortOnDrop(tokio::spawn(async move {
+        loop {
+            sleep(LOCAL_CANDIDATE_RESEND).await;
+            if tx.send(&body).await.is_err() {
+                break;
+            }
+        }
+    }));
     Ok(ProbeSession {
         socket,
         public,
         local,
-        peer_candidates: None,
         peer_rx,
+        resend: Some(resend),
         _sess: sess,
         _pump: pump,
     })

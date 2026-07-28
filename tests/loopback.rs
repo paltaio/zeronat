@@ -9,7 +9,7 @@ use tokio::time::{sleep, timeout};
 use zeronat::clientproto::{
     ClientMsg, ClientSnapshotBody, LinkStatus, PppPhase, ServerSecret, SessionMode,
 };
-use zeronat::proto::{Msg, PeerStatus, Proto, Source, PROVIDES_EXIT, PROVIDES_SEGMENT};
+use zeronat::proto::{Msg, PathStatus, PeerStatus, Proto, Source, PROVIDES_EXIT, PROVIDES_SEGMENT};
 use zeronat::server::{ListenerSpec, ServerSettings};
 
 const SECRET: &str = "integration-test-secret";
@@ -3189,6 +3189,10 @@ async fn peer_rendezvous_pairs_and_invalidates() {
 
         let (pair_id, status) = peer_connect(&mut c1r, &mut c1w, "ghost", PROVIDES_EXIT).await;
         assert_eq!((pair_id, status), (0, PeerStatus::UnknownPeer));
+        // A party naming itself reads as unknown: the punch elects roles by
+        // comparing the two ids, so a self-pair has no initiator.
+        let (pair_id, status) = peer_connect(&mut c1r, &mut c1w, "c1", PROVIDES_EXIT).await;
+        assert_eq!((pair_id, status), (0, PeerStatus::UnknownPeer));
         let (pair_id, status) = peer_connect(&mut c1r, &mut c1w, "prov", PROVIDES_SEGMENT).await;
         assert_eq!((pair_id, status), (0, PeerStatus::NotProvided));
 
@@ -3370,16 +3374,12 @@ async fn peer_probe_discovers_candidates_both_ways() {
         );
         assert_eq!(c_sess.local.port(), c_sess.public.port());
 
-        c_sess.peer_candidates = Some(recv_peer_info(&mut cr, pair_id).await);
-        p_sess.peer_candidates = Some(recv_peer_info(&mut pr, pair_id).await);
-        assert_eq!(
-            c_sess.peer_candidates.as_deref(),
-            Some(&[p_sess.public, p_sess.local][..])
-        );
-        assert_eq!(
-            p_sess.peer_candidates.as_deref(),
-            Some(&[c_sess.public, c_sess.local][..])
-        );
+        let c_info = recv_peer_info(&mut cr, pair_id).await;
+        let p_info = recv_peer_info(&mut pr, pair_id).await;
+        assert_eq!(c_info, vec![p_sess.public, p_sess.local]);
+        assert_eq!(p_info, vec![c_sess.public, c_sess.local]);
+        c_sess.stop_candidate_resend();
+        p_sess.stop_candidate_resend();
         // The probe sockets stay open and unconnected for the punch.
         assert!(c_sess.socket.peer_addr().is_err());
         assert!(p_sess.socket.peer_addr().is_err());
@@ -3494,4 +3494,602 @@ async fn peer_probe_skips_tcp_transport_clients() {
     timeout(Duration::from_secs(30), body)
         .await
         .expect("tcp relay-only flow did not complete within 30s");
+}
+
+/// Both parties of a live pair, each with a probe session and the candidate
+/// list its `PeerInfo` carried. The pump handles keep routing server
+/// datagrams into each control session.
+struct PunchParties {
+    pair_id: u64,
+    cr: zeronat::noise::NoiseReader,
+    cw: zeronat::noise::NoiseWriter,
+    c_sess: zeronat::client::ProbeSession,
+    c_cands: Vec<std::net::SocketAddr>,
+    pr: zeronat::noise::NoiseReader,
+    pw: zeronat::noise::NoiseWriter,
+    p_sess: zeronat::client::ProbeSession,
+    p_cands: Vec<std::net::SocketAddr>,
+    _pumps: (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
+}
+
+/// Pair a consumer "c" and a provider "prov" over the udp control transport
+/// and run both candidate probes to completion.
+async fn punch_parties(control: u16) -> PunchParties {
+    let (mut pr, pw, p_pump) = peer_control_connect_udp(control, "prov", PROVIDES_EXIT).await;
+    let (mut cr, mut cw, c_pump) = peer_control_connect_udp(control, "c", 0).await;
+
+    let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
+    assert_eq!(status, PeerStatus::Accepted);
+    let c_probe = recv_peer_probe(&mut cr, pair_id, "prov").await;
+    let p_probe = recv_peer_probe(&mut pr, pair_id, "c").await;
+
+    let psk = zeronat::noise::derive_psk(SECRET);
+    let server = format!("127.0.0.1:{control}").parse().unwrap();
+    let c_sess = zeronat::client::probe_candidates(server, &psk, c_probe)
+        .await
+        .expect("consumer probe");
+    let p_sess = zeronat::client::probe_candidates(server, &psk, p_probe)
+        .await
+        .expect("provider probe");
+    let c_cands = recv_peer_info(&mut cr, pair_id).await;
+    let p_cands = recv_peer_info(&mut pr, pair_id).await;
+
+    PunchParties {
+        pair_id,
+        cr,
+        cw,
+        c_sess,
+        c_cands,
+        pr,
+        pw,
+        p_sess,
+        p_cands,
+        _pumps: (c_pump, p_pump),
+    }
+}
+
+/// Forward the frames a punch reports onto `w`, echoing each one back to the
+/// caller so the test can assert what the party sent. The returned sender
+/// also carries the test's own control frames.
+fn punch_control(
+    mut w: zeronat::noise::NoiseWriter,
+) -> (
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+    tokio::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let (seen_tx, seen_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            seen_tx.send(frame.clone()).await.ok();
+            if w.send(&frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    (tx, seen_rx)
+}
+
+/// Read the next frame a party reported through `punch_control` as its
+/// `PeerPath` for `pair_id`, asserting the settled path.
+async fn expect_peer_path(
+    seen: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    pair_id: u64,
+    want: PathStatus,
+) {
+    let frame = timeout(Duration::from_secs(5), seen.recv())
+        .await
+        .expect("no peer path report")
+        .expect("control channel closed");
+    match Msg::decode(&frame).unwrap() {
+        Msg::PeerPath {
+            pair_id: got,
+            status,
+        } => {
+            assert_eq!(got, pair_id);
+            assert_eq!(status, want);
+        }
+        other => panic!("expected peer path, got {other:?}"),
+    }
+}
+
+/// Read one data frame off a punched session, skipping keepalives.
+async fn recv_punched(link: &mut zeronat::punch::PeerLink) -> Vec<u8> {
+    loop {
+        match timeout(Duration::from_secs(5), link.rx.recv())
+            .await
+            .expect("no frame on the punched session")
+        {
+            Some(zeronat::dgram::Frame::Data(body)) => return body,
+            Some(_) => continue,
+            None => panic!("punched session closed"),
+        }
+    }
+}
+
+/// Send a Ping through `tx` and assert the server answers, proving the
+/// control session survived the `PeerPath` report.
+async fn assert_control_alive(
+    tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    r: &mut zeronat::noise::NoiseReader,
+) {
+    tx.send(Msg::Ping.encode()).await.unwrap();
+    let frame = timeout(Duration::from_secs(5), r.recv())
+        .await
+        .expect("no pong after the peer path report")
+        .unwrap();
+    assert!(
+        matches!(Msg::decode(&frame), Ok(Msg::Pong)),
+        "control session must survive the peer path report"
+    );
+}
+
+// A punch over the loopback candidates brings up an authenticated direct
+// session between two clients: the lower client id runs the Noise initiator,
+// frames ride the punched dgram channel both ways, and both parties report
+// PeerPath direct without disturbing their control sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_punch_establishes_direct_session() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let mut parties = punch_parties(control).await;
+
+        let (c_ctl, mut c_seen) = punch_control(parties.cw);
+        let (p_ctl, mut p_seen) = punch_control(parties.pw);
+        let (c_out, p_out) = tokio::join!(
+            zeronat::punch::punch(
+                parties.c_sess,
+                &parties.c_cands,
+                parties.pair_id,
+                "c",
+                "prov",
+                &psk,
+                &c_ctl
+            ),
+            zeronat::punch::punch(
+                parties.p_sess,
+                &parties.p_cands,
+                parties.pair_id,
+                "prov",
+                "c",
+                &psk,
+                &p_ctl
+            ),
+        );
+        let (mut c_link, mut p_link) = match (c_out, p_out) {
+            (zeronat::punch::PunchOutcome::Direct(c), zeronat::punch::PunchOutcome::Direct(p)) => {
+                (c, p)
+            }
+            _ => panic!("both parties must settle on the direct path"),
+        };
+        expect_peer_path(&mut c_seen, parties.pair_id, PathStatus::Direct).await;
+        expect_peer_path(&mut p_seen, parties.pair_id, PathStatus::Direct).await;
+
+        // The punched session carries frames both ways.
+        c_link.tx.send(b"c-to-prov").await.unwrap();
+        assert_eq!(recv_punched(&mut p_link).await, b"c-to-prov");
+        p_link.tx.send(b"prov-to-c").await.unwrap();
+        assert_eq!(recv_punched(&mut c_link).await, b"prov-to-c");
+
+        assert_control_alive(&c_ctl, &mut parties.cr).await;
+        assert_control_alive(&p_ctl, &mut parties.pr).await;
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("punch flow did not complete within 60s");
+}
+
+// A punch whose only candidate black-holes every datagram settles on the
+// relay when the deadline lapses, far short of the transport idle windows.
+// Both roles are covered: the responder opens its mapping with punch probes
+// and the initiator's handshake goes unanswered, and each party reports
+// PeerPath relay on a control channel that survives the report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_punch_deadline_reports_relay() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let mut parties = punch_parties(control).await;
+
+        // A bound socket nothing ever answers on: every punch datagram is
+        // accepted by the kernel and replied to by no one.
+        let sink = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dead = vec![sink.local_addr().unwrap()];
+
+        // "prov" sorts above "c", so it runs the responder half and is the
+        // only party sending the one-byte mapping opener; the initiator's
+        // handshake rides KCP.
+        let saw_probe = {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1500];
+                loop {
+                    let (n, _) = sink.recv_from(&mut buf).await.unwrap();
+                    if buf[..n] == [zeronat::kcp::CLASS_PUNCH] {
+                        return;
+                    }
+                }
+            })
+        };
+
+        let (c_ctl, mut c_seen) = punch_control(parties.cw);
+        let (p_ctl, mut p_seen) = punch_control(parties.pw);
+        let started = std::time::Instant::now();
+        let (c_out, p_out) = tokio::join!(
+            zeronat::punch::punch(
+                parties.c_sess,
+                &dead,
+                parties.pair_id,
+                "c",
+                "prov",
+                &psk,
+                &c_ctl
+            ),
+            zeronat::punch::punch(
+                parties.p_sess,
+                &dead,
+                parties.pair_id,
+                "prov",
+                "c",
+                &psk,
+                &p_ctl
+            ),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(c_out, zeronat::punch::PunchOutcome::Relay)
+                && matches!(p_out, zeronat::punch::PunchOutcome::Relay),
+            "a black-holed candidate must fall back to the relay"
+        );
+        assert!(
+            elapsed >= zeronat::punch::PUNCH_DEADLINE,
+            "the punch gave up after {elapsed:?}, before its deadline"
+        );
+        assert!(
+            elapsed < zeronat::punch::PUNCH_DEADLINE * 3,
+            "the punch took {elapsed:?}, so the deadline did not bound it"
+        );
+        timeout(Duration::from_secs(1), saw_probe)
+            .await
+            .expect("the responder never sent a punch probe")
+            .unwrap();
+
+        expect_peer_path(&mut c_seen, parties.pair_id, PathStatus::Relay).await;
+        expect_peer_path(&mut p_seen, parties.pair_id, PathStatus::Relay).await;
+        assert_control_alive(&c_ctl, &mut parties.cr).await;
+        assert_control_alive(&p_ctl, &mut parties.pr).await;
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("punch fallback flow did not complete within 60s");
+}
+
+// The local-candidate frame rides the unreliable dgram channel, so it repeats
+// until PeerInfo arrives: a responder that misses the first copy still learns
+// the candidate from a later one, and recording the peer's candidates stops
+// the repeats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_resends_local_candidate_until_peer_info() {
+    let body = async {
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let socket = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = socket.local_addr().unwrap();
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel::<std::net::SocketAddr>(16);
+
+        // A stand-in for the server's probe path: admit the setup conv, seal
+        // the observed address into message two, then report every candidate
+        // frame that arrives instead of settling on the first.
+        let responder = tokio::spawn(async move {
+            let mut sessions: std::collections::HashMap<
+                std::net::SocketAddr,
+                std::sync::Arc<zeronat::kcp::Session>,
+            > = std::collections::HashMap::new();
+            let mut buf = vec![0u8; 65535];
+            loop {
+                let (n, src) = socket.recv_from(&mut buf).await.unwrap();
+                let sess = sessions
+                    .entry(src)
+                    .or_insert_with(|| zeronat::kcp::session(socket.clone(), src, 0))
+                    .clone();
+                if let Some(zeronat::kcp::Accepted::Setup { conv, stream }) =
+                    zeronat::kcp::route(&sess, &buf[..n])
+                {
+                    let frames_tx = frames_tx.clone();
+                    tokio::spawn(async move {
+                        let reply = zeronat::proto::encode_sockaddr(src);
+                        let (_id, noise) =
+                            zeronat::noise::server_handshake_stateless(stream, &psk, &reply)
+                                .await
+                                .unwrap();
+                        let (inbound, _guard) = sess.register_dgram(conv);
+                        let mut rx =
+                            zeronat::dgram::DgramRx::new(inbound, std::sync::Arc::new(noise));
+                        while let Some(frame) = rx.recv().await {
+                            if let zeronat::dgram::Frame::Data(body) = frame {
+                                let a = zeronat::proto::decode_sockaddr(&body).unwrap();
+                                if frames_tx.send(a).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        let mut probe = zeronat::client::probe_candidates(addr, &psk, 7)
+            .await
+            .expect("probe");
+        for nth in 0..2 {
+            let got = timeout(Duration::from_secs(10), frames_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no local candidate frame {nth}"))
+                .unwrap();
+            assert_eq!(got, probe.local);
+        }
+
+        probe.stop_candidate_resend();
+        sleep(Duration::from_millis(200)).await;
+        while frames_rx.try_recv().is_ok() {}
+        sleep(Duration::from_secs(5)).await;
+        assert!(
+            frames_rx.try_recv().is_err(),
+            "the resend must stop once the peer's candidates are known"
+        );
+        responder.abort();
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("candidate resend flow did not complete within 60s");
+}
+
+/// A bidirectional UDP forwarder to `target` with a per-direction delay and
+/// a loss count: the first `drop_dgrams` datagram-channel frames heading to
+/// `target` are discarded, which is how a nomination goes missing. Two of
+/// these give a pair two reachable candidates whose source addresses at the
+/// peer differ, and whose timing decides which one each side would pick on
+/// its own. Returns the address to advertise as that candidate.
+async fn punch_forwarder(
+    target: std::net::SocketAddr,
+    to_target: Duration,
+    to_origin: Duration,
+    drop_dgrams: usize,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let sock = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        let mut origin: Option<std::net::SocketAddr> = None;
+        let mut dropped = 0usize;
+        loop {
+            let Ok((n, src)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
+            let (dst, delay) = if src == target {
+                match origin {
+                    Some(origin) => (origin, to_origin),
+                    None => continue,
+                }
+            } else {
+                origin = Some(src);
+                if buf[..n].first() == Some(&zeronat::kcp::CLASS_DGRAM) && dropped < drop_dgrams {
+                    dropped += 1;
+                    continue;
+                }
+                (target, to_target)
+            };
+            let relay = sock.clone();
+            let datagram = buf[..n].to_vec();
+            tokio::spawn(async move {
+                sleep(delay).await;
+                relay.send_to(&datagram, dst).await.ok();
+            });
+        }
+    });
+    (addr, handle)
+}
+
+// Two candidates both reach the responder's socket, from two source
+// addresses, with delays that would hand each party a different winner if it
+// chose alone: the responder's first message one arrives over "fast-out"
+// while the initiator's first message two comes back over "fast-back". The
+// initiator nominates with its keepalive and the responder settles on that
+// source, so both ends bind one path and frames cross. Picking independently
+// leaves two half-open sessions carrying nothing while both report direct.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_punch_binds_one_path_across_two_candidates() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let parties = punch_parties(control).await;
+
+        // Both candidates forward to the responder's probe socket. "fast-out"
+        // delivers message one first but returns message two last, so each
+        // party's own first-completed handshake names a different candidate.
+        let target = parties.p_sess.public;
+        let (fast_out, _f1) =
+            punch_forwarder(target, Duration::ZERO, Duration::from_millis(800), 0).await;
+        let (fast_back, _f2) =
+            punch_forwarder(target, Duration::from_millis(100), Duration::ZERO, 0).await;
+        assert_ne!(fast_out, fast_back);
+        let c_cands = vec![fast_out, fast_back];
+
+        let (c_ctl, mut c_seen) = punch_control(parties.cw);
+        let (p_ctl, mut p_seen) = punch_control(parties.pw);
+        let (c_out, p_out) = tokio::join!(
+            zeronat::punch::punch(
+                parties.c_sess,
+                &c_cands,
+                parties.pair_id,
+                "c",
+                "prov",
+                &psk,
+                &c_ctl
+            ),
+            zeronat::punch::punch(
+                parties.p_sess,
+                &parties.p_cands,
+                parties.pair_id,
+                "prov",
+                "c",
+                &psk,
+                &p_ctl
+            ),
+        );
+        let (mut c_link, mut p_link) = match (c_out, p_out) {
+            (zeronat::punch::PunchOutcome::Direct(c), zeronat::punch::PunchOutcome::Direct(p)) => {
+                (c, p)
+            }
+            _ => panic!("both parties must settle on the direct path"),
+        };
+
+        // Each forwarder carries both directions on one socket, so a pair
+        // bound to one path sees that forwarder's address from both ends.
+        assert_eq!(
+            c_link.peer, fast_back,
+            "the initiator must nominate the candidate its message two came back on"
+        );
+        assert_eq!(
+            p_link.peer, c_link.peer,
+            "the responder bound a different path than the initiator nominated"
+        );
+
+        c_link.tx.send(b"c-to-prov").await.unwrap();
+        assert_eq!(recv_punched(&mut p_link).await, b"c-to-prov");
+        p_link.tx.send(b"prov-to-c").await.unwrap();
+        assert_eq!(recv_punched(&mut c_link).await, b"prov-to-c");
+
+        expect_peer_path(&mut c_seen, parties.pair_id, PathStatus::Direct).await;
+        expect_peer_path(&mut p_seen, parties.pair_id, PathStatus::Direct).await;
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("multi-candidate punch flow did not complete within 60s");
+}
+
+// A responder handshake completes by writing message two, which says nothing
+// about the reverse path. With no keepalive from the initiator the responder
+// has no evidence the peer can hear it, so it must fall back to the relay
+// instead of reporting a direct path the peer never confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_punch_responder_needs_inbound_evidence() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let parties = punch_parties(control).await;
+        let target = parties.p_sess.public;
+        let conv = (parties.pair_id as u32) | zeronat::kcp::SETUP_CONV_BIT;
+
+        // A hand-rolled initiator that completes the punch handshake against
+        // the responder and then sends nothing at all.
+        let socket = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sess = zeronat::kcp::session(socket.clone(), target, 1);
+        let pump = {
+            let sess = sess.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65535];
+                while let Ok((n, _)) = socket.recv_from(&mut buf).await {
+                    zeronat::kcp::route(&sess, &buf[..n]);
+                }
+            })
+        };
+        let stream = sess.open_conv_with(zeronat::kcp::CLASS_SETUP, conv);
+
+        let (p_ctl, mut p_seen) = punch_control(parties.pw);
+        let (handshake, outcome) = tokio::join!(
+            zeronat::noise::client_handshake_stateless(stream, &psk, parties.pair_id),
+            zeronat::punch::punch(
+                parties.p_sess,
+                &parties.p_cands,
+                parties.pair_id,
+                "prov",
+                "c",
+                &psk,
+                &p_ctl
+            ),
+        );
+        handshake.expect("punch handshake");
+        assert!(
+            matches!(outcome, zeronat::punch::PunchOutcome::Relay),
+            "a completed handshake with no inbound frame is not a direct path"
+        );
+        expect_peer_path(&mut p_seen, parties.pair_id, PathStatus::Relay).await;
+        pump.abort();
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("responder evidence flow did not complete within 60s");
+}
+
+// The nomination rides the unreliable datagram channel while every other
+// punch message is a retransmitted KCP segment, so it repeats inside the
+// deadline: a path that swallows the first copy still settles direct on a
+// later one rather than relaying a pair whose direct path works both ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_punch_survives_a_lost_nomination() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let parties = punch_parties(control).await;
+
+        // The only candidate reaches the responder through a forwarder that
+        // eats the first datagram-channel frame, which is the nomination.
+        let target = parties.p_sess.public;
+        let (lossy, _fwd) = punch_forwarder(target, Duration::ZERO, Duration::ZERO, 1).await;
+        let c_cands = vec![lossy];
+
+        let (c_ctl, mut c_seen) = punch_control(parties.cw);
+        let (p_ctl, mut p_seen) = punch_control(parties.pw);
+        let (c_out, p_out) = tokio::join!(
+            zeronat::punch::punch(
+                parties.c_sess,
+                &c_cands,
+                parties.pair_id,
+                "c",
+                "prov",
+                &psk,
+                &c_ctl
+            ),
+            zeronat::punch::punch(
+                parties.p_sess,
+                &parties.p_cands,
+                parties.pair_id,
+                "prov",
+                "c",
+                &psk,
+                &p_ctl
+            ),
+        );
+        let (mut c_link, mut p_link) = match (c_out, p_out) {
+            (zeronat::punch::PunchOutcome::Direct(c), zeronat::punch::PunchOutcome::Direct(p)) => {
+                (c, p)
+            }
+            _ => panic!("a repeated nomination must still settle both ends direct"),
+        };
+        assert_eq!(c_link.peer, lossy);
+        assert_eq!(p_link.peer, lossy);
+
+        c_link.tx.send(b"c-to-prov").await.unwrap();
+        assert_eq!(recv_punched(&mut p_link).await, b"c-to-prov");
+        p_link.tx.send(b"prov-to-c").await.unwrap();
+        assert_eq!(recv_punched(&mut c_link).await, b"prov-to-c");
+
+        expect_peer_path(&mut c_seen, parties.pair_id, PathStatus::Direct).await;
+        expect_peer_path(&mut p_seen, parties.pair_id, PathStatus::Direct).await;
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("lost-nomination punch flow did not complete within 60s");
 }

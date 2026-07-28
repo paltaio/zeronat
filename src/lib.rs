@@ -23,6 +23,7 @@ pub mod noise;
 pub mod pppoe;
 pub mod proto;
 pub mod proxyproto;
+pub mod punch;
 #[cfg(target_os = "linux")]
 pub mod route;
 pub mod server;
