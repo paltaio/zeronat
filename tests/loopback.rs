@@ -9,7 +9,7 @@ use tokio::time::{sleep, timeout};
 use zeronat::clientproto::{
     ClientMsg, ClientSnapshotBody, LinkStatus, PppPhase, ServerSecret, SessionMode,
 };
-use zeronat::proto::{Msg, Proto, Source};
+use zeronat::proto::{Msg, PeerStatus, Proto, Source, PROVIDES_EXIT, PROVIDES_SEGMENT};
 use zeronat::server::{ListenerSpec, ServerSettings};
 
 const SECRET: &str = "integration-test-secret";
@@ -3099,4 +3099,132 @@ async fn idle_healthy_stream_outlives_reap_udp_transport() {
     timeout(Duration::from_secs(320), body)
         .await
         .expect("udp idle survival did not complete within 320s");
+}
+
+/// Connect a hand-rolled peer-speaking control client: Noise handshake,
+/// `ClientHello`, `PeerAnnounce`, and the ack, asserting the ack echoes this
+/// socket's own address. Retries until the control listener is accepting.
+async fn peer_control_connect(
+    control: u16,
+    client_id: &str,
+    provides: u8,
+) -> (zeronat::noise::NoiseReader, zeronat::noise::NoiseWriter) {
+    let psk = zeronat::noise::derive_psk(SECRET);
+    let (mut r, mut w, local) = loop {
+        if let Ok(sock) = TcpStream::connect(("127.0.0.1", control)).await {
+            sock.set_nodelay(true).ok();
+            let local = sock.local_addr().unwrap();
+            if let Ok((r, w)) = zeronat::noise::client_handshake(sock, &psk).await {
+                break (r, w, local);
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
+    w.send(
+        &Msg::ClientHello {
+            version: zeronat::identity::PROTO_VERSION,
+            client_id: client_id.into(),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    w.send(&Msg::PeerAnnounce { provides }.encode())
+        .await
+        .unwrap();
+    let frame = r.recv().await.unwrap();
+    match Msg::decode(&frame).unwrap() {
+        Msg::PeerAnnounceAck { observed } => assert_eq!(observed, local),
+        other => panic!("expected announce ack, got {other:?}"),
+    }
+    (r, w)
+}
+
+/// One `PeerConnect` round-trip on an announced control session, asserting the
+/// result echoes the requested peer and capability.
+async fn peer_connect(
+    r: &mut zeronat::noise::NoiseReader,
+    w: &mut zeronat::noise::NoiseWriter,
+    peer_id: &str,
+    want: u8,
+) -> (u64, PeerStatus) {
+    w.send(
+        &Msg::PeerConnect {
+            peer_id: peer_id.into(),
+            want,
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let frame = r.recv().await.unwrap();
+    match Msg::decode(&frame).unwrap() {
+        Msg::PeerResult {
+            peer_id: got,
+            want: got_want,
+            pair_id,
+            status,
+        } => {
+            assert_eq!(got, peer_id);
+            assert_eq!(got_want, want);
+            (pair_id, status)
+        }
+        other => panic!("expected peer result, got {other:?}"),
+    }
+}
+
+// Rendezvous against a real server: the announce ack carries the observed
+// control address, an exit provider serves exactly one consumer, failures name
+// their reason, and a pair dies with its consumer's control session - whether
+// that session disconnects or is superseded by a reconnect under the same id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_rendezvous_pairs_and_invalidates() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+
+        let (_pr, _pw) = peer_control_connect(control, "prov", PROVIDES_EXIT).await;
+        let (mut c1r, mut c1w) = peer_control_connect(control, "c1", 0).await;
+        let (mut c2r, mut c2w) = peer_control_connect(control, "c2", 0).await;
+
+        let (pair_id, status) = peer_connect(&mut c1r, &mut c1w, "ghost", PROVIDES_EXIT).await;
+        assert_eq!((pair_id, status), (0, PeerStatus::UnknownPeer));
+        let (pair_id, status) = peer_connect(&mut c1r, &mut c1w, "prov", PROVIDES_SEGMENT).await;
+        assert_eq!((pair_id, status), (0, PeerStatus::NotProvided));
+
+        let (pair1, status) = peer_connect(&mut c1r, &mut c1w, "prov", PROVIDES_EXIT).await;
+        assert_eq!(status, PeerStatus::Accepted);
+        assert_ne!(pair1, 0);
+        let (pair_id, status) = peer_connect(&mut c2r, &mut c2w, "prov", PROVIDES_EXIT).await;
+        assert_eq!((pair_id, status), (0, PeerStatus::PeerBusy));
+
+        // Ending c1's control session frees the exclusive slot once the server
+        // tears it down.
+        drop((c1r, c1w));
+        let pair2 = loop {
+            let (pair, status) = peer_connect(&mut c2r, &mut c2w, "prov", PROVIDES_EXIT).await;
+            match status {
+                PeerStatus::Accepted => break pair,
+                PeerStatus::PeerBusy => sleep(Duration::from_millis(50)).await,
+                other => panic!("unexpected status {other:?}"),
+            }
+        };
+        assert_ne!(pair2, pair1);
+
+        // c1 registered earlier and its control session is gone (the re-pair
+        // above proves the teardown ran), so it reads as offline, not unknown.
+        let (pair_id, status) = peer_connect(&mut c2r, &mut c2w, "c1", PROVIDES_EXIT).await;
+        assert_eq!((pair_id, status), (0, PeerStatus::PeerOffline));
+
+        // A reconnect under c2's id supersedes the session holding the pair, so
+        // the fresh session pairs immediately.
+        let (mut c3r, mut c3w) = peer_control_connect(control, "c2", 0).await;
+        let (pair3, status) = peer_connect(&mut c3r, &mut c3w, "prov", PROVIDES_EXIT).await;
+        assert_eq!(status, PeerStatus::Accepted);
+        assert_ne!(pair3, pair2);
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("peer rendezvous flow did not complete within 30s");
 }

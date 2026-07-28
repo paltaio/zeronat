@@ -22,7 +22,8 @@ use crate::noise::{server_handshake, server_handshake_stateless, Noise, Stateles
 #[cfg(target_os = "linux")]
 use crate::proto::BridgeEntry;
 use crate::proto::{
-    proto_name, ClientEntry, FwdOptionEntry, Listener, Msg, Proto, RouteEntry, SnapshotBody, Source,
+    proto_name, ClientEntry, FwdOptionEntry, Listener, Msg, PeerStatus, Proto, RouteEntry,
+    SnapshotBody, Source, PROVIDES_EXIT,
 };
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
@@ -95,6 +96,13 @@ struct ClientHandle {
     tx: mpsc::Sender<Vec<u8>>,
     transport: ActiveTransport,
     fwd: Arc<HashMap<(Proto, u16), FwdOpt>>,
+    /// The control socket's source address as observed at registration.
+    /// Diagnostic only; never a punch candidate.
+    observed: Option<SocketAddr>,
+    /// The capability bitset from this client's `PeerAnnounce`, or `None` while
+    /// it has not announced. The server sends peer tags only to a client whose
+    /// entry holds `Some`, so an old client never sees an undecodable frame.
+    peer_provides: Option<u8>,
 }
 
 /// One forward's client-announced options: send `OpenProxy` for TCP opens, and
@@ -128,6 +136,15 @@ struct Route {
     source: Source,
 }
 
+/// One accepted rendezvous pair: the two parties and the capability it carries.
+/// Removed when either party's control session ends or is superseded.
+struct Pair {
+    consumer_id: String,
+    provider_id: String,
+    /// The pair's capability: the consumer's validated `want` bit.
+    want: u8,
+}
+
 /// A parked public UDP source, the public socket its replies must go out on, the
 /// channel carrying its inbound datagrams, and the relay's idle window, awaiting
 /// the matching UDP-forward setup conv.
@@ -145,6 +162,11 @@ pub(crate) struct Server {
     pending: Mutex<HashMap<u64, oneshot::Sender<Noise>>>,
     udp_pending: Mutex<HashMap<u64, UdpPending>>,
     clients: Mutex<HashMap<String, ClientHandle>>,
+    /// Every client id that has ever registered on this server, kept across
+    /// disconnects so `PeerConnect` can tell an offline peer from an unknown one.
+    known_clients: Mutex<HashSet<String>>,
+    /// Accepted rendezvous pairs by `pair_id`.
+    pairs: Mutex<HashMap<u64, Pair>>,
     routes: Mutex<HashMap<RouteKey, Route>>,
     listeners: Mutex<HashMap<RouteKey, ListenerHandle>>,
     handshakes: Arc<Semaphore>,
@@ -243,6 +265,81 @@ impl Server {
             return None;
         }
         Some((id, rx, idle))
+    }
+
+    /// Resolve a consumer's `PeerConnect` into a `PeerResult` status, inserting
+    /// a pair on acceptance. `None` means drop the frame without a reply: the
+    /// sending session never announced or lost its registry slot. The clients
+    /// guard spans the ownership check, the provider check, and the insert, so
+    /// a pair only lands while both parties' entries are live and owned; a
+    /// teardown or supersession swaps the registry before invalidating pairs,
+    /// so a racing insert is either refused here or cleared by that
+    /// invalidation. The busy check and the insert share the pair-table lock,
+    /// so two consumers racing for an exclusive provider cannot both pair.
+    /// Lock order is clients before pairs. A failure status carries pair_id 0.
+    fn peer_connect(
+        &self,
+        consumer_id: &str,
+        consumer_tx: &mpsc::Sender<Vec<u8>>,
+        provider_id: &str,
+        want: u8,
+    ) -> Option<(u64, PeerStatus)> {
+        let clients = self.clients.lock().unwrap();
+        let owned = clients
+            .get(consumer_id)
+            .is_some_and(|h| h.tx.same_channel(consumer_tx) && h.peer_provides.is_some());
+        if !owned {
+            return None;
+        }
+        let Some(handle) = clients.get(provider_id) else {
+            drop(clients);
+            // An id that has registered before but holds no live session is
+            // offline; one this server has never seen is unknown.
+            if self.known_clients.lock().unwrap().contains(provider_id) {
+                return Some((0, PeerStatus::PeerOffline));
+            }
+            return Some((0, PeerStatus::UnknownPeer));
+        };
+        if handle.tx.is_closed() {
+            return Some((0, PeerStatus::PeerOffline));
+        }
+        // A provider that never announced provides nothing, same as one whose
+        // announced bitset lacks the requested bit.
+        if handle.peer_provides.is_none_or(|p| p & want == 0) {
+            return Some((0, PeerStatus::NotProvided));
+        }
+        let mut pairs = self.pairs.lock().unwrap();
+        // Exit is exclusive: a tun provider serves one consumer. Segment is
+        // multi-consumer, so it is never busy here.
+        if want == PROVIDES_EXIT
+            && pairs
+                .values()
+                .any(|p| p.provider_id == provider_id && p.want == want)
+        {
+            return Some((0, PeerStatus::PeerBusy));
+        }
+        let pair_id = self.next_id();
+        pairs.insert(
+            pair_id,
+            Pair {
+                consumer_id: consumer_id.to_string(),
+                provider_id: provider_id.to_string(),
+                want,
+            },
+        );
+        crate::elog!("peer pair {pair_id}: {consumer_id} -> {provider_id}");
+        Some((pair_id, PeerStatus::Accepted))
+    }
+
+    /// Remove and return every pair `client_id` is a party to. A pair must not
+    /// outlive either party's control session, so this runs when a session
+    /// ends and when a reconnect supersedes it.
+    fn invalidate_pairs(&self, client_id: &str) -> Vec<(u64, Pair)> {
+        self.pairs
+            .lock()
+            .unwrap()
+            .extract_if(|_, p| p.consumer_id == client_id || p.provider_id == client_id)
+            .collect()
     }
 }
 
@@ -444,6 +541,8 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         pending: Mutex::new(HashMap::new()),
         udp_pending: Mutex::new(HashMap::new()),
         clients: Mutex::new(HashMap::new()),
+        known_clients: Mutex::new(HashSet::new()),
+        pairs: Mutex::new(HashMap::new()),
         routes: Mutex::new(
             routes
                 .into_iter()
@@ -567,11 +666,17 @@ pub(crate) async fn serve_stream(
                         tx: tx.clone(),
                         transport,
                         fwd: Arc::new(HashMap::new()),
+                        observed: peer,
+                        peer_provides: None,
                     },
                 )
             };
+            srv.known_clients.lock().unwrap().insert(client_id.clone());
             if superseded.is_some() {
                 crate::elog!("client {client_id} reconnected, superseding previous session");
+                // The superseded session's pairs would point at a dead handle;
+                // the new session holds none yet, so this only drops stale ones.
+                srv.invalidate_pairs(&client_id);
             }
             crate::elog!("client {client_id} connected");
             let mut w = w;
@@ -625,6 +730,47 @@ pub(crate) async fn serve_stream(
                         // so an old client never sees an undecodable frame.
                         tx.try_send(Msg::FwdOptionsAck.encode()).ok();
                     }
+                    Ok(Msg::PeerAnnounce { provides }) => {
+                        // Record peer support only while this session still owns
+                        // its slot (same guard as FwdOptions); the recorded
+                        // entry gates every later peer tag to this client.
+                        let observed = {
+                            let mut clients = srv.clients.lock().unwrap();
+                            match clients.get_mut(&client_id) {
+                                Some(h) if h.tx.same_channel(&tx) => {
+                                    h.peer_provides = Some(provides);
+                                    h.observed
+                                }
+                                _ => None,
+                            }
+                        };
+                        // The ack echoes the control address recorded at
+                        // registration; like FwdOptionsAck it is only ever sent
+                        // in reply.
+                        if let Some(observed) = observed {
+                            tx.try_send(Msg::PeerAnnounceAck { observed }.encode()).ok();
+                        }
+                    }
+                    Ok(Msg::PeerConnect { peer_id, want }) => {
+                        // `None` marks a sender that never announced or lost
+                        // its slot; the frame is dropped like any unknown
+                        // frame, since replying would send a peer tag through
+                        // an unannounced session.
+                        if let Some((pair_id, status)) =
+                            srv.peer_connect(&client_id, &tx, &peer_id, want)
+                        {
+                            tx.try_send(
+                                Msg::PeerResult {
+                                    peer_id,
+                                    want,
+                                    pair_id,
+                                    status,
+                                }
+                                .encode(),
+                            )
+                            .ok();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -633,14 +779,20 @@ pub(crate) async fn serve_stream(
             // tx no longer matches and this teardown is a no-op; the new session's
             // slot is preserved. A superseded reader runs this same no-op once it
             // times out, which is why the stale reader is left to self-reap.
-            {
+            let removed = {
                 let mut clients = srv.clients.lock().unwrap();
-                if clients
+                let owned = clients
                     .get(&client_id)
-                    .is_some_and(|h| h.tx.same_channel(&tx))
-                {
+                    .is_some_and(|h| h.tx.same_channel(&tx));
+                if owned {
                     clients.remove(&client_id);
                 }
+                owned
+            };
+            // Gated on the real removal so a stale reader's no-op teardown
+            // cannot drop pairs the superseding session created.
+            if removed {
+                srv.invalidate_pairs(&client_id);
             }
             writer.abort();
             crate::elog!("client {client_id} disconnected");
@@ -1651,6 +1803,8 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             pending: Mutex::new(HashMap::new()),
             udp_pending: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
+            known_clients: Mutex::new(HashSet::new()),
+            pairs: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashMap::new()),
             handshakes: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
@@ -1727,5 +1881,298 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             "silent admin request must time out and release the task"
         );
         client.abort();
+    }
+
+    /// Insert a live client handle with the given announced peer bitset,
+    /// recording the id as registered like a real `ClientHello` does. Returns
+    /// the handle's control sender (the session identity `peer_connect`
+    /// checks) and the receiver keeping the channel open; dropping the
+    /// receiver models an entry whose control session is no longer live.
+    fn register_peer_client(
+        srv: &Server,
+        id: &str,
+        peer_provides: Option<u8>,
+    ) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel(8);
+        srv.clients.lock().unwrap().insert(
+            id.into(),
+            ClientHandle {
+                tx: tx.clone(),
+                transport: ActiveTransport::Tcp,
+                fwd: Arc::new(HashMap::new()),
+                observed: None,
+                peer_provides,
+            },
+        );
+        srv.known_clients.lock().unwrap().insert(id.into());
+        (tx, rx)
+    }
+
+    // Every PeerConnect failure names its reason: an id the server has never
+    // seen, a registered id with no live session (torn down or mid-teardown),
+    // a provider that never announced, and one whose announced bitset lacks
+    // the requested bit. None of them may insert a pair.
+    #[test]
+    fn peer_connect_failure_statuses() {
+        use crate::proto::PROVIDES_SEGMENT;
+        let srv = test_server();
+        let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
+
+        assert_eq!(
+            srv.peer_connect("c", &c_tx, "ghost", PROVIDES_EXIT),
+            Some((0, PeerStatus::UnknownPeer))
+        );
+
+        // A completed disconnect removes the registry entry; the id stays known.
+        drop(register_peer_client(&srv, "left", Some(PROVIDES_EXIT)));
+        srv.clients.lock().unwrap().remove("left");
+        assert_eq!(
+            srv.peer_connect("c", &c_tx, "left", PROVIDES_EXIT),
+            Some((0, PeerStatus::PeerOffline))
+        );
+
+        // Mid-teardown the entry lingers with a closed channel; still offline.
+        drop(register_peer_client(&srv, "gone", Some(PROVIDES_EXIT)));
+        assert_eq!(
+            srv.peer_connect("c", &c_tx, "gone", PROVIDES_EXIT),
+            Some((0, PeerStatus::PeerOffline))
+        );
+
+        let _mute = register_peer_client(&srv, "mute", None);
+        assert_eq!(
+            srv.peer_connect("c", &c_tx, "mute", PROVIDES_EXIT),
+            Some((0, PeerStatus::NotProvided))
+        );
+
+        let _seg = register_peer_client(&srv, "seg", Some(PROVIDES_SEGMENT));
+        assert_eq!(
+            srv.peer_connect("c", &c_tx, "seg", PROVIDES_EXIT),
+            Some((0, PeerStatus::NotProvided))
+        );
+
+        assert!(srv.pairs.lock().unwrap().is_empty());
+    }
+
+    // Busy is per capability (a dual provider's segment side stays open while
+    // its exit slot is taken), and invalidating the holding consumer frees the
+    // exclusive slot.
+    #[test]
+    fn exit_pairs_are_exclusive_segment_pairs_are_not() {
+        use crate::proto::PROVIDES_SEGMENT;
+        let srv = test_server();
+        let (_prov_tx, _prov_rx) =
+            register_peer_client(&srv, "prov", Some(PROVIDES_EXIT | PROVIDES_SEGMENT));
+        let (c1_tx, _c1_rx) = register_peer_client(&srv, "c1", Some(0));
+        let (c2_tx, _c2_rx) = register_peer_client(&srv, "c2", Some(0));
+
+        let (exit_pair, status) = srv
+            .peer_connect("c1", &c1_tx, "prov", PROVIDES_EXIT)
+            .unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        assert_ne!(exit_pair, 0);
+        assert_eq!(
+            srv.peer_connect("c2", &c2_tx, "prov", PROVIDES_EXIT),
+            Some((0, PeerStatus::PeerBusy))
+        );
+
+        let (seg1, status1) = srv
+            .peer_connect("c1", &c1_tx, "prov", PROVIDES_SEGMENT)
+            .unwrap();
+        let (seg2, status2) = srv
+            .peer_connect("c2", &c2_tx, "prov", PROVIDES_SEGMENT)
+            .unwrap();
+        assert_eq!(status1, PeerStatus::Accepted);
+        assert_eq!(status2, PeerStatus::Accepted);
+        assert_ne!(seg1, seg2);
+
+        srv.invalidate_pairs("c1");
+        let (_, status) = srv
+            .peer_connect("c2", &c2_tx, "prov", PROVIDES_EXIT)
+            .unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+    }
+
+    // The liveness check and the pair insert share the clients guard, so a
+    // pair only lands while the provider entry is live and the teardown that
+    // removes the entry always invalidates it afterwards. The cross-task
+    // interleaving itself is not reachable from a test seam; this pins the
+    // observable invariant by replaying the teardown order: after removal
+    // plus invalidation no stale pair remains, and the provider's reconnect
+    // pairs instead of reading busy.
+    #[test]
+    fn provider_teardown_leaves_no_stale_pair_to_wedge_reconnect() {
+        let srv = test_server();
+        let live = register_peer_client(&srv, "prov", Some(PROVIDES_EXIT));
+        let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
+        let (first, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+
+        drop(live);
+        srv.clients.lock().unwrap().remove("prov");
+        srv.invalidate_pairs("prov");
+        assert_eq!(
+            srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT),
+            Some((0, PeerStatus::PeerOffline))
+        );
+        assert!(srv.pairs.lock().unwrap().is_empty());
+
+        let (_prov_tx, _prov_rx) = register_peer_client(&srv, "prov", Some(PROVIDES_EXIT));
+        let (second, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        assert_ne!(second, first);
+    }
+
+    // Invalidation removes and returns every pair the client is a party to,
+    // consumer and provider roles alike.
+    #[test]
+    fn invalidate_pairs_covers_both_roles() {
+        use crate::proto::PROVIDES_SEGMENT;
+        let srv = test_server();
+        let (_a_tx, _a_rx) = register_peer_client(&srv, "a", Some(PROVIDES_EXIT));
+        let (b_tx, _b_rx) = register_peer_client(&srv, "b", Some(PROVIDES_SEGMENT));
+        let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
+
+        srv.peer_connect("b", &b_tx, "a", PROVIDES_EXIT);
+        srv.peer_connect("c", &c_tx, "b", PROVIDES_SEGMENT);
+        assert_eq!(srv.pairs.lock().unwrap().len(), 2);
+
+        assert_eq!(srv.invalidate_pairs("b").len(), 2);
+        assert!(srv.pairs.lock().unwrap().is_empty());
+    }
+
+    // A connect from a session whose registry slot was swapped by a reconnect
+    // under the same id inserts nothing and gets no reply, so a stale reader
+    // cannot wedge an exclusive provider with a pair no live session owns.
+    #[test]
+    fn superseded_consumer_connect_is_dropped() {
+        let srv = test_server();
+        let (_prov_tx, _prov_rx) = register_peer_client(&srv, "prov", Some(PROVIDES_EXIT));
+        let (stale_tx, _stale_rx) = register_peer_client(&srv, "c", Some(0));
+        let (new_tx, _new_rx) = register_peer_client(&srv, "c", Some(0));
+
+        assert_eq!(
+            srv.peer_connect("c", &stale_tx, "prov", PROVIDES_EXIT),
+            None
+        );
+        assert!(srv.pairs.lock().unwrap().is_empty());
+
+        // The session that owns the slot pairs as usual.
+        let (pair_id, status) = srv
+            .peer_connect("c", &new_tx, "prov", PROVIDES_EXIT)
+            .unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        assert_ne!(pair_id, 0);
+    }
+
+    // PeerAnnounce is acked with the control address recorded at registration,
+    // and the announced bitset lands on the registry entry that gates every
+    // later peer tag.
+    #[tokio::test]
+    async fn peer_announce_acked_with_recorded_address() {
+        let srv = test_server();
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let psk = srv.psk;
+        let observed: SocketAddr = "203.0.113.7:4321".parse().unwrap();
+
+        let srv2 = srv.clone();
+        let server = tokio::spawn(async move {
+            let (r, w) = crate::noise::server_handshake(server_io, &psk)
+                .await
+                .expect("server handshake");
+            let _ = serve_stream(srv2, r, w, ActiveTransport::Tcp, Some(observed)).await;
+        });
+
+        let (mut cr, mut cw) = crate::noise::client_handshake(client_io, &psk)
+            .await
+            .expect("client handshake");
+        cw.send(
+            &Msg::ClientHello {
+                version: crate::identity::PROTO_VERSION,
+                client_id: "prov".into(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        cw.send(
+            &Msg::PeerAnnounce {
+                provides: PROVIDES_EXIT,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+
+        let bytes = timeout(Duration::from_secs(10), cr.recv())
+            .await
+            .expect("no announce ack")
+            .unwrap();
+        match Msg::decode(&bytes).unwrap() {
+            Msg::PeerAnnounceAck { observed: got } => assert_eq!(got, observed),
+            other => panic!("expected announce ack, got {other:?}"),
+        }
+        assert_eq!(
+            srv.clients
+                .lock()
+                .unwrap()
+                .get("prov")
+                .unwrap()
+                .peer_provides,
+            Some(PROVIDES_EXIT)
+        );
+        server.abort();
+    }
+
+    // A PeerConnect from a client that never announced gets no reply. Control
+    // replies are ordered, so the Pong for the ping sent right after the
+    // connect proves no PeerResult was queued ahead of it.
+    #[tokio::test]
+    async fn peer_connect_before_announce_is_dropped() {
+        let srv = test_server();
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let psk = srv.psk;
+
+        let srv2 = srv.clone();
+        let server = tokio::spawn(async move {
+            let (r, w) = crate::noise::server_handshake(server_io, &psk)
+                .await
+                .expect("server handshake");
+            let peer = Some("192.0.2.1:1".parse().unwrap());
+            let _ = serve_stream(srv2, r, w, ActiveTransport::Tcp, peer).await;
+        });
+
+        let (mut cr, mut cw) = crate::noise::client_handshake(client_io, &psk)
+            .await
+            .expect("client handshake");
+        cw.send(
+            &Msg::ClientHello {
+                version: crate::identity::PROTO_VERSION,
+                client_id: "c".into(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        cw.send(
+            &Msg::PeerConnect {
+                peer_id: "prov".into(),
+                want: PROVIDES_EXIT,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        cw.send(&Msg::Ping.encode()).await.unwrap();
+
+        let bytes = timeout(Duration::from_secs(10), cr.recv())
+            .await
+            .expect("no pong")
+            .unwrap();
+        assert!(
+            matches!(Msg::decode(&bytes), Ok(Msg::Pong)),
+            "unannounced PeerConnect must be dropped without a reply"
+        );
+        assert!(srv.pairs.lock().unwrap().is_empty());
+        server.abort();
     }
 }
