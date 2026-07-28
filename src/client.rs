@@ -21,7 +21,7 @@ use crate::clientproto::{
 };
 use crate::dgram::{DgramRx, DgramTx};
 #[cfg(target_os = "linux")]
-use crate::exitroute::ExitRouteGuard;
+use crate::exitroute::ExitRoutes;
 use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
@@ -539,6 +539,10 @@ pub struct ClientTun {
     /// the uplink and point `0.0.0.0/1`/`128.0.0.0/1` at the device while
     /// the tun profile is active.
     pub exit: bool,
+    /// Exit with no fallback: every original default route is deleted and
+    /// IPv6 blackholed while the routes are up, both restored on clean
+    /// teardown.
+    pub exit_strict: bool,
 }
 
 impl ClientTun {
@@ -974,12 +978,14 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         // its lifetime matches the device: both drop when a switch or teardown
         // ends this iteration, routes first.
         #[cfg(target_os = "linux")]
-        let exit_tun: Option<String> = match &mode {
-            RunMode::Device(DeviceConfig::Tun(cfg)) if cfg.exit => Some(cfg.name.clone()),
+        let exit_tun: Option<(String, bool)> = match &mode {
+            RunMode::Device(DeviceConfig::Tun(cfg)) if cfg.exit => {
+                Some((cfg.name.clone(), cfg.exit_strict))
+            }
             _ => None,
         };
         #[cfg(target_os = "linux")]
-        let mut exit_routes: Option<ExitRouteGuard> = None;
+        let mut exit_routes: Option<ExitRoutes> = None;
 
         let mut udp_health = UdpHealth::default();
         let mut backoff = Backoff::default();
@@ -1021,8 +1027,8 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
             // set) and backs off like a failed connect.
             #[cfg(target_os = "linux")]
             let addr = match &exit_tun {
-                Some(tun_name) => {
-                    match ensure_exit_routes(&mut exit_routes, &addr, tun_name).await {
+                Some((tun_name, strict)) => {
+                    match ensure_exit_routes(&mut exit_routes, &addr, tun_name, *strict).await {
                         Ok(target) => target,
                         Err(e) => {
                             crate::elog!("exit routes for {addr}: {e}");
@@ -1407,13 +1413,16 @@ async fn exit_server_v4(addr: &str) -> Result<Ipv4Addr> {
 /// Program or refresh the exit routes ahead of a dial against `addr`, and
 /// return the literal target the dial must use. The first call pins the
 /// resolved server over the uplink and installs the half-defaults via
-/// `tun_name`; every later call re-asserts the /32 pin, moving it when the
-/// resolved address changed.
+/// `tun_name` (in strict mode also the v6 blackholes and the deletion of
+/// every default route, captured from the same table read as the pin); every
+/// later call re-asserts the /32 pin, moving it when the resolved address
+/// changed.
 #[cfg(target_os = "linux")]
 async fn ensure_exit_routes(
-    guard: &mut Option<ExitRouteGuard>,
+    guard: &mut Option<ExitRoutes>,
     addr: &str,
     tun_name: &str,
+    strict: bool,
 ) -> Result<String> {
     let server = exit_server_v4(addr).await?;
     match guard {
@@ -1422,7 +1431,16 @@ async fn ensure_exit_routes(
             let table = std::fs::read_to_string("/proc/net/route")
                 .map_err(|e| -> crate::Error { format!("reading /proc/net/route: {e}").into() })?;
             let pin = crate::exitroute::plan_server_pin(&table, tun_name, server)?;
-            *guard = Some(ExitRouteGuard::bring_up(pin, tun_name)?);
+            let original = if strict {
+                let defaults = crate::route::parse_all_defaults(&table, tun_name);
+                if defaults.is_empty() {
+                    return Err("no default route to capture for strict exit".into());
+                }
+                Some(defaults)
+            } else {
+                None
+            };
+            *guard = Some(ExitRoutes::bring_up(pin, tun_name, original)?);
         }
     }
     exit_dial_target(server, addr)
@@ -2041,6 +2059,7 @@ mod tests {
             mtu: 1400,
             address: None,
             exit: false,
+            exit_strict: false,
         };
         let a = derived.resolve("secret-a");
         let b = derived.resolve("secret-b");
@@ -2054,6 +2073,7 @@ mod tests {
             mtu: 1400,
             address: Some((Ipv4Addr::new(192, 168, 7, 1), 30)),
             exit: false,
+            exit_strict: false,
         };
         let p = pinned.resolve("secret-a");
         assert_eq!(p.addr, Ipv4Addr::new(192, 168, 7, 1));

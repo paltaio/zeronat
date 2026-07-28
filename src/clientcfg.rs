@@ -76,6 +76,13 @@ pub struct CfgTun {
     /// This node's tunnel address as `(ip, prefix_len)`; derived from the
     /// active server's secret when unset.
     pub address: Option<(Ipv4Addr, u8)>,
+    /// Route the host's IPv4 traffic through the tunnel while the profile is
+    /// up.
+    pub exit: bool,
+    /// Exit with no fallback: every original default route is deleted and
+    /// IPv6 blackholed while the tunnel is up; a crash leaves the host
+    /// without a default route.
+    pub exit_strict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -175,6 +182,8 @@ struct PartialRecord {
     request_dns: Option<bool>,
     dev: Option<String>,
     address: Option<(Ipv4Addr, u8)>,
+    exit: Option<bool>,
+    exit_strict: Option<bool>,
 }
 
 /// Load a client config. A missing file yields the default (empty) config so a
@@ -327,6 +336,8 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
                 match key {
                     "dev" => record.dev = Some(parse_string(value, n)?),
                     "address" => record.address = Some(parse_cidr(value, n)?),
+                    "exit" => record.exit = Some(parse_bool(value, n)?),
+                    "exit_strict" => record.exit_strict = Some(parse_bool(value, n)?),
                     other => {
                         return Err(err(n, &format!("unknown key `{other}` in [tun]")));
                     }
@@ -440,9 +451,16 @@ fn close_record(
             cfg.tap = Some(CfgTap { dev });
         }
         Section::Tun => {
+            let exit = record.exit.take().unwrap_or(false);
+            let exit_strict = record.exit_strict.take().unwrap_or(false);
+            if exit_strict && !exit {
+                return Err(err(n, "`exit_strict = true` requires `exit = true`"));
+            }
             cfg.tun = Some(CfgTun {
                 dev: record.dev.take(),
                 address: record.address.take(),
+                exit,
+                exit_strict,
             });
         }
         Section::None | Section::Client => {}
@@ -579,6 +597,12 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
         if let Some((ip, len)) = tun.address {
             out.push_str(&format!("address = {}\n", quote(&format!("{ip}/{len}"))));
         }
+        if tun.exit {
+            out.push_str("exit = true\n");
+        }
+        if tun.exit_strict {
+            out.push_str("exit_strict = true\n");
+        }
     }
 
     out
@@ -680,6 +704,8 @@ mod tests {
             tun: Some(CfgTun {
                 dev: Some("zn0".into()),
                 address: Some((Ipv4Addr::new(10, 0, 0, 2), 24)),
+                exit: false,
+                exit_strict: false,
             }),
             ..ClientConfig::default()
         };
@@ -690,6 +716,8 @@ mod tests {
             tun: Some(CfgTun {
                 dev: None,
                 address: None,
+                exit: false,
+                exit_strict: false,
             }),
             ..ClientConfig::default()
         };
@@ -698,6 +726,30 @@ mod tests {
             parse_client(&serialize_client(&bare_tun)).unwrap(),
             bare_tun
         );
+    }
+
+    #[test]
+    fn tun_exit_keys_roundtrip_and_default_off() {
+        // A bare [tun] leaves exit mode off, and the false defaults are
+        // omitted from the rendering.
+        let cfg = parse_client("[tun]\nexit = true\n").unwrap();
+        let tun = cfg.tun.as_ref().unwrap();
+        assert!(tun.exit);
+        assert!(!tun.exit_strict);
+        assert_eq!(serialize_client(&cfg), "[tun]\nexit = true\n");
+        assert_eq!(parse_client(&serialize_client(&cfg)).unwrap(), cfg);
+
+        let strict = ClientConfig {
+            tun: Some(CfgTun {
+                dev: Some("zn0".into()),
+                address: None,
+                exit: true,
+                exit_strict: true,
+            }),
+            ..ClientConfig::default()
+        };
+        strict.validate().unwrap();
+        assert_eq!(parse_client(&serialize_client(&strict)).unwrap(), strict);
     }
 
     #[test]
@@ -794,6 +846,15 @@ mod tests {
             "[tun]\naddress = \"10.0.0.2\"\n",
             "[tun]\naddress = \"bogus/24\"\n",
             "[tun]\naddress = \"10.0.0.2/33\"\n",
+            "[tun]\nexit = 1\n",
+            "[tun]\nexit = \"true\"\n",
+            "[tun]\nexit_strict = 1\n",
+            // `exit_strict` hardens exit mode, so it needs exit mode on.
+            "[tun]\nexit_strict = true\n",
+            "[tun]\nexit = false\nexit_strict = true\n",
+            // `exit` is a [tun] key; the other tables reject it.
+            "[client]\nexit = true\n",
+            "[tap]\ndev = \"t0\"\nexit = true\n",
             // `proxy` belongs to tcp entries only, whatever its value and
             // whatever `enabled` says.
             "[[forwards]]\nproto = \"udp\"\nport = 1\nproxy = true\n",

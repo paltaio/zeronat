@@ -60,6 +60,11 @@ client options:
   --proxy             Send a PROXY protocol v2 header on every --tcp forward
   --tun               L3 all-ports mode (Linux only): receive every forwarded
                       port on local services (bind 0.0.0.0 or the tunnel address)
+  --exit              Exit mode (requires --tun): route this host's IPv4
+                      traffic through the server
+  --exit-strict       Strict exit (requires --exit): delete the default routes
+                      and blackhole IPv6 while the routes are up; a crash
+                      leaves the host without a default route
   --transport <MODE>  auto|udp|tcp (default: auto)
   --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
   --tap-mtu <N>       TAP/TUN MTU (default: 1400; alias --tun-mtu)
@@ -149,6 +154,8 @@ enum Cmd {
         tap_name: Option<String>,
         bridge: Option<String>,
         tun: bool,
+        exit: bool,
+        exit_strict: bool,
         mtu: Option<usize>,
         pppoe: bool,
         pppoe_user: Option<String>,
@@ -704,6 +711,8 @@ fn parse_args() -> Result<Cmd> {
         let mut tap_mtu: Option<usize> = None;
         let mut bridge: Option<String> = None;
         let mut tun = false;
+        let mut exit = false;
+        let mut exit_strict = false;
         let mut config: Option<std::path::PathBuf> = None;
         let mut pppoe = false;
         let mut pppoe_user: Option<String> = None;
@@ -725,6 +734,12 @@ fn parse_args() -> Result<Cmd> {
                 }
                 "--tun" => {
                     tun = true;
+                }
+                "--exit" => {
+                    exit = true;
+                }
+                "--exit-strict" => {
+                    exit_strict = true;
                 }
                 "--server" => {
                     server = Some(iter.next().ok_or("--server requires a value")?);
@@ -814,6 +829,8 @@ fn parse_args() -> Result<Cmd> {
             proxy,
             transport,
             tun,
+            exit,
+            exit_strict,
             mtu: tap_mtu,
             tap_name,
             bridge,
@@ -1229,6 +1246,8 @@ async fn run(cmd: Cmd) -> Result<()> {
             tap_name,
             bridge,
             tun,
+            exit,
+            exit_strict,
             mtu,
             pppoe,
             pppoe_user,
@@ -1318,6 +1337,12 @@ async fn run(cmd: Cmd) -> Result<()> {
                 if tun {
                     zeronat::elog!("config overrides --tun");
                 }
+                if exit {
+                    zeronat::elog!("config overrides --exit");
+                }
+                if exit_strict {
+                    zeronat::elog!("config overrides --exit-strict");
+                }
                 if let Some(v) = mtu {
                     zeronat::elog!("config overrides --tap-mtu {v}");
                 }
@@ -1345,7 +1370,8 @@ async fn run(cmd: Cmd) -> Result<()> {
                         .unwrap_or_else(|| DEFAULT_TUN_NAME.to_string()),
                     mtu: DEFAULT_TAP_MTU,
                     address: t.address,
-                    exit: false,
+                    exit: t.exit,
+                    exit_strict: t.exit_strict,
                 });
                 // Every [[pppoe]] entry is resolved at boot so the admin can
                 // spawn any of them; run_switchable derives the boot body
@@ -1441,6 +1467,12 @@ async fn run(cmd: Cmd) -> Result<()> {
                         return Err("--tun cannot be combined with --tcp/--udp forwards".into());
                     }
                 }
+                if exit && !tun {
+                    return Err("--exit requires --tun".into());
+                }
+                if exit_strict && !exit {
+                    return Err("--exit-strict requires --exit".into());
+                }
                 if tap.is_some() && (!tcp.is_empty() || !udp.is_empty()) {
                     return Err("--tap cannot be combined with --tcp/--udp forwards".into());
                 }
@@ -1512,7 +1544,8 @@ async fn run(cmd: Cmd) -> Result<()> {
                         name: DEFAULT_TUN_NAME.to_string(),
                         mtu,
                         address: None,
-                        exit: false,
+                        exit,
+                        exit_strict,
                     })
                 } else {
                     None
@@ -1781,6 +1814,8 @@ mod tests {
                 tun: Some(zeronat::clientcfg::CfgTun {
                     dev: None,
                     address: None,
+                    exit: false,
+                    exit_strict: false,
                 }),
                 ..ClientConfig::default()
             },

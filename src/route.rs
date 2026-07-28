@@ -6,7 +6,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::io::RawFd;
 
 /// The original default route captured before any mutation, so revert can put it
@@ -38,15 +38,32 @@ pub fn default_route_iface(contents: &str, skip_iface: &str) -> Option<String> {
     parse_default(contents, skip_iface, false).map(|d| d.iface)
 }
 
-/// The shared default-route scan. `require_gateway` keeps the pppoe capture
-/// strict (a captured original must be restorable via its gateway) while the
-/// interface lookup takes any dest==0/mask==0 row.
+/// Every active IPv4 default route excluding `skip_iface`, in file order:
+/// each dest==0/mask==0 row, gatewayless ones included. Strict exit captures
+/// the whole set, so a second default at a worse metric does not survive the
+/// delete.
+pub fn parse_all_defaults(contents: &str, skip_iface: &str) -> Vec<CapturedDefault> {
+    scan_defaults(contents, skip_iface, false)
+}
+
+/// The single-row default lookup: the lowest metric wins, ties broken by
+/// file order. `require_gateway` keeps the pppoe capture strict (a captured
+/// original must be restorable via its gateway) while the interface lookup
+/// takes any dest==0/mask==0 row.
 fn parse_default(
     contents: &str,
     skip_iface: &str,
     require_gateway: bool,
 ) -> Option<CapturedDefault> {
-    let mut best: Option<CapturedDefault> = None;
+    scan_defaults(contents, skip_iface, require_gateway)
+        .into_iter()
+        .min_by_key(|d| d.metric)
+}
+
+/// The shared default-route scan: every dest==0/mask==0 row excluding
+/// `skip_iface`, in file order.
+fn scan_defaults(contents: &str, skip_iface: &str, require_gateway: bool) -> Vec<CapturedDefault> {
+    let mut rows = Vec::new();
     for line in contents.lines().skip(1) {
         let f: Vec<&str> = line.split_whitespace().collect();
         // Iface Destination Gateway Flags RefCnt Use Metric Mask ...
@@ -76,19 +93,13 @@ fn parse_default(
             Ok(g) => g,
             Err(_) => continue,
         });
-        let better = match &best {
-            Some(b) => metric < b.metric,
-            None => true,
-        };
-        if better {
-            best = Some(CapturedDefault {
-                gateway,
-                iface: iface.to_string(),
-                metric,
-            });
-        }
+        rows.push(CapturedDefault {
+            gateway,
+            iface: iface.to_string(),
+            metric,
+        });
     }
-    best
+    rows
 }
 
 /// `RTF_GATEWAY` as it appears in the `/proc/net/route` Flags column.
@@ -222,6 +233,71 @@ fn modify_route_inner(
     Ok(())
 }
 
+/// The kernel's `struct in6_rtmsg`, the request `SIOCADDRT`/`SIOCDELRT` reads
+/// on an `AF_INET6` socket; declared here because libc keeps its fields
+/// private.
+#[repr(C)]
+struct In6Rtmsg {
+    dst: libc::in6_addr,
+    _src: libc::in6_addr,
+    _gateway: libc::in6_addr,
+    _type: u32,
+    dst_len: u16,
+    _src_len: u16,
+    _metric: u32,
+    _info: libc::c_ulong,
+    flags: u32,
+    _ifindex: libc::c_int,
+}
+
+/// Whether a failed `AF_INET6` socket open means the host has no IPv6 stack.
+fn no_ipv6_stack(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EAFNOSUPPORT)
+}
+
+/// Add or delete an unreachable IPv6 route via `SIOCADDRT`/`SIOCDELRT` on a
+/// throwaway `AF_INET6` socket. The route rejects matching traffic
+/// (`RTF_REJECT`) and is bound to no device; the zero metric adds at the
+/// kernel's default priority and deletes at any. A host without an IPv6
+/// stack has nothing to blackhole, so `EAFNOSUPPORT` from the socket open is
+/// success for add and delete alike.
+pub fn modify_route6_unreachable(add: bool, dst: Ipv6Addr, prefix: u8) -> crate::Result<()> {
+    let sock = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        let os = io::Error::last_os_error();
+        if no_ipv6_stack(&os) {
+            return Ok(());
+        }
+        return Err(os.into());
+    }
+    let res = modify_route6_inner(sock, add, dst, prefix);
+    unsafe { libc::close(sock) };
+    res
+}
+
+fn modify_route6_inner(sock: RawFd, add: bool, dst: Ipv6Addr, prefix: u8) -> crate::Result<()> {
+    let mut rt: In6Rtmsg = unsafe { std::mem::zeroed() };
+    rt.dst = libc::in6_addr {
+        s6_addr: dst.octets(),
+    };
+    rt.dst_len = prefix as u16;
+    rt.flags = libc::RTF_UP as u32 | libc::RTF_REJECT as u32;
+    let req = if add {
+        libc::SIOCADDRT
+    } else {
+        libc::SIOCDELRT
+    };
+    if unsafe { libc::ioctl(sock, req as _, &rt as *const In6Rtmsg as *mut libc::c_void) } < 0 {
+        let os = io::Error::last_os_error();
+        let op = if add { "SIOCADDRT" } else { "SIOCDELRT" };
+        return Err(Box::new(io::Error::new(
+            os.kind(),
+            format!("{op} {dst}/{prefix}: {os}"),
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +370,52 @@ eth0\t0150A8C0\t00000000\t0005\t0\t0\t100\tFFFFFFFF\t0\t0\t0
             default_route_iface(PPP_ROUTE, "zppp0").as_deref(),
             Some("ppp0")
         );
+    }
+
+    #[test]
+    fn all_defaults_keeps_every_row_and_skips_the_tun() {
+        // Two gateway defaults, a gatewayless one, the tun's own default, and
+        // a connected route: the capture keeps the three uplink defaults in
+        // file order and nothing else.
+        let routes = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+eth0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
+wlan0\t00000000\t0250A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0
+ppp0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
+zn0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
+eth0\t0050A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
+";
+        let all = parse_all_defaults(routes, "zn0");
+        assert_eq!(
+            all,
+            [
+                CapturedDefault {
+                    gateway: Ipv4Addr::new(192, 168, 80, 1),
+                    iface: "eth0".into(),
+                    metric: 100,
+                },
+                CapturedDefault {
+                    gateway: Ipv4Addr::new(192, 168, 80, 2),
+                    iface: "wlan0".into(),
+                    metric: 600,
+                },
+                CapturedDefault {
+                    gateway: Ipv4Addr::UNSPECIFIED,
+                    iface: "ppp0".into(),
+                    metric: 0,
+                },
+            ]
+        );
+        assert!(parse_all_defaults("", "zn0").is_empty());
+    }
+
+    #[test]
+    fn eafnosupport_means_no_ipv6_stack() {
+        assert!(no_ipv6_stack(&io::Error::from_raw_os_error(
+            libc::EAFNOSUPPORT
+        )));
+        assert!(!no_ipv6_stack(&io::Error::from_raw_os_error(libc::EPERM)));
+        assert!(!no_ipv6_stack(&io::Error::other("no os code")));
     }
 
     #[test]

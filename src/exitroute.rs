@@ -5,8 +5,14 @@
 //! length, so the host's own default route stays in place. The decision layer
 //! is pure and unit-tested without touching the host; route mutations go
 //! through the `crate::route` ioctl helpers behind the [`RouteOps`] seam.
+//!
+//! Strict mode closes the fallbacks the base set leaves open: every original
+//! default route is deleted (restored on teardown) and IPv6 is blackholed
+//! with unreachable routes for `::/1` and `8000::/1`, so no traffic escapes
+//! the tunnel while it is up. A crash skips the teardown and leaves the host
+//! without its default routes.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::route;
 
@@ -14,6 +20,12 @@ use crate::route;
 const HALF_DEFAULTS: [(Ipv4Addr, u8); 2] = [
     (Ipv4Addr::new(0, 0, 0, 0), 1),
     (Ipv4Addr::new(128, 0, 0, 0), 1),
+];
+
+/// The two `/1` destinations that together cover all of IPv6.
+const V6_HALF_DEFAULTS: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0),
+    Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0),
 ];
 
 /// One route mutation as data, so the decision layer and the guard's add and
@@ -130,6 +142,48 @@ impl RouteOps for SysRouteOps {
     }
 }
 
+/// One strict-mode route mutation as data, testable like [`RouteChange`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StrictChange {
+    /// One captured original IPv4 default route; deleted at bringup
+    /// (`add = false`), restored on teardown. `gw` is `None` for a captured
+    /// gatewayless default, which goes back link-scoped on its interface.
+    Default {
+        add: bool,
+        gw: Option<Ipv4Addr>,
+        iface: String,
+        metric: u32,
+    },
+    /// An unreachable route covering one half of IPv6.
+    Unreachable {
+        add: bool,
+        dst: Ipv6Addr,
+        prefix: u8,
+    },
+}
+
+/// How strict-mode mutations reach the kernel, the strict sibling of
+/// [`RouteOps`].
+pub trait StrictOps {
+    fn apply(&mut self, change: &StrictChange) -> crate::Result<()>;
+}
+
+impl StrictOps for SysRouteOps {
+    fn apply(&mut self, c: &StrictChange) -> crate::Result<()> {
+        match c {
+            StrictChange::Default {
+                add,
+                gw,
+                iface,
+                metric,
+            } => route::modify_route(*add, Ipv4Addr::UNSPECIFIED, 0, *gw, Some(iface), *metric),
+            StrictChange::Unreachable { add, dst, prefix } => {
+                route::modify_route6_unreachable(*add, *dst, *prefix)
+            }
+        }
+    }
+}
+
 /// Holds the programmed exit routes and removes them on drop. Held across
 /// redials: the routes live as long as the tun session, and the /32 pin is
 /// re-asserted before every dial because the guard's state is a cache of what
@@ -209,6 +263,115 @@ impl<S: RouteOps> Drop for ExitRouteGuard<S> {
         for change in self.changes(false).into_iter().rev() {
             let _ = self.ops.apply(&change);
         }
+    }
+}
+
+/// Holds the strict-mode route set: the v6 blackholes and the deleted
+/// original defaults, undone in reverse on drop.
+pub struct StrictRouteGuard<S: StrictOps = SysRouteOps> {
+    /// Every captured default, worst metric first: the deletion order.
+    defaults: Vec<route::CapturedDefault>,
+    ops: S,
+}
+
+impl<S: StrictOps> StrictRouteGuard<S> {
+    /// Program the strict set: the v6 blackholes, then the default deletes
+    /// last, worst metric first and the best last, so a failed earlier step
+    /// never leaves the host without its working default. A failed step
+    /// drops the guard, which unwinds the whole set.
+    pub fn bring_up_with(ops: S, mut defaults: Vec<route::CapturedDefault>) -> crate::Result<Self> {
+        defaults.sort_by_key(|d| std::cmp::Reverse(d.metric));
+        let mut guard = StrictRouteGuard { defaults, ops };
+        for change in guard.changes(true) {
+            guard.ops.apply(&change)?;
+        }
+        Ok(guard)
+    }
+
+    /// The strict change set in bringup order; reversed, the teardown order.
+    /// The default entries invert `up`: bringup deletes every captured
+    /// default and teardown restores them, best metric first. A gateway of
+    /// `0.0.0.0` in a capture means that default was gatewayless, restored
+    /// link-scoped.
+    fn changes(&self, up: bool) -> Vec<StrictChange> {
+        let mut v: Vec<StrictChange> = V6_HALF_DEFAULTS
+            .iter()
+            .map(|&dst| StrictChange::Unreachable {
+                add: up,
+                dst,
+                prefix: 1,
+            })
+            .collect();
+        for d in &self.defaults {
+            v.push(StrictChange::Default {
+                add: !up,
+                gw: (d.gateway != Ipv4Addr::UNSPECIFIED).then_some(d.gateway),
+                iface: d.iface.clone(),
+                metric: d.metric,
+            });
+        }
+        v
+    }
+}
+
+impl<S: StrictOps> Drop for StrictRouteGuard<S> {
+    /// Restore the defaults first, then remove the v6 blackholes (the
+    /// bringup order reversed). Each step is best-effort so a partially
+    /// applied bringup unwinds cleanly; a restore may find its default still
+    /// in place when the delete never ran.
+    fn drop(&mut self) {
+        for change in self.changes(false).into_iter().rev() {
+            let _ = self.ops.apply(&change);
+        }
+    }
+}
+
+/// The whole exit route set for one tun session: the base routes always, the
+/// strict set on top when strict mode is on. Field order is the teardown
+/// order: the strict set drops first, so the original default is back before
+/// the base routes come off.
+pub struct ExitRoutes<S: RouteOps = SysRouteOps, T: StrictOps = SysRouteOps> {
+    #[allow(dead_code)] // held for its Drop
+    strict: Option<StrictRouteGuard<T>>,
+    base: ExitRouteGuard<S>,
+}
+
+impl ExitRoutes {
+    /// Program the base routes and, when `strict` carries the captured
+    /// defaults, the strict set on top of them.
+    pub fn bring_up(
+        pin: ServerPin,
+        tun_name: &str,
+        strict: Option<Vec<route::CapturedDefault>>,
+    ) -> crate::Result<Self> {
+        Self::bring_up_with(SysRouteOps, SysRouteOps, pin, tun_name, strict)
+    }
+}
+
+impl<S: RouteOps, T: StrictOps> ExitRoutes<S, T> {
+    /// Base set first, strict set second; a failed strict bringup drops the
+    /// base guard, so an error here leaves no route behind.
+    pub fn bring_up_with(
+        ops: S,
+        strict_ops: T,
+        pin: ServerPin,
+        tun_name: &str,
+        strict: Option<Vec<route::CapturedDefault>>,
+    ) -> crate::Result<Self> {
+        let base = ExitRouteGuard::bring_up_with(ops, pin, tun_name)?;
+        let strict = match strict {
+            Some(defaults) => Some(StrictRouteGuard::bring_up_with(strict_ops, defaults)?),
+            None => None,
+        };
+        Ok(ExitRoutes { strict, base })
+    }
+
+    /// Assert the /32 pin for `server` ahead of a dial. The strict set is
+    /// never re-asserted: the v6 unreachable routes are bound to no
+    /// interface, so no uplink flap purges them, and the deleted defaults
+    /// are an absence with nothing to re-add.
+    pub fn assert_pin(&mut self, server: Ipv4Addr) -> crate::Result<()> {
+        self.base.assert_pin(server)
     }
 }
 
@@ -427,6 +590,278 @@ zn0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
             ..Fault::default()
         });
         assert!(guard.assert_pin(SERVER).is_err());
+    }
+
+    /// One applied change from either seam, so the composed guard's ordering
+    /// across both is assertable in a single log.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Entry {
+        Base(RouteChange),
+        Strict(StrictChange),
+    }
+
+    type MixedLog = Rc<RefCell<Vec<Entry>>>;
+
+    struct BaseRec {
+        log: MixedLog,
+    }
+
+    impl RouteOps for BaseRec {
+        fn apply(&mut self, change: &RouteChange) -> crate::Result<()> {
+            self.log.borrow_mut().push(Entry::Base(change.clone()));
+            Ok(())
+        }
+    }
+
+    /// Records strict changes; `fail_delete_iface` refuses the default
+    /// delete for that interface.
+    struct StrictRec {
+        log: MixedLog,
+        fail_delete_iface: Option<&'static str>,
+    }
+
+    impl StrictOps for StrictRec {
+        fn apply(&mut self, change: &StrictChange) -> crate::Result<()> {
+            if let StrictChange::Default {
+                add: false, iface, ..
+            } = change
+            {
+                if self.fail_delete_iface == Some(iface.as_str()) {
+                    return Err("delete refused".into());
+                }
+            }
+            self.log.borrow_mut().push(Entry::Strict(change.clone()));
+            Ok(())
+        }
+    }
+
+    fn captured(gw: [u8; 4], iface: &str, metric: u32) -> route::CapturedDefault {
+        route::CapturedDefault {
+            gateway: Ipv4Addr::from(gw),
+            iface: iface.into(),
+            metric,
+        }
+    }
+
+    fn v6half(hi: u16, add: bool) -> StrictChange {
+        StrictChange::Unreachable {
+            add,
+            dst: Ipv6Addr::new(hi, 0, 0, 0, 0, 0, 0, 0),
+            prefix: 1,
+        }
+    }
+
+    fn default_change(add: bool, gw: Option<[u8; 4]>, iface: &str, metric: u32) -> StrictChange {
+        StrictChange::Default {
+            add,
+            gw: gw.map(Ipv4Addr::from),
+            iface: iface.into(),
+            metric,
+        }
+    }
+
+    #[test]
+    fn strict_bringup_blackholes_v6_then_deletes_the_default_last() {
+        let log: MixedLog = Rc::new(RefCell::new(Vec::new()));
+        let rec = StrictRec {
+            log: log.clone(),
+            fail_delete_iface: None,
+        };
+        let guard =
+            StrictRouteGuard::bring_up_with(rec, vec![captured([192, 168, 80, 1], "eth0", 100)])
+                .unwrap();
+        assert_eq!(
+            *log.borrow(),
+            [
+                Entry::Strict(v6half(0, true)),
+                Entry::Strict(v6half(0x8000, true)),
+                Entry::Strict(default_change(false, Some([192, 168, 80, 1]), "eth0", 100)),
+            ]
+        );
+
+        // Teardown reversed: the default is back before the blackholes lift.
+        log.borrow_mut().clear();
+        drop(guard);
+        assert_eq!(
+            *log.borrow(),
+            [
+                Entry::Strict(default_change(true, Some([192, 168, 80, 1]), "eth0", 100)),
+                Entry::Strict(v6half(0x8000, false)),
+                Entry::Strict(v6half(0, false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn gatewayless_captured_default_restores_link_scoped() {
+        let log: MixedLog = Rc::new(RefCell::new(Vec::new()));
+        let rec = StrictRec {
+            log: log.clone(),
+            fail_delete_iface: None,
+        };
+        let guard =
+            StrictRouteGuard::bring_up_with(rec, vec![captured([0, 0, 0, 0], "ppp0", 0)]).unwrap();
+        log.borrow_mut().clear();
+        drop(guard);
+        assert_eq!(
+            log.borrow().first(),
+            Some(&Entry::Strict(default_change(true, None, "ppp0", 0)))
+        );
+    }
+
+    #[test]
+    fn every_captured_default_is_deleted_worst_first_and_restored_in_reverse() {
+        // Two uplink defaults plus the tun's own row: the capture takes both
+        // uplink rows and skips the tun. Gateways 0150A8C0 and 0100000A are
+        // little-endian 192.168.80.1 and 10.0.0.1.
+        let routes = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+eth0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
+wlan0\t00000000\t0100000A\t0003\t0\t0\t600\t00000000\t0\t0\t0
+zn0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
+";
+        let defaults = route::parse_all_defaults(routes, "zn0");
+        assert_eq!(defaults.len(), 2);
+
+        let log: MixedLog = Rc::new(RefCell::new(Vec::new()));
+        let rec = StrictRec {
+            log: log.clone(),
+            fail_delete_iface: None,
+        };
+        // Bringup deletes worst metric first: no default survives, and the
+        // best one is the last to go.
+        let guard = StrictRouteGuard::bring_up_with(rec, defaults).unwrap();
+        assert_eq!(
+            *log.borrow(),
+            [
+                Entry::Strict(v6half(0, true)),
+                Entry::Strict(v6half(0x8000, true)),
+                Entry::Strict(default_change(false, Some([10, 0, 0, 1]), "wlan0", 600)),
+                Entry::Strict(default_change(false, Some([192, 168, 80, 1]), "eth0", 100)),
+            ]
+        );
+
+        // Teardown restores in reverse: best first, worst last.
+        log.borrow_mut().clear();
+        drop(guard);
+        assert_eq!(
+            *log.borrow(),
+            [
+                Entry::Strict(default_change(true, Some([192, 168, 80, 1]), "eth0", 100)),
+                Entry::Strict(default_change(true, Some([10, 0, 0, 1]), "wlan0", 600)),
+                Entry::Strict(v6half(0x8000, false)),
+                Entry::Strict(v6half(0, false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_delete_restores_the_rows_already_deleted() {
+        let log: MixedLog = Rc::new(RefCell::new(Vec::new()));
+        let rec = StrictRec {
+            log: log.clone(),
+            fail_delete_iface: Some("eth0"),
+        };
+        let res = StrictRouteGuard::bring_up_with(
+            rec,
+            vec![
+                captured([192, 168, 80, 1], "eth0", 100),
+                captured([10, 0, 0, 1], "wlan0", 600),
+            ],
+        );
+        assert!(res.is_err());
+        // The worst default (wlan0) was already gone when the best delete
+        // was refused; the unwind puts both back, best first, then lifts the
+        // blackholes.
+        assert_eq!(
+            *log.borrow(),
+            [
+                Entry::Strict(v6half(0, true)),
+                Entry::Strict(v6half(0x8000, true)),
+                Entry::Strict(default_change(false, Some([10, 0, 0, 1]), "wlan0", 600)),
+                Entry::Strict(default_change(true, Some([192, 168, 80, 1]), "eth0", 100)),
+                Entry::Strict(default_change(true, Some([10, 0, 0, 1]), "wlan0", 600)),
+                Entry::Strict(v6half(0x8000, false)),
+                Entry::Strict(v6half(0, false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn strict_exit_layers_over_the_base_set_and_drop_reverses() {
+        let log: MixedLog = Rc::new(RefCell::new(Vec::new()));
+        let base = BaseRec { log: log.clone() };
+        let strict = StrictRec {
+            log: log.clone(),
+            fail_delete_iface: None,
+        };
+        let pin = plan_server_pin(GW_ROUTE, "zn0", SERVER).unwrap();
+        let original = vec![captured([192, 168, 80, 1], "eth0", 100)];
+        let mut guard =
+            ExitRoutes::bring_up_with(base, strict, pin.clone(), "zn0", Some(original)).unwrap();
+        assert_eq!(
+            *log.borrow(),
+            [
+                Entry::Base(pin.change(true)),
+                Entry::Base(half(true, [0, 0, 0, 0], "zn0")),
+                Entry::Base(half(true, [128, 0, 0, 0], "zn0")),
+                Entry::Strict(v6half(0, true)),
+                Entry::Strict(v6half(0x8000, true)),
+                Entry::Strict(default_change(false, Some([192, 168, 80, 1]), "eth0", 100)),
+            ]
+        );
+
+        // A redial re-asserts the pin only; the strict set is left alone.
+        log.borrow_mut().clear();
+        guard.assert_pin(SERVER).unwrap();
+        assert_eq!(*log.borrow(), [Entry::Base(pin.change(true))]);
+
+        log.borrow_mut().clear();
+        drop(guard);
+        assert_eq!(
+            *log.borrow(),
+            [
+                Entry::Strict(default_change(true, Some([192, 168, 80, 1]), "eth0", 100)),
+                Entry::Strict(v6half(0x8000, false)),
+                Entry::Strict(v6half(0, false)),
+                Entry::Base(half(false, [128, 0, 0, 0], "zn0")),
+                Entry::Base(half(false, [0, 0, 0, 0], "zn0")),
+                Entry::Base(pin.change(false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_strict_bringup_unwinds_and_restores_the_default() {
+        let log: MixedLog = Rc::new(RefCell::new(Vec::new()));
+        let base = BaseRec { log: log.clone() };
+        let strict = StrictRec {
+            log: log.clone(),
+            fail_delete_iface: Some("eth0"),
+        };
+        let pin = plan_server_pin(GW_ROUTE, "zn0", SERVER).unwrap();
+        let original = vec![captured([192, 168, 80, 1], "eth0", 100)];
+        let res = ExitRoutes::bring_up_with(base, strict, pin.clone(), "zn0", Some(original));
+        assert!(res.is_err());
+        // The base set and the blackholes went in; the refused delete unwinds
+        // the whole stack, the default restore first (best-effort: here the
+        // delete never ran, so it finds the default still in place).
+        assert_eq!(
+            *log.borrow(),
+            [
+                Entry::Base(pin.change(true)),
+                Entry::Base(half(true, [0, 0, 0, 0], "zn0")),
+                Entry::Base(half(true, [128, 0, 0, 0], "zn0")),
+                Entry::Strict(v6half(0, true)),
+                Entry::Strict(v6half(0x8000, true)),
+                Entry::Strict(default_change(true, Some([192, 168, 80, 1]), "eth0", 100)),
+                Entry::Strict(v6half(0x8000, false)),
+                Entry::Strict(v6half(0, false)),
+                Entry::Base(half(false, [128, 0, 0, 0], "zn0")),
+                Entry::Base(half(false, [0, 0, 0, 0], "zn0")),
+                Entry::Base(pin.change(false)),
+            ]
+        );
     }
 
     #[test]
