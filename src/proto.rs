@@ -18,6 +18,30 @@ pub enum Source {
     Runtime,
 }
 
+/// `provides` bit: the announcing client offers an L3 exit.
+pub const PROVIDES_EXIT: u8 = 1 << 0;
+/// `provides` bit: the announcing client offers an L2 segment.
+pub const PROVIDES_SEGMENT: u8 = 1 << 1;
+
+const PROVIDES_MASK: u8 = PROVIDES_EXIT | PROVIDES_SEGMENT;
+
+/// Outcome of a `PeerConnect`, reported to the consumer in `PeerResult`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerStatus {
+    Accepted,
+    UnknownPeer,
+    PeerOffline,
+    NotProvided,
+    PeerBusy,
+}
+
+/// The path a party settled on for a pair, reported in `PeerPath`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathStatus {
+    Direct,
+    Relay,
+}
+
 /// A public port the server is listening on, as reported in a `Snapshot`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Listener {
@@ -109,6 +133,13 @@ pub struct FwdOptionEntry {
 /// Admin channel (admin -> server): `AdminHello` mode 0 -> `Snapshot`; mode 1 ->
 /// one mutation message (`AddListener`/`RemoveListener`/`SetRoute`/`ClearRoute`),
 /// answered by `MutationResult`.
+/// Peer rendezvous (control channel): a peer-capable client sends `PeerAnnounce`
+/// after `ClientHello`; the server replies `PeerAnnounceAck` (an old server never
+/// acks, so an unacked announce means no peer support). A consumer sends
+/// `PeerConnect`, answered by `PeerResult`; on acceptance the server sends
+/// `PeerProbe` and `PeerInfo` to both parties, each party reports its punch
+/// outcome with `PeerPath`, and on fallback the server sends `PeerRelayOpen`
+/// to both parties.
 #[derive(Debug)]
 pub enum Msg {
     Ping,
@@ -171,6 +202,55 @@ pub enum Msg {
         /// The public listener address the connection arrived on.
         local: SocketAddr,
     },
+    PeerAnnounce {
+        /// Capability bitset: `PROVIDES_EXIT` and/or `PROVIDES_SEGMENT`; a
+        /// consumer announces with no bits set.
+        provides: u8,
+    },
+    PeerAnnounceAck {
+        /// The control socket's source address as the server observed it.
+        /// Diagnostic only; never a punch candidate.
+        observed: SocketAddr,
+    },
+    PeerConnect {
+        /// The provider's `client_id`.
+        peer_id: String,
+        /// The requested capability: exactly one provides bit.
+        want: u8,
+    },
+    PeerResult {
+        peer_id: String,
+        /// The requested capability echoed back, so concurrent connects to
+        /// one peer correlate.
+        want: u8,
+        pair_id: u64,
+        status: PeerStatus,
+    },
+    PeerProbe {
+        pair_id: u64,
+        /// The other party's `client_id`.
+        peer_id: String,
+        /// This party's server-assigned probe id, carried in the punch
+        /// probe's handshake app id.
+        probe_id: u64,
+        /// The pair's capability: the consumer's `want` bit, forwarded to
+        /// both parties.
+        provides: u8,
+    },
+    PeerInfo {
+        pair_id: u64,
+        /// The other party's punch candidates; empty when it is relay-only.
+        candidates: Vec<SocketAddr>,
+    },
+    PeerRelayOpen {
+        pair_id: u64,
+        /// This party's relay leg id, claimed with `Data`.
+        id: u64,
+    },
+    PeerPath {
+        pair_id: u64,
+        status: PathStatus,
+    },
 }
 
 pub(crate) fn proto_byte(p: Proto) -> u8 {
@@ -202,6 +282,58 @@ fn source_from_byte(n: u8) -> Result<Source> {
         1 => Ok(Source::Cli),
         2 => Ok(Source::Runtime),
         n => Err(format!("unknown source byte {n}").into()),
+    }
+}
+
+/// Validate a `provides` bitset: any bit outside the defined set is rejected.
+fn provides_from_byte(n: u8) -> Result<u8> {
+    if n & !PROVIDES_MASK != 0 {
+        return Err(format!("unknown provides byte {n}").into());
+    }
+    Ok(n)
+}
+
+/// Validate a requested capability: exactly one defined provides bit.
+fn want_from_byte(n: u8) -> Result<u8> {
+    if n & !PROVIDES_MASK != 0 || n.count_ones() != 1 {
+        return Err(format!("invalid want byte {n}").into());
+    }
+    Ok(n)
+}
+
+fn peer_status_byte(s: PeerStatus) -> u8 {
+    match s {
+        PeerStatus::Accepted => 0,
+        PeerStatus::UnknownPeer => 1,
+        PeerStatus::PeerOffline => 2,
+        PeerStatus::NotProvided => 3,
+        PeerStatus::PeerBusy => 4,
+    }
+}
+
+fn peer_status_from_byte(n: u8) -> Result<PeerStatus> {
+    match n {
+        0 => Ok(PeerStatus::Accepted),
+        1 => Ok(PeerStatus::UnknownPeer),
+        2 => Ok(PeerStatus::PeerOffline),
+        3 => Ok(PeerStatus::NotProvided),
+        4 => Ok(PeerStatus::PeerBusy),
+        n => Err(format!("unknown peer status byte {n}").into()),
+    }
+}
+
+fn path_status_byte(s: PathStatus) -> u8 {
+    match s {
+        PathStatus::Direct => 0,
+        PathStatus::Relay => 1,
+    }
+}
+
+fn path_status_from_byte(n: u8) -> Result<PathStatus> {
+    match n {
+        0 => Ok(PathStatus::Direct),
+        1 => Ok(PathStatus::Relay),
+        n => Err(format!("unknown path status byte {n}").into()),
     }
 }
 
@@ -601,6 +733,76 @@ impl Msg {
                 put_sockaddr(&mut b, *local);
                 b
             }
+            Msg::PeerAnnounce { provides } => vec![16, *provides],
+            Msg::PeerAnnounceAck { observed } => {
+                let mut b = Vec::with_capacity(20);
+                b.push(17);
+                put_sockaddr(&mut b, *observed);
+                b
+            }
+            Msg::PeerConnect { peer_id, want } => {
+                let mut b = Vec::new();
+                b.push(18);
+                put_str(&mut b, peer_id);
+                b.push(*want);
+                b
+            }
+            Msg::PeerResult {
+                peer_id,
+                want,
+                pair_id,
+                status,
+            } => {
+                let mut b = Vec::new();
+                b.push(19);
+                put_str(&mut b, peer_id);
+                b.push(*want);
+                b.extend_from_slice(&pair_id.to_be_bytes());
+                b.push(peer_status_byte(*status));
+                b
+            }
+            Msg::PeerProbe {
+                pair_id,
+                peer_id,
+                probe_id,
+                provides,
+            } => {
+                let mut b = Vec::new();
+                b.push(20);
+                b.extend_from_slice(&pair_id.to_be_bytes());
+                put_str(&mut b, peer_id);
+                b.extend_from_slice(&probe_id.to_be_bytes());
+                b.push(*provides);
+                b
+            }
+            Msg::PeerInfo {
+                pair_id,
+                candidates,
+            } => {
+                let mut b = Vec::new();
+                b.push(21);
+                b.extend_from_slice(&pair_id.to_be_bytes());
+                debug_assert!(candidates.len() <= u16::MAX as usize);
+                b.extend_from_slice(&(candidates.len() as u16).to_be_bytes());
+                for c in candidates {
+                    put_sockaddr(&mut b, *c);
+                }
+                b
+            }
+            Msg::PeerRelayOpen { pair_id, id } => {
+                let mut b = Vec::with_capacity(17);
+                b.push(22);
+                b.extend_from_slice(&pair_id.to_be_bytes());
+                b.extend_from_slice(&id.to_be_bytes());
+                b
+            }
+            Msg::PeerPath { pair_id, status } => {
+                let mut b = Vec::with_capacity(10);
+                b.push(23);
+                b.extend_from_slice(&pair_id.to_be_bytes());
+                b.push(path_status_byte(*status));
+                b
+            }
         }
     }
 
@@ -838,6 +1040,103 @@ impl Msg {
                     peer,
                     local,
                 })
+            }
+            Some(16) if b.len() == 2 => {
+                let provides = provides_from_byte(b[1])?;
+                Ok(Msg::PeerAnnounce { provides })
+            }
+            Some(17) => {
+                let mut at = 1;
+                let observed = take_sockaddr(b, &mut at)?;
+                if at != b.len() {
+                    return Err("trailing bytes in peer announce ack".into());
+                }
+                Ok(Msg::PeerAnnounceAck { observed })
+            }
+            Some(18) => {
+                let mut at = 1;
+                let peer_id = take_str(b, &mut at)?;
+                if at >= b.len() {
+                    return Err("truncated peer connect".into());
+                }
+                let want = want_from_byte(b[at])?;
+                at += 1;
+                if at != b.len() {
+                    return Err("trailing bytes in peer connect".into());
+                }
+                Ok(Msg::PeerConnect { peer_id, want })
+            }
+            Some(19) => {
+                let mut at = 1;
+                let peer_id = take_str(b, &mut at)?;
+                if at + 10 > b.len() {
+                    return Err("truncated peer result".into());
+                }
+                let want = want_from_byte(b[at])?;
+                let pair_id = u64::from_be_bytes(b[at + 1..at + 9].try_into().unwrap());
+                let status = peer_status_from_byte(b[at + 9])?;
+                at += 10;
+                if at != b.len() {
+                    return Err("trailing bytes in peer result".into());
+                }
+                Ok(Msg::PeerResult {
+                    peer_id,
+                    want,
+                    pair_id,
+                    status,
+                })
+            }
+            Some(20) => {
+                if b.len() < 9 {
+                    return Err("truncated peer probe".into());
+                }
+                let pair_id = u64::from_be_bytes(b[1..9].try_into().unwrap());
+                let mut at = 9;
+                let peer_id = take_str(b, &mut at)?;
+                if at + 9 > b.len() {
+                    return Err("truncated peer probe".into());
+                }
+                let probe_id = u64::from_be_bytes(b[at..at + 8].try_into().unwrap());
+                let provides = want_from_byte(b[at + 8])?;
+                at += 9;
+                if at != b.len() {
+                    return Err("trailing bytes in peer probe".into());
+                }
+                Ok(Msg::PeerProbe {
+                    pair_id,
+                    peer_id,
+                    probe_id,
+                    provides,
+                })
+            }
+            Some(21) => {
+                if b.len() < 11 {
+                    return Err("truncated peer info".into());
+                }
+                let pair_id = u64::from_be_bytes(b[1..9].try_into().unwrap());
+                let count = u16::from_be_bytes([b[9], b[10]]) as usize;
+                let mut at = 11;
+                let mut candidates = Vec::new();
+                for _ in 0..count {
+                    candidates.push(take_sockaddr(b, &mut at)?);
+                }
+                if at != b.len() {
+                    return Err("trailing bytes in peer info".into());
+                }
+                Ok(Msg::PeerInfo {
+                    pair_id,
+                    candidates,
+                })
+            }
+            Some(22) if b.len() == 17 => {
+                let pair_id = u64::from_be_bytes(b[1..9].try_into().unwrap());
+                let id = u64::from_be_bytes(b[9..17].try_into().unwrap());
+                Ok(Msg::PeerRelayOpen { pair_id, id })
+            }
+            Some(23) if b.len() == 10 => {
+                let pair_id = u64::from_be_bytes(b[1..9].try_into().unwrap());
+                let status = path_status_from_byte(b[9])?;
+                Ok(Msg::PeerPath { pair_id, status })
             }
             _ => Err(format!("malformed message ({} bytes)", b.len()).into()),
         }
@@ -1507,5 +1806,326 @@ mod tests {
 
         // Hello (tag 0) is gone: byte 0 must decode to Err.
         assert!(Msg::decode(&[0]).is_err());
+    }
+
+    #[test]
+    fn peer_announce_roundtrip() {
+        for provides in [0, PROVIDES_EXIT, PROVIDES_SEGMENT, PROVIDES_MASK] {
+            let enc = Msg::PeerAnnounce { provides }.encode();
+            assert_eq!(enc, vec![16, provides]);
+            match Msg::decode(&enc).unwrap() {
+                Msg::PeerAnnounce { provides: got } => assert_eq!(got, provides),
+                other => panic!("expected peer announce, got {other:?}"),
+            }
+        }
+        // Truncated, trailing, and undefined-bit bodies all error.
+        assert!(Msg::decode(&[16]).is_err());
+        assert!(Msg::decode(&[16, 0, 0]).is_err());
+        assert!(Msg::decode(&[16, 0x04]).is_err());
+        assert!(Msg::decode(&[16, 0xff]).is_err());
+        // The tag after the peer block is still unknown.
+        assert!(Msg::decode(&[24]).is_err());
+    }
+
+    #[test]
+    fn peer_announce_ack_roundtrip() {
+        let addrs: [SocketAddr; 2] = [
+            "203.0.113.5:51820".parse().unwrap(),
+            "[2001:db8::1]:4000".parse().unwrap(),
+        ];
+        for observed in addrs {
+            match roundtrip(&Msg::PeerAnnounceAck { observed }) {
+                Msg::PeerAnnounceAck { observed: got } => assert_eq!(got, observed),
+                other => panic!("expected peer announce ack, got {other:?}"),
+            }
+        }
+        let good = Msg::PeerAnnounceAck {
+            observed: "203.0.113.5:51820".parse().unwrap(),
+        }
+        .encode();
+        // 1 tag + 7 (v4 addr).
+        assert_eq!(good.len(), 8);
+        for cut in 1..good.len() {
+            assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
+        }
+        let mut junk = good.clone();
+        junk.push(0x00);
+        assert!(Msg::decode(&junk).is_err());
+        // An unknown address family byte.
+        let mut bad_family = good.clone();
+        bad_family[1] = 5;
+        assert!(Msg::decode(&bad_family).is_err());
+    }
+
+    #[test]
+    fn peer_connect_roundtrip() {
+        let max = "x".repeat(u16::MAX as usize);
+        for id in ["office-b1c2", "", max.as_str()] {
+            for want in [PROVIDES_EXIT, PROVIDES_SEGMENT] {
+                let m = Msg::PeerConnect {
+                    peer_id: id.into(),
+                    want,
+                };
+                match roundtrip(&m) {
+                    Msg::PeerConnect { peer_id, want: got } => {
+                        assert_eq!(peer_id, id);
+                        assert_eq!(got, want);
+                    }
+                    other => panic!("expected peer connect, got {other:?}"),
+                }
+            }
+        }
+        // Truncated length prefix, truncated body, a missing want byte, and
+        // trailing junk all error.
+        assert!(Msg::decode(&[18, 0]).is_err());
+        assert!(Msg::decode(&[18, 0, 4, b'a', b'b']).is_err());
+        assert!(Msg::decode(&[18, 0, 2, b'a', b'b']).is_err());
+        let mut junk = Msg::PeerConnect {
+            peer_id: "ok".into(),
+            want: PROVIDES_EXIT,
+        }
+        .encode();
+        junk.push(0xff);
+        assert!(Msg::decode(&junk).is_err());
+        // The want byte must be exactly one defined bit: zero bits, both bits,
+        // and an undefined bit all error.
+        for want in [0x00, PROVIDES_MASK, 0x04] {
+            assert!(Msg::decode(&[18, 0, 1, b'a', want]).is_err());
+        }
+    }
+
+    #[test]
+    fn peer_result_roundtrip() {
+        for status in [
+            PeerStatus::Accepted,
+            PeerStatus::UnknownPeer,
+            PeerStatus::PeerOffline,
+            PeerStatus::NotProvided,
+            PeerStatus::PeerBusy,
+        ] {
+            for want in [PROVIDES_EXIT, PROVIDES_SEGMENT] {
+                let m = Msg::PeerResult {
+                    peer_id: "office-b1c2".into(),
+                    want,
+                    pair_id: u64::MAX,
+                    status,
+                };
+                match roundtrip(&m) {
+                    Msg::PeerResult {
+                        peer_id,
+                        want: got_want,
+                        pair_id,
+                        status: got,
+                    } => {
+                        assert_eq!(peer_id, "office-b1c2");
+                        assert_eq!(got_want, want);
+                        assert_eq!(pair_id, u64::MAX);
+                        assert_eq!(got, status);
+                    }
+                    other => panic!("expected peer result, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn peer_result_rejects_malformed() {
+        let good = Msg::PeerResult {
+            peer_id: "a".into(),
+            want: PROVIDES_EXIT,
+            pair_id: 7,
+            status: PeerStatus::Accepted,
+        }
+        .encode();
+        // 1 tag + 3 (peer_id) + 1 want + 8 pair_id + 1 status.
+        assert_eq!(good.len(), 14);
+        for cut in 1..good.len() {
+            assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
+        }
+        let mut junk = good.clone();
+        junk.push(0x00);
+        assert!(Msg::decode(&junk).is_err());
+        // An unknown status byte (the last byte) errors.
+        let mut bad_status = good.clone();
+        bad_status[13] = 5;
+        assert!(Msg::decode(&bad_status).is_err());
+        // The want byte follows the peer_id: zero bits, both bits, and an
+        // undefined bit all error.
+        for want in [0x00, PROVIDES_MASK, 0x04] {
+            let mut bad_want = good.clone();
+            bad_want[4] = want;
+            assert!(Msg::decode(&bad_want).is_err());
+        }
+    }
+
+    #[test]
+    fn peer_probe_roundtrip() {
+        for want in [PROVIDES_EXIT, PROVIDES_SEGMENT] {
+            let m = Msg::PeerProbe {
+                pair_id: 3,
+                peer_id: "office-b1c2".into(),
+                probe_id: u64::MAX,
+                provides: want,
+            };
+            match roundtrip(&m) {
+                Msg::PeerProbe {
+                    pair_id,
+                    peer_id,
+                    probe_id,
+                    provides,
+                } => {
+                    assert_eq!(pair_id, 3);
+                    assert_eq!(peer_id, "office-b1c2");
+                    assert_eq!(probe_id, u64::MAX);
+                    assert_eq!(provides, want);
+                }
+                other => panic!("expected peer probe, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn peer_probe_rejects_malformed() {
+        let good = Msg::PeerProbe {
+            pair_id: 3,
+            peer_id: "a".into(),
+            probe_id: 4,
+            provides: PROVIDES_EXIT,
+        }
+        .encode();
+        // 1 tag + 8 pair_id + 3 (peer_id) + 8 probe_id + 1 provides.
+        assert_eq!(good.len(), 21);
+        for cut in 1..good.len() {
+            assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
+        }
+        let mut junk = good.clone();
+        junk.push(0x00);
+        assert!(Msg::decode(&junk).is_err());
+        // The pair capability (the last byte) must be exactly one defined bit:
+        // zero bits, both bits, and an undefined bit all error.
+        for provides in [0x00, PROVIDES_MASK, 0x04] {
+            let mut bad_provides = good.clone();
+            bad_provides[20] = provides;
+            assert!(Msg::decode(&bad_provides).is_err());
+        }
+    }
+
+    #[test]
+    fn peer_info_roundtrip() {
+        let candidates: Vec<SocketAddr> = vec![
+            "203.0.113.5:51820".parse().unwrap(),
+            "192.168.1.20:40000".parse().unwrap(),
+            "[2001:db8::1]:4000".parse().unwrap(),
+        ];
+        match roundtrip(&Msg::PeerInfo {
+            pair_id: 9,
+            candidates: candidates.clone(),
+        }) {
+            Msg::PeerInfo {
+                pair_id,
+                candidates: got,
+            } => {
+                assert_eq!(pair_id, 9);
+                assert_eq!(got, candidates);
+            }
+            other => panic!("expected peer info, got {other:?}"),
+        }
+        // A relay-only peer has no candidates.
+        match roundtrip(&Msg::PeerInfo {
+            pair_id: 9,
+            candidates: Vec::new(),
+        }) {
+            Msg::PeerInfo {
+                pair_id,
+                candidates: got,
+            } => {
+                assert_eq!(pair_id, 9);
+                assert!(got.is_empty());
+            }
+            other => panic!("expected peer info, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_info_rejects_malformed() {
+        let good = Msg::PeerInfo {
+            pair_id: 9,
+            candidates: vec![
+                "203.0.113.5:51820".parse().unwrap(),
+                "[2001:db8::1]:4000".parse().unwrap(),
+            ],
+        }
+        .encode();
+        // 1 tag + 8 pair_id + 2 count + 7 (v4 addr) + 19 (v6 addr).
+        assert_eq!(good.len(), 37);
+        for cut in 1..good.len() {
+            assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
+        }
+        let mut junk = good.clone();
+        junk.push(0x00);
+        assert!(Msg::decode(&junk).is_err());
+        // A count larger than the remaining bytes errors, not over-reads.
+        let mut big = good.clone();
+        big[9] = 0xff;
+        big[10] = 0xff;
+        assert!(Msg::decode(&big).is_err());
+        // The first candidate's family byte sits right after the count.
+        let mut bad_family = good.clone();
+        bad_family[11] = 5;
+        assert!(Msg::decode(&bad_family).is_err());
+    }
+
+    #[test]
+    fn peer_relay_open_roundtrip() {
+        let m = Msg::PeerRelayOpen {
+            pair_id: 9,
+            id: u64::MAX,
+        };
+        let enc = m.encode();
+        assert_eq!(enc.len(), 17);
+        match Msg::decode(&enc).unwrap() {
+            Msg::PeerRelayOpen { pair_id, id } => {
+                assert_eq!(pair_id, 9);
+                assert_eq!(id, u64::MAX);
+            }
+            other => panic!("expected peer relay open, got {other:?}"),
+        }
+        // Any other length is malformed.
+        assert!(Msg::decode(&enc[..16]).is_err());
+        let mut junk = enc.clone();
+        junk.push(0x00);
+        assert!(Msg::decode(&junk).is_err());
+    }
+
+    #[test]
+    fn peer_path_roundtrip() {
+        for status in [PathStatus::Direct, PathStatus::Relay] {
+            let m = Msg::PeerPath { pair_id: 9, status };
+            let enc = m.encode();
+            assert_eq!(enc.len(), 10);
+            match Msg::decode(&enc).unwrap() {
+                Msg::PeerPath {
+                    pair_id,
+                    status: got,
+                } => {
+                    assert_eq!(pair_id, 9);
+                    assert_eq!(got, status);
+                }
+                other => panic!("expected peer path, got {other:?}"),
+            }
+        }
+        // Any other length is malformed, and an unknown status byte errors.
+        let enc = Msg::PeerPath {
+            pair_id: 9,
+            status: PathStatus::Direct,
+        }
+        .encode();
+        assert!(Msg::decode(&enc[..9]).is_err());
+        let mut junk = enc.clone();
+        junk.push(0x00);
+        assert!(Msg::decode(&junk).is_err());
+        let mut bad_status = enc.clone();
+        bad_status[9] = 2;
+        assert!(Msg::decode(&bad_status).is_err());
     }
 }
