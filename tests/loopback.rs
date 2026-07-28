@@ -3593,16 +3593,16 @@ async fn expect_peer_path(
     }
 }
 
-/// Read one data frame off a punched session, skipping keepalives.
-async fn recv_punched(link: &mut zeronat::punch::PeerLink) -> Vec<u8> {
+/// Read one data frame off a datagram channel, skipping keepalives.
+async fn recv_dgram_frame(rx: &mut zeronat::dgram::DgramRx) -> Vec<u8> {
     loop {
-        match timeout(Duration::from_secs(5), link.rx.recv())
+        match timeout(Duration::from_secs(5), rx.recv())
             .await
-            .expect("no frame on the punched session")
+            .expect("no frame on the datagram channel")
         {
             Some(zeronat::dgram::Frame::Data(body)) => return body,
             Some(_) => continue,
-            None => panic!("punched session closed"),
+            None => panic!("datagram channel closed"),
         }
     }
 }
@@ -3669,9 +3669,9 @@ async fn peer_punch_establishes_direct_session() {
 
         // The punched session carries frames both ways.
         c_link.tx.send(b"c-to-prov").await.unwrap();
-        assert_eq!(recv_punched(&mut p_link).await, b"c-to-prov");
+        assert_eq!(recv_dgram_frame(&mut p_link.rx).await, b"c-to-prov");
         p_link.tx.send(b"prov-to-c").await.unwrap();
-        assert_eq!(recv_punched(&mut c_link).await, b"prov-to-c");
+        assert_eq!(recv_dgram_frame(&mut c_link.rx).await, b"prov-to-c");
 
         assert_control_alive(&c_ctl, &mut parties.cr).await;
         assert_control_alive(&p_ctl, &mut parties.pr).await;
@@ -3686,7 +3686,8 @@ async fn peer_punch_establishes_direct_session() {
 // relay when the deadline lapses, far short of the transport idle windows.
 // Both roles are covered: the responder opens its mapping with punch probes
 // and the initiator's handshake goes unanswered, and each party reports
-// PeerPath relay on a control channel that survives the report.
+// PeerPath relay on a control channel that survives the report. The report
+// hands each party its relay leg id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_punch_deadline_reports_relay() {
     let body = async {
@@ -3760,6 +3761,9 @@ async fn peer_punch_deadline_reports_relay() {
 
         expect_peer_path(&mut c_seen, parties.pair_id, PathStatus::Relay).await;
         expect_peer_path(&mut p_seen, parties.pair_id, PathStatus::Relay).await;
+        let c_leg = recv_relay_open(&mut parties.cr, parties.pair_id).await;
+        let p_leg = recv_relay_open(&mut parties.pr, parties.pair_id).await;
+        assert_ne!(c_leg, p_leg, "each party gets its own leg id");
         assert_control_alive(&c_ctl, &mut parties.cr).await;
         assert_control_alive(&p_ctl, &mut parties.pr).await;
     };
@@ -3962,9 +3966,9 @@ async fn peer_punch_binds_one_path_across_two_candidates() {
         );
 
         c_link.tx.send(b"c-to-prov").await.unwrap();
-        assert_eq!(recv_punched(&mut p_link).await, b"c-to-prov");
+        assert_eq!(recv_dgram_frame(&mut p_link.rx).await, b"c-to-prov");
         p_link.tx.send(b"prov-to-c").await.unwrap();
-        assert_eq!(recv_punched(&mut c_link).await, b"prov-to-c");
+        assert_eq!(recv_dgram_frame(&mut c_link.rx).await, b"prov-to-c");
 
         expect_peer_path(&mut c_seen, parties.pair_id, PathStatus::Direct).await;
         expect_peer_path(&mut p_seen, parties.pair_id, PathStatus::Direct).await;
@@ -4081,9 +4085,9 @@ async fn peer_punch_survives_a_lost_nomination() {
         assert_eq!(p_link.peer, lossy);
 
         c_link.tx.send(b"c-to-prov").await.unwrap();
-        assert_eq!(recv_punched(&mut p_link).await, b"c-to-prov");
+        assert_eq!(recv_dgram_frame(&mut p_link.rx).await, b"c-to-prov");
         p_link.tx.send(b"prov-to-c").await.unwrap();
-        assert_eq!(recv_punched(&mut c_link).await, b"prov-to-c");
+        assert_eq!(recv_dgram_frame(&mut c_link.rx).await, b"prov-to-c");
 
         expect_peer_path(&mut c_seen, parties.pair_id, PathStatus::Direct).await;
         expect_peer_path(&mut p_seen, parties.pair_id, PathStatus::Direct).await;
@@ -4092,4 +4096,336 @@ async fn peer_punch_survives_a_lost_nomination() {
     timeout(Duration::from_secs(60), body)
         .await
         .expect("lost-nomination punch flow did not complete within 60s");
+}
+
+/// Read the next control frame as this party's `PeerRelayOpen` for `pair_id`,
+/// returning the leg id it carries.
+async fn recv_relay_open(r: &mut zeronat::noise::NoiseReader, pair_id: u64) -> u64 {
+    let frame = timeout(Duration::from_secs(10), r.recv())
+        .await
+        .expect("no relay open")
+        .unwrap();
+    match Msg::decode(&frame).unwrap() {
+        Msg::PeerRelayOpen { pair_id: got, id } => {
+            assert_eq!(got, pair_id);
+            id
+        }
+        other => panic!("expected peer relay open, got {other:?}"),
+    }
+}
+
+/// Report a settled path on a party's control channel.
+async fn report_path(w: &mut zeronat::noise::NoiseWriter, pair_id: u64, status: PathStatus) {
+    w.send(&Msg::PeerPath { pair_id, status }.encode())
+        .await
+        .unwrap();
+}
+
+/// Ping a party and assert the answer is the very next control frame, so
+/// nothing the server queued after the previous read sits ahead of it.
+async fn assert_next_frame_is_pong(
+    w: &mut zeronat::noise::NoiseWriter,
+    r: &mut zeronat::noise::NoiseReader,
+) {
+    w.send(&Msg::Ping.encode()).await.unwrap();
+    let frame = timeout(Duration::from_secs(5), r.recv())
+        .await
+        .expect("no pong")
+        .unwrap();
+    assert!(
+        matches!(Msg::decode(&frame), Ok(Msg::Pong)),
+        "an unexpected frame arrived ahead of the pong"
+    );
+}
+
+/// A pair of tcp-transport parties whose consumer has reported the relay,
+/// with the leg id each party was handed.
+struct RelayPair {
+    pair_id: u64,
+    cr: zeronat::noise::NoiseReader,
+    cw: zeronat::noise::NoiseWriter,
+    c_leg: u64,
+    pr: zeronat::noise::NoiseReader,
+    pw: zeronat::noise::NoiseWriter,
+    p_leg: u64,
+}
+
+/// Pair a consumer "c" with a provider "prov" over the tcp control transport,
+/// where both parties are relay-only, and report the relay from the consumer.
+async fn relay_pair(control: u16) -> RelayPair {
+    let (mut pr, pw) = peer_control_connect(control, "prov", PROVIDES_EXIT).await;
+    let (mut cr, mut cw) = peer_control_connect(control, "c", 0).await;
+
+    let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
+    assert_eq!(status, PeerStatus::Accepted);
+    assert_eq!(recv_peer_info(&mut cr, pair_id).await, Vec::new());
+    assert_eq!(recv_peer_info(&mut pr, pair_id).await, Vec::new());
+
+    report_path(&mut cw, pair_id, PathStatus::Relay).await;
+    let c_leg = recv_relay_open(&mut cr, pair_id).await;
+    let p_leg = recv_relay_open(&mut pr, pair_id).await;
+    assert_ne!(c_leg, p_leg, "each party gets its own leg id");
+
+    RelayPair {
+        pair_id,
+        cr,
+        cw,
+        c_leg,
+        pr,
+        pw,
+        p_leg,
+    }
+}
+
+/// Open a relay leg on the datagram channel over a fresh udp session to the
+/// control port. The returned pump keeps routing the server's datagrams into
+/// that session.
+async fn dgram_leg(
+    control: u16,
+    id: u64,
+) -> (zeronat::client::RelayDgramLeg, tokio::task::JoinHandle<()>) {
+    use zeronat::kcp::{route, session};
+    let psk = zeronat::noise::derive_psk(SECRET);
+    let server: std::net::SocketAddr = format!("127.0.0.1:{control}").parse().unwrap();
+    let socket = std::sync::Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+    socket.connect(server).await.unwrap();
+    let sess = session(socket.clone(), server, 1);
+    let pump = {
+        let sess = sess.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            while let Ok(n) = socket.recv(&mut buf).await {
+                route(&sess, &buf[..n]);
+            }
+        })
+    };
+    let leg = zeronat::client::relay_leg_dgram(&sess, &psk, id)
+        .await
+        .expect("relay leg");
+    (leg, pump)
+}
+
+/// Open a relay leg over a fresh tcp connection to the control port.
+async fn stream_leg(control: u16, id: u64) -> zeronat::noise::Noise {
+    let psk = zeronat::noise::derive_psk(SECRET);
+    zeronat::client::relay_leg_stream(&format!("127.0.0.1:{control}"), &psk, id)
+        .await
+        .expect("relay leg")
+}
+
+/// Read one frame off a stream leg.
+async fn recv_stream_leg(r: &mut zeronat::noise::NoiseReader) -> Vec<u8> {
+    timeout(Duration::from_secs(5), r.recv())
+        .await
+        .expect("no frame on the stream leg")
+        .expect("stream leg closed")
+}
+
+// A relayed pair carries frames both ways: the first relay report opens a leg
+// for each party, both claim theirs with the ordinary data-channel rendezvous,
+// and the server splices the two into one opaque pipe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_relay_splices_two_stream_legs() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let pair = relay_pair(control).await;
+
+        let (mut c_lr, mut c_lw) = stream_leg(control, pair.c_leg).await;
+        let (mut p_lr, mut p_lw) = stream_leg(control, pair.p_leg).await;
+
+        c_lw.send(b"c-to-prov").await.unwrap();
+        assert_eq!(recv_stream_leg(&mut p_lr).await, b"c-to-prov");
+        p_lw.send(b"prov-to-c").await.unwrap();
+        assert_eq!(recv_stream_leg(&mut c_lr).await, b"prov-to-c");
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("relay splice flow did not complete within 30s");
+}
+
+// A stream leg spliced to a dgram leg keeps frame boundaries: two records
+// written back to back arrive as two datagrams, and a datagram comes back as
+// one record. Invalidating the pair then takes both legs down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_relay_splices_a_stream_leg_to_a_dgram_leg() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let pair = relay_pair(control).await;
+
+        let (mut c_lr, mut c_lw) = stream_leg(control, pair.c_leg).await;
+        let (mut p_leg, _pump) = dgram_leg(control, pair.p_leg).await;
+
+        c_lw.send(b"one").await.unwrap();
+        c_lw.send(b"two").await.unwrap();
+        assert_eq!(recv_dgram_frame(&mut p_leg.rx).await, b"one");
+        assert_eq!(recv_dgram_frame(&mut p_leg.rx).await, b"two");
+        p_leg.tx.send(b"prov-to-c").await.unwrap();
+        assert_eq!(recv_stream_leg(&mut c_lr).await, b"prov-to-c");
+
+        // The provider's control session owns the pair, so ending it
+        // invalidates the pair and closes the legs with it.
+        drop((pair.pr, pair.pw));
+        assert!(
+            timeout(Duration::from_secs(10), c_lr.recv())
+                .await
+                .expect("the stream leg outlived its pair")
+                .is_err(),
+            "invalidating the pair must close both legs"
+        );
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("mixed relay splice flow did not complete within 30s");
+}
+
+// A dgram leg carries no EOF of its own, so the server closes both legs when
+// either dies: dropping one party's leg closes the other party's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_relay_leg_death_closes_both_legs() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let pair = relay_pair(control).await;
+
+        let (c_lr, mut c_lw) = stream_leg(control, pair.c_leg).await;
+        let (mut p_lr, _p_lw) = stream_leg(control, pair.p_leg).await;
+
+        c_lw.send(b"spliced").await.unwrap();
+        assert_eq!(recv_stream_leg(&mut p_lr).await, b"spliced");
+
+        drop((c_lr, c_lw));
+        assert!(
+            timeout(Duration::from_secs(10), p_lr.recv())
+                .await
+                .expect("the surviving leg was never closed")
+                .is_err(),
+            "one leg dying must take the other down"
+        );
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("relay teardown flow did not complete within 30s");
+}
+
+// A relayed pair dies with its splice, on control sessions that both stay up:
+// a dead relay carries nothing, so holding the pair would keep an exclusive
+// provider busy for as long as the consumer stays connected. A fresh connect
+// pairs again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_relay_death_frees_an_exclusive_provider() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let mut pair = relay_pair(control).await;
+
+        let (c_lr, mut c_lw) = stream_leg(control, pair.c_leg).await;
+        let (mut p_lr, _p_lw) = stream_leg(control, pair.p_leg).await;
+        c_lw.send(b"spliced").await.unwrap();
+        assert_eq!(recv_stream_leg(&mut p_lr).await, b"spliced");
+
+        drop((c_lr, c_lw));
+        assert!(
+            timeout(Duration::from_secs(10), p_lr.recv())
+                .await
+                .expect("the surviving leg was never closed")
+                .is_err(),
+            "one leg dying must take the other down"
+        );
+        assert_next_frame_is_pong(&mut pair.cw, &mut pair.cr).await;
+        assert_next_frame_is_pong(&mut pair.pw, &mut pair.pr).await;
+
+        let (mut c2r, mut c2w) = peer_control_connect(control, "c2", 0).await;
+        let next = loop {
+            let (next, status) = peer_connect(&mut c2r, &mut c2w, "prov", PROVIDES_EXIT).await;
+            match status {
+                PeerStatus::Accepted => break next,
+                PeerStatus::PeerBusy => sleep(Duration::from_millis(50)).await,
+                other => panic!("unexpected status {other:?}"),
+            }
+        };
+        assert_ne!(next, pair.pair_id);
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("relay death flow did not complete within 30s");
+}
+
+// One party's relay report opens the relay while the other party is still
+// punching, and both parties' legs splice. A peer client races its punch
+// against the control channel and drops it when the open arrives, which is
+// what the select! below stands in for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_relay_opens_while_the_peer_is_still_punching() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let mut parties = punch_parties(control).await;
+
+        // "prov" holds its probe socket open but never punches, so "c" keeps
+        // handshaking into it for the whole deadline while the relay opens.
+        let (c_ctl, _c_seen) = punch_control(parties.cw);
+        let mut punching = Box::pin(zeronat::punch::punch(
+            parties.c_sess,
+            &parties.c_cands,
+            parties.pair_id,
+            "c",
+            "prov",
+            &psk,
+            &c_ctl,
+        ));
+        report_path(&mut parties.pw, parties.pair_id, PathStatus::Relay).await;
+
+        let c_leg = tokio::select! {
+            _ = &mut punching => panic!("the punch settled before the relay opened"),
+            id = recv_relay_open(&mut parties.cr, parties.pair_id) => id,
+        };
+        drop(punching);
+        let p_leg = recv_relay_open(&mut parties.pr, parties.pair_id).await;
+
+        let (mut c_leg, _c_pump) = dgram_leg(control, c_leg).await;
+        let (mut p_leg, _p_pump) = dgram_leg(control, p_leg).await;
+        c_leg.tx.send(b"c-to-prov").await.unwrap();
+        assert_eq!(recv_dgram_frame(&mut p_leg.rx).await, b"c-to-prov");
+        p_leg.tx.send(b"prov-to-c").await.unwrap();
+        assert_eq!(recv_dgram_frame(&mut c_leg.rx).await, b"prov-to-c");
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("relay open flow did not complete within 60s");
+}
+
+// Both parties report the relay, which is the ordinary outcome of a punch
+// neither side wins. The second report opens nothing: the pair keeps the one
+// pair of legs the first report handed out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_relay_opens_once_for_both_reports() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let mut pair = relay_pair(control).await;
+
+        report_path(&mut pair.pw, pair.pair_id, PathStatus::Relay).await;
+        sleep(Duration::from_millis(500)).await;
+        assert_next_frame_is_pong(&mut pair.cw, &mut pair.cr).await;
+        assert_next_frame_is_pong(&mut pair.pw, &mut pair.pr).await;
+
+        // The legs from the one open still splice, so the second report left
+        // the relay alone rather than replacing it.
+        let (_c_lr, mut c_lw) = stream_leg(control, pair.c_leg).await;
+        let (mut p_lr, _p_lw) = stream_leg(control, pair.p_leg).await;
+        c_lw.send(b"c-to-prov").await.unwrap();
+        assert_eq!(recv_stream_leg(&mut p_lr).await, b"c-to-prov");
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("relay dedupe flow did not complete within 30s");
 }

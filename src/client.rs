@@ -22,7 +22,9 @@ use crate::clientproto::{
 use crate::dgram::{DgramRx, DgramTx};
 #[cfg(target_os = "linux")]
 use crate::exitroute::ExitRoutes;
-use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT};
+use crate::kcp::{
+    route, session as kcp_session, ConvGuard, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT,
+};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{
@@ -1353,6 +1355,60 @@ pub async fn probe_candidates(
         resend: Some(resend),
         _sess: sess,
         _pump: pump,
+    })
+}
+
+/// A relay leg on the datagram channel: the framed pipe the server splices to
+/// the other party's leg, one inner frame per datagram. The guard holds the
+/// session's tag registered for the leg's life.
+pub struct RelayDgramLeg {
+    pub rx: DgramRx,
+    pub tx: DgramTx,
+    _guard: ConvGuard,
+}
+
+/// Open this party's relay leg over the tcp transport: a fresh data connection
+/// claiming the leg `id` a `PeerRelayOpen` carried, the same claim a forward
+/// data channel makes. The server parks the leg until the other party's
+/// arrives, then splices the two; each Noise record carries one inner frame.
+pub async fn relay_leg_stream(
+    server: &str,
+    psk: &[u8; 32],
+    id: u64,
+) -> Result<crate::noise::Noise> {
+    let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
+        let sock = TcpStream::connect(server).await?;
+        sock.set_nodelay(true).ok();
+        client_handshake(sock, psk).await
+    })
+    .await
+    .map_err(|_| -> crate::Error { "relay leg connect+handshake timed out".into() })??;
+    nw.send(&Msg::Data { id, name: None }.encode()).await?;
+    Ok((nr, nw))
+}
+
+/// Open this party's relay leg over the udp transport: a setup conv carrying
+/// the leg `id`, then the datagram channel under the matching tag, following
+/// the UDP-forward rule for both. One datagram carries one inner frame, so the
+/// server's splice keeps frame boundaries against a stream leg.
+pub async fn relay_leg_dgram(sess: &Session, psk: &[u8; 32], id: u64) -> Result<RelayDgramLeg> {
+    let conv = (id as u32) | SETUP_CONV_BIT;
+    let stream = sess.open_conv_with(CLASS_SETUP, conv);
+    let noise = Arc::new(
+        tokio_timeout(
+            OPEN_HANDSHAKE_TIMEOUT,
+            client_handshake_stateless(stream, psk, id),
+        )
+        .await
+        .map_err(|_| -> crate::Error { "relay leg handshake timed out".into() })??,
+    );
+    let (inbound, guard) = sess.register_dgram(conv);
+    let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
+    let rx = DgramRx::new(inbound, noise);
+    Ok(RelayDgramLeg {
+        rx,
+        tx,
+        _guard: guard,
     })
 }
 

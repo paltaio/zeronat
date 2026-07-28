@@ -13,12 +13,14 @@ use tokio::time::{timeout, Instant};
 use crate::bridge;
 use crate::config;
 use crate::dgram::{DgramRx, DgramTx, Frame};
-use crate::kcp::{route, session, Accepted, Session};
+use crate::kcp::{route, session, Accepted, ConvGuard, Session};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 #[cfg(target_os = "linux")]
 use crate::netfilter;
-use crate::noise::{server_handshake, server_handshake_stateless, Noise, StatelessNoise};
+use crate::noise::{
+    server_handshake, server_handshake_stateless, Noise, NoiseReader, NoiseWriter, StatelessNoise,
+};
 #[cfg(target_os = "linux")]
 use crate::proto::BridgeEntry;
 use crate::proto::{
@@ -154,6 +156,115 @@ struct Pair {
     /// Set once the `PeerInfo` frames go out, so a completing probe and the
     /// pairing deadline cannot both send them.
     info_sent: bool,
+    /// The relay, from the first `relay` report onward; `None` while the pair
+    /// is still punching.
+    relay: Option<Relay>,
+}
+
+/// A pair's relay: the leg id handed to each party, and how far the two legs
+/// have got.
+struct Relay {
+    legs: [u64; 2],
+    state: RelayState,
+}
+
+/// The relay's progress, one state at a time: a parked leg and a running
+/// splice cannot coexist.
+enum RelayState {
+    /// Both leg ids are out; neither has been claimed.
+    Open,
+    /// The first leg to arrive, held until the second does.
+    Parked(RelayLeg),
+    /// Both legs are in and the splice is running. Dropping the sender stops
+    /// it, which closes both legs, so invalidating the pair tears the relay
+    /// down with it.
+    Spliced { _stop: oneshot::Sender<()> },
+}
+
+/// One party's claimed relay leg. A stream leg carries one inner frame per
+/// Noise record and a dgram leg one per datagram, so splicing the two kinds
+/// together preserves frame boundaries. Nothing else about delivery survives
+/// the splice: a pair whose legs differ gets the weaker of the two, so the
+/// pipe is lossy and unordered whatever a party's own leg promises. The dgram
+/// guard holds the session's tag registered for the leg's life.
+enum RelayLeg {
+    Stream(NoiseReader, NoiseWriter),
+    Dgram(DgramRx, DgramTx, ConvGuard),
+}
+
+impl RelayLeg {
+    fn split(self) -> (LegRead, LegWrite) {
+        match self {
+            RelayLeg::Stream(r, w) => (LegRead::Stream(r), LegWrite::Stream(w)),
+            RelayLeg::Dgram(rx, tx, guard) => {
+                (LegRead::Dgram(rx), LegWrite::Dgram { tx, _guard: guard })
+            }
+        }
+    }
+}
+
+enum LegRead {
+    Stream(NoiseReader),
+    Dgram(DgramRx),
+}
+
+enum LegWrite {
+    Stream(NoiseWriter),
+    Dgram { tx: DgramTx, _guard: ConvGuard },
+}
+
+impl LegRead {
+    /// The next inner frame, or `None` once the leg dies. A dgram keepalive
+    /// belongs to the hop, and an empty frame is a keepalive on a stream leg
+    /// and vanishes when written to one, so both leg kinds drop them and the
+    /// pipe carries the same frames on every path. Everything else crosses
+    /// opaque.
+    async fn recv(&mut self) -> Option<Vec<u8>> {
+        loop {
+            match self {
+                LegRead::Stream(r) => match r.recv().await {
+                    Ok(frame) if frame.is_empty() => continue,
+                    Ok(frame) => return Some(frame),
+                    Err(_) => return None,
+                },
+                LegRead::Dgram(rx) => match rx.recv().await? {
+                    Frame::Data(body) if !body.is_empty() => return Some(body),
+                    _ => continue,
+                },
+            }
+        }
+    }
+}
+
+impl LegWrite {
+    async fn send(&mut self, frame: &[u8]) -> Result<()> {
+        match self {
+            LegWrite::Stream(w) => w.send(frame).await,
+            LegWrite::Dgram { tx, .. } => tx.send(frame).await,
+        }
+    }
+}
+
+/// Move inner frames between two claimed legs until either dies or `stop`
+/// resolves, then drop both. A dgram leg carries no EOF of its own, so closing
+/// the pair's other leg here is the only way its party learns the relay is
+/// gone.
+async fn splice_relay(a: RelayLeg, b: RelayLeg, stop: oneshot::Receiver<()>) {
+    let (mut a_read, mut a_write) = a.split();
+    let (mut b_read, mut b_write) = b.split();
+    tokio::select! {
+        _ = pump_leg(&mut a_read, &mut b_write) => {}
+        _ = pump_leg(&mut b_read, &mut a_write) => {}
+        _ = stop => {}
+    }
+}
+
+async fn pump_leg(from: &mut LegRead, to: &mut LegWrite) {
+    while let Some(frame) = from.recv().await {
+        if to.send(&frame).await.is_err() {
+            break;
+        }
+    }
 }
 
 /// One party's probe progress and settled path. `probe_id` is assigned when
@@ -195,6 +306,10 @@ pub(crate) struct Server {
     /// control listener classify a stateless-handshake app id as a probe.
     /// Taken after `pairs` when both are held; entries die with their pair.
     probes: Mutex<HashMap<u64, u64>>,
+    /// Outstanding relay leg ids to their owning `pair_id`, letting a claimed
+    /// data channel find the pair to splice it into. Same lock rules as
+    /// `probes`; a leg id is single-use and removed when it is claimed.
+    relay_legs: Mutex<HashMap<u64, u64>>,
     routes: Mutex<HashMap<RouteKey, Route>>,
     listeners: Mutex<HashMap<RouteKey, ListenerHandle>>,
     handshakes: Arc<Semaphore>,
@@ -364,6 +479,7 @@ impl Server {
                 consumer: PartyProbe::default(),
                 provider: PartyProbe::default(),
                 info_sent: false,
+                relay: None,
             },
         );
         crate::elog!("peer pair {pair_id}: {consumer_id} -> {provider_id}");
@@ -371,9 +487,10 @@ impl Server {
     }
 
     /// Remove and return every pair `client_id` is a party to, dropping any
-    /// outstanding probe ids with them. A pair must not outlive either
-    /// party's control session, so this runs when a session ends and when a
-    /// reconnect supersedes it.
+    /// outstanding probe and relay leg ids with them. A pair must not outlive
+    /// either party's control session, so this runs when a session ends and
+    /// when a reconnect supersedes it. The caller drops the returned pairs,
+    /// which tears down any relay they carry.
     fn invalidate_pairs(&self, client_id: &str) -> Vec<(u64, Pair)> {
         let removed: Vec<(u64, Pair)> = self
             .pairs
@@ -381,18 +498,29 @@ impl Server {
             .unwrap()
             .extract_if(|_, p| p.consumer_id == client_id || p.provider_id == client_id)
             .collect();
-        if !removed.is_empty() {
-            let mut probes = self.probes.lock().unwrap();
-            for (_, p) in &removed {
-                for id in [p.consumer.probe_id, p.provider.probe_id]
-                    .into_iter()
-                    .flatten()
-                {
-                    probes.remove(&id);
-                }
-            }
+        for (_, p) in &removed {
+            self.forget_pair_ids(p);
         }
         removed
+    }
+
+    /// Drop the rendezvous ids a removed pair owned: its outstanding probe
+    /// ids and any relay leg id still unclaimed. Both maps are taken after
+    /// `pairs` and never together.
+    fn forget_pair_ids(&self, pair: &Pair) {
+        {
+            let mut probes = self.probes.lock().unwrap();
+            for id in [pair.consumer.probe_id, pair.provider.probe_id]
+                .into_iter()
+                .flatten()
+            {
+                probes.remove(&id);
+            }
+        }
+        let mut relay_legs = self.relay_legs.lock().unwrap();
+        for id in pair.relay.iter().flat_map(|r| r.legs) {
+            relay_legs.remove(&id);
+        }
     }
 
     /// Start candidate discovery for a freshly accepted pair: assign each
@@ -538,11 +666,15 @@ impl Server {
         }
     }
 
-    /// Record a party's punch outcome against its pair. The sender must own
-    /// its registry slot, have announced peer support, and be a party of a
-    /// live pair; anything else is dropped. The first report per party wins,
-    /// so a repeat cannot rewrite a settled path. Lock order is clients
-    /// before pairs.
+    /// Record a party's punch outcome against its pair, and open the relay on
+    /// the first `relay` report. The sender must own its registry slot, have
+    /// announced peer support, and be a party of a live pair; anything else is
+    /// dropped. The first report per party wins, so a repeat cannot rewrite a
+    /// settled path, and the second party's report (or a `direct` from the
+    /// other side) opens no second relay. Each party gets its own leg id: two
+    /// parties cannot both claim one id through a oneshot pending entry. Lock
+    /// order is clients, pairs, relay legs, with `next_id` a leaf; the sends
+    /// run outside every lock.
     fn peer_path(
         &self,
         client_id: &str,
@@ -550,6 +682,8 @@ impl Server {
         pair_id: u64,
         status: PathStatus,
     ) {
+        let mut sends: Vec<(mpsc::Sender<Vec<u8>>, Vec<u8>)> = Vec::new();
+        let mut opened = false;
         {
             let clients = self.clients.lock().unwrap();
             let owned = clients
@@ -573,12 +707,81 @@ impl Server {
                 return;
             }
             party.path = Some(status);
+            if status == PathStatus::Relay && pair.relay.is_none() {
+                let legs = [self.next_id(), self.next_id()];
+                let mut relay_legs = self.relay_legs.lock().unwrap();
+                for (&id, party_id) in legs.iter().zip([&pair.consumer_id, &pair.provider_id]) {
+                    relay_legs.insert(id, pair_id);
+                    if let Some(h) = clients.get(party_id).filter(|h| h.peer_provides.is_some()) {
+                        sends.push((h.tx.clone(), Msg::PeerRelayOpen { pair_id, id }.encode()));
+                    }
+                }
+                drop(relay_legs);
+                pair.relay = Some(Relay {
+                    legs,
+                    state: RelayState::Open,
+                });
+                opened = true;
+            }
+        }
+        for (tx, msg) in sends {
+            tx.try_send(msg).ok();
         }
         let name = match status {
             PathStatus::Direct => "direct",
             PathStatus::Relay => "relay",
         };
         crate::elog!("peer pair {pair_id}: {client_id} reports the {name} path");
+        if opened {
+            crate::elog!("peer pair {pair_id}: opening the relay");
+        }
+    }
+
+    /// Claim a relay leg id and return the pair it belongs to. A leg id is
+    /// single-use, so a second claim of the same id finds nothing. Callers
+    /// claim before they build the leg, so a duplicate claim never registers
+    /// transport state the winner then loses.
+    fn take_relay_leg(&self, id: u64) -> Option<u64> {
+        self.relay_legs.lock().unwrap().remove(&id)
+    }
+
+    /// Park a claimed leg against its pair, splicing the two once both are in.
+    /// A leg whose pair died between the claim and here is dropped, which
+    /// closes it. The splice removes the pair when it ends: a relayed pair
+    /// whose legs are gone carries nothing, and holding it would keep an
+    /// exclusive provider busy for a session that never times out.
+    fn park_relay_leg(self: &Arc<Self>, pair_id: u64, leg: RelayLeg) {
+        let mut pairs = self.pairs.lock().unwrap();
+        let Some(relay) = pairs.get_mut(&pair_id).and_then(|p| p.relay.as_mut()) else {
+            return;
+        };
+        match std::mem::replace(&mut relay.state, RelayState::Open) {
+            RelayState::Open => relay.state = RelayState::Parked(leg),
+            RelayState::Parked(first) => {
+                let (stop_tx, stop_rx) = oneshot::channel();
+                let srv = self.clone();
+                tokio::spawn(async move {
+                    splice_relay(first, leg, stop_rx).await;
+                    srv.end_relay(pair_id);
+                });
+                relay.state = RelayState::Spliced { _stop: stop_tx };
+            }
+            // A pair that is already spliced holds both its legs, so this one
+            // is dropped.
+            state => relay.state = state,
+        }
+    }
+
+    /// Remove a pair whose splice has ended, with any rendezvous ids it still
+    /// owns. A fresh `PeerConnect` is the only recovery, matching every other
+    /// path change.
+    fn end_relay(&self, pair_id: u64) {
+        let removed = self.pairs.lock().unwrap().remove(&pair_id);
+        let Some(pair) = removed else {
+            return;
+        };
+        self.forget_pair_ids(&pair);
+        crate::elog!("peer pair {pair_id}: relay closed");
     }
 }
 
@@ -783,6 +986,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         known_clients: Mutex::new(HashSet::new()),
         pairs: Mutex::new(HashMap::new()),
         probes: Mutex::new(HashMap::new()),
+        relay_legs: Mutex::new(HashMap::new()),
         routes: Mutex::new(
             routes
                 .into_iter()
@@ -1093,8 +1297,18 @@ pub(crate) async fn serve_stream(
             // linux-only switch above.
             #[cfg(not(target_os = "linux"))]
             let _ = (&name, &peer);
-            if let Some(tx) = srv.pending.lock().unwrap().remove(&id) {
-                let _ = tx.send((r, w));
+            let claimed = srv.pending.lock().unwrap().remove(&id);
+            match claimed {
+                Some(tx) => {
+                    let _ = tx.send((r, w));
+                }
+                // Forward opens and relay legs draw ids from one counter, so
+                // an id no forward parked can only be a relay leg's.
+                None => {
+                    if let Some(pair_id) = srv.take_relay_leg(id) {
+                        srv.park_relay_leg(pair_id, RelayLeg::Stream(r, w));
+                    }
+                }
             }
             Ok(())
         }
@@ -1831,6 +2045,8 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
                         }
                         if srv.probes.lock().unwrap().contains_key(&id) {
                             accept_probe(srv, sess2, conv, id, noise, src).await;
+                        } else if srv.relay_legs.lock().unwrap().contains_key(&id) {
+                            accept_relay_leg(&srv, &sess2, conv, id, noise);
                         } else {
                             accept_udp_forward(srv, sess2, conv, id, noise).await;
                         }
@@ -1873,6 +2089,25 @@ async fn accept_udp_forward(
 
 fn take_udp_pending(srv: &Server, id: u64) -> Option<UdpPending> {
     srv.udp_pending.lock().unwrap().remove(&id)
+}
+
+/// Claim a udp-transport party's relay leg: the setup conv's app id is the leg
+/// id its `PeerRelayOpen` carried, and the datagram channel under the matching
+/// tag carries one inner frame per datagram.
+fn accept_relay_leg(srv: &Arc<Server>, sess: &Session, conv: u32, id: u64, noise: StatelessNoise) {
+    // Claim the id before registering the tag: two handshakes completing for
+    // one leg id would otherwise both register it, and the loser's guard would
+    // erase the winner's entry on the way out.
+    let Some(pair_id) = srv.take_relay_leg(id) else {
+        return;
+    };
+    let noise = Arc::new(noise);
+    // The guard rides the leg, keeping the session counted live for as long as
+    // the splice holds it.
+    let (inbound, guard) = sess.register_dgram(conv);
+    let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
+    let rx = DgramRx::new(inbound, noise);
+    srv.park_relay_leg(pair_id, RelayLeg::Dgram(rx, tx, guard));
 }
 
 /// Record a probe session's candidates against its pair: the datagram source
@@ -2091,6 +2326,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             known_clients: Mutex::new(HashSet::new()),
             pairs: Mutex::new(HashMap::new()),
             probes: Mutex::new(HashMap::new()),
+            relay_legs: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashMap::new()),
             handshakes: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
