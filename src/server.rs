@@ -37,6 +37,14 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// local-candidate frame has not arrived when it lapses is reported
 /// relay-only.
 const PAIR_PROBE_DEADLINE: Duration = OPEN_TIMEOUT;
+/// Window for both parties to claim the relay legs they were handed, measured
+/// from the open. A pair whose second leg never arrives carries nothing and
+/// would hold an exclusive provider's slot until a control session bounced, so
+/// it is torn down here like a splice that ended. It clears the client's
+/// `OPEN_HANDSHAKE_TIMEOUT`, which is what a party spends connecting and
+/// handshaking a leg, plus the flight of the frame that told it to, so a leg
+/// still inside its own open is never reaped out from under it.
+const RELAY_CLAIM_DEADLINE: Duration = Duration::from_secs(20);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Liveness window for the control channel. The client pings every 25s, so no
 /// inbound control frame for this long means the link is a black hole (no
@@ -680,9 +688,10 @@ impl Server {
     /// other side) opens no second relay. Each party gets its own leg id: two
     /// parties cannot both claim one id through a oneshot pending entry. Lock
     /// order is clients, pairs, relay legs, with `next_id` a leaf; the sends
-    /// run outside every lock.
+    /// run outside every lock. Opening the relay arms the claim deadline, so a
+    /// leg that never arrives cannot pin the pair.
     fn peer_path(
-        &self,
+        self: &Arc<Self>,
         client_id: &str,
         tx: &mpsc::Sender<Vec<u8>>,
         pair_id: u64,
@@ -740,7 +749,33 @@ impl Server {
         crate::elog!("peer pair {pair_id}: {client_id} reports the {name} path");
         if opened {
             crate::elog!("peer pair {pair_id}: opening the relay");
+            let srv = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(RELAY_CLAIM_DEADLINE).await;
+                srv.reap_unclaimed_relay(pair_id);
+            });
         }
+    }
+
+    /// Drop a pair whose relay opened but never spliced: neither party claimed
+    /// its leg, or only one did and the other never arrived. Such a pair
+    /// carries nothing, so it goes the way a finished splice goes, leaving a
+    /// fresh `PeerConnect` as the recovery. A pair already spliced is left to
+    /// `end_relay`.
+    fn reap_unclaimed_relay(&self, pair_id: u64) {
+        let removed = {
+            let mut pairs = self.pairs.lock().unwrap();
+            let unclaimed = pairs
+                .get(&pair_id)
+                .and_then(|p| p.relay.as_ref())
+                .is_some_and(|r| !matches!(r.state, RelayState::Spliced { .. }));
+            unclaimed.then(|| pairs.remove(&pair_id)).flatten()
+        };
+        let Some(pair) = removed else {
+            return;
+        };
+        self.forget_pair_ids(&pair);
+        crate::elog!("peer pair {pair_id}: the relay legs were never claimed");
     }
 
     /// Claim a relay leg id and return the pair it belongs to. A leg id is
@@ -2543,6 +2578,69 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         assert_eq!(status, PeerStatus::Accepted);
     }
 
+    /// Let the claim deadline lapse and give the reaper it armed a turn.
+    async fn advance_past_claim_deadline() {
+        tokio::time::sleep(RELAY_CLAIM_DEADLINE + Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // Opening the relay arms a claim deadline. A relay that spliced in time
+    // survives it and is left to its own teardown; one whose second leg never
+    // arrives is dropped, because the pair carries nothing and holding it
+    // would answer the consumer's own retry with peer_busy for as long as
+    // both control sessions stayed up.
+    #[tokio::test(start_paused = true)]
+    async fn unclaimed_relay_legs_free_the_exclusive_provider() {
+        let srv = test_server();
+        let (_prov_tx, _prov_rx) = register_peer_client(&srv, "prov", Some(PROVIDES_EXIT));
+        let (c1_tx, _c1_rx) = register_peer_client(&srv, "c1", Some(0));
+        let (c2_tx, _c2_rx) = register_peer_client(&srv, "c2", Some(0));
+
+        let (spliced, status) = srv
+            .peer_connect("c1", &c1_tx, "prov", PROVIDES_EXIT)
+            .unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        srv.peer_path("c1", &c1_tx, spliced, PathStatus::Relay);
+        let (stop, _stop_rx) = oneshot::channel();
+        {
+            let mut pairs = srv.pairs.lock().unwrap();
+            let relay = pairs
+                .get_mut(&spliced)
+                .and_then(|p| p.relay.as_mut())
+                .expect("the report opened the relay");
+            relay.state = RelayState::Spliced { _stop: stop };
+        }
+
+        advance_past_claim_deadline().await;
+        assert!(
+            srv.pairs.lock().unwrap().contains_key(&spliced),
+            "a spliced relay outlives the claim deadline"
+        );
+        assert_eq!(
+            srv.peer_connect("c2", &c2_tx, "prov", PROVIDES_EXIT),
+            Some((0, PeerStatus::PeerBusy))
+        );
+
+        // The next pair is handed its legs and neither party ever claims one.
+        srv.end_relay(spliced);
+        let (unclaimed, status) = srv
+            .peer_connect("c2", &c2_tx, "prov", PROVIDES_EXIT)
+            .unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        srv.peer_path("c2", &c2_tx, unclaimed, PathStatus::Relay);
+
+        advance_past_claim_deadline().await;
+        assert!(srv.pairs.lock().unwrap().is_empty());
+        assert!(srv.relay_legs.lock().unwrap().is_empty());
+        let (next, status) = srv
+            .peer_connect("c2", &c2_tx, "prov", PROVIDES_EXIT)
+            .unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        assert_ne!(next, unclaimed);
+    }
+
     // The liveness check and the pair insert share the clients guard, so a
     // pair only lands while the provider entry is live and the teardown that
     // removes the entry always invalidates it afterwards. The cross-task
@@ -2894,8 +2992,8 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
     // its registry slot and is a party to it. A stranger's report, one naming
     // an unknown pair, a repeat after the first, and one from a session a
     // reconnect superseded are all dropped.
-    #[test]
-    fn peer_path_records_only_a_live_party() {
+    #[tokio::test]
+    async fn peer_path_records_only_a_live_party() {
         let srv = test_server();
         let (p_tx, _p_rx) = register_peer_client(&srv, "prov", Some(PROVIDES_EXIT));
         let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));

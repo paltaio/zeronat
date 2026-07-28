@@ -21,6 +21,8 @@ pub mod logging;
 pub mod netfilter;
 pub mod noise;
 pub mod peer;
+#[cfg(target_os = "linux")]
+pub(crate) mod peerexit;
 pub mod peerslot;
 pub mod pppoe;
 pub mod proto;

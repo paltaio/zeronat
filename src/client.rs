@@ -32,7 +32,7 @@ use crate::noise::{
 };
 use crate::peerslot;
 use crate::peerslot::PeerControl;
-pub use crate::peerslot::{PeerSlotSession, PeerSlotSpec, SessionSink};
+pub use crate::peerslot::{PeerExit, PeerSlotSession, PeerSlotSpec, SessionSink};
 use crate::proto::{decode_sockaddr, encode_sockaddr, FwdOptionEntry, Msg, Proto};
 use crate::tap::TapConfig;
 #[cfg(target_os = "linux")]
@@ -1041,6 +1041,14 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
     if !pppoe.is_empty() {
         return Err("pppoe is only supported on Linux".into());
     }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(spec) = peers.iter().find(|s| s.device().is_some()) {
+        return Err(format!(
+            "{} opens a network device, which is only supported on Linux",
+            spec.label()
+        )
+        .into());
+    }
 
     let forwards = SharedForwards::new(tcp, udp);
     // Held for the loop's lifetime: a pppoe attempt's datapath borrows the
@@ -1182,7 +1190,13 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                  can pair; peer slots pair while this client runs forwards or sits idle"
             );
         }
-        let peer_slots = peerslot::spawn(&peers, &client_id, &peer_control, &peer_sessions);
+        let peer_slots = peerslot::spawn(
+            &peers,
+            &client_id,
+            &target.secret,
+            &peer_control,
+            &peer_sessions,
+        );
 
         let mut udp_health = UdpHealth::default();
         let mut backoff = Backoff::default();
@@ -2943,6 +2957,20 @@ mod tests {
         PeerSlotSpec::Provider {
             provides: bit,
             device: device.map(Into::into),
+            exit: None,
+        }
+    }
+
+    /// An exit provider, which claims the tun its adapter opens.
+    fn exit_provider_slot(device: &str) -> PeerSlotSpec {
+        PeerSlotSpec::Provider {
+            provides: crate::proto::PROVIDES_EXIT,
+            device: None,
+            exit: Some(PeerExit {
+                device: device.into(),
+                mtu: 1400,
+                iface: None,
+            }),
         }
     }
 
@@ -3000,6 +3028,20 @@ mod tests {
         assert!(err.contains("default route"), "{err}");
         // The same session without the default swap runs beside the consumer.
         claims.admit_body(pppoe_mode("wan").claims()).unwrap();
+    }
+
+    // An exit provider claims the tun its adapter opens, so a body naming that
+    // device is refused the same way a segment provider's NIC refuses one.
+    #[test]
+    fn an_exit_provider_claims_the_tun_it_opens() {
+        let claims = SlotClaims::new(peer_claims(&[exit_provider_slot("znx0")])).unwrap();
+        let err = claims.admit_body(tap_body("znx0").claims()).unwrap_err();
+        assert!(err.contains("znx0"), "{err}");
+        assert!(err.contains("exit provider"), "{err}");
+        claims.admit_body(tap_body("zn0").claims()).unwrap();
+        // The host's routing stays free: the adapter masquerades rather than
+        // programming default routes.
+        assert!(!exit_provider_slot("znx0").default_route());
     }
 
     // Two peer slots naming one interface contend with each other, and the

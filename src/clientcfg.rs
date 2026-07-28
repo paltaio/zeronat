@@ -95,6 +95,9 @@ pub struct CfgTun {
 pub struct CfgPeer {
     /// Serve one consumer's IPv4 traffic out this node's connection.
     pub exit: bool,
+    /// Interface the served consumer's traffic masquerades out of; the
+    /// default-route interface when unset.
+    pub exit_iface: Option<String>,
     /// Bridge consumers onto this node's L2 segment, naming the NIC.
     pub segment: Option<String>,
 }
@@ -215,6 +218,7 @@ struct PartialRecord {
     exit: Option<bool>,
     exit_strict: Option<bool>,
     exit_via: Option<String>,
+    exit_iface: Option<String>,
     segment: Option<String>,
 }
 
@@ -388,6 +392,7 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
                 reject_dup(&mut record_keys, key, n)?;
                 match key {
                     "exit" => record.exit = Some(parse_bool(value, n)?),
+                    "exit_iface" => record.exit_iface = Some(parse_string(value, n)?),
                     "segment" => record.segment = Some(parse_string(value, n)?),
                     other => {
                         return Err(err(n, &format!("unknown key `{other}` in [peer]")));
@@ -524,8 +529,17 @@ fn close_record(
             if segment.as_ref().is_some_and(|s| s.is_empty()) {
                 return Err(err(n, "peer `segment` must name an interface"));
             }
+            let exit = record.exit.take().unwrap_or(false);
+            let exit_iface = record.exit_iface.take();
+            if exit_iface.as_ref().is_some_and(|i| i.is_empty()) {
+                return Err(err(n, "peer `exit_iface` must name an interface"));
+            }
+            if exit_iface.is_some() && !exit {
+                return Err(err(n, "`exit_iface` requires `exit = true`"));
+            }
             cfg.peer = Some(CfgPeer {
-                exit: record.exit.take().unwrap_or(false),
+                exit,
+                exit_iface,
                 segment,
             });
         }
@@ -678,6 +692,9 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
         table(&mut out, "[peer]");
         if peer.exit {
             out.push_str("exit = true\n");
+        }
+        if let Some(iface) = &peer.exit_iface {
+            out.push_str(&format!("exit_iface = {}\n", quote(iface)));
         }
         if let Some(nic) = &peer.segment {
             out.push_str(&format!("segment = {}\n", quote(nic)));
@@ -844,7 +861,7 @@ mod tests {
             "[[forwards]]\nproto = \"tcp\"\nport = 443\n\
              [[pppoe]]\nname = \"wan\"\nusername = \"u\"\n\
              [tun]\ndev = \"zn0\"\nexit = true\nexit_via = \"office-b1c2\"\n\
-             [peer]\nexit = true\nsegment = \"eth1\"\n",
+             [peer]\nexit = true\nexit_iface = \"wan0\"\nsegment = \"eth1\"\n",
         )
         .unwrap();
         cfg.validate().unwrap();
@@ -853,8 +870,15 @@ mod tests {
         assert_eq!(tun.exit_via.as_deref(), Some("office-b1c2"));
         let peer = cfg.peer.as_ref().unwrap();
         assert!(peer.exit);
+        assert_eq!(peer.exit_iface.as_deref(), Some("wan0"));
         assert_eq!(peer.segment.as_deref(), Some("eth1"));
         assert_eq!(parse_client(&serialize_client(&cfg)).unwrap(), cfg);
+
+        // An exit provider without a named interface takes the default-route
+        // one at bringup.
+        let auto = parse_client("[peer]\nexit = true\n").unwrap();
+        assert_eq!(auto.peer.as_ref().unwrap().exit_iface, None);
+        assert_eq!(parse_client(&serialize_client(&auto)).unwrap(), auto);
 
         // A bare [peer] declares no provider at all.
         let none = parse_client("[peer]\n").unwrap();
@@ -964,6 +988,11 @@ mod tests {
             "[peer]\nsegment = \"\"\n",
             "[peer]\nfoo = 1\n",
             "[peer]\n[peer]\n",
+            "[peer]\nexit = true\nexit_iface = \"\"\n",
+            // The masquerade the interface names is what `exit` turns on.
+            "[peer]\nexit_iface = \"wan0\"\n",
+            // `exit_iface` is a [peer] key; [tun] takes `exit_via` instead.
+            "[tun]\nexit_iface = \"wan0\"\n",
             // `exit_strict` hardens exit mode, so it needs exit mode on.
             "[tun]\nexit_strict = true\n",
             "[tun]\nexit = false\nexit_strict = true\n",

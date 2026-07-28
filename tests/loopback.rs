@@ -4350,6 +4350,50 @@ async fn peer_relay_death_frees_an_exclusive_provider() {
         .expect("relay death flow did not complete within 30s");
 }
 
+// A relay whose second leg never arrives frees the exclusive provider it
+// pinned. Both control sessions stay up and healthy, so nothing else would
+// ever clear the pair, and the consumer's own retry would read peer_busy off
+// its own dead pair for as long as it stayed connected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_unclaimed_relay_legs_free_an_exclusive_provider() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let mut pair = relay_pair(control).await;
+
+        // Only the consumer claims its leg; the provider's is never opened, so
+        // the splice never starts.
+        let (_c_lr, _c_lw) = stream_leg(control, pair.c_leg).await;
+
+        let (mut c2r, mut c2w) = peer_control_connect(control, "c2", 0).await;
+        let (id, status) = peer_connect(&mut c2r, &mut c2w, "prov", PROVIDES_EXIT).await;
+        assert_eq!(
+            (id, status),
+            (0, PeerStatus::PeerBusy),
+            "the pair holds the slot until its claim deadline"
+        );
+
+        let next = loop {
+            let (next, status) = peer_connect(&mut c2r, &mut c2w, "prov", PROVIDES_EXIT).await;
+            match status {
+                PeerStatus::Accepted => break next,
+                PeerStatus::PeerBusy => sleep(Duration::from_millis(200)).await,
+                other => panic!("unexpected status {other:?}"),
+            }
+        };
+        assert_ne!(next, pair.pair_id);
+        // Neither original control session bounced, so the deadline is what
+        // freed the slot: the consumer's is still answering, and the
+        // provider's is the one carrying the fresh pair.
+        assert_next_frame_is_pong(&mut pair.cw, &mut pair.cr).await;
+        recv_peer_probe(&mut pair.pr, next, "c2").await;
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("unclaimed relay flow did not complete within 60s");
+}
+
 // One party's relay report opens the relay while the other party is still
 // punching, and both parties' legs splice. A peer client races its punch
 // against the control channel and drops it when the open arrives, which is
@@ -4867,6 +4911,7 @@ async fn run_two_slot_test(transport: zeronat::client::Transport) {
         provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
             provides: PROVIDES_EXIT,
             device: None,
+            exit: None,
         }];
         provider.peer_sessions = Some(prov_tx);
         tokio::spawn(zeronat::client::run_switchable(
@@ -4933,6 +4978,193 @@ async fn peer_slot_runs_beside_the_server_slot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_slot_pairs_over_the_relay() {
     run_two_slot_test(zeronat::client::Transport::Tcp).await;
+}
+
+// The provider is authoritative for a pair the server has forgotten. A punched
+// pair survives the supersession that clears the server's pair state, so the
+// fast-fail has nothing left to refuse with and a second consumer is accepted;
+// the refusal then has to ride the provider's own handshake answer, for as long
+// as the running pair stays inside its keepalive deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let psk = zeronat::noise::derive_psk(SECRET);
+
+        let consumer_id = zeronat::identity::derive_client_id(Some("consumer"));
+        let provider_id = zeronat::identity::derive_client_id(Some("provider"));
+        let target = || zeronat::client::ServerTarget {
+            name: "home".into(),
+            addr: format!("127.0.0.1:{control}"),
+            secret: SECRET.into(),
+            transport: zeronat::client::Transport::Udp,
+        };
+
+        let (prov_tx, mut prov_rx) = tokio::sync::mpsc::channel(4);
+        let mut provider = client_settings(vec![target()], vec![], "provider", None);
+        provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
+            provides: PROVIDES_EXIT,
+            device: None,
+            exit: None,
+        }];
+        provider.peer_sessions = Some(prov_tx);
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(target()),
+            provider,
+        ));
+
+        let (cons_tx, mut cons_rx) = tokio::sync::mpsc::channel(4);
+        let mut consumer = client_settings(vec![target()], vec![], "consumer", None);
+        consumer.peers = vec![zeronat::client::PeerSlotSpec::Consumer {
+            peer_id: provider_id.clone(),
+            want: PROVIDES_EXIT,
+            device: None,
+            default_route: false,
+        }];
+        consumer.peer_sessions = Some(cons_tx);
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(target()),
+            consumer,
+        ));
+
+        let mut consumer_slot = next_slot_session(&mut cons_rx).await;
+        let mut provider_slot = next_slot_session(&mut prov_rx).await;
+        cross_peer_frame(&consumer_slot, &mut provider_slot, b"first-pair").await;
+
+        // A reconnect under the consumer's id supersedes its control session,
+        // which is what drops the server's copy of the pair. The punched pair
+        // carries on: nothing about it touches the server.
+        let (_sr, _sw, _pump) = peer_control_connect_udp(control, &consumer_id, 0).await;
+        cross_peer_frame(
+            &consumer_slot,
+            &mut provider_slot,
+            b"outlived-the-pair-state",
+        )
+        .await;
+
+        // With the pair forgotten, the server accepts a second consumer.
+        let (mut c2r, mut c2w) = peer_control_connect(control, "c2", 0).await;
+        let pair_id = loop {
+            let (pair_id, status) =
+                peer_connect(&mut c2r, &mut c2w, &provider_id, PROVIDES_EXIT).await;
+            match status {
+                PeerStatus::Accepted => break pair_id,
+                PeerStatus::PeerBusy => sleep(Duration::from_millis(100)).await,
+                other => panic!("unexpected status {other:?}"),
+            }
+        };
+        recv_peer_probe(&mut c2r, pair_id, &provider_id).await;
+        // c2 arrived on tcp and never probes, so it reports the relay as soon
+        // as the pair's info lands, whatever candidates the provider offered.
+        recv_peer_info(&mut c2r, pair_id).await;
+        report_path(&mut c2w, pair_id, PathStatus::Relay).await;
+        let leg = recv_relay_open(&mut c2r, pair_id).await;
+
+        let (_refused, answer) = zeronat::peer::PeerSession::consumer(
+            zeronat::peer::PeerPath::relay_stream(stream_leg(control, leg).await),
+            &psk,
+            pair_id,
+        )
+        .await
+        .expect("the provider must answer the second pair's handshake");
+        assert_eq!(answer, b"already serving a pair");
+
+        // The pair holding the slot is still the one carrying traffic.
+        cross_peer_frame(&provider_slot, &mut consumer_slot, b"still-serving").await;
+    };
+
+    timeout(Duration::from_secs(180), body)
+        .await
+        .expect("provider-authoritative refusal did not complete within 180s");
+}
+
+/// Pair with `provider` as a relay-only consumer and return the answer its
+/// message two carried, which is empty when the provider took the pair.
+async fn exit_pair_answer(
+    control: u16,
+    r: &mut zeronat::noise::NoiseReader,
+    w: &mut zeronat::noise::NoiseWriter,
+    provider: &str,
+    psk: &[u8; 32],
+) -> Vec<u8> {
+    let pair_id = loop {
+        let (pair_id, status) = peer_connect(r, w, provider, PROVIDES_EXIT).await;
+        match status {
+            PeerStatus::Accepted => break pair_id,
+            // The provider is still holding the pair before it, or its
+            // announce has not reached the server yet.
+            PeerStatus::PeerBusy | PeerStatus::NotProvided => {
+                sleep(Duration::from_millis(100)).await
+            }
+            other => panic!("unexpected status {other:?}"),
+        }
+    };
+    recv_peer_probe(r, pair_id, provider).await;
+    recv_peer_info(r, pair_id).await;
+    report_path(w, pair_id, PathStatus::Relay).await;
+    let leg = recv_relay_open(r, pair_id).await;
+    let (_session, answer) = zeronat::peer::PeerSession::consumer(
+        zeronat::peer::PeerPath::relay_stream(stream_leg(control, leg).await),
+        psk,
+        pair_id,
+    )
+    .await
+    .expect("the provider must answer the inner handshake");
+    answer
+}
+
+// A provider whose exit adapter cannot come up refuses the pair in message
+// two instead of accepting it and serving nothing. An accepted handshake is a
+// served session to the consumer, which resets its backoff and re-pairs on
+// every cycle for as long as the misconfiguration lasts; a refusal makes it
+// back off. The state outlives the pair, so the pair after it is refused too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_exit_provider_refuses_a_pair_it_cannot_serve() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let provider_id = zeronat::identity::derive_client_id(Some("provider"));
+        let target = || zeronat::client::ServerTarget {
+            name: "home".into(),
+            addr: format!("127.0.0.1:{control}"),
+            secret: SECRET.into(),
+            transport: zeronat::client::Transport::Tcp,
+        };
+
+        let mut provider = client_settings(vec![target()], vec![], "provider", None);
+        provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
+            provides: PROVIDES_EXIT,
+            device: None,
+            // The egress names the tun the pair itself rides, which is a
+            // bringup no pair can make work.
+            exit: Some(zeronat::client::PeerExit {
+                device: "znx0".into(),
+                mtu: 1400,
+                iface: Some("znx0".into()),
+            }),
+        }];
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(target()),
+            provider,
+        ));
+
+        let (mut cr, mut cw) = peer_control_connect(control, "c", 0).await;
+        wait_clients(control, 2).await;
+        for _ in 0..2 {
+            let answer = exit_pair_answer(control, &mut cr, &mut cw, &provider_id, &psk).await;
+            let reason = String::from_utf8_lossy(&answer).into_owned();
+            assert!(
+                reason.contains("znx0"),
+                "the refusal must name the bringup, got {reason:?}"
+            );
+        }
+    };
+
+    timeout(Duration::from_secs(180), body)
+        .await
+        .expect("failed-bringup refusal did not complete within 180s");
 }
 
 /// The pair and probe ids of the next `PeerProbe` on a control channel, for a

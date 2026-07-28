@@ -46,6 +46,13 @@ const FRAME_QUEUE: usize = 64;
 /// serves a pair.
 const REFUSE_BUSY: &[u8] = b"already serving a pair";
 
+/// How long a refused pair holds its path open after sealing the answer. The
+/// refusal rides message two, and dropping the path as that frame is written
+/// takes the frame down with it on a relayed pair, where the splice ends the
+/// moment either leg does. Holding lets the answer land, and lets a consumer
+/// that lost it repeat its message one and be answered again.
+const REFUSAL_LINGER: Duration = Duration::from_secs(2);
+
 /// The live control session as a peer slot sees it: the frame sender, what a
 /// probe socket and a relay leg need to reach the server, and the psk of the
 /// profile the pairing is keyed by.
@@ -302,7 +309,21 @@ pub enum PeerSlotSpec {
         provides: u8,
         /// The interface a segment provider bridges.
         device: Option<String>,
+        /// The tun and masquerade an exit provider runs for the pair it
+        /// serves; unset on a segment provider.
+        exit: Option<PeerExit>,
     },
+}
+
+/// What an exit provider opens for the pair it serves.
+#[derive(Clone)]
+pub struct PeerExit {
+    /// The tun device brought up on the provider's end of the pair's subnet.
+    pub device: String,
+    pub mtu: usize,
+    /// Interface the pair's traffic masquerades out of; the host's
+    /// default-route interface when unset.
+    pub iface: Option<String>,
 }
 
 impl PeerSlotSpec {
@@ -318,11 +339,16 @@ impl PeerSlotSpec {
         }
     }
 
+    /// The interface this slot opens, which is the claim it holds: a
+    /// consumer's tun, an exit provider's tun, or the NIC a segment provider
+    /// bridges.
     pub fn device(&self) -> Option<&str> {
         match self {
-            PeerSlotSpec::Consumer { device, .. } | PeerSlotSpec::Provider { device, .. } => {
-                device.as_deref()
-            }
+            PeerSlotSpec::Consumer { device, .. } => device.as_deref(),
+            PeerSlotSpec::Provider { device, exit, .. } => exit
+                .as_ref()
+                .map(|e| e.device.as_str())
+                .or(device.as_deref()),
         }
     }
 
@@ -381,6 +407,7 @@ pub type SessionSink = Option<mpsc::Sender<PeerSlotSession>>;
 pub(crate) fn spawn(
     specs: &[PeerSlotSpec],
     client_id: &str,
+    secret: &str,
     control: &PeerControl,
     sink: &SessionSink,
 ) -> Vec<AbortOnDrop> {
@@ -388,15 +415,16 @@ pub(crate) fn spawn(
         .iter()
         .map(|spec| {
             let client_id = client_id.to_string();
+            let secret = secret.to_string();
             let control = control.clone();
             let sink = sink.clone();
             AbortOnDrop(match spec.clone() {
                 PeerSlotSpec::Consumer { peer_id, want, .. } => {
                     tokio::spawn(consumer_slot(peer_id, want, client_id, control, sink))
                 }
-                PeerSlotSpec::Provider { provides, .. } => {
-                    tokio::spawn(provider_slot(provides, client_id, control, sink))
-                }
+                PeerSlotSpec::Provider { provides, exit, .. } => tokio::spawn(provider_slot(
+                    provides, exit, secret, client_id, control, sink,
+                )),
             })
         })
         .collect()
@@ -500,8 +528,21 @@ async fn pair_as_consumer(
 /// One provider slot: it never initiates. A pair reaches it as the
 /// `PeerProbe` naming the peer and the capability, and every later frame for
 /// that pair follows the binding the probe installed. A pair that dies takes
-/// its own session down and nothing else.
-async fn provider_slot(provides: u8, client_id: String, control: PeerControl, sink: SessionSink) {
+/// its own session down and, on an exit provider, the adapter this task was
+/// running for it; every other pair is untouched.
+///
+/// An exit provider's adapter runs in this task rather than in the pair task
+/// that handshaked it, so the device it opens and the rules it installs are
+/// released when this task ends. That is what a profile switch awaits before
+/// the incoming slot set claims anything.
+async fn provider_slot(
+    provides: u8,
+    exit: Option<PeerExit>,
+    secret: String,
+    client_id: String,
+    control: PeerControl,
+    sink: SessionSink,
+) {
     let (mut rx, _route) = control.register_provider(provides);
     // Exit is exclusive: the slot serves one pair at a time and refuses a
     // second in its handshake answer, which is the only enforcement left once
@@ -509,7 +550,46 @@ async fn provider_slot(provides: u8, client_id: String, control: PeerControl, si
     let busy = Arc::new(AtomicBool::new(false));
     let mut pairs: HashMap<u64, mpsc::Sender<Msg>> = HashMap::new();
     let mut running: Vec<(u64, AbortOnDrop)> = Vec::new();
-    while let Some(msg) = rx.recv().await {
+    // Where the pair that took the exclusive slot hands its adapter over. One
+    // pair at a time reaches it: the hold rides along, so a second is refused
+    // before it has a session to hand over.
+    let (served_tx, mut served_rx) = mpsc::channel::<ExitAdapter>(1);
+    let owner = exit.map(|exit| ExitOwner {
+        served: served_tx,
+        exit,
+        secret,
+        health: Arc::new(ExitHealth::default()),
+    });
+    let mut adapter: Option<ExitAdapter> = None;
+    loop {
+        let step = tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(msg) => SlotStep::Control(msg),
+                None => break,
+            },
+            // The sender lives in `owner`, so a slot with no adapter has
+            // nothing to listen for and a slot with one never sees the channel
+            // close.
+            served = served_rx.recv(), if owner.is_some() && adapter.is_none() => match served {
+                Some(served) => SlotStep::Serve(served),
+                None => break,
+            },
+            _ = drive(&mut adapter) => SlotStep::AdapterEnded,
+        };
+        let msg = match step {
+            SlotStep::Serve(served) => {
+                crate::elog!("peer {}: exit pair up", served.peer_id);
+                adapter = Some(served);
+                continue;
+            }
+            SlotStep::AdapterEnded => {
+                if let Some(done) = adapter.take() {
+                    crate::elog!("peer {}: exit pair ended", done.peer_id);
+                }
+                continue;
+            }
+            SlotStep::Control(msg) => msg,
+        };
         running.retain(|(id, task)| {
             let live = !task.0.is_finished();
             if !live {
@@ -540,7 +620,10 @@ async fn provider_slot(provides: u8, client_id: String, control: PeerControl, si
                     pair_rx,
                     control.pair_guard(pair_id),
                     control.clone(),
-                    sink.clone(),
+                    PairOwner {
+                        sink: sink.clone(),
+                        exit: owner.clone(),
+                    },
                     busy.clone(),
                 );
                 running.push((pair_id, AbortOnDrop(tokio::spawn(task))));
@@ -556,6 +639,108 @@ async fn provider_slot(provides: u8, client_id: String, control: PeerControl, si
             }
             _ => {}
         }
+    }
+}
+
+/// What moved the provider slot's loop forward.
+enum SlotStep {
+    Control(Msg),
+    Serve(ExitAdapter),
+    AdapterEnded,
+}
+
+/// One pair's exit adapter: the peer it serves, and the future holding the
+/// device it opened, the rules it installed, and the exclusive hold it took.
+/// Built by the pair task and run by the slot task, so the slot's own end is
+/// what releases all three.
+struct ExitAdapter {
+    peer_id: String,
+    run: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
+
+/// Poll the running adapter, or wait forever while the slot has none.
+async fn drive(adapter: &mut Option<ExitAdapter>) {
+    match adapter {
+        Some(a) => a.run.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Run the exit adapter over `session`, holding the exclusive slot for as long
+/// as it lives. A bringup this provider cannot do is held against the pairs
+/// that follow, so they are refused instead of served nothing.
+async fn run_exit(
+    session: PeerSession,
+    _hold: Option<BusyGuard>,
+    exit: PeerExit,
+    secret: String,
+    health: Arc<ExitHealth>,
+) {
+    #[cfg(target_os = "linux")]
+    if let Err(e) = crate::peerexit::serve(session, &exit, &secret).await {
+        health.latch(e.to_string());
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (session, exit, secret, health);
+}
+
+/// Where a served pair goes: the exit adapter the slot runs, else the frame
+/// seam whoever owns the slot set took.
+struct PairOwner {
+    sink: SessionSink,
+    exit: Option<ExitOwner>,
+}
+
+/// What an exit provider's pair needs to hand its adapter to the slot: the
+/// channel the slot listens on, the tun and secret the adapter runs with, and
+/// the bringup state the slot carries between pairs.
+#[derive(Clone)]
+struct ExitOwner {
+    served: mpsc::Sender<ExitAdapter>,
+    exit: PeerExit,
+    secret: String,
+    health: Arc<ExitHealth>,
+}
+
+/// An exit provider's bringup state. An adapter that cannot come up refuses
+/// the pair rather than accepting it and hanging up: a completed handshake is
+/// a served session to the consumer, which resets its backoff and re-pairs on
+/// the next cycle for as long as the misconfiguration lasts.
+#[derive(Default)]
+struct ExitHealth(Mutex<Option<String>>);
+
+impl ExitHealth {
+    /// The refusal this provider owes the pair it is about to answer. What it
+    /// can check without a pair decides it; a bringup that failed for a reason
+    /// those checks cannot see refuses the next pair and then lets the one
+    /// after it try again, so a transient failure recovers on its own.
+    fn refusal(&self, exit: &PeerExit) -> Option<String> {
+        match exit_precheck(exit) {
+            Err(e) => Some(self.latch(e.to_string())),
+            Ok(()) => self.0.lock().unwrap().take(),
+        }
+    }
+
+    /// Record a bringup failure, naming the cause the first time it appears so
+    /// a misconfiguration says why once rather than once per pair.
+    fn latch(&self, reason: String) -> String {
+        let mut held = self.0.lock().unwrap();
+        if held.as_deref() != Some(reason.as_str()) {
+            crate::elog!("peer exit: {reason}");
+        }
+        *held = Some(reason.clone());
+        reason
+    }
+}
+
+/// What an exit provider can decide about its bringup with no pair in hand.
+fn exit_precheck(exit: &PeerExit) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return crate::peerexit::precheck(exit);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = exit;
+        Ok(())
     }
 }
 
@@ -578,7 +763,7 @@ async fn provider_pair(
     mut rx: mpsc::Receiver<Msg>,
     _pair: RouteGuard,
     control: PeerControl,
-    sink: SessionSink,
+    owner: PairOwner,
     busy: Arc<AtomicBool>,
 ) {
     let PairStart {
@@ -591,22 +776,29 @@ async fn provider_pair(
     let served: Result<Served> = {
         let cycle = async {
             let settled = settle_path(pair_id, &peer_id, &client_id, &session, &mut rx).await?;
+            // An adapter that cannot come up refuses before it takes the slot,
+            // so a provider stuck on its own config never reads as busy.
+            let broken = owner
+                .exit
+                .as_ref()
+                .and_then(|e| e.health.refusal(&e.exit))
+                .map(String::into_bytes);
             // The slot is taken here rather than at the pair's start, so two
             // pairs settling at once cannot both be served: the loser's
             // refusal rides the message two it is about to seal.
-            let hold = if exclusive {
+            let hold = if exclusive && broken.is_none() {
                 BusyGuard::take(&busy)
             } else {
                 None
             };
-            let refuse: &[u8] = if exclusive && hold.is_none() {
-                REFUSE_BUSY
-            } else {
-                &[]
+            let refuse = match broken {
+                Some(reason) => reason,
+                None if exclusive && hold.is_none() => REFUSE_BUSY.to_vec(),
+                None => Vec::new(),
             };
             let (peer, _) = handshake_under_relay_authority(
                 settled,
-                Side::Provider(refuse),
+                Side::Provider(&refuse),
                 pair_id,
                 &session,
                 &mut rx,
@@ -615,7 +807,7 @@ async fn provider_pair(
             Ok(if refuse.is_empty() {
                 Served::Taken(peer, hold)
             } else {
-                Served::Refused
+                Served::Refused(String::from_utf8_lossy(&refuse).into_owned(), peer)
             })
         };
         tokio::select! {
@@ -627,13 +819,39 @@ async fn provider_pair(
         }
     };
     match served {
-        Ok(Served::Taken(peer, _hold)) => {
-            let bit = provides_name(provides);
-            crate::elog!("peer {peer_id}: {bit} pair up");
-            run_session(peer, &peer_id, provides, &sink).await;
-            crate::elog!("peer {peer_id}: {bit} pair ended");
+        Ok(Served::Taken(peer, hold)) => match &owner.exit {
+            // The adapter runs on the slot task, and the hold rides with it,
+            // so this task is done the moment it has handed both over.
+            Some(exit) => {
+                exit.served
+                    .send(ExitAdapter {
+                        peer_id,
+                        run: Box::pin(run_exit(
+                            peer,
+                            hold,
+                            exit.exit.clone(),
+                            exit.secret.clone(),
+                            exit.health.clone(),
+                        )),
+                    })
+                    .await
+                    .ok();
+            }
+            None => {
+                let bit = provides_name(provides);
+                crate::elog!("peer {peer_id}: {bit} pair up");
+                run_session(peer, &peer_id, provides, &owner.sink).await;
+                crate::elog!("peer {peer_id}: {bit} pair ended");
+            }
+        },
+        Ok(Served::Refused(reason, mut peer)) => {
+            crate::elog!("peer pair {pair_id}: refused, {reason}");
+            timeout(REFUSAL_LINGER, async {
+                while peer.recv().await.is_some() {}
+            })
+            .await
+            .ok();
         }
-        Ok(Served::Refused) => crate::elog!("peer pair {pair_id}: refused, the slot is busy"),
         Err(e) => crate::elog!("peer pair {pair_id}: {e}"),
     }
 }
@@ -643,8 +861,9 @@ enum Served {
     /// The pair is served; the hold keeps an exclusive slot taken until the
     /// session ends, however the pair task exits.
     Taken(PeerSession, Option<BusyGuard>),
-    /// The slot was already serving a pair, and the refusal rode message two.
-    Refused,
+    /// The slot could not take the pair; the reason rode message two, and the
+    /// session is held open long enough for it to land.
+    Refused(String, PeerSession),
 }
 
 /// Holds an exclusive provider slot for one pair.
@@ -964,6 +1183,66 @@ mod tests {
             .await
             .expect("the slot never re-armed after the deadline");
         assert_eq!(again, "prov");
+        drop(slot);
+    }
+
+    // An adapter that cannot come up refuses the pair, and the refusal
+    // outlives it: every pair that follows reads the same reason off the
+    // checks a provider can run without one. A failure those checks cannot
+    // see is handed to one pair and then cleared, so the pair after it tries
+    // the bringup again.
+    #[test]
+    fn a_provider_that_cannot_bring_its_exit_up_refuses_every_pair() {
+        let exit = PeerExit {
+            device: "znx0".into(),
+            mtu: 1400,
+            // Masquerading onto the tun the pair itself rides is a bringup no
+            // pair can make work, and it reads the same on every call.
+            iface: Some("znx0".into()),
+        };
+        let health = ExitHealth::default();
+        let first = health.refusal(&exit).expect("a standing failure refuses");
+        assert!(first.contains("znx0"), "{first}");
+        assert_eq!(health.refusal(&exit), Some(first));
+
+        // The held reason is what the log speaks on, so repeating it says
+        // nothing new; the next pair takes it and leaves the state clear.
+        let health = ExitHealth::default();
+        let busy = "the device is busy".to_string();
+        assert_eq!(health.latch(busy.clone()), busy);
+        assert_eq!(health.latch(busy.clone()), busy);
+        assert_eq!(health.0.lock().unwrap().take(), Some(busy));
+        assert!(health.0.lock().unwrap().is_none());
+    }
+
+    // A provider with no adapter hands no session to its slot task, and the
+    // slot must not read the silent handoff as its own control route closing:
+    // it stays registered and keeps taking pairs.
+    #[tokio::test]
+    async fn a_provider_without_an_adapter_keeps_its_slot_open() {
+        let control = PeerControl::default();
+        let (tx, _sent) = mpsc::channel(8);
+        let _live = control.install(control_session(tx));
+        let slot = AbortOnDrop(tokio::spawn(provider_slot(
+            PROVIDES_EXIT,
+            None,
+            "secret".into(),
+            "prov".into(),
+            control.clone(),
+            None,
+        )));
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!slot.0.is_finished(), "the slot stopped serving");
+        assert!(control
+            .inner
+            .routes
+            .lock()
+            .unwrap()
+            .providers
+            .contains_key(&PROVIDES_EXIT));
         drop(slot);
     }
 

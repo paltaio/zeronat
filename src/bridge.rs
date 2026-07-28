@@ -514,23 +514,18 @@ impl TapSwitch {
     /// device; an L3 switch serves exactly one client. The returned `Arc` owns the
     /// device; every attached port shares it.
     pub fn new(tap: Arc<TapDevice>, is_l2: bool) -> Arc<Self> {
-        let sw = Arc::new(TapSwitch {
-            tap,
-            is_l2,
-            ports: Mutex::new(HashMap::new()),
-            macs: Mutex::new(HashMap::new()),
-            next_port: AtomicU32::new(0),
-        });
+        let sw = Self::detached(tap, is_l2);
         let reader = sw.clone();
-        tokio::spawn(async move { reader.tap_read_loop().await });
+        tokio::spawn(reader.read_loop());
         sw
     }
 
-    /// Build a switch over `tap` without spawning the reader loop, so a test drives
-    /// `forward_inbound`/`flood`/`learn`/`add_port`/Drop deterministically against
-    /// the port channels with no live TAP read consuming frames.
-    #[cfg(test)]
-    fn new_without_reader(tap: Arc<TapDevice>, is_l2: bool) -> Arc<Self> {
+    /// Build the switch without starting the reader, leaving [`Self::read_loop`]
+    /// for the caller to drive. A switch whose device must be closed the moment
+    /// its owner goes away drives the loop inside that owner's future, since a
+    /// spawned reader keeps its own reference to the device until the runtime
+    /// gets around to cancelling it.
+    pub fn detached(tap: Arc<TapDevice>, is_l2: bool) -> Arc<Self> {
         Arc::new(TapSwitch {
             tap,
             is_l2,
@@ -543,7 +538,7 @@ impl TapSwitch {
     /// Sole owner of `tap.read_frame()`: fan every inbound frame out to the right
     /// port(s). On an unrecoverable read error, cancel every port (so their relays
     /// reap) and exit, ending the switch's inbound path.
-    async fn tap_read_loop(self: Arc<Self>) {
+    pub async fn read_loop(self: Arc<Self>) {
         loop {
             let frame = match self.tap.read_frame().await {
                 Ok(f) => f,
@@ -885,6 +880,53 @@ pub async fn switch_port_stream(mut handle: SwitchHandle, nr: NoiseReader, nw: N
     stream_relay(local_r, local_w, nr, nw, TCP_IDLE, stop).await;
 }
 
+/// Per-pair half of the switch over an inner peer session: the exit provider's
+/// side of an L3 pair. A frame from the peer is one IP packet and writes to the
+/// shared device; a frame the switch routed to this port goes out to the peer.
+/// The session carries its own keepalive and reaps a silent peer at its own
+/// deadline, so this half keeps no idle window: it ends when the session dies,
+/// when the device write fails, or when the port is cancelled (the device
+/// reader on device death, `SwitchHandle`'s drop otherwise).
+#[cfg(target_os = "linux")]
+pub async fn switch_port_peer(mut handle: SwitchHandle, mut session: crate::peer::PeerSession) {
+    let mut out_rx = handle.out_rx.take().expect("switch port out_rx");
+    let switch = handle.switch.clone();
+    let port_id = handle.port_id;
+    let stats = handle.stats.clone();
+    let cancel = handle.cancel.clone();
+    loop {
+        // The borrow of the session ends with this statement, so the send in
+        // the outbound arm below is free to take it again.
+        let step = tokio::select! {
+            _ = cancel.notified() => PeerStep::Cancel,
+            frame = session.recv() => PeerStep::FromPeer(frame),
+            frame = out_rx.recv() => PeerStep::ToPeer(frame),
+        };
+        let alive = match step {
+            PeerStep::Cancel => false,
+            PeerStep::FromPeer(Some(frame)) => {
+                stats.note_rx(frame.len());
+                switch.learn_and_write_egress(&frame, port_id).await.is_ok()
+            }
+            PeerStep::ToPeer(Some(frame)) => {
+                stats.note_tx(frame.len());
+                session.send(&frame).await.is_ok()
+            }
+            PeerStep::FromPeer(None) | PeerStep::ToPeer(None) => false,
+        };
+        if !alive {
+            break;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum PeerStep {
+    Cancel,
+    FromPeer(Option<Vec<u8>>),
+    ToPeer(Option<Vec<u8>>),
+}
+
 /// `stream_relay` local-read half for a switch port: yields the next switch-routed
 /// inbound frame (TAP -> client). A closed channel is the empty-Vec EOF sentinel,
 /// which a switch frame never collides with (a TAP frame is never empty).
@@ -1170,7 +1212,7 @@ mod switch_tests {
     /// real TAP `IFF_NO_PI` fd, only a stand-in the switch logic reads and writes.
     fn test_switch() -> (Arc<TapSwitch>, TapFdGuard) {
         let (dev, peer) = crate::tap::TapDevice::socketpair_for_test(1500).unwrap();
-        let sw = TapSwitch::new_without_reader(Arc::new(dev), true);
+        let sw = TapSwitch::detached(Arc::new(dev), true);
         (sw, TapFdGuard(peer))
     }
 
@@ -1431,7 +1473,7 @@ mod switch_tests {
     async fn tun_switch_admits_one_port_l2_admits_many() {
         let (dev, peer) = crate::tap::TapDevice::socketpair_for_test(1500).unwrap();
         let _g = TapFdGuard(peer);
-        let tun = TapSwitch::new_without_reader(Arc::new(dev), false);
+        let tun = TapSwitch::detached(Arc::new(dev), false);
 
         let first = tun.add_port(1, None).expect("first tun port attaches");
         assert!(

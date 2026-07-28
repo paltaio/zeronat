@@ -7,6 +7,10 @@ use zeronat::{admin, client, client_admin, server, Result};
 
 const DEFAULT_TAP_MTU: usize = 1400;
 const DEFAULT_TUN_NAME: &str = "zn0";
+/// Tun an exit provider brings up for the pair it serves. Distinct from the
+/// `[tun]` and `[tap]` defaults, since a node can run one of those on the
+/// server slot while providing exit on a peer slot.
+const DEFAULT_PEER_EXIT_NAME: &str = "znx0";
 const TUN_PREFIX_LEN: u8 = 24;
 
 /// The tunnel `/24` for `secret`: `(network base, server .1, client .2)`.
@@ -343,7 +347,7 @@ fn declares_shape(cfg: &ClientConfig) -> bool {
 
 /// The peer slots a config declares: one consumer for a `[tun]` naming a peer,
 /// and one provider per bit the `[peer]` table sets.
-fn peer_slots(cfg: &ClientConfig) -> Vec<client::PeerSlotSpec> {
+fn peer_slots(cfg: &ClientConfig) -> Result<Vec<client::PeerSlotSpec>> {
     let mut slots = Vec::new();
     if let Some(tun) = &cfg.tun {
         if let Some(peer_id) = &tun.exit_via {
@@ -361,19 +365,33 @@ fn peer_slots(cfg: &ClientConfig) -> Vec<client::PeerSlotSpec> {
     }
     if let Some(peer) = &cfg.peer {
         if peer.exit {
+            // Masquerading onto the tun the pair rides would send the
+            // consumer's traffic back into the tunnel carrying it.
+            if peer.exit_iface.as_deref() == Some(DEFAULT_PEER_EXIT_NAME) {
+                return Err(format!(
+                    "[peer] exit_iface cannot be the exit provider's own tun {DEFAULT_PEER_EXIT_NAME}"
+                )
+                .into());
+            }
             slots.push(client::PeerSlotSpec::Provider {
                 provides: zeronat::proto::PROVIDES_EXIT,
                 device: None,
+                exit: Some(client::PeerExit {
+                    device: DEFAULT_PEER_EXIT_NAME.to_string(),
+                    mtu: DEFAULT_TAP_MTU,
+                    iface: peer.exit_iface.clone(),
+                }),
             });
         }
         if let Some(nic) = &peer.segment {
             slots.push(client::PeerSlotSpec::Provider {
                 provides: zeronat::proto::PROVIDES_SEGMENT,
                 device: Some(nic.clone()),
+                exit: None,
             });
         }
     }
-    slots
+    Ok(slots)
 }
 
 /// The `[[servers]]` entry to dial at boot: `[client].active` when set (its
@@ -1396,7 +1414,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                     mtu: DEFAULT_TAP_MTU,
                     bridge: None,
                 });
-                let peers = peer_slots(&file);
+                let peers = peer_slots(&file)?;
                 // An unpinned [tun] address is derived from the active
                 // server's secret at each bringup, so a server switch moves
                 // the device onto the new server's subnet. A [tun] naming a
@@ -1819,6 +1837,32 @@ mod tests {
             addr: format!("{name}.example:2222"),
             secret: zeronat::clientproto::ServerSecret("s".into()),
             transport: zeronat::client::Transport::Auto,
+        }
+    }
+
+    // An exit provider takes its own tun name and masquerades out a separate
+    // interface. Naming that tun as the egress would put the consumer's
+    // traffic back into the tunnel carrying it, so the set is refused before
+    // anything opens.
+    #[test]
+    fn an_exit_provider_refuses_its_own_tun_as_the_egress() {
+        let peer = |iface: Option<&str>| ClientConfig {
+            peer: Some(zeronat::clientcfg::CfgPeer {
+                exit: true,
+                exit_iface: iface.map(Into::into),
+                segment: None,
+            }),
+            ..ClientConfig::default()
+        };
+        let Err(err) = peer_slots(&peer(Some(DEFAULT_PEER_EXIT_NAME))) else {
+            panic!("the provider's own tun must be refused as its egress");
+        };
+        assert!(err.to_string().contains(DEFAULT_PEER_EXIT_NAME), "{err}");
+
+        for iface in [None, Some("wan0")] {
+            let slots = peer_slots(&peer(iface)).unwrap();
+            assert_eq!(slots.len(), 1);
+            assert_eq!(slots[0].device(), Some(DEFAULT_PEER_EXIT_NAME));
         }
     }
 
