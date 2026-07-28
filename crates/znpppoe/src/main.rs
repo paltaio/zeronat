@@ -10,6 +10,7 @@ mod httpproxy;
 mod netstack;
 mod proxy;
 mod socks5;
+mod uplink;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -46,6 +47,7 @@ const DEFAULT_MAX_CONNS: usize = 1024;
 struct Config {
     host: Option<String>,
     dht: bool,
+    peer: Option<String>,
     secret: String,
     username: String,
     password: String,
@@ -63,9 +65,11 @@ struct Config {
 
 fn usage() -> ! {
     eprintln!(
-        "znpppoe (--host IP:PORT | --dht) [--connections N]\n\
+        "znpppoe (--host IP:PORT | --dht) [--peer CLIENT_ID] [--connections N]\n\
          [--socks-listen ADDR] [--http-listen ADDR] [--pppoe-mtu N]\n\
          [--sock-rx KIB] [--sock-tx KIB] [--max-conns N]\n\
+         --peer attaches the sessions to that client's L2 segment; the default is\n\
+         a bridge port on the server\n\
          env: ZN_SECRET, ZN_USER, ZN_PASSWORD (PPPoE login), ZN_PROXY_USER, ZN_PROXY_PASS\n\
          (proxy auth) required; ZN_SERVICE optional\n\
          SOCKS5 and HTTP CONNECT proxies share auth: password = ZN_PROXY_PASS; username\n\
@@ -78,6 +82,7 @@ fn usage() -> ! {
 fn parse() -> Result<Config> {
     let mut host = None;
     let mut dht = false;
+    let mut peer = None;
     let mut connections = 1usize;
     let mut socks_listen: SocketAddr = "127.0.0.1:1080".parse().unwrap();
     let mut http_listen: SocketAddr = "127.0.0.1:8081".parse().unwrap();
@@ -91,6 +96,7 @@ fn parse() -> Result<Config> {
         match a.as_str() {
             "--host" => host = Some(args.next().context("--host needs a value")?),
             "--dht" => dht = true,
+            "--peer" => peer = Some(args.next().context("--peer needs a value")?),
             "--connections" => {
                 connections = args
                     .next()
@@ -178,6 +184,13 @@ fn parse() -> Result<Config> {
     if !dht && host.is_none() {
         bail!("pass --host IP:PORT or --dht");
     }
+    if let Some(h) = &host {
+        h.parse::<SocketAddr>()
+            .with_context(|| format!("--host must be ip:port, got {h}"))?;
+    }
+    if peer.as_deref().is_some_and(str::is_empty) {
+        bail!("--peer must name a client id");
+    }
     let secret = std::env::var("ZN_SECRET").context("ZN_SECRET env is required")?;
     let username = std::env::var("ZN_USER").context("ZN_USER env is required")?;
     let password = std::env::var("ZN_PASSWORD").context("ZN_PASSWORD env is required")?;
@@ -191,6 +204,7 @@ fn parse() -> Result<Config> {
     Ok(Config {
         host,
         dht,
+        peer,
         secret,
         username,
         password,
@@ -210,9 +224,11 @@ fn parse() -> Result<Config> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = parse()?;
-    let client_id = format!("znpppoe-{}", std::process::id());
+    // The peer client derives its own id from this prefix, so both paths
+    // announce the one name a fleet view lists the process under.
+    let id_prefix = format!("znpppoe-{}", std::process::id());
+    let client_id = zeronat::identity::derive_client_id(Some(&id_prefix));
 
-    let target = bridge::Target::new(cfg.host.as_deref(), cfg.dht, &cfg.secret)?;
     eprintln!(
         "znpppoe: server {} ({} session{})",
         if cfg.dht {
@@ -224,10 +240,19 @@ async fn main() -> Result<()> {
         if cfg.connections == 1 { "" } else { "s" }
     );
 
-    let dialer = driver::Dialer {
-        target,
-        secret: cfg.secret,
-        client_id,
+    let uplink = match &cfg.peer {
+        Some(peer) => {
+            eprintln!("znpppoe: attaching to {peer}'s L2 segment");
+            // The peer is paired through the server, whose discovery reads a
+            // dht target as the address `dht`.
+            let server = cfg.host.as_deref().unwrap_or("dht");
+            uplink::peer(server, &cfg.secret, &id_prefix, uplink::PeerId(peer))
+        }
+        None => uplink::Uplink::Server(uplink::Dialer::new(
+            bridge::Target::new(cfg.host.as_deref(), cfg.dht, &cfg.secret)?,
+            cfg.secret.clone(),
+            client_id,
+        )),
     };
     let creds = driver::Creds {
         username: cfg.username.into_bytes(),
@@ -238,7 +263,7 @@ async fn main() -> Result<()> {
         clamp_mss: Some(cfg.pppoe_mtu.saturating_sub(40)),
     };
 
-    let sessions = driver::spawn(dialer, cfg.connections, creds);
+    let (sessions, driver) = driver::spawn(uplink, cfg.connections, creds);
     let mtu = cfg.pppoe_mtu as usize;
     let mut handles = Vec::with_capacity(cfg.connections);
     let mut live = Vec::with_capacity(cfg.connections);
@@ -267,6 +292,15 @@ async fn main() -> Result<()> {
             conns.clone()
         ),
         httpproxy::serve(cfg.http_listen, selector, handles, conns),
+        driver_exit(driver),
     )?;
     Ok(())
+}
+
+/// The driver stops only once no further channel can come up, which leaves both
+/// front ends accepting connections onto sessions that will never be back. Fail
+/// the process instead, so a supervisor restarts it.
+async fn driver_exit(driver: tokio::task::JoinHandle<()>) -> Result<()> {
+    let _ = driver.await;
+    bail!("the pppoe driver stopped; no session can come up")
 }

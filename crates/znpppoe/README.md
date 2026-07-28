@@ -6,7 +6,9 @@ all run in this process; nothing touches the kernel, so the container needs no
 `NET_ADMIN` and no `/dev/net/tun`.
 
 A zeronat server bridges the tunnel to the real PPPoE segment (`zeronat server
---tap <nic>` on a NIC that reaches the BRAS). Each session negotiates its own
+--tap <nic>` on a NIC that reaches the BRAS). With `--peer`, the segment comes
+from another zeronat client running `segment` in its `[peer]` section, and the
+frames ride a peer session between the two. Each session negotiates its own
 PPPoE session with a distinct MAC and gets its own ISP-assigned IP; inbound L2
 frames are demultiplexed back to the right session by destination MAC.
 
@@ -45,6 +47,8 @@ curl --proxy http://proxy_sjob42:proxypass@127.0.0.1:8081 https://ifconfig.me  #
 ## Flags and environment
 
 - `--host IP:PORT` zeronat server control endpoint (or `--dht`).
+- `--peer CLIENT_ID` client id of the peer serving the L2 segment. The server
+  pairs the two, so name it with `--host` or `--dht`.
 - `--connections N` number of PPPoE sessions (default 1).
 - `--socks-listen ADDR` SOCKS5 bind address (default `127.0.0.1:1080`).
 - `--http-listen ADDR` HTTP CONNECT bind address (default `127.0.0.1:8081`).

@@ -66,20 +66,26 @@ impl Target {
 }
 
 /// The frame send/receive ends of the bridge plus the handles that must outlive
-/// them: the KCP session, the conv registration guard, and the UDP receive pump.
+/// them.
 pub struct Bridge {
     pub tx: DgramTx,
     pub rx: DgramRx,
     pub cancel: Arc<Notify>,
+    pub hold: BridgeHold,
+}
+
+/// What the send and receive ends need alive under them: the KCP session, the
+/// conv registration guard, and the UDP receive pump.
+pub struct BridgeHold {
     _sess: Arc<Session>,
     _guard: zeronat::kcp::ConvGuard,
     _pump: AbortOnDrop,
 }
 
-/// Aborts its task when dropped. Ties the receive pump's lifetime to the scope
-/// that owns this guard, so no error path can strand the pump (and the socket
-/// it holds) as a detached task.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+/// Aborts its task when dropped. Ties a task's lifetime to the scope that owns
+/// this guard, so no error path can strand it (and whatever it holds open) as a
+/// detached task.
+pub struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -149,9 +155,11 @@ pub async fn connect(addr: SocketAddr, secret: &str, client_id: &str) -> Result<
         tx,
         rx,
         cancel,
-        _sess: sess,
-        _guard: guard,
-        _pump: pump,
+        hold: BridgeHold {
+            _sess: sess,
+            _guard: guard,
+            _pump: pump,
+        },
     })
 }
 

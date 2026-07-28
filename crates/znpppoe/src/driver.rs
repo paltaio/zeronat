@@ -1,23 +1,23 @@
-//! Drives N userspace PPPoE sessions over one shared bridge channel. Each session
+//! Drives N userspace PPPoE sessions over one shared L2 channel. Each session
 //! is a `PppoeDatapath` with its own MAC; inbound L2 frames are demuxed to the
 //! right session by destination MAC. The negotiated IP never touches the kernel:
 //! decapsulated inbound IP packets are handed to the session's userspace netstack
 //! and outbound IP packets come back the same way.
 //!
-//! The driver owns tunnel reconnection: if the bridge dies it redials with backoff
-//! and renegotiates every session over the new tunnel, keeping the datapaths and
-//! the per-session channels (so the netstacks and SOCKS handles) stable.
+//! The driver owns reconnection: if the channel dies it takes the next one the
+//! uplink brings up and renegotiates every session over it, keeping the
+//! datapaths and the per-session channels (so the netstacks and SOCKS handles)
+//! stable.
 
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::sleep;
 
-use zeronat::dgram::Frame;
 use zeronat::pppoe::datapath::{DpPhase, PppoeDatapath};
 use zeronat::pppoe::engine::Established;
 
-use crate::bridge::{self, Bridge, Target};
+use crate::uplink::{Inbound, Link, LinkTx, Uplink, REBRIDGE_GRACE, UDP_IDLE};
 
 const RETRANSMIT_TICKS: u32 = 3;
 const MAX_ATTEMPTS: u32 = 5;
@@ -28,24 +28,7 @@ const KEEPALIVE: Duration = Duration::from_secs(20);
 // full TCP window of in-flight segments at the netstack's buffer size; too small
 // and a fast download's inbound burst is dropped faster than it is drained.
 const IP_QUEUE: usize = 1024;
-const BACKOFF_START: Duration = Duration::from_secs(1);
-const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
-/// No inbound frame for this long means the tunnel is wedged (a silent UDP
-/// black-hole or expired NAT mapping yields no error), so bounce and reconnect.
-const UDP_IDLE: Duration = Duration::from_secs(120);
-/// Every session down for this long after the link was up means the bridge to the
-/// server is gone (e.g. the server restarted): the attach happens once per tunnel
-/// connect and cannot re-establish in place, so an in-place PPPoE redial loops
-/// forever. Bounce the tunnel to re-attach instead of waiting out `UDP_IDLE`.
-const REBRIDGE_GRACE: Duration = Duration::from_secs(30);
-
-/// How to reach the zeronat server, so the driver can redial after a tunnel drop.
-pub struct Dialer {
-    pub target: Target,
-    pub secret: String,
-    pub client_id: String,
-}
 
 /// PPPoE credentials and link parameters shared by every session in the process.
 #[derive(Clone)]
@@ -91,8 +74,14 @@ fn demux(frame: &[u8], macs: &[[u8; 6]]) -> Demux {
     }
 }
 
-/// Spawn the driver task and return one `Session` handle per PPPoE connection.
-pub fn spawn(dialer: Dialer, count: usize, creds: Creds) -> Vec<Session> {
+/// Spawn the driver task and return one `Session` handle per PPPoE connection,
+/// with the task's handle. The task ends only when no further channel can come
+/// up, which leaves every session dead for good.
+pub fn spawn(
+    uplink: Uplink,
+    count: usize,
+    creds: Creds,
+) -> (Vec<Session>, tokio::task::JoinHandle<()>) {
     let (out_tx, out_rx) = mpsc::channel::<(usize, Vec<u8>)>(IP_QUEUE);
 
     let mut sessions = Vec::with_capacity(count);
@@ -112,12 +101,12 @@ pub fn spawn(dialer: Dialer, count: usize, creds: Creds) -> Vec<Session> {
     }
     drop(out_tx);
 
-    tokio::spawn(run(dialer, count, creds, out_rx, inbound_txs, est_txs));
-    sessions
+    let task = tokio::spawn(run(uplink, count, creds, out_rx, inbound_txs, est_txs));
+    (sessions, task)
 }
 
 async fn run(
-    dialer: Dialer,
+    mut uplink: Uplink,
     count: usize,
     creds: Creds,
     mut out_rx: mpsc::Receiver<(usize, Vec<u8>)>,
@@ -151,33 +140,15 @@ async fn run(
 
     let macs: Vec<[u8; 6]> = dps.iter().map(|d| *d.our_mac().octets()).collect();
     let mut seen = vec![false; count];
-    let mut backoff = BACKOFF_START;
 
     loop {
-        let addr = match dialer.target.resolve().await {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("znpppoe: {e}; retry in {backoff:?}");
-                sleep(backoff).await;
-                backoff = (backoff * 2).min(BACKOFF_MAX);
-                continue;
-            }
+        let Some(mut link) = uplink.connect().await else {
+            eprintln!("znpppoe: the uplink is gone; no session can come up");
+            return;
         };
-        let mut bridge = match bridge::connect(addr, &dialer.secret, &dialer.client_id).await {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("znpppoe: tunnel connect failed: {e}; retry in {backoff:?}");
-                // Drop the cached DHT address so the next attempt re-resolves.
-                dialer.target.invalidate();
-                sleep(backoff).await;
-                backoff = (backoff * 2).min(BACKOFF_MAX);
-                continue;
-            }
-        };
-        backoff = BACKOFF_START;
-        eprintln!("znpppoe: tunnel up; negotiating {count} session(s)");
+        eprintln!("znpppoe: link up; negotiating {count} session(s)");
 
-        // Fresh discovery for every session over this tunnel.
+        // Fresh discovery for every session over this channel.
         for i in 0..count {
             let _ = dps[i].reset();
             if seen[i] {
@@ -185,10 +156,10 @@ async fn run(
                 est_txs[i].send_replace(None);
             }
         }
-        flush_all(&mut dps, &bridge).await;
+        flush_all(&mut dps, link.tx()).await;
 
         session_loop(
-            &mut bridge,
+            &mut link,
             count,
             &mut dps,
             &macs,
@@ -196,11 +167,10 @@ async fn run(
             &mut out_rx,
             &inbound_txs,
             &est_txs,
-            &dialer.client_id,
         )
         .await;
 
-        eprintln!("znpppoe: tunnel down; reconnecting");
+        eprintln!("znpppoe: link down; reconnecting");
         for i in 0..count {
             if seen[i] {
                 seen[i] = false;
@@ -211,10 +181,18 @@ async fn run(
     }
 }
 
-/// Pump one tunnel until it dies (cancel fired or the receive side closes).
+/// Resolves when the channel's cancel signal fires, or never when it has none.
+async fn cancelled(cancel: Option<&Notify>) {
+    match cancel {
+        Some(cancel) => cancel.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Pump one channel until it dies (cancel fired or the receive side closes).
 #[allow(clippy::too_many_arguments)]
 async fn session_loop(
-    bridge: &mut Bridge,
+    link: &mut Link,
     count: usize,
     dps: &mut [PppoeDatapath<'_>],
     macs: &[[u8; 6]],
@@ -222,9 +200,21 @@ async fn session_loop(
     out_rx: &mut mpsc::Receiver<(usize, Vec<u8>)>,
     inbound_txs: &[mpsc::Sender<Vec<u8>>],
     est_txs: &[watch::Sender<Option<Established>>],
-    client_id: &str,
 ) {
-    let cancel = bridge.cancel.clone();
+    // `idle` bounds how long the channel may stay silent, `grace` how long every
+    // session may be down on a channel that is otherwise alive. A peer session
+    // has neither: its pair reaps a silent peer on its own, and with no attach
+    // to redo a bounce only buys a re-pair onto the same segment.
+    let (rx, tx, cancel, idle, grace) = match link {
+        Link::Bridge { rx, tx, cancel, .. } => (
+            rx,
+            &*tx,
+            Some(&**cancel),
+            Some(UDP_IDLE),
+            Some(REBRIDGE_GRACE),
+        ),
+        Link::Peer { rx, tx } => (rx, &*tx, None, None, None),
+    };
     let mut nego = tokio::time::interval(NEGO_TICK);
     nego.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut keepalive = tokio::time::interval(KEEPALIVE);
@@ -234,18 +224,18 @@ async fn session_loop(
 
     loop {
         tokio::select! {
-            _ = cancel.notified() => return,
+            _ = cancelled(cancel) => return,
 
-            m = bridge.rx.recv() => match m {
+            m = rx.recv() => match m {
                 None => return,
-                Some(frame) => {
+                Some(inbound) => {
                     last_in = Instant::now();
-                    if let Frame::Data(d) = frame {
+                    if let Inbound::Frame(d) = inbound {
                         match demux(&d, macs) {
-                            Demux::One(i) => handle_l2(i, &d, dps, bridge, inbound_txs, est_txs, seen).await,
+                            Demux::One(i) => handle_l2(i, &d, dps, tx, inbound_txs, est_txs, seen).await,
                             Demux::All => {
                                 for i in 0..count {
-                                    handle_l2(i, &d, dps, bridge, inbound_txs, est_txs, seen).await;
+                                    handle_l2(i, &d, dps, tx, inbound_txs, est_txs, seen).await;
                                 }
                             }
                             Demux::Drop => {}
@@ -257,35 +247,32 @@ async fn session_loop(
             Some((idx, pkt)) = out_rx.recv() => {
                 if idx < dps.len() {
                     dps[idx].on_tun_ip(&pkt);
-                    flush_one(idx, dps, bridge).await;
+                    flush_one(idx, dps, tx).await;
                 }
             }
 
             _ = nego.tick() => {
                 for i in 0..count {
                     let phase = dps[i].on_tick();
-                    flush_one(i, dps, bridge).await;
-                    apply_phase(i, phase, dps, bridge, inbound_txs, est_txs, seen).await;
+                    flush_one(i, dps, tx).await;
+                    apply_phase(i, phase, dps, tx, inbound_txs, est_txs, seen).await;
                 }
                 // A live session keeps the timer fresh; if every session has been
-                // down past the grace, the bridge is gone and redialing in place
-                // cannot recover, so bounce the tunnel to re-attach.
+                // down past the grace, the channel to the segment is gone and
+                // redialing in place cannot recover, so bounce it to re-attach.
                 if seen.iter().any(|&s| s) {
                     last_up = Instant::now();
-                } else if last_up.elapsed() >= REBRIDGE_GRACE {
-                    eprintln!("znpppoe: all sessions down {REBRIDGE_GRACE:?}; rebridging");
+                } else if let Some(window) = grace.filter(|w| last_up.elapsed() >= *w) {
+                    eprintln!("znpppoe: all sessions down {window:?}; reattaching");
                     return;
                 }
             }
 
             _ = keepalive.tick() => {
-                // A wedged tunnel surfaces no error; bounce it on inbound silence.
-                if last_in.elapsed() >= UDP_IDLE {
+                if idle.is_some_and(|window| last_in.elapsed() >= window) {
                     return;
                 }
-                // Re-announce the name so a dropped attach frame self-heals.
-                bridge.tx.send_name(client_id).await.ok();
-                bridge.tx.probe().await.ok();
+                tx.keepalive().await;
             }
         }
     }
@@ -296,17 +283,17 @@ async fn handle_l2(
     idx: usize,
     frame: &[u8],
     dps: &mut [PppoeDatapath<'_>],
-    bridge: &Bridge,
+    tx: &LinkTx,
     inbound_txs: &[mpsc::Sender<Vec<u8>>],
     est_txs: &[watch::Sender<Option<Established>>],
     seen: &mut [bool],
 ) {
     let phase = dps[idx].on_l2_frame(frame);
-    flush_one(idx, dps, bridge).await;
+    flush_one(idx, dps, tx).await;
     while let Some(ip) = dps[idx].poll_inbound_ip() {
         let _ = inbound_txs[idx].try_send(ip);
     }
-    apply_phase(idx, phase, dps, bridge, inbound_txs, est_txs, seen).await;
+    apply_phase(idx, phase, dps, tx, inbound_txs, est_txs, seen).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -314,7 +301,7 @@ async fn apply_phase(
     idx: usize,
     phase: DpPhase,
     dps: &mut [PppoeDatapath<'_>],
-    bridge: &Bridge,
+    tx: &LinkTx,
     inbound_txs: &[mpsc::Sender<Vec<u8>>],
     est_txs: &[watch::Sender<Option<Established>>],
     seen: &mut [bool],
@@ -338,7 +325,7 @@ async fn apply_phase(
             }
             let _ = dps[idx].reset();
             // Send the fresh PADI now rather than waiting a tick.
-            flush_one(idx, dps, bridge).await;
+            flush_one(idx, dps, tx).await;
         }
         DpPhase::Dead => {
             eprintln!("znpppoe: session {idx} discovery failed, retrying");
@@ -347,21 +334,21 @@ async fn apply_phase(
                 est_txs[idx].send_replace(None);
             }
             let _ = dps[idx].reset();
-            flush_one(idx, dps, bridge).await;
+            flush_one(idx, dps, tx).await;
         }
         DpPhase::Discovery | DpPhase::Ppp => {}
     }
 }
 
-async fn flush_one(idx: usize, dps: &mut [PppoeDatapath<'_>], bridge: &Bridge) {
+async fn flush_one(idx: usize, dps: &mut [PppoeDatapath<'_>], tx: &LinkTx) {
     while let Some(frame) = dps[idx].poll_transmit_frame() {
-        bridge.tx.send(&frame).await.ok();
+        tx.send(&frame).await;
     }
 }
 
-async fn flush_all(dps: &mut [PppoeDatapath<'_>], bridge: &Bridge) {
+async fn flush_all(dps: &mut [PppoeDatapath<'_>], tx: &LinkTx) {
     for i in 0..dps.len() {
-        flush_one(i, dps, bridge).await;
+        flush_one(i, dps, tx).await;
     }
 }
 
@@ -388,5 +375,71 @@ mod tests {
     fn demux_drops_runt_frames() {
         let macs = [[1u8; 6]];
         assert!(matches!(demux(&[1, 1, 1, 1, 1, 1], &macs), Demux::Drop));
+    }
+
+    fn creds() -> Creds {
+        Creds {
+            username: b"user".to_vec(),
+            password: b"pass".to_vec(),
+            service: Vec::new(),
+            mru: 1280,
+            request_dns: false,
+            clamp_mss: None,
+        }
+    }
+
+    fn peer_uplink(sessions: mpsc::Receiver<zeronat::client::PeerSlotSession>) -> Uplink {
+        Uplink::Peer {
+            sessions,
+            _client: crate::bridge::AbortOnDrop(tokio::spawn(std::future::pending::<()>())),
+        }
+    }
+
+    // With `--peer` the sessions ride a switch port on a segment provider
+    // instead of a bridge port on the server, so the driver's discovery has to
+    // leave on the pair the consumer slot handed it.
+    #[tokio::test]
+    async fn a_peer_uplink_carries_pppoe_discovery() {
+        let (sessions_tx, sessions_rx) = mpsc::channel(1);
+        let (_from_provider, inbound) = mpsc::channel(4);
+        let (outbound, mut to_provider) = mpsc::channel(4);
+        sessions_tx
+            .send(zeronat::client::PeerSlotSession {
+                peer_id: "prov".into(),
+                want: zeronat::proto::PROVIDES_SEGMENT,
+                path: zeronat::client::PairPath::Relayed,
+                inbound,
+                outbound,
+            })
+            .await
+            .unwrap();
+
+        // The provider-side sender and the session handles keep the driver's
+        // queues open for as long as the test runs.
+        let (_sessions, _driver) = spawn(peer_uplink(sessions_rx), 1, creds());
+
+        let frame = tokio::time::timeout(Duration::from_secs(10), to_provider.recv())
+            .await
+            .expect("no frame reached the provider")
+            .expect("the pair closed");
+        let padi = zeronat::pppoe::discovery::parse_discovery_frame(&frame)
+            .expect("the first frame is not pppoe discovery");
+        assert_eq!(padi.code, zeronat::pppoe::discovery::CODE_PADI);
+    }
+
+    // A peer client that stops pairing ends the driver, which is what the
+    // process exits on: nothing above it can serve over sessions that can no
+    // longer come up.
+    #[tokio::test]
+    async fn a_gone_peer_uplink_ends_the_driver() {
+        let (sessions_tx, sessions_rx) = mpsc::channel(1);
+        drop(sessions_tx);
+
+        let (_sessions, driver) = spawn(peer_uplink(sessions_rx), 1, creds());
+
+        tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("the driver is still running")
+            .expect("the driver panicked");
     }
 }
