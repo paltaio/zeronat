@@ -3210,6 +3210,9 @@ async fn peer_rendezvous_pairs_and_invalidates() {
             }
         };
         assert_ne!(pair2, pair1);
+        // A tcp-transport pair settles relay-only at once; drain its PeerInfo
+        // so the next connect reads its own result.
+        assert_eq!(recv_peer_info(&mut c2r, pair2).await, Vec::new());
 
         // c1 registered earlier and its control session is gone (the re-pair
         // above proves the teardown ran), so it reads as offline, not unknown.
@@ -3227,4 +3230,268 @@ async fn peer_rendezvous_pairs_and_invalidates() {
     timeout(Duration::from_secs(30), body)
         .await
         .expect("peer rendezvous flow did not complete within 30s");
+}
+
+/// Connect a hand-rolled peer-speaking control client over the udp/KCP
+/// transport: session, Noise handshake, `ClientHello`, `PeerAnnounce`, ack.
+/// The server sends `PeerProbe` only to udp-transport clients, so the probe
+/// tests connect this way. The returned pump task keeps routing server
+/// datagrams into the session.
+async fn peer_control_connect_udp(
+    control: u16,
+    client_id: &str,
+    provides: u8,
+) -> (
+    zeronat::noise::NoiseReader,
+    zeronat::noise::NoiseWriter,
+    tokio::task::JoinHandle<()>,
+) {
+    use zeronat::kcp::{route, session, CLASS_KCP};
+    let psk = zeronat::noise::derive_psk(SECRET);
+    let server: std::net::SocketAddr = format!("127.0.0.1:{control}").parse().unwrap();
+    let (mut r, mut w, pump) = loop {
+        let socket = std::sync::Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        socket.connect(server).await.unwrap();
+        let sess = session(socket.clone(), server, 1);
+        let pump = {
+            let sess = sess.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65535];
+                while let Ok(n) = socket.recv(&mut buf).await {
+                    route(&sess, &buf[..n]);
+                }
+            })
+        };
+        let (_conv, stream) = sess.open_conv(CLASS_KCP);
+        match timeout(
+            Duration::from_secs(2),
+            zeronat::noise::client_handshake(stream, &psk),
+        )
+        .await
+        {
+            Ok(Ok((r, w))) => break (r, w, pump),
+            _ => {
+                pump.abort();
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    w.send(
+        &Msg::ClientHello {
+            version: zeronat::identity::PROTO_VERSION,
+            client_id: client_id.into(),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    w.send(&Msg::PeerAnnounce { provides }.encode())
+        .await
+        .unwrap();
+    let frame = r.recv().await.unwrap();
+    assert!(
+        matches!(Msg::decode(&frame).unwrap(), Msg::PeerAnnounceAck { .. }),
+        "expected announce ack"
+    );
+    (r, w, pump)
+}
+
+/// Read the next control frame as this party's `PeerProbe` for `pair_id`,
+/// asserting it names `peer` and carries the pair's capability.
+async fn recv_peer_probe(r: &mut zeronat::noise::NoiseReader, pair_id: u64, peer: &str) -> u64 {
+    let frame = r.recv().await.unwrap();
+    match Msg::decode(&frame).unwrap() {
+        Msg::PeerProbe {
+            pair_id: got,
+            peer_id,
+            probe_id,
+            provides,
+        } => {
+            assert_eq!(got, pair_id);
+            assert_eq!(peer_id, peer);
+            assert_eq!(provides, PROVIDES_EXIT);
+            probe_id
+        }
+        other => panic!("expected peer probe, got {other:?}"),
+    }
+}
+
+/// Read the next control frame as this party's `PeerInfo` for `pair_id`.
+async fn recv_peer_info(
+    r: &mut zeronat::noise::NoiseReader,
+    pair_id: u64,
+) -> Vec<std::net::SocketAddr> {
+    let frame = r.recv().await.unwrap();
+    match Msg::decode(&frame).unwrap() {
+        Msg::PeerInfo {
+            pair_id: got,
+            candidates,
+        } => {
+            assert_eq!(got, pair_id);
+            candidates
+        }
+        other => panic!("expected peer info, got {other:?}"),
+    }
+}
+
+// Two-phase rendezvous end to end over the udp transport: pairing hands each
+// party its own probe id, the probe handshake returns the server-observed
+// mapping in its reply payload, and each party's PeerInfo carries the other's
+// public and local candidates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_probe_discovers_candidates_both_ways() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+
+        let (mut pr, _pw, _pp) = peer_control_connect_udp(control, "prov", PROVIDES_EXIT).await;
+        let (mut cr, mut cw, _cp) = peer_control_connect_udp(control, "c", 0).await;
+
+        let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
+        assert_eq!(status, PeerStatus::Accepted);
+
+        let c_probe = recv_peer_probe(&mut cr, pair_id, "prov").await;
+        let p_probe = recv_peer_probe(&mut pr, pair_id, "c").await;
+        assert_ne!(c_probe, p_probe);
+
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let server = format!("127.0.0.1:{control}").parse().unwrap();
+        let mut c_sess = zeronat::client::probe_candidates(server, &psk, c_probe)
+            .await
+            .expect("consumer probe");
+        let mut p_sess = zeronat::client::probe_candidates(server, &psk, p_probe)
+            .await
+            .expect("provider probe");
+        // The public candidate is the probe socket's mapping as the server
+        // observed it: over loopback, the socket's own port unchanged.
+        assert_eq!(
+            c_sess.public.port(),
+            c_sess.socket.local_addr().unwrap().port()
+        );
+        assert_eq!(c_sess.local.port(), c_sess.public.port());
+
+        c_sess.peer_candidates = Some(recv_peer_info(&mut cr, pair_id).await);
+        p_sess.peer_candidates = Some(recv_peer_info(&mut pr, pair_id).await);
+        assert_eq!(
+            c_sess.peer_candidates.as_deref(),
+            Some(&[p_sess.public, p_sess.local][..])
+        );
+        assert_eq!(
+            p_sess.peer_candidates.as_deref(),
+            Some(&[c_sess.public, c_sess.local][..])
+        );
+        // The probe sockets stay open and unconnected for the punch.
+        assert!(c_sess.socket.peer_addr().is_err());
+        assert!(p_sess.socket.peer_addr().is_err());
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("peer probe flow did not complete within 30s");
+}
+
+// A datagram from a non-server source lands in the probe session's peer
+// queue instead of being lost to the rx pump, so the punch reads it from the
+// same socket the probe learned its mapping on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_probe_socket_queues_peer_datagrams() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+
+        let (mut pr, _pw, _pp) = peer_control_connect_udp(control, "prov", PROVIDES_EXIT).await;
+        let (mut cr, mut cw, _cp) = peer_control_connect_udp(control, "c", 0).await;
+
+        let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
+        assert_eq!(status, PeerStatus::Accepted);
+        let c_probe = recv_peer_probe(&mut cr, pair_id, "prov").await;
+        let p_probe = recv_peer_probe(&mut pr, pair_id, "c").await;
+
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let server = format!("127.0.0.1:{control}").parse().unwrap();
+        let mut c_sess = zeronat::client::probe_candidates(server, &psk, c_probe)
+            .await
+            .expect("consumer probe");
+        let p_sess = zeronat::client::probe_candidates(server, &psk, p_probe)
+            .await
+            .expect("provider probe");
+
+        p_sess
+            .socket
+            .send_to(b"punch", c_sess.public)
+            .await
+            .unwrap();
+        let (src, payload) = timeout(Duration::from_secs(5), c_sess.recv_peer())
+            .await
+            .expect("peer datagram not queued")
+            .unwrap();
+        assert_eq!(payload, b"punch");
+        assert_eq!(src, p_sess.public);
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("peer datagram queue flow did not complete within 30s");
+}
+
+// A party that ignores its PeerProbe is reported relay-only: its peer's
+// PeerInfo arrives with an empty candidate list once the pairing deadline
+// lapses, while the silent party still learns the probing peer's candidates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_probe_deadline_marks_silent_party_relay_only() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+
+        let (mut pr, _pw, _pp) = peer_control_connect_udp(control, "prov", PROVIDES_EXIT).await;
+        let (mut cr, mut cw, _cp) = peer_control_connect_udp(control, "c", 0).await;
+
+        let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
+        assert_eq!(status, PeerStatus::Accepted);
+
+        let c_probe = recv_peer_probe(&mut cr, pair_id, "prov").await;
+        let _p_probe = recv_peer_probe(&mut pr, pair_id, "c").await;
+
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let server = format!("127.0.0.1:{control}").parse().unwrap();
+        let c_sess = zeronat::client::probe_candidates(server, &psk, c_probe)
+            .await
+            .expect("consumer probe");
+
+        assert_eq!(recv_peer_info(&mut cr, pair_id).await, Vec::new());
+        assert_eq!(
+            recv_peer_info(&mut pr, pair_id).await,
+            vec![c_sess.public, c_sess.local]
+        );
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("probe deadline flow did not complete within 30s");
+}
+
+// TCP-transport clients never probe: pairing over the tcp control transport
+// sends no PeerProbe, and both parties get an immediate PeerInfo with an
+// empty (relay-only) candidate list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_probe_skips_tcp_transport_clients() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+
+        let (mut pr, _pw) = peer_control_connect(control, "prov", PROVIDES_EXIT).await;
+        let (mut cr, mut cw) = peer_control_connect(control, "c", 0).await;
+
+        let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
+        assert_eq!(status, PeerStatus::Accepted);
+
+        // The very next frame on each channel is the PeerInfo; no PeerProbe
+        // precedes it.
+        assert_eq!(recv_peer_info(&mut cr, pair_id).await, Vec::new());
+        assert_eq!(recv_peer_info(&mut pr, pair_id).await, Vec::new());
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("tcp relay-only flow did not complete within 30s");
 }

@@ -186,8 +186,13 @@ struct Keys {
     recv_key: [u8; 32],
 }
 
-/// Run the NNpsk0 initiator handshake to completion over `stream`.
-async fn run_initiator(stream: &mut BoxStream, psk: &[u8; 32], payload1: &[u8]) -> Result<Keys> {
+/// Run the NNpsk0 initiator handshake to completion over `stream`, returning
+/// the transport keys and the responder's message-2 payload.
+async fn run_initiator(
+    stream: &mut BoxStream,
+    psk: &[u8; 32],
+    payload1: &[u8],
+) -> Result<(Keys, Vec<u8>)> {
     let mut ss = SymmetricState::new();
     ss.mix_hash(&[]); // MixHash(prologue) with the empty prologue.
 
@@ -215,18 +220,25 @@ async fn run_initiator(stream: &mut BoxStream, psk: &[u8; 32], payload1: &[u8]) 
     ss.mix_key(&re_bytes);
     let dh = e_priv.diffie_hellman(&re);
     ss.mix_key(dh.as_bytes());
-    ss.decrypt_and_hash(&msg2[DHLEN..])?;
+    let payload2 = ss.decrypt_and_hash(&msg2[DHLEN..])?;
 
     let (t1, t2) = ss.split();
-    Ok(Keys {
-        send_key: t1,
-        recv_key: t2,
-    })
+    Ok((
+        Keys {
+            send_key: t1,
+            recv_key: t2,
+        },
+        payload2,
+    ))
 }
 
-/// Run the NNpsk0 responder handshake; returns the keys and the decrypted
-/// payload from message 1.
-async fn run_responder(stream: &mut BoxStream, psk: &[u8; 32]) -> Result<(Keys, Vec<u8>)> {
+/// Run the NNpsk0 responder handshake, sealing `payload2` into message 2;
+/// returns the keys and the decrypted payload from message 1.
+async fn run_responder(
+    stream: &mut BoxStream,
+    psk: &[u8; 32],
+    payload2: &[u8],
+) -> Result<(Keys, Vec<u8>)> {
     let mut ss = SymmetricState::new();
     ss.mix_hash(&[]); // MixHash(prologue) with the empty prologue.
 
@@ -250,7 +262,7 @@ async fn run_responder(stream: &mut BoxStream, psk: &[u8; 32]) -> Result<(Keys, 
     ss.mix_key(e_pub.as_bytes());
     let dh = e_priv.diffie_hellman(&re);
     ss.mix_key(dh.as_bytes());
-    let ct2 = ss.encrypt_and_hash(&[]);
+    let ct2 = ss.encrypt_and_hash(payload2);
     let mut msg2 = Vec::with_capacity(DHLEN + ct2.len());
     msg2.extend_from_slice(e_pub.as_bytes());
     msg2.extend_from_slice(&ct2);
@@ -272,7 +284,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut stream: BoxStream = Box::new(stream);
-    let keys = run_initiator(&mut stream, psk, &[]).await?;
+    let (keys, _payload2) = run_initiator(&mut stream, psk, &[]).await?;
     Ok(finish(stream, keys))
 }
 
@@ -281,7 +293,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut stream: BoxStream = Box::new(stream);
-    let (keys, _payload) = run_responder(&mut stream, psk).await?;
+    let (keys, _payload) = run_responder(&mut stream, psk, &[]).await?;
     Ok(finish(stream, keys))
 }
 
@@ -445,25 +457,45 @@ pub async fn client_handshake_stateless<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let (noise, _reply) = client_handshake_stateless_reply(stream, psk, id).await?;
+    Ok(noise)
+}
+
+/// Like [`client_handshake_stateless`], also returning the responder's
+/// message-2 payload.
+pub async fn client_handshake_stateless_reply<S>(
+    stream: S,
+    psk: &[u8; 32],
+    id: u64,
+) -> Result<(StatelessNoise, Vec<u8>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut stream: BoxStream = Box::new(stream);
-    let keys = run_initiator(&mut stream, psk, &id.to_be_bytes()).await?;
-    Ok(StatelessNoise {
-        send_key: keys.send_key,
-        recv_key: keys.recv_key,
-        send_nonce: Mutex::new(0),
-    })
+    let (keys, reply) = run_initiator(&mut stream, psk, &id.to_be_bytes()).await?;
+    Ok((
+        StatelessNoise {
+            send_key: keys.send_key,
+            recv_key: keys.recv_key,
+            send_nonce: Mutex::new(0),
+        },
+        reply,
+    ))
 }
 
 /// Responder handshake; returns the peer's `id` and the stateless transport.
+/// `reply` is sealed into message 2's payload; an initiator that expects no
+/// reply decrypts and discards it.
 pub async fn server_handshake_stateless<S>(
     stream: S,
     psk: &[u8; 32],
+    reply: &[u8],
 ) -> Result<(u64, StatelessNoise)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut stream: BoxStream = Box::new(stream);
-    let (keys, payload) = run_responder(&mut stream, psk).await?;
+    let (keys, payload) = run_responder(&mut stream, psk, reply).await?;
     if payload.len() < 8 {
         return Err("missing stream id in handshake payload".into());
     }
@@ -487,7 +519,8 @@ mod tests {
         let psk = derive_psk("stateless secret");
         let (a, b) = tokio::io::duplex(8192);
 
-        let srv = tokio::spawn(async move { server_handshake_stateless(b, &psk).await.unwrap() });
+        let srv =
+            tokio::spawn(async move { server_handshake_stateless(b, &psk, &[]).await.unwrap() });
         let cli = client_handshake_stateless(a, &psk, 0xABCD).await.unwrap();
         let (id, srv) = srv.await.unwrap();
         assert_eq!(id, 0xABCD);
@@ -521,6 +554,29 @@ mod tests {
                                                            // server -> client
         sw.send(b"pong").await.unwrap();
         assert_eq!(cr.recv().await.unwrap(), b"pong");
+    }
+
+    // The responder's message-2 payload reaches the initiator intact, and the
+    // resulting transport still carries datagrams both ways.
+    #[tokio::test]
+    async fn stateless_reply_payload_roundtrip() {
+        let psk = derive_psk("reply payload");
+        let (a, b) = tokio::io::duplex(8192);
+
+        let srv = tokio::spawn(async move {
+            server_handshake_stateless(b, &psk, b"reply bytes")
+                .await
+                .unwrap()
+        });
+        let (cli, reply) = client_handshake_stateless_reply(a, &psk, 7).await.unwrap();
+        assert_eq!(reply, b"reply bytes");
+        let (id, srv) = srv.await.unwrap();
+        assert_eq!(id, 7);
+
+        let d = cli.seal(b"up");
+        assert_eq!(srv.open(&d).unwrap(), b"up");
+        let d = srv.seal(b"down");
+        assert_eq!(cli.open(&d).unwrap(), b"down");
     }
 
     #[tokio::test]
@@ -631,7 +687,7 @@ mod tests {
             assert_eq!(n, 8);
             let got_id = u64::from_be_bytes(pt[..8].try_into().unwrap());
             assert_eq!(got_id, id, "carried id must match");
-            let n = hs.write_message(&[], &mut buf).unwrap();
+            let n = hs.write_message(b"sealed by snow", &mut buf).unwrap();
             write_frame(&mut hs_b, &buf[..n]).await.unwrap();
             let t = hs.into_stateless_transport_mode().unwrap();
 
@@ -652,7 +708,10 @@ mod tests {
             write_frame(&mut dg_b, &out).await.unwrap();
         });
 
-        let cli = client_handshake_stateless(hs_a, &psk, id).await.unwrap();
+        let (cli, reply) = client_handshake_stateless_reply(hs_a, &psk, id)
+            .await
+            .unwrap();
+        assert_eq!(reply, b"sealed by snow");
         let dg = cli.seal(b"datagram from ours");
         write_frame(&mut dg_a, &dg).await.unwrap();
         let reply = read_frame(&mut dg_a).await.unwrap();

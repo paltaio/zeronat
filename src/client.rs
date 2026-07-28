@@ -25,8 +25,10 @@ use crate::exitroute::ExitRoutes;
 use crate::kcp::{route, session as kcp_session, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
-use crate::noise::{client_handshake, client_handshake_stateless};
-use crate::proto::{FwdOptionEntry, Msg, Proto};
+use crate::noise::{
+    client_handshake, client_handshake_stateless, client_handshake_stateless_reply,
+};
+use crate::proto::{decode_sockaddr, encode_sockaddr, FwdOptionEntry, Msg, Proto};
 use crate::tap::TapConfig;
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
@@ -1229,6 +1231,107 @@ async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop, Arc<
         })
     };
     Ok((sess, AbortOnDrop(pump), cancel))
+}
+
+/// Bound on datagrams queued from non-server sources on a probe socket. Punch
+/// traffic is a handful of small probes; when the queue is full, new
+/// datagrams are dropped so a flood cannot grow it.
+const PROBE_PEER_QUEUE: usize = 64;
+
+/// A live punch-probe socket and the candidates learned through it. The
+/// socket stays wildcard-bound and unconnected, and the rx pump owns every
+/// read on it: server datagrams feed the probe session, and datagrams from
+/// any other source are queued for [`recv_peer`](Self::recv_peer), so a punch
+/// consumer never races the pump. Dropping the value aborts the pump and
+/// releases the socket, so it must outlive the punch that uses it.
+pub struct ProbeSession {
+    /// The socket to punch from.
+    pub socket: Arc<UdpSocket>,
+    /// This socket's public mapping as the server observed it.
+    pub public: SocketAddr,
+    /// The local candidate: the route-source address toward the server,
+    /// paired with the socket's bound port.
+    pub local: SocketAddr,
+    /// The peer's candidates from this pair's `PeerInfo`, once known.
+    pub peer_candidates: Option<Vec<SocketAddr>>,
+    peer_rx: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+    _sess: Arc<Session>,
+    _pump: AbortOnDrop,
+}
+
+impl ProbeSession {
+    /// The next datagram the probe socket received from a non-server source,
+    /// with the address it came from.
+    pub async fn recv_peer(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
+        self.peer_rx.recv().await
+    }
+}
+
+/// Run one candidate-discovery probe against the server's udp control port:
+/// bind a fresh wildcard socket, handshake a setup conv carrying the
+/// server-assigned `probe_id`, read this socket's public mapping from the
+/// handshake reply, and report the local candidate as the first frame on the
+/// authenticated session.
+pub async fn probe_candidates(
+    server: SocketAddr,
+    psk: &[u8; 32],
+    probe_id: u64,
+) -> Result<ProbeSession> {
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    // The route-source address toward the server: the wildcard-bound probe
+    // socket reports 0.0.0.0 as its own address, so a throwaway connected
+    // socket learns the ip the kernel picks for that route.
+    let local = {
+        let throwaway = UdpSocket::bind("0.0.0.0:0").await?;
+        throwaway.connect(server).await?;
+        SocketAddr::new(throwaway.local_addr()?.ip(), socket.local_addr()?.port())
+    };
+    let sess = kcp_session(socket.clone(), server, 1);
+    // The probe socket is never connected, so it can receive from the peer as
+    // well as the server; the pump routes server datagrams into the session
+    // and queues everything else for the punch.
+    let (peer_tx, peer_rx) = mpsc::channel(PROBE_PEER_QUEUE);
+    let pump = {
+        let sess = sess.clone();
+        let socket = socket.clone();
+        AbortOnDrop(tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((n, src)) if src == server => {
+                        route(&sess, &buf[..n]);
+                    }
+                    Ok((n, src)) => {
+                        peer_tx.try_send((src, buf[..n].to_vec())).ok();
+                    }
+                    Err(e) => {
+                        crate::elog!("probe recv error: {e}");
+                        sleep(RECV_ERROR_BACKOFF).await;
+                    }
+                }
+            }
+        }))
+    };
+    let conv = (probe_id as u32) | SETUP_CONV_BIT;
+    let stream = sess.open_conv_with(CLASS_SETUP, conv);
+    let (noise, reply) = tokio_timeout(
+        UDP_HANDSHAKE_TIMEOUT,
+        client_handshake_stateless_reply(stream, psk, probe_id),
+    )
+    .await
+    .map_err(|_| -> crate::Error { "probe handshake timed out".into() })??;
+    let public = decode_sockaddr(&reply)?;
+    let tx = DgramTx::new(sess.send_tx(), conv, Arc::new(noise));
+    tx.send(&encode_sockaddr(local)).await?;
+    Ok(ProbeSession {
+        socket,
+        public,
+        local,
+        peer_candidates: None,
+        peer_rx,
+        _sess: sess,
+        _pump: pump,
+    })
 }
 
 /// L2 bridge over the UDP transport: frames ride the unreliable datagram channel.

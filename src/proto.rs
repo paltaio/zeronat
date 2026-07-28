@@ -439,6 +439,27 @@ fn take_sockaddr(b: &[u8], at: &mut usize) -> Result<SocketAddr> {
     Ok(SocketAddr::new(ip, port))
 }
 
+/// Encode a socket address as a standalone body: a family byte, the raw ip
+/// octets, then the port. Carried in the probe handshake's message-2 payload
+/// (the server-observed public mapping) and in the probe session's first
+/// frame (the party's local candidate).
+pub fn encode_sockaddr(a: SocketAddr) -> Vec<u8> {
+    let mut b = Vec::with_capacity(19);
+    put_sockaddr(&mut b, a);
+    b
+}
+
+/// Decode a standalone socket address body written by [`encode_sockaddr`],
+/// rejecting trailing bytes.
+pub fn decode_sockaddr(b: &[u8]) -> Result<SocketAddr> {
+    let mut at = 0;
+    let a = take_sockaddr(b, &mut at)?;
+    if at != b.len() {
+        return Err("trailing bytes in socket address".into());
+    }
+    Ok(a)
+}
+
 /// Encode a forward-option list: a u16 count then the fixed 8-byte entries.
 /// Shared by the `FwdOptions` body and each snapshot client's announced list;
 /// the count is a u16 on the wire, so the encoded entries are capped to match
@@ -2127,5 +2148,30 @@ mod tests {
         let mut bad_status = enc.clone();
         bad_status[9] = 2;
         assert!(Msg::decode(&bad_status).is_err());
+    }
+
+    #[test]
+    fn sockaddr_body_roundtrip() {
+        for addr in ["203.0.113.9:41641", "0.0.0.0:0", "[2001:db8::7]:9"] {
+            let a: SocketAddr = addr.parse().unwrap();
+            assert_eq!(decode_sockaddr(&encode_sockaddr(a)).unwrap(), a);
+        }
+    }
+
+    #[test]
+    fn sockaddr_body_rejects_malformed() {
+        let good = encode_sockaddr("198.51.100.3:53".parse().unwrap());
+        for cut in 0..good.len() {
+            assert!(
+                decode_sockaddr(&good[..cut]).is_err(),
+                "cut {cut} should error"
+            );
+        }
+        let mut junk = good.clone();
+        junk.push(0x00);
+        assert!(decode_sockaddr(&junk).is_err());
+        let mut bad_family = good;
+        bad_family[0] = 5;
+        assert!(decode_sockaddr(&bad_family).is_err());
     }
 }

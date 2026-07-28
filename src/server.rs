@@ -12,7 +12,7 @@ use tokio::time::{timeout, Instant};
 
 use crate::bridge;
 use crate::config;
-use crate::dgram::{DgramRx, DgramTx};
+use crate::dgram::{DgramRx, DgramTx, Frame};
 use crate::kcp::{route, session, Accepted, Session};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
@@ -30,6 +30,11 @@ use crate::tap::TapDevice;
 use crate::tap::{TapConfig, TunConfig};
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Window for both parties of an accepted pair to report their punch
+/// candidates, measured from the `PeerProbe` send; a party whose
+/// local-candidate frame has not arrived when it lapses is reported
+/// relay-only.
+const PAIR_PROBE_DEADLINE: Duration = OPEN_TIMEOUT;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Liveness window for the control channel. The client pings every 25s, so no
 /// inbound control frame for this long means the link is a black hole (no
@@ -136,13 +141,29 @@ struct Route {
     source: Source,
 }
 
-/// One accepted rendezvous pair: the two parties and the capability it carries.
-/// Removed when either party's control session ends or is superseded.
+/// One accepted rendezvous pair: the two parties, the capability it carries,
+/// and each party's candidate-discovery progress. Removed when either party's
+/// control session ends or is superseded.
 struct Pair {
     consumer_id: String,
     provider_id: String,
     /// The pair's capability: the consumer's validated `want` bit.
     want: u8,
+    consumer: PartyProbe,
+    provider: PartyProbe,
+    /// Set once the `PeerInfo` frames go out, so a completing probe and the
+    /// pairing deadline cannot both send them.
+    info_sent: bool,
+}
+
+/// One party's probe progress. `probe_id` is assigned when the party can
+/// probe (udp control transport). `candidates` is `None` until the party
+/// settles: the server-observed public mapping plus the party's reported
+/// local candidate, or empty for a relay-only party.
+#[derive(Default)]
+struct PartyProbe {
+    probe_id: Option<u64>,
+    candidates: Option<Vec<SocketAddr>>,
 }
 
 /// A parked public UDP source, the public socket its replies must go out on, the
@@ -167,6 +188,10 @@ pub(crate) struct Server {
     known_clients: Mutex<HashSet<String>>,
     /// Accepted rendezvous pairs by `pair_id`.
     pairs: Mutex<HashMap<u64, Pair>>,
+    /// Outstanding probe ids to their owning `pair_id`, letting the udp
+    /// control listener classify a stateless-handshake app id as a probe.
+    /// Taken after `pairs` when both are held; entries die with their pair.
+    probes: Mutex<HashMap<u64, u64>>,
     routes: Mutex<HashMap<RouteKey, Route>>,
     listeners: Mutex<HashMap<RouteKey, ListenerHandle>>,
     handshakes: Arc<Semaphore>,
@@ -325,21 +350,181 @@ impl Server {
                 consumer_id: consumer_id.to_string(),
                 provider_id: provider_id.to_string(),
                 want,
+                consumer: PartyProbe::default(),
+                provider: PartyProbe::default(),
+                info_sent: false,
             },
         );
         crate::elog!("peer pair {pair_id}: {consumer_id} -> {provider_id}");
         Some((pair_id, PeerStatus::Accepted))
     }
 
-    /// Remove and return every pair `client_id` is a party to. A pair must not
-    /// outlive either party's control session, so this runs when a session
-    /// ends and when a reconnect supersedes it.
+    /// Remove and return every pair `client_id` is a party to, dropping any
+    /// outstanding probe ids with them. A pair must not outlive either
+    /// party's control session, so this runs when a session ends and when a
+    /// reconnect supersedes it.
     fn invalidate_pairs(&self, client_id: &str) -> Vec<(u64, Pair)> {
-        self.pairs
+        let removed: Vec<(u64, Pair)> = self
+            .pairs
             .lock()
             .unwrap()
             .extract_if(|_, p| p.consumer_id == client_id || p.provider_id == client_id)
-            .collect()
+            .collect();
+        if !removed.is_empty() {
+            let mut probes = self.probes.lock().unwrap();
+            for (_, p) in &removed {
+                for id in [p.consumer.probe_id, p.provider.probe_id]
+                    .into_iter()
+                    .flatten()
+                {
+                    probes.remove(&id);
+                }
+            }
+        }
+        removed
+    }
+
+    /// Start candidate discovery for a freshly accepted pair: assign each
+    /// udp-transport party a probe id from the shared counter, send it a
+    /// `PeerProbe`, and arm the pairing deadline. A tcp-transport party never
+    /// probes and settles as relay-only at once, so a pair of tcp clients is
+    /// finished before the deadline task even arms. The sends run outside
+    /// every lock; lock order is clients, pairs, probes, with `next_id` a leaf.
+    fn start_pair_probes(self: &Arc<Self>, pair_id: u64) {
+        let mut sends: Vec<(mpsc::Sender<Vec<u8>>, Vec<u8>)> = Vec::new();
+        let settled = {
+            let clients = self.clients.lock().unwrap();
+            let mut pairs = self.pairs.lock().unwrap();
+            let Some(pair) = pairs.get_mut(&pair_id) else {
+                return;
+            };
+            let consumer_id = pair.consumer_id.clone();
+            let provider_id = pair.provider_id.clone();
+            let want = pair.want;
+            let mut probes = self.probes.lock().unwrap();
+            for (id, peer_id, party) in [
+                (&consumer_id, &provider_id, &mut pair.consumer),
+                (&provider_id, &consumer_id, &mut pair.provider),
+            ] {
+                // An entry gone or swapped mid-teardown is left unsettled: the
+                // pending invalidation clears this pair, and a probe must not
+                // ride a session that never announced.
+                let Some(h) = clients.get(id).filter(|h| h.peer_provides.is_some()) else {
+                    continue;
+                };
+                match h.transport {
+                    ActiveTransport::Tcp => party.candidates = Some(Vec::new()),
+                    ActiveTransport::Udp => {
+                        let probe_id = self.next_id();
+                        party.probe_id = Some(probe_id);
+                        probes.insert(probe_id, pair_id);
+                        sends.push((
+                            h.tx.clone(),
+                            Msg::PeerProbe {
+                                pair_id,
+                                peer_id: peer_id.clone(),
+                                probe_id,
+                                provides: want,
+                            }
+                            .encode(),
+                        ));
+                    }
+                }
+            }
+            pair.consumer.candidates.is_some() && pair.provider.candidates.is_some()
+        };
+        for (tx, msg) in sends {
+            tx.try_send(msg).ok();
+        }
+        if settled {
+            self.finish_pair(pair_id);
+            return;
+        }
+        let srv = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PAIR_PROBE_DEADLINE).await;
+            srv.finish_pair(pair_id);
+        });
+    }
+
+    /// Record a probing party's settled candidate list. Returns the pair id
+    /// when the report completes the pair (both parties settled, info frames
+    /// still unsent), telling the caller to finish it; a duplicate or
+    /// orphaned report settles nothing. The probes guard is released before
+    /// the pairs lock is taken.
+    fn settle_probe(&self, probe_id: u64, candidates: Vec<SocketAddr>) -> Option<u64> {
+        let pair_id = self.probes.lock().unwrap().get(&probe_id).copied()?;
+        let mut pairs = self.pairs.lock().unwrap();
+        let pair = pairs.get_mut(&pair_id)?;
+        let party = if pair.consumer.probe_id == Some(probe_id) {
+            &mut pair.consumer
+        } else if pair.provider.probe_id == Some(probe_id) {
+            &mut pair.provider
+        } else {
+            return None;
+        };
+        if party.candidates.is_some() {
+            return None;
+        }
+        party.candidates = Some(candidates);
+        (!pair.info_sent
+            && pair.consumer.candidates.is_some()
+            && pair.provider.candidates.is_some())
+        .then_some(pair_id)
+    }
+
+    /// Send both parties their `PeerInfo`, each carrying the other party's
+    /// candidates; a party that never settled contributes an empty
+    /// (relay-only) list. Idempotent: the first call marks the pair reported
+    /// and clears its probe ids. Frames go only to sessions that announced,
+    /// and the sends run outside every lock.
+    fn finish_pair(&self, pair_id: u64) {
+        let (consumer_id, provider_id, consumer_c, provider_c) = {
+            let mut pairs = self.pairs.lock().unwrap();
+            let Some(pair) = pairs.get_mut(&pair_id) else {
+                return;
+            };
+            if pair.info_sent {
+                return;
+            }
+            pair.info_sent = true;
+            let mut probes = self.probes.lock().unwrap();
+            for id in [pair.consumer.probe_id, pair.provider.probe_id]
+                .into_iter()
+                .flatten()
+            {
+                probes.remove(&id);
+            }
+            drop(probes);
+            (
+                pair.consumer_id.clone(),
+                pair.provider_id.clone(),
+                pair.consumer.candidates.clone().unwrap_or_default(),
+                pair.provider.candidates.clone().unwrap_or_default(),
+            )
+        };
+        let (consumer_tx, provider_tx) = {
+            let clients = self.clients.lock().unwrap();
+            let announced = |id: &str| {
+                clients
+                    .get(id)
+                    .filter(|h| h.peer_provides.is_some())
+                    .map(|h| h.tx.clone())
+            };
+            (announced(&consumer_id), announced(&provider_id))
+        };
+        for (tx, candidates) in [(consumer_tx, provider_c), (provider_tx, consumer_c)] {
+            if let Some(tx) = tx {
+                tx.try_send(
+                    Msg::PeerInfo {
+                        pair_id,
+                        candidates,
+                    }
+                    .encode(),
+                )
+                .ok();
+            }
+        }
     }
 }
 
@@ -543,6 +728,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         clients: Mutex::new(HashMap::new()),
         known_clients: Mutex::new(HashSet::new()),
         pairs: Mutex::new(HashMap::new()),
+        probes: Mutex::new(HashMap::new()),
         routes: Mutex::new(
             routes
                 .into_iter()
@@ -769,6 +955,9 @@ pub(crate) async fn serve_stream(
                                 .encode(),
                             )
                             .ok();
+                            if status == PeerStatus::Accepted {
+                                srv.start_pair_probes(pair_id);
+                            }
                         }
                     }
                     _ => {}
@@ -1567,18 +1756,27 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
                     let Ok(permit) = srv.handshakes.clone().acquire_owned().await else {
                         return;
                     };
-                    let handshake =
-                        timeout(HANDSHAKE_TIMEOUT, server_handshake_stateless(stream, &psk)).await;
+                    // Message 2's payload carries the datagram source address
+                    // back to the initiator: a probe reads its public mapping
+                    // from it, every other initiator discards it.
+                    let reply = crate::proto::encode_sockaddr(src);
+                    let handshake = timeout(
+                        HANDSHAKE_TIMEOUT,
+                        server_handshake_stateless(stream, &psk, &reply),
+                    )
+                    .await;
                     drop(permit);
                     if let Ok(Ok((id, noise))) = handshake {
                         #[cfg(target_os = "linux")]
                         if conv == BRIDGE_CONV {
                             accept_bridge(srv, sess2, conv, noise, src).await;
+                            return;
+                        }
+                        if srv.probes.lock().unwrap().contains_key(&id) {
+                            accept_probe(srv, sess2, conv, id, noise, src).await;
                         } else {
                             accept_udp_forward(srv, sess2, conv, id, noise).await;
                         }
-                        #[cfg(not(target_os = "linux"))]
-                        accept_udp_forward(srv, sess2, conv, id, noise).await;
                     }
                 });
             }
@@ -1618,6 +1816,36 @@ async fn accept_udp_forward(
 
 fn take_udp_pending(srv: &Server, id: u64) -> Option<UdpPending> {
     srv.udp_pending.lock().unwrap().remove(&id)
+}
+
+/// Record a probe session's candidates against its pair: the datagram source
+/// is the party's public mapping, and the first frame on the authenticated
+/// session carries its local candidate. A probe whose frame never arrives
+/// settles nothing; the pairing deadline reports that party relay-only.
+async fn accept_probe(
+    srv: Arc<Server>,
+    sess: Arc<Session>,
+    conv: u32,
+    probe_id: u64,
+    noise: StatelessNoise,
+    src: SocketAddr,
+) {
+    // `_guard` keeps the session counted live while the frame is awaited.
+    let (inbound, _guard) = sess.register_dgram(conv);
+    let mut rx = DgramRx::new(inbound, Arc::new(noise));
+    let local = loop {
+        match timeout(PAIR_PROBE_DEADLINE, rx.recv()).await {
+            Ok(Some(Frame::Data(body))) => match crate::proto::decode_sockaddr(&body) {
+                Ok(a) => break a,
+                Err(_) => return,
+            },
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => return,
+        }
+    };
+    if let Some(pair_id) = srv.settle_probe(probe_id, vec![src, local]) {
+        srv.finish_pair(pair_id);
+    }
 }
 
 /// Attach a client's UDP bridge conv to the software switch. The bridge setup conv
@@ -1805,6 +2033,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             clients: Mutex::new(HashMap::new()),
             known_clients: Mutex::new(HashSet::new()),
             pairs: Mutex::new(HashMap::new()),
+            probes: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashMap::new()),
             handshakes: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
@@ -1893,12 +2122,21 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         id: &str,
         peer_provides: Option<u8>,
     ) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        register_peer_client_with(srv, id, peer_provides, ActiveTransport::Tcp)
+    }
+
+    fn register_peer_client_with(
+        srv: &Server,
+        id: &str,
+        peer_provides: Option<u8>,
+        transport: ActiveTransport,
+    ) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
         let (tx, rx) = mpsc::channel(8);
         srv.clients.lock().unwrap().insert(
             id.into(),
             ClientHandle {
                 tx: tx.clone(),
-                transport: ActiveTransport::Tcp,
+                transport,
                 fwd: Arc::new(HashMap::new()),
                 observed: None,
                 peer_provides,
@@ -2174,5 +2412,168 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         );
         assert!(srv.pairs.lock().unwrap().is_empty());
         server.abort();
+    }
+
+    /// Decode the next frame queued on a registered client's control channel.
+    fn next_msg(rx: &mut mpsc::Receiver<Vec<u8>>) -> Msg {
+        Msg::decode(&rx.try_recv().expect("queued control frame")).expect("decodable frame")
+    }
+
+    /// Pair two registered udp-transport clients, start their probes, and
+    /// return the pair id plus each party's `PeerProbe`-assigned probe id.
+    fn paired_udp_probes(
+        srv: &Arc<Server>,
+        c_tx: &mpsc::Sender<Vec<u8>>,
+        c_rx: &mut mpsc::Receiver<Vec<u8>>,
+        p_rx: &mut mpsc::Receiver<Vec<u8>>,
+    ) -> (u64, u64, u64) {
+        let (pair_id, status) = srv.peer_connect("c", c_tx, "prov", PROVIDES_EXIT).unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        srv.start_pair_probes(pair_id);
+        let probe_of = |rx: &mut mpsc::Receiver<Vec<u8>>, peer: &str| match next_msg(rx) {
+            Msg::PeerProbe {
+                pair_id: got,
+                peer_id,
+                probe_id,
+                provides,
+            } => {
+                assert_eq!(got, pair_id);
+                assert_eq!(peer_id, peer);
+                assert_eq!(provides, PROVIDES_EXIT);
+                probe_id
+            }
+            other => panic!("expected peer probe, got {other:?}"),
+        };
+        let c_probe = probe_of(c_rx, "prov");
+        let p_probe = probe_of(p_rx, "c");
+        assert_ne!(c_probe, p_probe);
+        (pair_id, c_probe, p_probe)
+    }
+
+    // Each udp party gets its own probe id, mapped for app-id classification,
+    // and a party that never reports is announced relay-only at the deadline
+    // while the reporting party's candidates still reach the other side.
+    #[tokio::test(start_paused = true)]
+    async fn pair_probe_deadline_reports_silent_party_relay_only() {
+        let srv = test_server();
+        let (_p_tx, mut p_rx) =
+            register_peer_client_with(&srv, "prov", Some(PROVIDES_EXIT), ActiveTransport::Udp);
+        let (c_tx, mut c_rx) = register_peer_client_with(&srv, "c", Some(0), ActiveTransport::Udp);
+        let (pair_id, c_probe, p_probe) = paired_udp_probes(&srv, &c_tx, &mut c_rx, &mut p_rx);
+        {
+            let probes = srv.probes.lock().unwrap();
+            assert_eq!(probes.get(&c_probe), Some(&pair_id));
+            assert_eq!(probes.get(&p_probe), Some(&pair_id));
+        }
+
+        // The provider reports; the consumer stays silent past the deadline.
+        let public: SocketAddr = "203.0.113.9:41641".parse().unwrap();
+        let local: SocketAddr = "192.168.1.9:41641".parse().unwrap();
+        assert_eq!(srv.settle_probe(p_probe, vec![public, local]), None);
+
+        let bytes = timeout(Duration::from_secs(60), c_rx.recv())
+            .await
+            .expect("no peer info at the deadline")
+            .unwrap();
+        match Msg::decode(&bytes).unwrap() {
+            Msg::PeerInfo {
+                pair_id: got,
+                candidates,
+            } => {
+                assert_eq!(got, pair_id);
+                assert_eq!(candidates, vec![public, local]);
+            }
+            other => panic!("expected peer info, got {other:?}"),
+        }
+        match next_msg(&mut p_rx) {
+            Msg::PeerInfo { candidates, .. } => assert!(candidates.is_empty()),
+            other => panic!("expected peer info, got {other:?}"),
+        }
+        // A reported pair holds no probe ids, and a late report settles nothing.
+        assert!(srv.probes.lock().unwrap().is_empty());
+        assert_eq!(srv.settle_probe(c_probe, vec![public]), None);
+    }
+
+    // Both parties reporting completes the pair before the deadline: each
+    // side's `PeerInfo` carries the other's candidates, duplicate and late
+    // reports are ignored, and the lapsed deadline sends nothing further.
+    #[tokio::test(start_paused = true)]
+    async fn pair_probe_completion_sends_info_before_deadline() {
+        let srv = test_server();
+        let (_p_tx, mut p_rx) =
+            register_peer_client_with(&srv, "prov", Some(PROVIDES_EXIT), ActiveTransport::Udp);
+        let (c_tx, mut c_rx) = register_peer_client_with(&srv, "c", Some(0), ActiveTransport::Udp);
+        let (pair_id, c_probe, p_probe) = paired_udp_probes(&srv, &c_tx, &mut c_rx, &mut p_rx);
+
+        let c_cand: Vec<SocketAddr> = vec![
+            "198.51.100.1:1000".parse().unwrap(),
+            "10.0.0.1:1000".parse().unwrap(),
+        ];
+        let p_cand: Vec<SocketAddr> = vec![
+            "198.51.100.2:2000".parse().unwrap(),
+            "10.0.0.2:2000".parse().unwrap(),
+        ];
+        assert_eq!(srv.settle_probe(c_probe, c_cand.clone()), None);
+        assert_eq!(srv.settle_probe(p_probe, p_cand.clone()), Some(pair_id));
+        srv.finish_pair(pair_id);
+
+        match next_msg(&mut c_rx) {
+            Msg::PeerInfo { candidates, .. } => assert_eq!(candidates, p_cand),
+            other => panic!("expected peer info, got {other:?}"),
+        }
+        match next_msg(&mut p_rx) {
+            Msg::PeerInfo { candidates, .. } => assert_eq!(candidates, c_cand),
+            other => panic!("expected peer info, got {other:?}"),
+        }
+        assert!(srv.probes.lock().unwrap().is_empty());
+        assert_eq!(srv.settle_probe(c_probe, c_cand), None);
+
+        tokio::time::sleep(PAIR_PROBE_DEADLINE * 2).await;
+        assert!(c_rx.try_recv().is_err());
+        assert!(p_rx.try_recv().is_err());
+    }
+
+    // Tcp-transport parties never probe: no `PeerProbe` is sent, and both
+    // sides get an immediate `PeerInfo` with an empty (relay-only) list.
+    #[tokio::test]
+    async fn tcp_transport_parties_settle_relay_only_immediately() {
+        let srv = test_server();
+        let (_p_tx, mut p_rx) = register_peer_client(&srv, "prov", Some(PROVIDES_EXIT));
+        let (c_tx, mut c_rx) = register_peer_client(&srv, "c", Some(0));
+        let (pair_id, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        srv.start_pair_probes(pair_id);
+
+        for rx in [&mut c_rx, &mut p_rx] {
+            match next_msg(rx) {
+                Msg::PeerInfo {
+                    pair_id: got,
+                    candidates,
+                } => {
+                    assert_eq!(got, pair_id);
+                    assert!(candidates.is_empty());
+                }
+                other => panic!("expected immediate peer info, got {other:?}"),
+            }
+        }
+        assert!(srv.probes.lock().unwrap().is_empty());
+    }
+
+    // Probe state dies with the pair: invalidation drops the outstanding
+    // probe ids, so a report for a dead pair settles nothing.
+    #[tokio::test(start_paused = true)]
+    async fn invalidate_pairs_clears_probe_state() {
+        let srv = test_server();
+        let (_p_tx, mut p_rx) =
+            register_peer_client_with(&srv, "prov", Some(PROVIDES_EXIT), ActiveTransport::Udp);
+        let (c_tx, mut c_rx) = register_peer_client_with(&srv, "c", Some(0), ActiveTransport::Udp);
+        let (_pair_id, c_probe, _p_probe) = paired_udp_probes(&srv, &c_tx, &mut c_rx, &mut p_rx);
+
+        assert_eq!(srv.invalidate_pairs("c").len(), 1);
+        assert!(srv.probes.lock().unwrap().is_empty());
+        assert_eq!(
+            srv.settle_probe(c_probe, vec!["203.0.113.9:41641".parse().unwrap()]),
+            None
+        );
     }
 }
