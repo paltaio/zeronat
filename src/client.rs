@@ -17,7 +17,8 @@ use crate::bridge;
 use crate::clientcfg::{CfgPeer, CfgTun, ClientConfig};
 use crate::clientctl::{ControlPath, ControlState, Persist};
 use crate::clientproto::{
-    ClientForwardEntry, ClientServerEntry, LinkCell, LinkStatus, PppPhase, PppStatus, SessionMode,
+    ClientForwardEntry, ClientPeerSlotEntry, ClientServerEntry, LinkCell, LinkStatus, PppPhase,
+    PppStatus, SessionMode,
 };
 use crate::dgram::{DgramRx, DgramTx};
 #[cfg(target_os = "linux")]
@@ -33,8 +34,8 @@ use crate::noise::{
 use crate::peerslot;
 use crate::peerslot::PeerControl;
 pub use crate::peerslot::{
-    ConsumerAdapter, ExitVia, PairPath, PeerExit, PeerSegment, PeerSlotSession, PeerSlotSpec,
-    ProviderAdapter, SessionSink,
+    ConsumerAdapter, ExitVia, PairPath, PeerExit, PeerSegment, PeerSlot, PeerSlotSession,
+    PeerSlotSpec, ProviderAdapter, SessionSink,
 };
 use crate::proto::{decode_sockaddr, encode_sockaddr, FwdOptionEntry, Msg, Proto};
 use crate::tap::TapConfig;
@@ -746,9 +747,9 @@ impl SlotClaims {
 }
 
 /// The claims a configured peer slot set holds, in declaration order.
-fn peer_claims(specs: &[PeerSlotSpec]) -> Vec<(Claim, String)> {
+fn peer_claims(slots: &[PeerSlot]) -> Vec<(Claim, String)> {
     let mut out = Vec::new();
-    for spec in specs {
+    for spec in slots.iter().map(|slot| &slot.spec) {
         let holder = spec.label();
         for dev in spec.devices() {
             out.push((Claim::Device(dev.to_string()), holder.clone()));
@@ -760,20 +761,29 @@ fn peer_claims(specs: &[PeerSlotSpec]) -> Vec<(Claim, String)> {
     out
 }
 
-/// Refuse a slot set whose identities collide. A consumer is identified by the
-/// peer and capability its `PeerConnect` carries and a provider by its
-/// capability alone, and those are the keys inbound frames fan out by, so a
-/// duplicate is unroutable rather than merely redundant.
-fn check_slot_identities(specs: &[PeerSlotSpec]) -> std::result::Result<(), String> {
-    for (i, spec) in specs.iter().enumerate() {
-        let clash =
-            specs[..i]
-                .iter()
-                .any(|other| match (spec.consumer_key(), other.consumer_key()) {
-                    (Some(a), Some(b)) => a == b,
-                    (None, None) => spec.provides() == other.provides(),
-                    _ => false,
-                });
+/// Refuse a slot set whose identities collide or that no snapshot can name. A
+/// consumer is identified by the peer and capability its `PeerConnect` carries
+/// and a provider by its capability alone, and those are the keys inbound
+/// frames fan out by, so a duplicate is unroutable rather than merely
+/// redundant. A capability is one bit: a provider announcing any other number
+/// of them encodes a want byte the client snapshot cannot decode, which costs
+/// the admin socket every view rather than this one slot.
+fn check_slot_identities(slots: &[PeerSlot]) -> std::result::Result<(), String> {
+    for (i, slot) in slots.iter().enumerate() {
+        let spec = &slot.spec;
+        if spec.consumer_key().is_none() && spec.provides().count_ones() != 1 {
+            return Err(format!(
+                "a peer provider serves one capability; this one announces {}",
+                spec.provides().count_ones()
+            ));
+        }
+        let clash = slots[..i].iter().map(|held| &held.spec).any(|other| {
+            match (spec.consumer_key(), other.consumer_key()) {
+                (Some(a), Some(b)) => a == b,
+                (None, None) => spec.provides() == other.provides(),
+                _ => false,
+            }
+        });
         if clash {
             return Err(format!("{} is configured twice", spec.label()));
         }
@@ -841,10 +851,11 @@ struct ActiveState {
     // waiter could consume the permit, the loop would never see the cancel,
     // and it would redial the old target, silently dropping the switch.
     cancel: Arc<Notify>,
-    // The peer slots the loop runs beside the session body. Held here because
-    // attaching one is admitted against the body under this lock and started
-    // by the same cancel a body swap fires.
-    peers: Vec<PeerSlotSpec>,
+    // The peer slots the loop runs beside the session body, each with the cell
+    // its loop reports through. Held here because attaching one is admitted
+    // against the body under this lock and started by the same cancel a body
+    // swap fires.
+    peers: Vec<PeerSlot>,
     // Read under the same lock that swaps the body, so a mutation installing a
     // device body is answered as a refusal before anything is torn down.
     claims: SlotClaims,
@@ -877,6 +888,7 @@ impl ActiveTarget {
         peers: Vec<PeerSlotSpec>,
         mode: RunMode,
     ) -> std::result::Result<(), String> {
+        let peers: Vec<PeerSlot> = peers.into_iter().map(PeerSlot::new).collect();
         let mut s = self.state.lock().unwrap();
         check_slot_identities(&peers)?;
         s.claims = SlotClaims::new(peer_claims(&peers))?;
@@ -899,19 +911,19 @@ impl ActiveTarget {
         spec: PeerSlotSpec,
         boot: &RunMode,
     ) -> std::result::Result<(), String> {
-        let incoming = peer_claims(std::slice::from_ref(&spec));
+        let slot = PeerSlot::new(spec);
+        let incoming = peer_claims(std::slice::from_ref(&slot));
         let mut s = self.state.lock().unwrap();
         // One slot per identity: a provider by the capability it announces, a
         // consumer by the client's one `[tun]` table, whose device, exit, and
         // strict keys a second consumer would overwrite whatever peer it names.
-        let held = s
-            .peers
-            .iter()
-            .find(|held| match (held.consumer_key(), spec.consumer_key()) {
+        let held = s.peers.iter().map(|held| &held.spec).find(|held| {
+            match (held.consumer_key(), slot.spec.consumer_key()) {
                 (Some(_), Some(_)) => true,
-                (None, None) => held.provides() == spec.provides(),
+                (None, None) => held.provides() == slot.spec.provides(),
                 _ => false,
-            });
+            }
+        });
         if let Some(held) = held {
             return Err(format!(
                 "this client already has {}; detach it first",
@@ -919,7 +931,7 @@ impl ActiveTarget {
             ));
         }
         let mut peers = s.peers.clone();
-        peers.push(spec);
+        peers.push(slot);
         let claims = SlotClaims::new(peer_claims(&peers))?;
         SlotClaims(s.mode.claims()).admit(&incoming)?;
         let at_boot: Vec<_> = boot
@@ -939,7 +951,7 @@ impl ActiveTarget {
     pub fn detach_peer(&self, peer_id: &str, want: u8) -> bool {
         let mut s = self.state.lock().unwrap();
         let before = s.peers.len();
-        s.peers.retain(|spec| !spec.is_named_by(peer_id, want));
+        s.peers.retain(|slot| !slot.spec.is_named_by(peer_id, want));
         if s.peers.len() == before {
             return false;
         }
@@ -1053,7 +1065,7 @@ impl ActiveTarget {
     /// Snapshot the target, body, and peer slots to bring up and install a
     /// fresh cancel scoped to them. A mutation racing this call lands its
     /// permit on the fresh cancel, so a switch is never lost between profiles.
-    fn begin(&self) -> (ServerTarget, RunMode, Arc<Notify>, Vec<PeerSlotSpec>) {
+    fn begin(&self) -> (ServerTarget, RunMode, Arc<Notify>, Vec<PeerSlot>) {
         let mut s = self.state.lock().unwrap();
         s.cancel = Arc::new(Notify::new());
         (
@@ -1075,6 +1087,13 @@ impl ActiveTarget {
             _ => String::new(),
         };
         (s.target.name.clone(), s.mode.session_mode(), session)
+    }
+
+    /// The configured peer slots as the admin snapshot reports them, each with
+    /// what its own loop last wrote. Read-only, like `admin_view`.
+    pub fn peer_view(&self) -> Vec<ClientPeerSlotEntry> {
+        let s = self.state.lock().unwrap();
+        s.peers.iter().map(PeerSlot::entry).collect()
     }
 }
 
@@ -1283,7 +1302,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         // The union of the provider bits, or none at all when this client runs
         // no peer slot and announces nothing.
         let announce =
-            (!peers.is_empty()).then(|| peers.iter().fold(0u8, |bits, s| bits | s.provides()));
+            (!peers.is_empty()).then(|| peers.iter().fold(0u8, |bits, s| bits | s.spec.provides()));
         if !matches!(mode, RunMode::Pppoe { .. }) {
             // Only a live pppoe body reports a phase.
             ppp.set(PppPhase::None);
@@ -3163,7 +3182,7 @@ mod tests {
     // both, and leaves the running slots alone.
     #[test]
     fn a_body_cannot_take_a_device_a_peer_slot_holds() {
-        let peers = peer_claims(&[segment_provider_slot("zns0", "eth1")]);
+        let peers = peer_claims(&[PeerSlot::new(segment_provider_slot("zns0", "eth1"))]);
         let claims = SlotClaims::new(peers).unwrap();
         let err = claims.admit(&tap_body("eth1").claims()).unwrap_err();
         assert!(err.contains("eth1"), "{err}");
@@ -3180,7 +3199,7 @@ mod tests {
     // the host's routing, whatever devices they open.
     #[test]
     fn the_default_route_takes_one_holder() {
-        let peers = peer_claims(&[consumer_slot("office", Some("zn0"), true)]);
+        let peers = peer_claims(&[PeerSlot::new(consumer_slot("office", Some("zn0"), true))]);
         let claims = SlotClaims::new(peers).unwrap();
         let RunMode::Pppoe { name, config } = pppoe_mode("wan") else {
             unreachable!("pppoe_mode builds a pppoe body")
@@ -3205,7 +3224,8 @@ mod tests {
     // device is refused the same way a segment provider's NIC refuses one.
     #[test]
     fn an_exit_provider_claims_the_tun_it_opens() {
-        let claims = SlotClaims::new(peer_claims(&[exit_provider_slot("znx0")])).unwrap();
+        let claims =
+            SlotClaims::new(peer_claims(&[PeerSlot::new(exit_provider_slot("znx0"))])).unwrap();
         let err = claims.admit(&tap_body("znx0").claims()).unwrap_err();
         assert!(err.contains("znx0"), "{err}");
         assert!(err.contains("exit provider"), "{err}");
@@ -3263,8 +3283,8 @@ mod tests {
     #[test]
     fn two_peer_slots_cannot_name_one_interface() {
         let err = SlotClaims::new(peer_claims(&[
-            consumer_slot("office", Some("eth1"), false),
-            segment_provider_slot("zns0", "eth1"),
+            PeerSlot::new(consumer_slot("office", Some("eth1"), false)),
+            PeerSlot::new(segment_provider_slot("zns0", "eth1")),
         ]))
         .unwrap_err();
         assert!(err.contains("eth1"), "{err}");
@@ -3274,31 +3294,40 @@ mod tests {
 
     // Inbound frames fan out by slot identity: a consumer by the peer and
     // capability it asks for, a provider by its capability. A set holding the
-    // same identity twice is unroutable, so it is refused.
+    // same identity twice is unroutable, so it is refused, and so is a
+    // provider whose capability is not one bit, which no snapshot can name.
     #[test]
     fn duplicate_slot_identities_are_refused() {
         let err = check_slot_identities(&[
-            consumer_slot("office", None, false),
-            consumer_slot("office", None, false),
+            PeerSlot::new(consumer_slot("office", None, false)),
+            PeerSlot::new(consumer_slot("office", None, false)),
         ])
         .unwrap_err();
         assert!(err.contains("office"), "{err}");
         check_slot_identities(&[
-            consumer_slot("office", None, false),
-            consumer_slot("depot", None, false),
+            PeerSlot::new(consumer_slot("office", None, false)),
+            PeerSlot::new(consumer_slot("depot", None, false)),
         ])
         .unwrap();
 
         assert!(check_slot_identities(&[
-            provider_slot(crate::proto::PROVIDES_EXIT),
-            provider_slot(crate::proto::PROVIDES_EXIT),
+            PeerSlot::new(provider_slot(crate::proto::PROVIDES_EXIT)),
+            PeerSlot::new(provider_slot(crate::proto::PROVIDES_EXIT)),
         ])
         .is_err());
         check_slot_identities(&[
-            provider_slot(crate::proto::PROVIDES_EXIT),
-            segment_provider_slot("zns0", "eth1"),
+            PeerSlot::new(provider_slot(crate::proto::PROVIDES_EXIT)),
+            PeerSlot::new(segment_provider_slot("zns0", "eth1")),
         ])
         .unwrap();
+
+        for provides in [
+            0,
+            crate::proto::PROVIDES_EXIT | crate::proto::PROVIDES_SEGMENT,
+        ] {
+            let err = check_slot_identities(&[PeerSlot::new(provider_slot(provides))]).unwrap_err();
+            assert!(err.contains("one capability"), "{err}");
+        }
     }
 
     // A runtime attach is admitted against the body in place and the slots

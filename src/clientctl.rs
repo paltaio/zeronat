@@ -304,6 +304,7 @@ fn snapshot(state: &ControlState) -> ClientSnapshotBody {
         pppoe: state.pppoe.iter().map(|(name, _)| name.clone()).collect(),
         session,
         link: state.link.get(),
+        peers: state.active.peer_view(),
     }
 }
 

@@ -95,6 +95,18 @@ pub struct BridgeEntry {
     pub idle_secs: u32,
 }
 
+/// An accepted rendezvous pair, as reported in a `Snapshot`. `want` is the
+/// capability the pair carries. `path` is the path the two parties settled on:
+/// relay once the server opened one, direct once both parties reported a
+/// punched session, and `None` while the pair is still pairing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairEntry {
+    pub consumer_id: String,
+    pub provider_id: String,
+    pub want: u8,
+    pub path: Option<PathStatus>,
+}
+
 /// A point-in-time view of one server's topology, returned to admin on request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotBody {
@@ -104,6 +116,7 @@ pub struct SnapshotBody {
     pub clients: Vec<ClientEntry>,
     pub routes: Vec<RouteEntry>,
     pub bridge_clients: Vec<BridgeEntry>,
+    pub pairs: Vec<PairEntry>,
 }
 
 /// Per-forward options a client announces for one of its public ports.
@@ -334,6 +347,42 @@ fn path_status_from_byte(n: u8) -> Result<PathStatus> {
         0 => Ok(PathStatus::Direct),
         1 => Ok(PathStatus::Relay),
         n => Err(format!("unknown path status byte {n}").into()),
+    }
+}
+
+/// A settled path as a snapshot field: a pair that has settled on neither path
+/// gets its own value.
+pub fn settled_path_byte(p: Option<PathStatus>) -> u8 {
+    match p {
+        None => 0,
+        Some(PathStatus::Direct) => 1,
+        Some(PathStatus::Relay) => 2,
+    }
+}
+
+/// The path a pair settled on, as the admin views name it.
+pub fn path_name(p: PathStatus) -> &'static str {
+    match p {
+        PathStatus::Direct => "direct",
+        PathStatus::Relay => "relay",
+    }
+}
+
+pub fn settled_path_from_byte(n: u8) -> Result<Option<PathStatus>> {
+    match n {
+        0 => Ok(None),
+        1 => Ok(Some(PathStatus::Direct)),
+        2 => Ok(Some(PathStatus::Relay)),
+        n => Err(format!("unknown settled path byte {n}").into()),
+    }
+}
+
+/// Name of a single capability bit, for admin output and refusals.
+pub fn provides_name(bit: u8) -> &'static str {
+    match bit {
+        PROVIDES_EXIT => "exit",
+        PROVIDES_SEGMENT => "segment",
+        _ => "peer",
     }
 }
 
@@ -591,6 +640,38 @@ fn decode_bridge_clients(b: &[u8], at: &mut usize) -> Result<Vec<BridgeEntry>> {
     Ok(out)
 }
 
+/// Decode the pair trailer that follows the bridge clients in a snapshot: a
+/// u16 count then that many entries. Length-guarded like the bridge trailer,
+/// with the capability and the settled path validated at decode; the caller
+/// still rejects any bytes left over.
+fn decode_pairs(b: &[u8], at: &mut usize) -> Result<Vec<PairEntry>> {
+    if *at + 2 > b.len() {
+        return Err(
+            "truncated pair count: the admin reader and the server are different versions".into(),
+        );
+    }
+    let count = u16::from_be_bytes([b[*at], b[*at + 1]]) as usize;
+    *at += 2;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let consumer_id = take_str(b, at)?;
+        let provider_id = take_str(b, at)?;
+        if *at + 2 > b.len() {
+            return Err("truncated pair capability".into());
+        }
+        let want = want_from_byte(b[*at])?;
+        let path = settled_path_from_byte(b[*at + 1])?;
+        *at += 2;
+        out.push(PairEntry {
+            consumer_id,
+            provider_id,
+            want,
+            path,
+        });
+    }
+    Ok(out)
+}
+
 impl Msg {
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -673,6 +754,16 @@ impl Msg {
                     b.extend_from_slice(&e.tx_frames.to_be_bytes());
                     b.extend_from_slice(&e.uptime_secs.to_be_bytes());
                     b.extend_from_slice(&e.idle_secs.to_be_bytes());
+                }
+                // Pair trailer: a u16 count then that many entries (the count
+                // is 0 when no pairs are up).
+                let count = snap.pairs.len().min(u16::MAX as usize);
+                b.extend_from_slice(&(count as u16).to_be_bytes());
+                for p in &snap.pairs[..count] {
+                    put_str(&mut b, &p.consumer_id);
+                    put_str(&mut b, &p.provider_id);
+                    b.push(p.want);
+                    b.push(settled_path_byte(p.path));
                 }
                 b
             }
@@ -953,8 +1044,12 @@ impl Msg {
                     });
                 }
                 let bridge_clients = decode_bridge_clients(b, &mut at)?;
+                let pairs = decode_pairs(b, &mut at)?;
                 if at != b.len() {
-                    return Err("trailing bytes in snapshot".into());
+                    return Err(
+                        "trailing bytes in snapshot: the admin reader and the server are different versions"
+                            .into(),
+                    );
                 }
                 Ok(Msg::Snapshot(SnapshotBody {
                     version,
@@ -963,6 +1058,7 @@ impl Msg {
                     clients,
                     routes,
                     bridge_clients,
+                    pairs,
                 }))
             }
             Some(8) if b.len() == 8 => {
@@ -1303,6 +1399,20 @@ mod tests {
                     idle_secs: 2,
                 },
             ],
+            pairs: vec![
+                PairEntry {
+                    consumer_id: "rpi-1-ab12".into(),
+                    provider_id: "office-b1c2".into(),
+                    want: PROVIDES_EXIT,
+                    path: Some(PathStatus::Direct),
+                },
+                PairEntry {
+                    consumer_id: "rpi-2-cd34".into(),
+                    provider_id: "office-b1c2".into(),
+                    want: PROVIDES_SEGMENT,
+                    path: None,
+                },
+            ],
         };
         match roundtrip(&Msg::Snapshot(body.clone())) {
             Msg::Snapshot(decoded) => assert_eq!(decoded, body),
@@ -1316,6 +1426,7 @@ mod tests {
             clients: Vec::new(),
             routes: Vec::new(),
             bridge_clients: Vec::new(),
+            pairs: Vec::new(),
         };
         match roundtrip(&Msg::Snapshot(empty.clone())) {
             Msg::Snapshot(decoded) => assert_eq!(decoded, empty),
@@ -1323,8 +1434,9 @@ mod tests {
         }
     }
 
-    /// The bridge trailer is mandatory: a snapshot whose bytes end at the routes
-    /// (no trailer) is malformed and must error, not decode to an empty fleet.
+    /// Both trailers are mandatory: a snapshot whose bytes end at the routes or
+    /// at the bridge clients is malformed and must error, not decode to an
+    /// empty fleet.
     #[test]
     fn snapshot_missing_trailer_errors() {
         let body = SnapshotBody {
@@ -1334,11 +1446,13 @@ mod tests {
             clients: Vec::new(),
             routes: Vec::new(),
             bridge_clients: Vec::new(),
+            pairs: Vec::new(),
         };
-        let mut bytes = Msg::Snapshot(body).encode();
-        assert_eq!(&bytes[bytes.len() - 2..], &[0, 0]);
-        bytes.truncate(bytes.len() - 2);
-        assert!(Msg::decode(&bytes).is_err());
+        let bytes = Msg::Snapshot(body).encode();
+        assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
+        for missing in [2, 4] {
+            assert!(Msg::decode(&bytes[..bytes.len() - missing]).is_err());
+        }
     }
 
     #[test]
@@ -1402,6 +1516,7 @@ mod tests {
                 clients: Vec::new(),
                 routes: Vec::new(),
                 bridge_clients: bridge,
+                pairs: Vec::new(),
             })
         };
         let good = mk(vec![entry]).encode();
@@ -1433,6 +1548,53 @@ mod tests {
         let mut bad_named = good.clone();
         bad_named[transport_at - 1] = 2;
         assert!(Msg::decode(&bad_named).is_err());
+    }
+
+    /// Every malformed pair trailer must error, never panic (panic=abort).
+    #[test]
+    fn snapshot_pair_trailer_rejects_malformed() {
+        let mk = |pairs: Vec<PairEntry>| {
+            Msg::Snapshot(SnapshotBody {
+                version: 1,
+                server_id: "s".into(),
+                listeners: Vec::new(),
+                clients: Vec::new(),
+                routes: Vec::new(),
+                bridge_clients: Vec::new(),
+                pairs,
+            })
+        };
+        let good = mk(vec![PairEntry {
+            consumer_id: "c".into(),
+            provider_id: "p".into(),
+            want: PROVIDES_EXIT,
+            path: Some(PathStatus::Relay),
+        }])
+        .encode();
+        // The pair count begins where the same body with no pairs ends.
+        let trailer_at = mk(Vec::new()).encode().len() - 2;
+
+        for cut in trailer_at + 1..good.len() {
+            assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
+        }
+        let mut junk = good.clone();
+        junk.push(0x00);
+        assert!(Msg::decode(&junk).is_err());
+        // A pair count larger than the remaining bytes errors, not over-reads.
+        let mut big = good.clone();
+        big[trailer_at] = 0xff;
+        big[trailer_at + 1] = 0xff;
+        assert!(Msg::decode(&big).is_err());
+        // The capability and settled-path bytes end the entry: a capability
+        // that is not exactly one defined bit and an undefined path both error.
+        for bad in [0u8, PROVIDES_EXIT | PROVIDES_SEGMENT, 4] {
+            let mut corrupt = good.clone();
+            corrupt[good.len() - 2] = bad;
+            assert!(Msg::decode(&corrupt).is_err(), "want {bad} should error");
+        }
+        let mut bad_path = good.clone();
+        *bad_path.last_mut().unwrap() = 3;
+        assert!(Msg::decode(&bad_path).is_err());
     }
 
     #[test]
@@ -1572,17 +1734,19 @@ mod tests {
             }],
             routes: Vec::new(),
             bridge_clients: Vec::new(),
+            pairs: Vec::new(),
         })
         .encode();
-        // The trailing six bytes are the zero forward-option, route, and bridge
-        // counts; back up past them to the client transport byte and corrupt it.
+        // The trailing eight bytes are the zero forward-option, route, bridge,
+        // and pair counts; back up past them to the client transport byte and
+        // corrupt it.
         let n = snap.len();
-        snap[n - 7] = 3;
+        snap[n - 9] = 3;
         assert!(Msg::decode(&snap).is_err());
 
         // tag-7 with a bad listener source byte (5). A single listener and no
-        // clients/routes puts the listener source byte before the three zero
-        // counts (client + route + bridge), i.e. seven bytes from the end.
+        // clients/routes puts the listener source byte before the four zero
+        // counts (client + route + bridge + pair), i.e. nine bytes from the end.
         let mut snap = Msg::Snapshot(SnapshotBody {
             version: 1,
             server_id: "0".into(),
@@ -1595,15 +1759,16 @@ mod tests {
             clients: Vec::new(),
             routes: Vec::new(),
             bridge_clients: Vec::new(),
+            pairs: Vec::new(),
         })
         .encode();
         let n = snap.len();
-        snap[n - 7] = 5;
+        snap[n - 9] = 5;
         assert!(Msg::decode(&snap).is_err());
 
         // tag-7 with a bad route source byte (7). A single route and no
-        // clients/listeners puts the route source byte just before the two zero
-        // bridge-count bytes, i.e. three bytes from the end.
+        // clients/listeners puts the route source byte just before the zero
+        // bridge-count and pair-count bytes, i.e. five bytes from the end.
         let mut snap = Msg::Snapshot(SnapshotBody {
             version: 1,
             server_id: "0".into(),
@@ -1618,16 +1783,17 @@ mod tests {
                 source: Source::File,
             }],
             bridge_clients: Vec::new(),
+            pairs: Vec::new(),
         })
         .encode();
         let n = snap.len();
-        snap[n - 3] = 7;
+        snap[n - 5] = 7;
         assert!(Msg::decode(&snap).is_err());
 
         // tag-7 with a client forward-option flags byte carrying reserved bits
         // (2). A single client with one entry and nothing else puts the flags
-        // byte before the entry's idle u32 and the two zero route-count and
-        // bridge-count bytes, i.e. nine bytes from the end.
+        // byte before the entry's idle u32 and the zero route, bridge, and pair
+        // counts, i.e. eleven bytes from the end.
         let mut snap = Msg::Snapshot(SnapshotBody {
             version: 1,
             server_id: "0".into(),
@@ -1644,10 +1810,11 @@ mod tests {
             }],
             routes: Vec::new(),
             bridge_clients: Vec::new(),
+            pairs: Vec::new(),
         })
         .encode();
         let n = snap.len();
-        snap[n - 9] = 2;
+        snap[n - 11] = 2;
         assert!(Msg::decode(&snap).is_err());
     }
 

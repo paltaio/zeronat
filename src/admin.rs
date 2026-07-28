@@ -1,4 +1,4 @@
-use crate::proto::{proto_name, Msg, RouteEntry, SnapshotBody, Source};
+use crate::proto::{path_name, proto_name, provides_name, Msg, RouteEntry, SnapshotBody, Source};
 use crate::Result;
 use tokio::net::TcpStream;
 
@@ -96,12 +96,13 @@ fn render(snap: &SnapshotBody, addr: &str) -> String {
 
     out.push_str("Servers\n");
     out.push_str(&format!(
-        "  {:<8}  connected  {}  clients {}  bridge {}  routes {}\n",
+        "  {:<8}  connected  {}  clients {}  bridge {}  routes {}  pairs {}\n",
         snap.server_id,
         addr,
         snap.clients.len(),
         snap.bridge_clients.len(),
-        snap.routes.len()
+        snap.routes.len(),
+        snap.pairs.len()
     ));
 
     out.push_str("\nRoutes\n");
@@ -182,6 +183,25 @@ fn render(snap: &SnapshotBody, addr: &str) -> String {
         }
     }
 
+    out.push_str("\nPairs\n");
+    if snap.pairs.is_empty() {
+        out.push_str("  (no pairs)\n");
+    } else {
+        out.push_str(&format!(
+            "  {:<20}  {:<20}  {:<8}  {}\n",
+            "CONSUMER", "PROVIDER", "CAP", "PATH"
+        ));
+        for p in &snap.pairs {
+            out.push_str(&format!(
+                "  {:<20}  {:<20}  {:<8}  {}\n",
+                strip_ctrl(&p.consumer_id),
+                strip_ctrl(&p.provider_id),
+                provides_name(p.want),
+                p.path.map_or("pairing", path_name),
+            ));
+        }
+    }
+
     out.push_str("\nListeners\n");
     if snap.listeners.is_empty() {
         out.push_str("  (none)\n");
@@ -215,7 +235,7 @@ pub(crate) fn transport_name(t: u8) -> &'static str {
 
 /// Drop control characters from server-reported text before printing it, so a
 /// crafted label or address cannot inject terminal escape sequences.
-fn strip_ctrl(s: &str) -> String {
+pub(crate) fn strip_ctrl(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
@@ -298,7 +318,10 @@ pub(crate) fn fmt_dur(secs: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{BridgeEntry, ClientEntry, FwdOptionEntry, Listener, Proto, Source};
+    use crate::proto::{
+        BridgeEntry, ClientEntry, FwdOptionEntry, Listener, PairEntry, PathStatus, Proto, Source,
+        PROVIDES_EXIT, PROVIDES_SEGMENT,
+    };
     use std::net::Ipv4Addr;
 
     #[test]
@@ -339,6 +362,7 @@ mod tests {
                 source: Source::Runtime,
             }],
             bridge_clients: Vec::new(),
+            pairs: Vec::new(),
         };
         let s = render(&snap, "vps.example:2222");
         assert!(s.contains("Servers"));
@@ -381,12 +405,14 @@ mod tests {
             clients: Vec::new(),
             routes: Vec::new(),
             bridge_clients: Vec::new(),
+            pairs: Vec::new(),
         };
         let s = render(&snap, "vps.example:2222");
         assert!(s.contains("clients 0"));
         assert!(s.contains("routes 0"));
         assert!(s.contains("(no clients connected)"));
         assert!(s.contains("(no bridge clients)"));
+        assert!(s.contains("(no pairs)"));
         assert!(s.contains("(no routes)"));
         assert!(s.contains("(none)"));
     }
@@ -427,6 +453,7 @@ mod tests {
                     idle_secs: 2,
                 },
             ],
+            pairs: Vec::new(),
         };
         let s = render(&snap, "vps.example:2222");
         assert!(s.contains("bridge 2"));
@@ -440,6 +467,50 @@ mod tests {
         // The anonymous udp port shows its fallback label and the anon marker.
         assert!(s.contains("bridge-7 (anon)"));
         assert!(s.contains("udp"));
+    }
+
+    /// The fleet view lists every accepted pair with the capability it carries
+    /// and the path it settled on, including a pair still pairing.
+    #[test]
+    fn render_pairs() {
+        let snap = SnapshotBody {
+            version: 1,
+            server_id: "0".into(),
+            listeners: Vec::new(),
+            clients: Vec::new(),
+            routes: Vec::new(),
+            bridge_clients: Vec::new(),
+            pairs: vec![
+                PairEntry {
+                    consumer_id: "laptop-ab12".into(),
+                    provider_id: "office-b1c2".into(),
+                    want: PROVIDES_EXIT,
+                    path: Some(PathStatus::Direct),
+                },
+                PairEntry {
+                    consumer_id: "znpppoe-42-cd34".into(),
+                    provider_id: "office-b1c2".into(),
+                    want: PROVIDES_SEGMENT,
+                    path: Some(PathStatus::Relay),
+                },
+                PairEntry {
+                    consumer_id: "rpi-ef56".into(),
+                    provider_id: "office-b1c2".into(),
+                    want: PROVIDES_EXIT,
+                    path: None,
+                },
+            ],
+        };
+        let s = render(&snap, "vps.example:2222");
+        assert!(s.contains("pairs 3"));
+        assert!(s.contains("CONSUMER"));
+        for row in [
+            "laptop-ab12           office-b1c2           exit      direct",
+            "znpppoe-42-cd34       office-b1c2           segment   relay",
+            "rpi-ef56              office-b1c2           exit      pairing",
+        ] {
+            assert!(s.contains(row), "{s}");
+        }
     }
 
     #[test]

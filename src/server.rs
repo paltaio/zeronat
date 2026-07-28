@@ -24,8 +24,8 @@ use crate::noise::{
 #[cfg(target_os = "linux")]
 use crate::proto::BridgeEntry;
 use crate::proto::{
-    proto_name, ClientEntry, FwdOptionEntry, Listener, Msg, PathStatus, PeerStatus, Proto,
-    RouteEntry, SnapshotBody, Source, PROVIDES_EXIT,
+    proto_name, ClientEntry, FwdOptionEntry, Listener, Msg, PairEntry, PathStatus, PeerStatus,
+    Proto, RouteEntry, SnapshotBody, Source, PROVIDES_EXIT,
 };
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
@@ -742,10 +742,7 @@ impl Server {
         for (tx, msg) in sends {
             tx.try_send(msg).ok();
         }
-        let name = match status {
-            PathStatus::Direct => "direct",
-            PathStatus::Relay => "relay",
-        };
+        let name = crate::proto::path_name(status);
         crate::elog!("peer pair {pair_id}: {client_id} reports the {name} path");
         if opened {
             crate::elog!("peer pair {pair_id}: opening the relay");
@@ -1460,6 +1457,34 @@ impl Server {
                 .unwrap_or_default();
         #[cfg(not(target_os = "linux"))]
         let bridge_clients = Vec::new();
+        // Accepted pairs, each with the path its two parties settled on. The
+        // relay is the server's own fact and outranks a stale `direct` report;
+        // a punched pair needs both reports, since one party reporting direct
+        // while the other has not says nothing about a path that carries
+        // traffic. Everything else is a pair still pairing.
+        let mut pairs: Vec<PairEntry> = self
+            .pairs
+            .lock()
+            .unwrap()
+            .values()
+            .map(|p| PairEntry {
+                consumer_id: p.consumer_id.clone(),
+                provider_id: p.provider_id.clone(),
+                want: p.want,
+                path: if p.relay.is_some() {
+                    Some(PathStatus::Relay)
+                } else if p.consumer.path == Some(PathStatus::Direct)
+                    && p.provider.path == Some(PathStatus::Direct)
+                {
+                    Some(PathStatus::Direct)
+                } else {
+                    None
+                },
+            })
+            .collect();
+        pairs.sort_unstable_by(|a, b| {
+            (&a.consumer_id, &a.provider_id, a.want).cmp(&(&b.consumer_id, &b.provider_id, b.want))
+        });
 
         SnapshotBody {
             version: crate::identity::PROTO_VERSION,
@@ -1468,6 +1493,7 @@ impl Server {
             clients,
             routes,
             bridge_clients,
+            pairs,
         }
     }
 
@@ -3038,6 +3064,48 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             srv.pairs.lock().unwrap().get(&pair2).unwrap().consumer.path,
             None
         );
+    }
+
+    // The path a snapshot shows is the pair's, not a party's: a punched path
+    // needs both reports, the relay is the server's own fact and outranks a
+    // party still reporting direct, and anything short of that is pairing.
+    #[tokio::test]
+    async fn snapshot_pairs_settle_on_both_reports() {
+        let srv = test_server();
+        // Exit is exclusive, so the two pairs take a provider each.
+        let (p_tx, _p_rx) = register_peer_client(&srv, "prov", Some(PROVIDES_EXIT));
+        let (q_tx, _q_rx) = register_peer_client(&srv, "prov2", Some(PROVIDES_EXIT));
+        let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
+        let (d_tx, _d_rx) = register_peer_client(&srv, "d", Some(0));
+        let (punched, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        let (relayed, status) = srv
+            .peer_connect("d", &d_tx, "prov2", PROVIDES_EXIT)
+            .unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        let path = |consumer: &str| {
+            srv.snapshot()
+                .pairs
+                .into_iter()
+                .find(|p| p.consumer_id == consumer)
+                .expect("pair in the snapshot")
+                .path
+        };
+
+        // Neither party has reported yet.
+        assert_eq!(path("c"), None);
+
+        // One direct report says nothing about a path that carries traffic.
+        srv.peer_path("c", &c_tx, punched, PathStatus::Direct);
+        assert_eq!(path("c"), None);
+        srv.peer_path("prov", &p_tx, punched, PathStatus::Direct);
+        assert_eq!(path("c"), Some(PathStatus::Direct));
+
+        // The relay the server opened outranks the direct report the other
+        // party filed before it.
+        srv.peer_path("d", &d_tx, relayed, PathStatus::Direct);
+        srv.peer_path("prov2", &q_tx, relayed, PathStatus::Relay);
+        assert_eq!(path("d"), Some(PathStatus::Relay));
     }
 
     // Probe state dies with the pair: invalidation drops the outstanding

@@ -8,7 +8,8 @@
 
 use crate::client::Transport;
 use crate::proto::{
-    proto_byte, proto_from_byte, put_str, take_str, Proto, PROVIDES_EXIT, PROVIDES_SEGMENT,
+    proto_byte, proto_from_byte, put_str, settled_path_byte, settled_path_from_byte, take_str,
+    PathStatus, Proto, PROVIDES_EXIT, PROVIDES_SEGMENT,
 };
 use crate::Result;
 
@@ -173,6 +174,79 @@ impl LinkCell {
     }
 }
 
+/// Shared per-slot status cell: the four link states every slot reports plus,
+/// on a consumer, the path its pair settled on. Two bytes written without a
+/// lock, the shape [`LinkCell`] uses. A running slot holds the cell through
+/// [`PeerSlotCell::hold`], so a slot the loop tore down reads offline rather
+/// than whatever it last wrote.
+#[derive(Clone, Default)]
+pub struct PeerSlotCell {
+    link: LinkCell,
+    path: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl PeerSlotCell {
+    /// Report the slot's state. The path belongs to a connected consumer; a
+    /// provider and any other state carry none.
+    pub fn set(&self, link: LinkStatus, path: Option<PathStatus>) {
+        self.link.set(link);
+        self.path.store(
+            settled_path_byte(path),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    pub fn get(&self) -> (LinkStatus, Option<PathStatus>) {
+        // Only `set` writes the cell, so the byte is always a valid path. The
+        // path belongs to a connected slot and is reported under no other link
+        // state: the two bytes are read one at a time, so a reader landing
+        // between a slot's two stores would otherwise see a settled path on a
+        // slot that is already backing off.
+        let link = self.link.get();
+        let path = settled_path_from_byte(self.path.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(None)
+            .filter(|_| link == LinkStatus::Connected);
+        (link, path)
+    }
+
+    /// Take the cell for a running slot: it reads offline again when the slot
+    /// that held it ends, aborted by a profile switch included.
+    pub fn hold(&self) -> PeerSlotHold {
+        PeerSlotHold(self.clone())
+    }
+}
+
+/// Resets its slot's cell to offline on drop.
+pub struct PeerSlotHold(PeerSlotCell);
+
+impl Drop for PeerSlotHold {
+    fn drop(&mut self) {
+        self.0.set(LinkStatus::Offline, None);
+    }
+}
+
+/// A configured peer slot as reported in a `ClientSnapshot`: what the slot
+/// asks for, what it opens, and where its loop stands. `peer_id` is empty on a
+/// provider, which is identified by its capability alone; `iface` is the
+/// device or bridge the slot's adapter opens, empty when it opens none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientPeerSlotEntry {
+    pub peer_id: String,
+    pub want: u8,
+    pub iface: String,
+    pub link: LinkStatus,
+    /// The path a connected consumer's pair settled on.
+    pub path: Option<PathStatus>,
+}
+
+impl ClientPeerSlotEntry {
+    /// The peer a consumer slot asks; `None` on a provider, which the empty
+    /// `peer_id` marks and which its capability names alone.
+    pub fn peer(&self) -> Option<&str> {
+        (!self.peer_id.is_empty()).then_some(self.peer_id.as_str())
+    }
+}
+
 /// A forward as reported in a `ClientSnapshot`: the public port, the local
 /// target it dials, and the per-forward options. `idle_secs` 0 means the proto
 /// default idle window.
@@ -216,6 +290,9 @@ pub struct ClientSnapshotBody {
     pub session: String,
     /// Link state toward the active server.
     pub link: LinkStatus,
+    /// The peer slots this client runs beside the server slot, each with its
+    /// own link state.
+    pub peers: Vec<ClientPeerSlotEntry>,
 }
 
 /// Server secret carried by `AddServer` and held by the parsed client config;
@@ -363,6 +440,15 @@ impl ClientMsg {
                 }
                 put_str(&mut b, &snap.session);
                 b.push(link_byte(snap.link));
+                let count = snap.peers.len().min(u16::MAX as usize);
+                b.extend_from_slice(&(count as u16).to_be_bytes());
+                for slot in &snap.peers[..count] {
+                    put_str(&mut b, &slot.peer_id);
+                    b.push(slot.want);
+                    put_str(&mut b, &slot.iface);
+                    b.push(link_byte(slot.link));
+                    b.push(settled_path_byte(slot.path));
+                }
                 b
             }
             ClientMsg::MutationResult { ok, msg } => {
@@ -574,6 +660,34 @@ impl ClientMsg {
                 }
                 let link = link_from_byte(b[at])?;
                 at += 1;
+                if at + 2 > b.len() {
+                    return Err("truncated client snapshot peer list".into());
+                }
+                let count = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
+                at += 2;
+                let mut peers = Vec::new();
+                for _ in 0..count {
+                    let peer_id = take_str(b, &mut at)?;
+                    if at >= b.len() {
+                        return Err("truncated peer slot capability".into());
+                    }
+                    let want = want_from_byte(b[at])?;
+                    at += 1;
+                    let iface = take_str(b, &mut at)?;
+                    if at + 2 > b.len() {
+                        return Err("truncated peer slot status".into());
+                    }
+                    let link = link_from_byte(b[at])?;
+                    let path = settled_path_from_byte(b[at + 1])?;
+                    at += 2;
+                    peers.push(ClientPeerSlotEntry {
+                        peer_id,
+                        want,
+                        iface,
+                        link,
+                        path,
+                    });
+                }
                 if at != b.len() {
                     return Err("trailing bytes in client snapshot".into());
                 }
@@ -587,6 +701,7 @@ impl ClientMsg {
                     pppoe,
                     session,
                     link,
+                    peers,
                 }))
             }
             Some(3) => {
@@ -845,6 +960,22 @@ mod tests {
             pppoe: vec!["wan".into(), "dsl".into()],
             session: String::new(),
             link: LinkStatus::Connected,
+            peers: vec![
+                ClientPeerSlotEntry {
+                    peer_id: "office-b1c2".into(),
+                    want: PROVIDES_EXIT,
+                    iface: "zn0".into(),
+                    link: LinkStatus::Connected,
+                    path: Some(PathStatus::Direct),
+                },
+                ClientPeerSlotEntry {
+                    peer_id: String::new(),
+                    want: PROVIDES_SEGMENT,
+                    iface: "br0".into(),
+                    link: LinkStatus::Dialing,
+                    path: None,
+                },
+            ],
         }
     }
 
@@ -866,6 +997,7 @@ mod tests {
             pppoe: Vec::new(),
             session: "wan".into(),
             link: LinkStatus::Offline,
+            peers: Vec::new(),
         };
         match roundtrip(&ClientMsg::ClientSnapshot(empty.clone())) {
             ClientMsg::ClientSnapshot(decoded) => assert_eq!(decoded, empty),
@@ -906,6 +1038,7 @@ mod tests {
                         pppoe: Vec::new(),
                         session: String::new(),
                         link,
+                        peers: Vec::new(),
                     };
                     match roundtrip(&ClientMsg::ClientSnapshot(body.clone())) {
                         ClientMsg::ClientSnapshot(decoded) => assert_eq!(decoded, body),
@@ -924,7 +1057,8 @@ mod tests {
         // 9 proto, 10-11 port, 12-14 target ("t"), 15 proxy, 16-19 idle,
         // 20 enabled, 21-22 server count, 23-25 name ("s"), 26-28 addr ("d"),
         // 29 transport, 30-31 pppoe count, 32-34 name ("w"),
-        // 35-37 session ("x"), 38 link.
+        // 35-37 session ("x"), 38 link, 39-40 peer count, 41-43 peer ("p"),
+        // 44 want, 45-47 iface ("i"), 48 slot link, 49 slot path.
         let good = ClientMsg::ClientSnapshot(ClientSnapshotBody {
             version: 1,
             active: "a".into(),
@@ -946,9 +1080,16 @@ mod tests {
             pppoe: vec!["w".into()],
             session: "x".into(),
             link: LinkStatus::Connected,
+            peers: vec![ClientPeerSlotEntry {
+                peer_id: "p".into(),
+                want: PROVIDES_EXIT,
+                iface: "i".into(),
+                link: LinkStatus::Backoff,
+                path: Some(PathStatus::Relay),
+            }],
         })
         .encode();
-        assert_eq!(good.len(), 39);
+        assert_eq!(good.len(), 50);
         // Any truncation errors, never panics.
         for cut in 1..good.len() {
             assert!(
@@ -960,8 +1101,8 @@ mod tests {
         let mut junk = good.clone();
         junk.push(0x00);
         assert!(ClientMsg::decode(&junk).is_err());
-        // Forward and server counts larger than the remaining bytes.
-        for at in [7usize, 21] {
+        // Forward, server, and peer counts larger than the remaining bytes.
+        for at in [7usize, 21, 39] {
             let mut big = good.clone();
             big[at] = 0xff;
             big[at + 1] = 0xff;
@@ -971,7 +1112,8 @@ mod tests {
             );
         }
         // Unknown mode, phase, proto, proxy, enabled, transport, and link
-        // bytes.
+        // bytes, and a peer slot naming no capability, an unknown link state,
+        // or an unknown path.
         for (at, bad) in [
             (5, 5u8),
             (6, 6u8),
@@ -980,6 +1122,10 @@ mod tests {
             (20, 2u8),
             (29, 3u8),
             (38, 4u8),
+            (44, 0u8),
+            (44, PROVIDES_EXIT | PROVIDES_SEGMENT),
+            (48, 4u8),
+            (49, 3u8),
         ] {
             let mut corrupt = good.clone();
             corrupt[at] = bad;

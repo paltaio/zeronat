@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use crate::admin;
 use crate::proto::{
-    proto_name, BridgeEntry, ClientEntry, Listener, Msg, Proto, RouteEntry, SnapshotBody, Source,
+    proto_name, provides_name, BridgeEntry, ClientEntry, Listener, Msg, PairEntry, Proto,
+    RouteEntry, SnapshotBody, Source,
 };
 use crate::Result;
 
@@ -167,6 +168,15 @@ impl App {
             .unwrap_or_default();
         v.sort_by(|a, b| a.label.cmp(&b.label));
         v
+    }
+
+    /// Unlike the sibling accessors, this one sorts nothing: pairs arrive
+    /// ordered, since the server keeps them in a map and sorts them itself.
+    fn pairs(&self) -> Vec<PairEntry> {
+        self.snap
+            .as_ref()
+            .map(|s| s.pairs.clone())
+            .unwrap_or_default()
     }
 
     fn item_count(&self) -> usize {
@@ -593,6 +603,7 @@ impl App {
         let listeners = self.listeners();
         let clients = self.clients();
         let bridge = self.bridge();
+        let pairs = self.pairs();
 
         let mut lines: Vec<String> = Vec::with_capacity(h);
         lines.push(frame::top(w, self.header_left(), self.status_seg()));
@@ -630,6 +641,14 @@ impl App {
         }
         for e in &bridge {
             content.push(frame::row(w, bridge_row(e)));
+        }
+        content.push(frame::blank(w));
+        content.push(frame::row(w, section_head("PAIRS", pairs.len())));
+        if pairs.is_empty() {
+            content.push(frame::row(w, muted_line("  (none)")));
+        }
+        for p in &pairs {
+            content.push(frame::row(w, pair_row(p)));
         }
 
         // Reserve the last four rows: divider, toast, hints, bottom border.
@@ -966,6 +985,30 @@ fn bridge_row(e: &BridgeEntry) -> Line {
         crate::admin::fmt_dur(e.idle_secs),
     );
     l.add(MUTED, &tail);
+    l
+}
+
+/// One accepted pair: who consumes, who provides, the capability, and the path
+/// the two ends settled on. A pair carrying traffic reads good, a pair still
+/// pairing reads muted.
+fn pair_row(p: &PairEntry) -> Line {
+    let mut l = Line::new();
+    l.add(PLAIN, "  ");
+    l.add(
+        ACCENT,
+        &format!("{:<20}", trunc(&sanitize(&p.consumer_id), 20)),
+    );
+    l.add(MUTED, "→ ");
+    l.add(
+        PLAIN,
+        &format!("{:<20}", trunc(&sanitize(&p.provider_id), 20)),
+    );
+    l.add(MUTED, &format!("{:<9}", provides_name(p.want)));
+    let (txt, style) = match p.path {
+        Some(path) => (crate::proto::path_name(path), GOOD),
+        None => ("pairing", MUTED),
+    };
+    l.add(style, txt);
     l
 }
 

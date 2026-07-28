@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 use crate::client::Transport;
 use crate::client_admin;
 use crate::clientproto::{
-    ClientForwardEntry, ClientMsg, ClientServerEntry, ClientSnapshotBody, LinkStatus, PppPhase,
-    ServerSecret, SessionMode,
+    ClientForwardEntry, ClientMsg, ClientPeerSlotEntry, ClientServerEntry, ClientSnapshotBody,
+    LinkStatus, PppPhase, ServerSecret, SessionMode,
 };
-use crate::proto::{proto_name, Proto};
+use crate::proto::{proto_name, provides_name, Proto};
 use crate::Result;
 
 use super::input::{self, Key};
@@ -178,6 +178,15 @@ impl App {
         self.snap
             .as_ref()
             .map(|s| s.forwards.clone())
+            .unwrap_or_default()
+    }
+
+    /// Peer slots in the order the daemon runs them, consumers and providers
+    /// alike.
+    fn peers(&self) -> Vec<ClientPeerSlotEntry> {
+        self.snap
+            .as_ref()
+            .map(|s| s.peers.clone())
             .unwrap_or_default()
     }
 
@@ -874,6 +883,7 @@ impl App {
         }
         let servers = self.servers();
         let forwards = self.forwards();
+        let peers = self.peers();
 
         let mut lines: Vec<String> = Vec::with_capacity(h);
         lines.push(frame::top(w, self.header_left(), self.status_seg()));
@@ -905,6 +915,14 @@ impl App {
         }
         for (i, f) in forwards.iter().enumerate() {
             content.push(frame::row(w, self.forward_row(f, servers.len() + i)));
+        }
+        content.push(frame::blank(w));
+        content.push(frame::row(w, section_head("PEERS", peers.len())));
+        if peers.is_empty() {
+            content.push(frame::row(w, muted_line("  (none)")));
+        }
+        for slot in &peers {
+            content.push(frame::row(w, peer_row(slot)));
         }
 
         // Reserve the last four rows: divider, toast, hints, bottom border.
@@ -1363,6 +1381,33 @@ fn link_status_view(l: LinkStatus) -> (&'static str, Style) {
     }
 }
 
+/// One peer slot: what it asks for, what it opens, and where its own loop
+/// stands. A consumer names the peer it exits through; a provider names the
+/// capability it serves. The path renders beside the status on a connected
+/// consumer, which is the only slot that has settled on one.
+fn peer_row(slot: &ClientPeerSlotEntry) -> Line {
+    let mut l = Line::new();
+    l.add(PLAIN, "  ");
+    l.add(MUTED, &format!("{:<8}", provides_name(slot.want)));
+    let name = match slot.peer() {
+        Some(peer) => format!("via {}", trunc(&sanitize(peer), 22)),
+        None => "provider".to_string(),
+    };
+    l.add(PLAIN, &format!("{name:<26}"));
+    let iface = if slot.iface.is_empty() {
+        "-".to_string()
+    } else {
+        trunc(&sanitize(&slot.iface), 12)
+    };
+    l.add(MUTED, &format!("{iface:<14}"));
+    let (txt, style) = link_status_view(slot.link);
+    l.add(style, txt);
+    if let Some(path) = slot.path {
+        l.add(MUTED, &format!("  {}", crate::proto::path_name(path)));
+    }
+    l
+}
+
 /// The PPP link, folded to up/down for the sessions panel.
 fn link_view(p: PppPhase) -> (&'static str, Style) {
     match p {
@@ -1482,6 +1527,7 @@ fn window(sel: usize, len: usize, max: usize) -> (usize, usize) {
 mod tests {
     use super::*;
     use crate::clientproto::LinkStatus;
+    use crate::proto::{PathStatus, PROVIDES_EXIT, PROVIDES_SEGMENT};
 
     fn server(name: &str, addr: &str, transport: Transport) -> ClientServerEntry {
         ClientServerEntry {
@@ -1525,6 +1571,23 @@ mod tests {
             pppoe: vec!["wan".into()],
             session: String::new(),
             link: LinkStatus::Offline,
+            peers: Vec::new(),
+        }
+    }
+
+    fn peer(
+        peer_id: &str,
+        want: u8,
+        iface: &str,
+        link: LinkStatus,
+        path: Option<PathStatus>,
+    ) -> ClientPeerSlotEntry {
+        ClientPeerSlotEntry {
+            peer_id: peer_id.into(),
+            want,
+            iface: iface.into(),
+            link,
+            path,
         }
     }
 
@@ -1923,6 +1986,61 @@ mod tests {
         assert!(mode.contains("offline"), "{mode}");
         assert!(mode.contains("nothing is dialed until connect"), "{mode}");
         assert!(!mode.contains("idle"), "{mode}");
+    }
+
+    /// Every configured slot gets a row naming what it asks for, what it
+    /// opens, and where its loop stands; only a connected consumer names the
+    /// path its pair settled on.
+    #[test]
+    fn peer_slots_render_with_their_status() {
+        let mut s = snap();
+        s.peers = vec![
+            peer(
+                "office-b1c2",
+                PROVIDES_EXIT,
+                "zn0",
+                LinkStatus::Connected,
+                Some(PathStatus::Direct),
+            ),
+            peer("", PROVIDES_EXIT, "", LinkStatus::Connected, None),
+            peer("", PROVIDES_SEGMENT, "br0", LinkStatus::Offline, None),
+            peer(
+                "depot-cd34",
+                PROVIDES_EXIT,
+                "zn1",
+                LinkStatus::Backoff,
+                None,
+            ),
+        ];
+        let rows = plain_view(&app_with(s));
+        assert!(row_containing(&rows, "PEERS").contains('4'));
+
+        let consumer = row_containing(&rows, "via office-b1c2");
+        assert!(consumer.contains("exit"), "{consumer}");
+        assert!(consumer.contains("zn0"), "{consumer}");
+        assert!(consumer.contains("connected  direct"), "{consumer}");
+
+        // An exit provider on the default-route interface names no device.
+        let exit = row_containing(&rows, "exit    provider");
+        assert!(exit.contains("connected"), "{exit}");
+        assert!(!exit.contains("direct"), "{exit}");
+        assert!(!exit.contains("relay"), "{exit}");
+
+        let segment = row_containing(&rows, "segment provider");
+        assert!(segment.contains("br0"), "{segment}");
+        assert!(segment.contains("offline"), "{segment}");
+
+        let backoff = row_containing(&rows, "via depot-cd34");
+        assert!(backoff.contains("backoff"), "{backoff}");
+
+        // An empty peers panel still names itself and reads (none).
+        let rows = plain_view(&app_with(snap()));
+        let head = rows
+            .iter()
+            .position(|r| r.contains("PEERS"))
+            .expect("no peers head");
+        assert!(rows[head].contains('0'), "{}", rows[head]);
+        assert!(rows[head + 1].contains("(none)"), "{}", rows[head + 1]);
     }
 
     #[tokio::test]

@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 
 use crate::client::{Forward, Transport};
 use crate::clientproto::{
-    ClientMsg, ClientSnapshotBody, LinkStatus, PppPhase, ServerSecret, SessionMode,
+    ClientMsg, ClientPeerSlotEntry, ClientSnapshotBody, LinkStatus, PppPhase, ServerSecret,
+    SessionMode,
 };
-use crate::proto::{proto_name, Proto, PROVIDES_EXIT, PROVIDES_SEGMENT};
+use crate::proto::{proto_name, provides_name, Proto, PROVIDES_EXIT, PROVIDES_SEGMENT};
 use crate::Result;
 
 /// The control socket to talk to: an explicit path is used as given; otherwise
@@ -479,7 +480,39 @@ pub fn render(snap: &ClientSnapshotBody) -> String {
         }
     }
 
+    out.push_str("\nPeer slots\n");
+    if snap.peers.is_empty() {
+        out.push_str("  (no peer slots)\n");
+    } else {
+        for slot in &snap.peers {
+            out.push_str(&format!(
+                "  {:<28}  {:<12}  {}{}\n",
+                slot_name(slot),
+                if slot.iface.is_empty() {
+                    "-"
+                } else {
+                    &slot.iface
+                },
+                link_name(slot.link),
+                match slot.path {
+                    Some(path) => format!("  {}", crate::proto::path_name(path)),
+                    None => String::new(),
+                },
+            ));
+        }
+    }
+
     out
+}
+
+/// How a peer slot names itself: a consumer by the capability and the peer it
+/// asks, a provider by the capability it serves.
+fn slot_name(slot: &ClientPeerSlotEntry) -> String {
+    let capability = provides_name(slot.want);
+    match slot.peer() {
+        Some(peer) => format!("{capability} via {}", crate::admin::strip_ctrl(peer)),
+        None => format!("{capability} provider"),
+    }
 }
 
 #[cfg(test)]
@@ -602,6 +635,7 @@ mod tests {
             pppoe: Vec::new(),
             session: String::new(),
             link: LinkStatus::Connected,
+            peers: Vec::new(),
         };
         let s = render(&snap);
         assert!(s.contains("active  home"));
@@ -627,10 +661,51 @@ mod tests {
             pppoe: Vec::new(),
             session: String::new(),
             link: LinkStatus::Offline,
+            peers: Vec::new(),
         };
         let s = render(&snap);
         assert!(s.contains("mode    offline"));
         assert!(s.contains("link    offline"));
+        assert!(s.contains("(no peer slots)"));
+    }
+
+    /// Every configured slot is listed with its own status; the path shows on
+    /// the connected consumer that settled on one.
+    #[test]
+    fn render_lists_peer_slots_with_their_status() {
+        let slot = |peer_id: &str, want, iface: &str, link, path| ClientPeerSlotEntry {
+            peer_id: peer_id.into(),
+            want,
+            iface: iface.into(),
+            link,
+            path,
+        };
+        let snap = ClientSnapshotBody {
+            version: 1,
+            active: "home".into(),
+            mode: SessionMode::Idle,
+            phase: PppPhase::None,
+            forwards: Vec::new(),
+            servers: Vec::new(),
+            pppoe: Vec::new(),
+            session: String::new(),
+            link: LinkStatus::Connected,
+            peers: vec![
+                slot(
+                    "office-b1c2",
+                    PROVIDES_EXIT,
+                    "zn0",
+                    LinkStatus::Connected,
+                    Some(crate::proto::PathStatus::Relay),
+                ),
+                slot("", PROVIDES_EXIT, "", LinkStatus::Connected, None),
+                slot("", PROVIDES_SEGMENT, "br0", LinkStatus::Offline, None),
+            ],
+        };
+        let s = render(&snap);
+        assert!(s.contains("exit via office-b1c2          zn0           connected  relay\n"));
+        assert!(s.contains("exit provider                 -             connected\n"));
+        assert!(s.contains("segment provider              br0           offline\n"));
     }
 
     #[test]
@@ -667,6 +742,7 @@ mod tests {
             pppoe: Vec::new(),
             session: "wan".into(),
             link: LinkStatus::Connected,
+            peers: Vec::new(),
         };
         let s = render(&snap);
         assert!(s.contains("mode    pppoe"));

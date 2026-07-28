@@ -6,8 +6,10 @@
 //! the raw-mode/stdin/stdout path the console uses in production. The driver
 //! feeds key bytes to the pty master, reconstructs the screen from the
 //! renderer's cursor-addressed output, and asserts against a live loopback
-//! tunnel: a server, a config-driven client with an admin socket, and a local
-//! echo service capturing what actually reaches the forward target.
+//! tunnel: a server, a config-driven client with an admin socket, a second
+//! client providing the exit bit so a real pair forms, and a local echo
+//! service capturing what actually reaches the forward target. The server
+//! console runs on a pty of its own against the same server.
 
 #[cfg(all(feature = "tui", unix))]
 mod pty {
@@ -22,31 +24,49 @@ mod pty {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{sleep, timeout};
 
-    use zeronat::proto::{Proto, Source};
+    use zeronat::proto::{Proto, Source, PROVIDES_EXIT};
     use zeronat::server::{ListenerSpec, ServerSettings};
 
     const SECRET: &str = "console-pty-test-secret";
     /// Carries the admin socket path into the re-executed console child.
     const CHILD_ENV: &str = "ZERONAT_CONSOLE_PTY_CHILD";
+    /// Carries the server address into the re-executed fleet-console child.
+    const SERVER_CHILD_ENV: &str = "ZERONAT_CONSOLE_PTY_SERVER_CHILD";
 
     pub fn main() {
         if let Some(sock) = std::env::var_os(CHILD_ENV) {
             child(PathBuf::from(sock));
             return;
         }
+        if let Some(addr) = std::env::var_os(SERVER_CHILD_ENV) {
+            server_child(addr.to_string_lossy().into_owned());
+            return;
+        }
         driver();
         println!("console_pty: ok");
     }
 
-    /// The console process: plain `run_client` on the inherited pty stdio.
-    fn child(sock: PathBuf) {
-        let rt = tokio::runtime::Builder::new_multi_thread()
+    fn child_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
-            .expect("child runtime");
-        if let Err(e) = rt.block_on(zeronat::tui::run_client(Some(sock))) {
+            .expect("child runtime")
+    }
+
+    /// The client console process: plain `run_client` on the inherited pty
+    /// stdio.
+    fn child(sock: PathBuf) {
+        if let Err(e) = child_runtime().block_on(zeronat::tui::run_client(Some(sock))) {
             eprintln!("console failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    /// The fleet console process: `run` against one server's control port.
+    fn server_child(addr: String) {
+        if let Err(e) = child_runtime().block_on(zeronat::tui::run(addr, SECRET.into())) {
+            eprintln!("fleet console failed: {e}");
             std::process::exit(1);
         }
     }
@@ -169,6 +189,35 @@ mod pty {
         rows
     }
 
+    /// Spawn one console on its own pty, mirroring everything it writes.
+    /// The child re-executes this binary with `env` naming what to run.
+    fn spawn_console(env: &str, value: &std::ffi::OsStr) -> (KillOnDrop, std::fs::File, Output) {
+        let pty = open_pty();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .env(env, value)
+            .stdin(Stdio::from(pty.slave.try_clone().unwrap()))
+            .stdout(Stdio::from(pty.slave))
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn console child");
+        let master = pty.master;
+        let out = Output::default();
+        {
+            let out = out.clone();
+            let mut reader = master.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => out.0.lock().unwrap().extend_from_slice(&buf[..n]),
+                    }
+                }
+            });
+        }
+        (KillOnDrop(child), master, out)
+    }
+
     fn send(master: &mut std::fs::File, bytes: &[u8]) {
         master.write_all(bytes).expect("write to pty master");
         master.flush().expect("flush pty master");
@@ -236,7 +285,7 @@ mod pty {
         }
     }
 
-    fn server_settings(control: u16, tcp: u16, udp: u16) -> ServerSettings {
+    fn server_settings(control: u16, tcp: u16, udp: u16, routed: &str) -> ServerSettings {
         ServerSettings {
             bind: std::net::Ipv4Addr::LOCALHOST,
             control_port: control,
@@ -261,7 +310,19 @@ mod pty {
                     cli_locked: false,
                 },
             ],
-            routes: Vec::new(),
+            // Two clients are connected, so the forwards need an explicit
+            // route to the one the console drives.
+            routes: [Proto::Tcp, Proto::Udp]
+                .into_iter()
+                .zip([tcp, udp])
+                .map(|(proto, port)| zeronat::server::RouteSpec {
+                    bind_ip: std::net::Ipv4Addr::LOCALHOST,
+                    proto,
+                    port,
+                    client_id: routed.to_string(),
+                    source: Source::Runtime,
+                })
+                .collect(),
             config_path: None,
             file_id: None,
             file_control: None,
@@ -342,8 +403,10 @@ mod pty {
         let local_tcp = free_tcp_port();
         let local_udp = free_udp_port();
         tokio::spawn(tcp_echo(local_tcp));
+        let client_id = zeronat::identity::derive_client_id(Some("pty"));
+        let provider_id = zeronat::identity::derive_client_id(Some("ptyexit"));
         tokio::spawn(zeronat::server::run(server_settings(
-            control, public_tcp, public_udp,
+            control, public_tcp, public_udp, &client_id,
         )));
 
         // A config-driven client: two server profiles (only `home` is ever
@@ -375,6 +438,34 @@ mod pty {
             secret: "other".into(),
             transport: zeronat::client::Transport::Tcp,
         };
+        // The peer the console client exits through: a second client
+        // announcing the exit bit with no adapter, so the pair carries frames
+        // and opens no device. Both sinks stay alive for the whole scenario;
+        // a dropped one would end the slot that hands its session over.
+        let (prov_tx, mut prov_rx) = tokio::sync::mpsc::channel(4);
+        let provider = zeronat::client::ClientSettings {
+            servers: vec![home.clone()],
+            tcp: vec![],
+            udp: vec![],
+            tap: None,
+            tun: None,
+            pppoe: vec![],
+            autostart: None,
+            id_prefix: Some("ptyexit".into()),
+            control: None,
+            config: None,
+            peers: vec![zeronat::client::PeerSlotSpec::Provider {
+                provides: PROVIDES_EXIT,
+                adapter: None,
+            }],
+            peer_sessions: Some(prov_tx),
+        };
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(home.clone()),
+            provider,
+        ));
+
+        let (cons_tx, mut cons_rx) = tokio::sync::mpsc::channel(4);
         let settings = zeronat::client::ClientSettings {
             servers: vec![home.clone(), away],
             tcp: vec![forward(public_tcp, local_tcp)],
@@ -386,8 +477,12 @@ mod pty {
             id_prefix: Some("pty".into()),
             control: Some(zeronat::clientctl::ControlPath::Explicit(sock.clone())),
             config: Some((path.clone(), cfg)),
-            peers: vec![],
-            peer_sessions: None,
+            peers: vec![zeronat::client::PeerSlotSpec::Consumer {
+                peer_id: provider_id.clone(),
+                want: PROVIDES_EXIT,
+                adapter: None,
+            }],
+            peer_sessions: Some(cons_tx),
         };
         tokio::spawn(zeronat::client::run_switchable(
             zeronat::client::ActiveTarget::new(home),
@@ -401,30 +496,7 @@ mod pty {
         assert_eq!(&bytes, payload, "baseline forward injected bytes");
 
         // Spawn the console on the pty and mirror its screen.
-        let pty = open_pty();
-        let child = Command::new(std::env::current_exe().unwrap())
-            .env(CHILD_ENV, &sock)
-            .stdin(Stdio::from(pty.slave.try_clone().unwrap()))
-            .stdout(Stdio::from(pty.slave))
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn console child");
-        let mut child = KillOnDrop(child);
-        let mut master = pty.master;
-        let out = Output::default();
-        {
-            let out = out.clone();
-            let mut reader = master.try_clone().unwrap();
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => out.0.lock().unwrap().extend_from_slice(&buf[..n]),
-                    }
-                }
-            });
-        }
+        let (mut child, mut master, out) = spawn_console(CHILD_ENV, sock.as_os_str());
 
         // The servers panel lists both profiles; the marker sits on the
         // active row only. The sessions panel lists both forwards with their
@@ -454,6 +526,56 @@ mod pty {
             !tcp_row.contains('+'),
             "default options must render bare: {tcp_row}"
         );
+
+        // Both clients reach the pair and name each other. Their sessions stay
+        // bound for the rest of the scenario; dropping one would end the slot
+        // the consoles below read. The tcp control transport lets neither
+        // party probe, so the pair settles relayed.
+        let consumer_slot = timeout(Duration::from_secs(120), cons_rx.recv())
+            .await
+            .expect("the consumer slot never paired")
+            .expect("the consumer sink closed");
+        let provider_slot = timeout(Duration::from_secs(120), prov_rx.recv())
+            .await
+            .expect("the provider slot never paired")
+            .expect("the provider sink closed");
+        assert_eq!(consumer_slot.peer_id, provider_id);
+        assert_eq!(provider_slot.peer_id, client_id);
+
+        // The client's peers panel names the slot, the peer it exits through,
+        // and the path its pair settled on.
+        wait_screen(&out, "the peer slot row", 30, |s| {
+            row_containing(s, &format!("via {provider_id}"))
+                .is_some_and(|r| r.contains("connected") && r.contains("relay"))
+        });
+        let peer_row = row_containing(&out.screen(), &format!("via {provider_id}")).unwrap();
+        assert!(peer_row.contains("exit"), "peer row: {peer_row}");
+
+        // The fleet console lists the same pair from the server's side, with
+        // the capability it carries and the path both parties settled on.
+        let (fleet, _fleet_master, fleet_out) = spawn_console(
+            SERVER_CHILD_ENV,
+            std::ffi::OsStr::new(&format!("127.0.0.1:{control}")),
+        );
+        wait_screen(&fleet_out, "the fleet pairs panel", 60, |s| {
+            s.iter().any(|r| {
+                r.contains(&client_id)
+                    && r.contains(&provider_id)
+                    && r.contains("exit")
+                    && r.contains("relay")
+            })
+        });
+        let fleet_screen = fleet_out.screen();
+        assert!(
+            row_containing(&fleet_screen, "PAIRS").is_some_and(|r| r.contains('1')),
+            "fleet screen:\n{}",
+            fleet_screen.join("\n")
+        );
+        drop(fleet);
+        // The mutations below bounce the control session, and every pair that
+        // forms after this one is left to the slots.
+        drop(consumer_slot);
+        drop(provider_slot);
 
         // Rows: home(0), away(1), tcp forward(2), udp forward(3). Open the
         // tcp forward's option editor and flip proxy on, idle 600. The form

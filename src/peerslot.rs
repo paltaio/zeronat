@@ -18,9 +18,10 @@ use tokio::time::{sleep, timeout};
 use crate::client::{
     probe_candidates, relay_leg_dgram, relay_leg_stream, AbortOnDrop, Backoff, ProbeSession,
 };
+use crate::clientproto::{ClientPeerSlotEntry, LinkStatus, PeerSlotCell};
 use crate::kcp::Session;
 use crate::peer::{PeerPath, PeerSession};
-use crate::proto::{Msg, PathStatus, PeerStatus, PROVIDES_EXIT, PROVIDES_SEGMENT};
+use crate::proto::{provides_name, Msg, PathStatus, PeerStatus, PROVIDES_EXIT};
 use crate::punch::{punch, PunchOutcome};
 use crate::Result;
 
@@ -145,6 +146,12 @@ impl PeerControl {
     fn live(&self) -> Option<(u64, ControlSession)> {
         let live = self.inner.live.borrow();
         live.session.clone().map(|s| (live.generation, s))
+    }
+
+    /// A receiver that wakes on every control-session change, for a slot whose
+    /// loop has to notice one without a frame to carry it.
+    fn subscribe_live(&self) -> watch::Receiver<Live> {
+        self.inner.live.subscribe()
     }
 
     /// Resolves once the control session is no longer the one `generation`
@@ -288,6 +295,39 @@ impl Drop for RouteGuard {
             RouteKey::Pair(pair_id) => {
                 routes.pairs.remove(pair_id);
             }
+        }
+    }
+}
+
+/// A configured slot and the cell its loop reports through. Cloning shares the
+/// cell, so the snapshot reads what the running slot last wrote.
+#[derive(Clone)]
+pub struct PeerSlot {
+    pub spec: PeerSlotSpec,
+    pub status: PeerSlotCell,
+}
+
+impl PeerSlot {
+    pub fn new(spec: PeerSlotSpec) -> PeerSlot {
+        PeerSlot {
+            spec,
+            status: PeerSlotCell::default(),
+        }
+    }
+
+    /// This slot as the admin snapshot reports it.
+    pub fn entry(&self) -> ClientPeerSlotEntry {
+        let (link, path) = self.status.get();
+        let (peer_id, want) = match &self.spec {
+            PeerSlotSpec::Consumer { peer_id, want, .. } => (peer_id.clone(), *want),
+            PeerSlotSpec::Provider { provides, .. } => (String::new(), *provides),
+        };
+        ClientPeerSlotEntry {
+            peer_id,
+            want,
+            iface: self.spec.iface().unwrap_or_default().to_string(),
+            link,
+            path,
         }
     }
 }
@@ -452,6 +492,21 @@ impl PeerSlotSpec {
         }
     }
 
+    /// The interface an operator set on this slot: the tun a consumer brings
+    /// up, the uplink an exit provider masquerades out of, and the bridge a
+    /// segment provider joins. `None` when the operator set none.
+    pub fn iface(&self) -> Option<&str> {
+        match self {
+            PeerSlotSpec::Consumer { adapter, .. } => match adapter.as_ref()? {
+                ConsumerAdapter::Exit(via) => Some(&via.device),
+            },
+            PeerSlotSpec::Provider { adapter, .. } => match adapter.as_ref()? {
+                ProviderAdapter::Exit(exit) => exit.iface.as_deref(),
+                ProviderAdapter::Segment(segment) => Some(&segment.bridge),
+            },
+        }
+    }
+
     /// The peer and capability that identify a consumer slot; `None` for a
     /// provider, which is identified by its capability alone.
     pub fn consumer_key(&self) -> Option<(&str, u8)> {
@@ -496,14 +551,6 @@ pub(crate) fn slot_label(peer_id: &str, want: u8) -> String {
     }
 }
 
-fn provides_name(bit: u8) -> &'static str {
-    match bit {
-        PROVIDES_EXIT => "exit",
-        PROVIDES_SEGMENT => "segment",
-        _ => "peer",
-    }
-}
-
 /// Where a pair's frames travel. Direct and relayed are the same thing above
 /// the peer session, except to a consumer programming the host's routing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -515,6 +562,14 @@ pub enum PairPath {
 }
 
 impl PairPath {
+    /// The path as the admin views name it.
+    pub fn status(&self) -> PathStatus {
+        match self {
+            PairPath::Direct(_) => PathStatus::Direct,
+            PairPath::Relayed => PathStatus::Relay,
+        }
+    }
+
     /// The addresses an exit consumer pins beside the server's, so the tunnel
     /// it brings up cannot swallow the path carrying it: the punched peer's on
     /// a direct v4 path, and none on a relayed one, whose frames travel to the
@@ -550,29 +605,30 @@ pub type SessionSink = Option<mpsc::Sender<PeerSlotSession>>;
 /// admitted, since the psk that pairs a slot belongs to the active profile, and
 /// a slot never outlives the loop that started it.
 pub(crate) fn spawn(
-    specs: &[PeerSlotSpec],
+    slots: &[PeerSlot],
     client_id: &str,
     secret: &str,
     control: &PeerControl,
     sink: &SessionSink,
 ) -> Vec<AbortOnDrop> {
-    specs
+    slots
         .iter()
-        .map(|spec| {
+        .map(|slot| {
             let client_id = client_id.to_string();
             let secret = secret.to_string();
             let control = control.clone();
             let sink = sink.clone();
-            AbortOnDrop(match spec.clone() {
+            let status = slot.status.clone();
+            AbortOnDrop(match slot.spec.clone() {
                 PeerSlotSpec::Consumer {
                     peer_id,
                     want,
                     adapter,
                 } => tokio::spawn(consumer_slot(
-                    peer_id, want, adapter, secret, client_id, control, sink,
+                    peer_id, want, adapter, secret, client_id, control, sink, status,
                 )),
                 PeerSlotSpec::Provider { provides, adapter } => tokio::spawn(provider_slot(
-                    provides, adapter, secret, client_id, control, sink,
+                    provides, adapter, secret, client_id, control, sink, status,
                 )),
             })
         })
@@ -583,6 +639,7 @@ pub(crate) fn spawn(
 /// server forms, and hold the inner session until it dies. Every cycle short
 /// of a completed inner handshake re-arms the backoff, and so does the pair
 /// dying afterwards; there is no recovery inside a pair.
+#[allow(clippy::too_many_arguments)]
 async fn consumer_slot(
     peer_id: String,
     want: u8,
@@ -591,11 +648,17 @@ async fn consumer_slot(
     client_id: String,
     control: PeerControl,
     sink: SessionSink,
+    status: PeerSlotCell,
 ) {
     let (mut rx, _route) = control.register_consumer(&peer_id, want);
+    let _status = status.hold();
     let mut backoff = Backoff::default();
     loop {
+        // Nothing is asked for until a control session is up, and the whole
+        // pairing that follows is this slot's dial.
+        status.set(LinkStatus::Offline, None);
         let (generation, session) = control.wait_live().await;
+        status.set(LinkStatus::Dialing, None);
         // A bringup this consumer cannot do refuses before `PeerConnect` goes
         // out: a provider that answered would open its device and take its
         // exclusive hold for a pair this end drops, once per backoff interval.
@@ -616,6 +679,7 @@ async fn consumer_slot(
         match paired {
             Ok((peer, path)) => {
                 backoff.reset();
+                status.set(LinkStatus::Connected, Some(path.status()));
                 crate::elog!("peer {peer_id}: session up");
                 let failed = match &adapter {
                     // The adapter runs on this task, so its device and the
@@ -646,6 +710,7 @@ async fn consumer_slot(
                 backoff.fail();
             }
         }
+        status.set(LinkStatus::Backoff, None);
         sleep(backoff.delay()).await;
     }
 }
@@ -748,6 +813,7 @@ const NO_TUN_DEVICE: &str =
 /// handshaked it, so the devices it opens and the rules it installs are
 /// released when this task ends. That is what a profile switch awaits before
 /// the incoming slot set claims anything.
+#[allow(clippy::too_many_arguments)]
 async fn provider_slot(
     provides: u8,
     adapter: Option<ProviderAdapter>,
@@ -755,8 +821,12 @@ async fn provider_slot(
     client_id: String,
     control: PeerControl,
     sink: SessionSink,
+    status: PeerSlotCell,
 ) {
     let (mut rx, _route) = control.register_provider(provides);
+    let _status = status.hold();
+    let mut live = control.subscribe_live();
+    status.set(announced(&control), None);
     // Exit is exclusive: the slot serves one pair at a time and refuses a
     // second in its handshake answer, which is the only enforcement left once
     // a punched pair outlives the server-side state that fast-fails it. A
@@ -791,8 +861,15 @@ async fn provider_slot(
             },
             _ = drive(&mut exit_adapter) => SlotStep::AdapterEnded,
             ended = segment.drive() => ended,
+            // The sender lives in the `PeerControl` this slot holds, so the
+            // wait only ends on a real change.
+            _ = live.changed() => SlotStep::ControlChanged,
         };
         let msg = match step {
+            SlotStep::ControlChanged => {
+                status.set(announced(&control), None);
+                continue;
+            }
             SlotStep::Serve(served) => {
                 if let Some(owner) = &owner {
                     serve_pair(owner, &mut exit_adapter, &mut segment, served);
@@ -871,9 +948,19 @@ async fn provider_slot(
     }
 }
 
+/// A provider slot's link state: connected while the control session its
+/// announcement rode is up.
+fn announced(control: &PeerControl) -> LinkStatus {
+    match control.live() {
+        Some(_) => LinkStatus::Connected,
+        None => LinkStatus::Offline,
+    }
+}
+
 /// What moved the provider slot's loop forward.
 enum SlotStep {
     Control(Msg),
+    ControlChanged,
     Serve(ServedPair),
     AdapterEnded,
     PortEnded(String),
@@ -1589,6 +1676,7 @@ mod tests {
         let control = PeerControl::default();
         let (tx, mut sent) = mpsc::channel(8);
         let _live = control.install(control_session(tx));
+        let status = PeerSlotCell::default();
         let slot = AbortOnDrop(tokio::spawn(consumer_slot(
             "prov".into(),
             PROVIDES_EXIT,
@@ -1597,12 +1685,15 @@ mod tests {
             "c".into(),
             control.clone(),
             None,
+            status.clone(),
         )));
 
         let asked = timeout(CYCLE_DEADLINE, next_connect(&mut sent))
             .await
             .expect("the slot never asked");
         assert_eq!(asked, "prov");
+        // The whole pairing is the slot's dial, and it carries no path.
+        assert_eq!(status.get(), (LinkStatus::Dialing, None));
         // The server accepts the pair and then goes silent: no `PeerProbe`
         // ever follows.
         control.route(Msg::PeerResult {
@@ -1616,7 +1707,13 @@ mod tests {
             .await
             .expect("the slot never re-armed after the deadline");
         assert_eq!(again, "prov");
+        // A slot the loop tears down reports offline rather than the state it
+        // died in.
         drop(slot);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(status.get(), (LinkStatus::Offline, None));
     }
 
     // An adapter that cannot come up refuses the pair, and the refusal
@@ -1711,6 +1808,7 @@ mod tests {
         let control = PeerControl::default();
         let (tx, _sent) = mpsc::channel(8);
         let _live = control.install(control_session(tx));
+        let status = PeerSlotCell::default();
         let slot = AbortOnDrop(tokio::spawn(provider_slot(
             PROVIDES_EXIT,
             None,
@@ -1718,12 +1816,21 @@ mod tests {
             "prov".into(),
             control.clone(),
             None,
+            status.clone(),
         )));
 
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
         assert!(!slot.0.is_finished(), "the slot stopped serving");
+        // A provider is connected while the session its announcement rode is
+        // up, and offline again when that session ends.
+        assert_eq!(status.get(), (LinkStatus::Connected, None));
+        drop(_live);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(status.get(), (LinkStatus::Offline, None));
         assert!(control
             .inner
             .routes
@@ -1749,6 +1856,7 @@ mod tests {
             "c".into(),
             control.clone(),
             None,
+            PeerSlotCell::default(),
         )));
 
         for _ in 0..2 {
