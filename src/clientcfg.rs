@@ -83,6 +83,20 @@ pub struct CfgTun {
     /// IPv6 blackholed while the tunnel is up; a crash leaves the host
     /// without a default route.
     pub exit_strict: bool,
+    /// The peer whose internet connection this tunnel exits through, naming
+    /// its `client_id`. Set, the table feeds a peer consumer slot; unset, it
+    /// feeds the server slot.
+    pub exit_via: Option<String>,
+}
+
+/// What this node provides to peers. Provider roles are explicit, never
+/// implied: the union of these bits is what the client announces.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CfgPeer {
+    /// Serve one consumer's IPv4 traffic out this node's connection.
+    pub exit: bool,
+    /// Bridge consumers onto this node's L2 segment, naming the NIC.
+    pub segment: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -97,6 +111,15 @@ pub struct ClientConfig {
     pub pppoe: Vec<CfgPppoe>,
     pub tap: Option<CfgTap>,
     pub tun: Option<CfgTun>,
+    pub peer: Option<CfgPeer>,
+}
+
+impl CfgTun {
+    /// Whether this table feeds a peer consumer slot rather than the server
+    /// slot.
+    pub fn is_peer(&self) -> bool {
+        self.exit_via.is_some()
+    }
 }
 
 impl ClientConfig {
@@ -133,10 +156,16 @@ impl ClientConfig {
         if self.pppoe.iter().filter(|p| p.autostart).count() > 1 {
             return Err("more than one [[pppoe]] entry sets autostart = true".into());
         }
-        if self.tap.is_some() && self.tun.is_some() {
+        // Device exclusivity keys on the slot a table feeds, not on the table
+        // being present: a [tun] naming a peer feeds a consumer slot and
+        // leaves the server slot to its forwards, its pppoe sessions, or
+        // nothing. What that consumer opens is admitted against the running
+        // slots at startup instead.
+        let server_tun = self.tun.as_ref().is_some_and(|t| !t.is_peer());
+        if self.tap.is_some() && server_tun {
             return Err("[tap] and [tun] are mutually exclusive".into());
         }
-        if (self.tap.is_some() || self.tun.is_some())
+        if (self.tap.is_some() || server_tun)
             && (!self.forwards.is_empty() || !self.pppoe.is_empty())
         {
             return Err("[tap]/[tun] cannot be combined with [[forwards]] or [[pppoe]]".into());
@@ -154,6 +183,7 @@ enum Section {
     Pppoe,
     Tap,
     Tun,
+    Peer,
 }
 
 /// One in-progress record; a superset of the fields of every table. Fields are
@@ -184,6 +214,8 @@ struct PartialRecord {
     address: Option<(Ipv4Addr, u8)>,
     exit: Option<bool>,
     exit_strict: Option<bool>,
+    exit_via: Option<String>,
+    segment: Option<String>,
 }
 
 /// Load a client config. A missing file yields the default (empty) config so a
@@ -199,6 +231,7 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
     let mut seen_client = false;
     let mut seen_tap = false;
     let mut seen_tun = false;
+    let mut seen_peer = false;
     let mut client_keys: Vec<&str> = Vec::new();
     let mut record = PartialRecord::default();
     let mut record_keys: Vec<&str> = Vec::new();
@@ -244,6 +277,13 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
                     }
                     seen_tun = true;
                     section = Section::Tun;
+                }
+                "peer" => {
+                    if seen_peer {
+                        return Err(err(n, "duplicate [peer] table"));
+                    }
+                    seen_peer = true;
+                    section = Section::Peer;
                 }
                 other => {
                     return Err(err(n, &format!("unknown table header [{other}]")));
@@ -338,8 +378,19 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
                     "address" => record.address = Some(parse_cidr(value, n)?),
                     "exit" => record.exit = Some(parse_bool(value, n)?),
                     "exit_strict" => record.exit_strict = Some(parse_bool(value, n)?),
+                    "exit_via" => record.exit_via = Some(parse_string(value, n)?),
                     other => {
                         return Err(err(n, &format!("unknown key `{other}` in [tun]")));
+                    }
+                }
+            }
+            Section::Peer => {
+                reject_dup(&mut record_keys, key, n)?;
+                match key {
+                    "exit" => record.exit = Some(parse_bool(value, n)?),
+                    "segment" => record.segment = Some(parse_string(value, n)?),
+                    other => {
+                        return Err(err(n, &format!("unknown key `{other}` in [peer]")));
                     }
                 }
             }
@@ -456,11 +507,26 @@ fn close_record(
             if exit_strict && !exit {
                 return Err(err(n, "`exit_strict = true` requires `exit = true`"));
             }
+            let exit_via = record.exit_via.take();
+            if exit_via.as_ref().is_some_and(|p| p.is_empty()) {
+                return Err(err(n, "tun `exit_via` must name a peer"));
+            }
             cfg.tun = Some(CfgTun {
                 dev: record.dev.take(),
                 address: record.address.take(),
                 exit,
                 exit_strict,
+                exit_via,
+            });
+        }
+        Section::Peer => {
+            let segment = record.segment.take();
+            if segment.as_ref().is_some_and(|s| s.is_empty()) {
+                return Err(err(n, "peer `segment` must name an interface"));
+            }
+            cfg.peer = Some(CfgPeer {
+                exit: record.exit.take().unwrap_or(false),
+                segment,
             });
         }
         Section::None | Section::Client => {}
@@ -603,6 +669,19 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
         if tun.exit_strict {
             out.push_str("exit_strict = true\n");
         }
+        if let Some(peer) = &tun.exit_via {
+            out.push_str(&format!("exit_via = {}\n", quote(peer)));
+        }
+    }
+
+    if let Some(peer) = &cfg.peer {
+        table(&mut out, "[peer]");
+        if peer.exit {
+            out.push_str("exit = true\n");
+        }
+        if let Some(nic) = &peer.segment {
+            out.push_str(&format!("segment = {}\n", quote(nic)));
+        }
     }
 
     out
@@ -663,6 +742,7 @@ mod tests {
             }],
             tap: None,
             tun: None,
+            peer: None,
         }
     }
 
@@ -706,6 +786,7 @@ mod tests {
                 address: Some((Ipv4Addr::new(10, 0, 0, 2), 24)),
                 exit: false,
                 exit_strict: false,
+                exit_via: None,
             }),
             ..ClientConfig::default()
         };
@@ -718,6 +799,7 @@ mod tests {
                 address: None,
                 exit: false,
                 exit_strict: false,
+                exit_via: None,
             }),
             ..ClientConfig::default()
         };
@@ -745,11 +827,39 @@ mod tests {
                 address: None,
                 exit: true,
                 exit_strict: true,
+                exit_via: None,
             }),
             ..ClientConfig::default()
         };
         strict.validate().unwrap();
         assert_eq!(parse_client(&serialize_client(&strict)).unwrap(), strict);
+    }
+
+    // A [tun] naming a peer feeds a consumer slot, so it coexists with the
+    // forwards and pppoe sessions the server slot keeps serving; a [peer]
+    // table declares the provider bits.
+    #[test]
+    fn peer_slot_tables_roundtrip() {
+        let cfg = parse_client(
+            "[[forwards]]\nproto = \"tcp\"\nport = 443\n\
+             [[pppoe]]\nname = \"wan\"\nusername = \"u\"\n\
+             [tun]\ndev = \"zn0\"\nexit = true\nexit_via = \"office-b1c2\"\n\
+             [peer]\nexit = true\nsegment = \"eth1\"\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let tun = cfg.tun.as_ref().unwrap();
+        assert!(tun.is_peer());
+        assert_eq!(tun.exit_via.as_deref(), Some("office-b1c2"));
+        let peer = cfg.peer.as_ref().unwrap();
+        assert!(peer.exit);
+        assert_eq!(peer.segment.as_deref(), Some("eth1"));
+        assert_eq!(parse_client(&serialize_client(&cfg)).unwrap(), cfg);
+
+        // A bare [peer] declares no provider at all.
+        let none = parse_client("[peer]\n").unwrap();
+        assert_eq!(none.peer, Some(CfgPeer::default()));
+        assert_eq!(parse_client(&serialize_client(&none)).unwrap(), none);
     }
 
     #[test]
@@ -849,6 +959,11 @@ mod tests {
             "[tun]\nexit = 1\n",
             "[tun]\nexit = \"true\"\n",
             "[tun]\nexit_strict = 1\n",
+            "[tun]\nexit_via = \"\"\n",
+            "[peer]\nexit = 1\n",
+            "[peer]\nsegment = \"\"\n",
+            "[peer]\nfoo = 1\n",
+            "[peer]\n[peer]\n",
             // `exit_strict` hardens exit mode, so it needs exit mode on.
             "[tun]\nexit_strict = true\n",
             "[tun]\nexit = false\nexit_strict = true\n",

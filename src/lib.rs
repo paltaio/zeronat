@@ -21,6 +21,7 @@ pub mod logging;
 pub mod netfilter;
 pub mod noise;
 pub mod peer;
+pub mod peerslot;
 pub mod pppoe;
 pub mod proto;
 pub mod proxyproto;

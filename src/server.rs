@@ -523,12 +523,16 @@ impl Server {
         }
     }
 
-    /// Start candidate discovery for a freshly accepted pair: assign each
-    /// udp-transport party a probe id from the shared counter, send it a
-    /// `PeerProbe`, and arm the pairing deadline. A tcp-transport party never
-    /// probes and settles as relay-only at once, so a pair of tcp clients is
-    /// finished before the deadline task even arms. The sends run outside
-    /// every lock; lock order is clients, pairs, probes, with `next_id` a leaf.
+    /// Start candidate discovery for a freshly accepted pair: send both
+    /// parties a `PeerProbe` naming the peer and the pair's capability, and arm
+    /// the pairing deadline. Only a udp-transport party's probe id is mapped,
+    /// so only that party can present it; a tcp-transport party never probes,
+    /// takes the frame as the pair notification alone, and settles as
+    /// relay-only at once, so a pair of tcp clients is finished before the
+    /// deadline task even arms. Every party hears of a pair through a frame
+    /// naming its capability, which is what lets a node announcing both bits
+    /// place the pair. The sends run outside every lock; lock order is clients,
+    /// pairs, probes, with `next_id` a leaf.
     fn start_pair_probes(self: &Arc<Self>, pair_id: u64) {
         let mut sends: Vec<(mpsc::Sender<Vec<u8>>, Vec<u8>)> = Vec::new();
         let settled = {
@@ -551,24 +555,26 @@ impl Server {
                 let Some(h) = clients.get(id).filter(|h| h.peer_provides.is_some()) else {
                     continue;
                 };
+                let probe_id = self.next_id();
                 match h.transport {
+                    // The id stays out of the map, so a probe presented under
+                    // it is refused like any unknown app id.
                     ActiveTransport::Tcp => party.candidates = Some(Vec::new()),
                     ActiveTransport::Udp => {
-                        let probe_id = self.next_id();
                         party.probe_id = Some(probe_id);
                         probes.insert(probe_id, pair_id);
-                        sends.push((
-                            h.tx.clone(),
-                            Msg::PeerProbe {
-                                pair_id,
-                                peer_id: peer_id.clone(),
-                                probe_id,
-                                provides: want,
-                            }
-                            .encode(),
-                        ));
                     }
                 }
+                sends.push((
+                    h.tx.clone(),
+                    Msg::PeerProbe {
+                        pair_id,
+                        peer_id: peer_id.clone(),
+                        probe_id,
+                        provides: want,
+                    }
+                    .encode(),
+                ));
             }
             pair.consumer.candidates.is_some() && pair.provider.candidates.is_some()
         };
@@ -2840,8 +2846,10 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         assert!(p_rx.try_recv().is_err());
     }
 
-    // Tcp-transport parties never probe: no `PeerProbe` is sent, and both
-    // sides get an immediate `PeerInfo` with an empty (relay-only) list.
+    // A tcp-transport party takes its `PeerProbe` as the pair notification
+    // alone: the frame names the peer and the capability, its probe id is
+    // mapped nowhere, and the party settles relay-only at once, so the
+    // `PeerInfo` follows immediately with an empty candidate list.
     #[tokio::test]
     async fn tcp_transport_parties_settle_relay_only_immediately() {
         let srv = test_server();
@@ -2851,7 +2859,23 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         assert_eq!(status, PeerStatus::Accepted);
         srv.start_pair_probes(pair_id);
 
-        for rx in [&mut c_rx, &mut p_rx] {
+        for (rx, peer) in [(&mut c_rx, "prov"), (&mut p_rx, "c")] {
+            let probe_id = match next_msg(rx) {
+                Msg::PeerProbe {
+                    pair_id: got,
+                    peer_id,
+                    probe_id,
+                    provides,
+                } => {
+                    assert_eq!(got, pair_id);
+                    assert_eq!(peer_id, peer);
+                    assert_eq!(provides, PROVIDES_EXIT);
+                    probe_id
+                }
+                other => panic!("expected peer probe, got {other:?}"),
+            };
+            // The id is inert: nothing can be settled under it.
+            assert_eq!(srv.settle_probe(probe_id, vec![]), None);
             match next_msg(rx) {
                 Msg::PeerInfo {
                     pair_id: got,

@@ -338,6 +338,42 @@ fn declares_shape(cfg: &ClientConfig) -> bool {
         || !cfg.pppoe.is_empty()
         || cfg.tap.is_some()
         || cfg.tun.is_some()
+        || cfg.peer.is_some()
+}
+
+/// The peer slots a config declares: one consumer for a `[tun]` naming a peer,
+/// and one provider per bit the `[peer]` table sets.
+fn peer_slots(cfg: &ClientConfig) -> Vec<client::PeerSlotSpec> {
+    let mut slots = Vec::new();
+    if let Some(tun) = &cfg.tun {
+        if let Some(peer_id) = &tun.exit_via {
+            slots.push(client::PeerSlotSpec::Consumer {
+                peer_id: peer_id.clone(),
+                want: zeronat::proto::PROVIDES_EXIT,
+                device: Some(
+                    tun.dev
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_TUN_NAME.to_string()),
+                ),
+                default_route: tun.exit,
+            });
+        }
+    }
+    if let Some(peer) = &cfg.peer {
+        if peer.exit {
+            slots.push(client::PeerSlotSpec::Provider {
+                provides: zeronat::proto::PROVIDES_EXIT,
+                device: None,
+            });
+        }
+        if let Some(nic) = &peer.segment {
+            slots.push(client::PeerSlotSpec::Provider {
+                provides: zeronat::proto::PROVIDES_SEGMENT,
+                device: Some(nic.clone()),
+            });
+        }
+    }
+    slots
 }
 
 /// The `[[servers]]` entry to dial at boot: `[client].active` when set (its
@@ -1360,19 +1396,25 @@ async fn run(cmd: Cmd) -> Result<()> {
                     mtu: DEFAULT_TAP_MTU,
                     bridge: None,
                 });
+                let peers = peer_slots(&file);
                 // An unpinned [tun] address is derived from the active
                 // server's secret at each bringup, so a server switch moves
-                // the device onto the new server's subnet.
-                let tun = file.tun.as_ref().map(|t| client::ClientTun {
-                    name: t
-                        .dev
-                        .clone()
-                        .unwrap_or_else(|| DEFAULT_TUN_NAME.to_string()),
-                    mtu: DEFAULT_TAP_MTU,
-                    address: t.address,
-                    exit: t.exit,
-                    exit_strict: t.exit_strict,
-                });
+                // the device onto the new server's subnet. A [tun] naming a
+                // peer feeds that consumer slot instead of the server slot.
+                let tun = file
+                    .tun
+                    .as_ref()
+                    .filter(|t| !t.is_peer())
+                    .map(|t| client::ClientTun {
+                        name: t
+                            .dev
+                            .clone()
+                            .unwrap_or_else(|| DEFAULT_TUN_NAME.to_string()),
+                        mtu: DEFAULT_TAP_MTU,
+                        address: t.address,
+                        exit: t.exit,
+                        exit_strict: t.exit_strict,
+                    });
                 // Every [[pppoe]] entry is resolved at boot so the admin can
                 // spawn any of them; run_switchable derives the boot body
                 // (forwards, else the autostart entry, else the device, else
@@ -1433,6 +1475,8 @@ async fn run(cmd: Cmd) -> Result<()> {
                     // The shape came from the file, so admin mutations
                     // persist back to it.
                     config: config.map(|path| (path, file)),
+                    peers,
+                    peer_sessions: None,
                 };
                 client::run_switchable(client::ActiveTarget::new(target), settings).await
             } else {
@@ -1816,6 +1860,7 @@ mod tests {
                     address: None,
                     exit: false,
                     exit_strict: false,
+                    exit_via: None,
                 }),
                 ..ClientConfig::default()
             },

@@ -30,6 +30,9 @@ use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{
     client_handshake, client_handshake_stateless, client_handshake_stateless_reply,
 };
+use crate::peerslot;
+use crate::peerslot::PeerControl;
+pub use crate::peerslot::{PeerSlotSession, PeerSlotSpec, SessionSink};
 use crate::proto::{decode_sockaddr, encode_sockaddr, FwdOptionEntry, Msg, Proto};
 use crate::tap::TapConfig;
 #[cfg(target_os = "linux")]
@@ -102,11 +105,11 @@ fn record(state: &mut UdpHealth, healthy: bool, now: Instant) {
     }
 }
 
-/// Exponential backoff for the reconnect loop. Owned by the loop (like
-/// `UdpHealth`) so each running client keeps its own redial cadence. Starts at
-/// RETRY_DELAY, doubles after every failed cycle, and is capped at
-/// RETRY_DELAY_MAX; a cycle that established a control session resets it.
-struct Backoff(Duration);
+/// Exponential backoff for one slot's cycle. Owned by the slot (like
+/// `UdpHealth` is owned by the server slot) so each keeps its own cadence.
+/// Starts at RETRY_DELAY, doubles after every failed cycle, and is capped at
+/// RETRY_DELAY_MAX; a cycle that established resets it.
+pub(crate) struct Backoff(Duration);
 
 impl Default for Backoff {
     fn default() -> Self {
@@ -115,15 +118,15 @@ impl Default for Backoff {
 }
 
 impl Backoff {
-    fn delay(&self) -> Duration {
+    pub(crate) fn delay(&self) -> Duration {
         self.0
     }
 
-    fn fail(&mut self) {
+    pub(crate) fn fail(&mut self) {
         self.0 = (self.0 * 2).min(RETRY_DELAY_MAX);
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.0 = RETRY_DELAY;
     }
 }
@@ -335,6 +338,9 @@ struct Client {
     tcp: HashMap<u16, ForwardTarget>,
     udp: HashMap<u16, ForwardTarget>,
     transport: Transport,
+    /// The capability bits to announce once this control session is up, or
+    /// `None` when no peer slot is configured and nothing is announced.
+    peer_announce: Option<u8>,
 }
 
 /// Aborts its task when dropped. Ties a spawned task's lifetime to the scope
@@ -603,7 +609,129 @@ pub(crate) fn derive_mode(forwards: &SharedForwards, fallback: &RunMode) -> RunM
     }
 }
 
+/// An exclusive resource a slot holds while it runs: one OS network device by
+/// name, or the host's default routing. Two slots naming one interface is the
+/// conflict whichever slots they are, and at most one slot programs the host's
+/// defaults.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Claim {
+    Device(String),
+    DefaultRoute,
+}
+
+impl Claim {
+    /// How a refusal names the contended resource.
+    fn describe(&self) -> String {
+        match self {
+            Claim::Device(name) => format!("device `{name}`"),
+            Claim::DefaultRoute => "the default route".to_string(),
+        }
+    }
+}
+
+/// What the peer slots hold and which slot holds each. One server-slot body
+/// runs at a time, so an incoming body is admitted against these alone.
+#[derive(Default, Debug)]
+struct SlotClaims(Vec<(Claim, String)>);
+
+impl SlotClaims {
+    /// The claims of a configured peer slot set, refusing a set that contends
+    /// with itself.
+    fn new(peers: Vec<(Claim, String)>) -> std::result::Result<Self, String> {
+        for (i, (claim, holder)) in peers.iter().enumerate() {
+            if let Some((_, first)) = peers[..i].iter().find(|(c, _)| c == claim) {
+                return Err(format!(
+                    "{} is claimed by both {first} and {holder}",
+                    claim.describe()
+                ));
+            }
+        }
+        Ok(SlotClaims(peers))
+    }
+
+    /// Admit an incoming session body, refusing a claim a peer slot holds and
+    /// leaving the running slots alone.
+    fn admit_body(&self, body: Vec<(Claim, String)>) -> std::result::Result<(), String> {
+        for (claim, holder) in &body {
+            if let Some((_, first)) = self.0.iter().find(|(c, _)| c == claim) {
+                return Err(format!(
+                    "{} is claimed by {first}, so {holder} cannot open it",
+                    claim.describe()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The claims a configured peer slot set holds, in declaration order.
+fn peer_claims(specs: &[PeerSlotSpec]) -> Vec<(Claim, String)> {
+    let mut out = Vec::new();
+    for spec in specs {
+        let holder = spec.label();
+        if let Some(dev) = spec.device() {
+            out.push((Claim::Device(dev.to_string()), holder.clone()));
+        }
+        if spec.default_route() {
+            out.push((Claim::DefaultRoute, holder));
+        }
+    }
+    out
+}
+
+/// Refuse a slot set whose identities collide. A consumer is identified by the
+/// peer and capability its `PeerConnect` carries and a provider by its
+/// capability alone, and those are the keys inbound frames fan out by, so a
+/// duplicate is unroutable rather than merely redundant.
+fn check_slot_identities(specs: &[PeerSlotSpec]) -> std::result::Result<(), String> {
+    for (i, spec) in specs.iter().enumerate() {
+        let clash =
+            specs[..i]
+                .iter()
+                .any(|other| match (spec.consumer_key(), other.consumer_key()) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, None) => spec.provides() == other.provides(),
+                    _ => false,
+                });
+        if clash {
+            return Err(format!("{} is configured twice", spec.label()));
+        }
+    }
+    Ok(())
+}
+
 impl RunMode {
+    /// What the server slot claims while this body runs. Forwards claim
+    /// nothing; a device body claims its interface, and the bodies that
+    /// program the host's defaults claim the route as well.
+    fn claims(&self) -> Vec<(Claim, String)> {
+        let holder = "the server session body".to_string();
+        match self {
+            RunMode::Idle | RunMode::Forwards | RunMode::Offline => Vec::new(),
+            RunMode::Device(DeviceConfig::Tun(cfg)) => {
+                let mut out = vec![(Claim::Device(cfg.name.clone()), holder.clone())];
+                if cfg.exit {
+                    out.push((Claim::DefaultRoute, holder));
+                }
+                out
+            }
+            RunMode::Device(DeviceConfig::Tap(cfg)) => {
+                let mut out = vec![(Claim::Device(cfg.name.clone()), holder.clone())];
+                if let Some(nic) = &cfg.bridge {
+                    out.push((Claim::Device(nic.clone()), holder));
+                }
+                out
+            }
+            RunMode::Pppoe { config, .. } => {
+                let mut out = vec![(Claim::Device(config.tun_name.clone()), holder.clone())];
+                if config.default_route {
+                    out.push((Claim::DefaultRoute, holder));
+                }
+                out
+            }
+        }
+    }
+
     pub fn session_mode(&self) -> SessionMode {
         match self {
             RunMode::Idle => SessionMode::Idle,
@@ -632,6 +760,9 @@ struct ActiveState {
     // waiter could consume the permit, the loop would never see the cancel,
     // and it would redial the old target, silently dropping the switch.
     cancel: Arc<Notify>,
+    // Read under the same lock that swaps the body, so a mutation installing a
+    // device body is answered as a refusal before anything is torn down.
+    claims: SlotClaims,
 }
 
 impl ActiveTarget {
@@ -641,14 +772,30 @@ impl ActiveTarget {
                 target,
                 mode: RunMode::Idle,
                 cancel: Arc::new(Notify::new()),
+                claims: SlotClaims::default(),
             })),
         }
     }
 
-    /// Install the boot-derived session body before the loop starts. Fires no
-    /// cancel: nothing runs yet.
+    /// Install a session body with no peer slots to admit it against.
+    #[cfg(test)]
     fn init_mode(&self, mode: RunMode) {
         self.state.lock().unwrap().mode = mode;
+    }
+
+    /// Install the configured peer slots' claims and the boot-derived session
+    /// body. Every slot's interface is named in config, so the whole set is
+    /// decidable before anything opens and a conflicting file is refused here.
+    fn init_slots(
+        &self,
+        peers: Vec<(Claim, String)>,
+        mode: RunMode,
+    ) -> std::result::Result<(), String> {
+        let mut s = self.state.lock().unwrap();
+        s.claims = SlotClaims::new(peers)?;
+        s.claims.admit_body(mode.claims())?;
+        s.mode = mode;
+        Ok(())
     }
 
     /// Retarget the client: replace the shared target and fire the current
@@ -663,11 +810,15 @@ impl ActiveTarget {
     }
 
     /// Replace the session body and fire the cancel: the loop tears the
-    /// running body down and brings the new one up against the same target.
-    pub fn set_mode(&self, mode: RunMode) {
+    /// running body down and brings the new one up against the same target. A
+    /// body whose device or default route a peer slot holds is refused and
+    /// nothing is torn down.
+    pub fn set_mode(&self, mode: RunMode) -> std::result::Result<(), String> {
         let mut s = self.state.lock().unwrap();
+        s.claims.admit_body(mode.claims())?;
         s.mode = mode;
         s.cancel.notify_one();
+        Ok(())
     }
 
     /// Park the client offline: replace the session body with the offline
@@ -684,19 +835,24 @@ impl ActiveTarget {
     }
 
     /// Leave the park and install `boot`, retargeting first when `target` is
-    /// set. `false` (and no change) while a session body is up: connecting is
-    /// the park's exit, never a retarget of a live session.
-    pub fn connect(&self, target: Option<ServerTarget>, boot: RunMode) -> bool {
+    /// set. `Ok(false)` (and no change) while a session body is up: connecting
+    /// is the park's exit, never a retarget of a live session.
+    pub fn connect(
+        &self,
+        target: Option<ServerTarget>,
+        boot: RunMode,
+    ) -> std::result::Result<bool, String> {
         let mut s = self.state.lock().unwrap();
         if !matches!(s.mode, RunMode::Idle | RunMode::Offline) {
-            return false;
+            return Ok(false);
         }
+        s.claims.admit_body(boot.claims())?;
         if let Some(t) = target {
             s.target = t;
         }
         s.mode = boot;
         s.cancel.notify_one();
-        true
+        Ok(true)
     }
 
     /// Stop the named pppoe session, falling back to `base`. Fires the cancel
@@ -804,6 +960,8 @@ pub async fn run(
         id_prefix,
         control,
         config: None,
+        peers: Vec::new(),
+        peer_sessions: None,
     };
     run_switchable(ActiveTarget::new(target), settings).await
 }
@@ -834,6 +992,11 @@ pub struct ClientSettings {
     /// Admin-mutation persistence: the config file and its parsed contents.
     /// `None` on a runtime-only client, whose mutations stay in memory.
     pub config: Option<(PathBuf, ClientConfig)>,
+    /// The peer slots this client runs beside the server slot.
+    pub peers: Vec<PeerSlotSpec>,
+    /// Where a live peer slot hands its frames, or `None` while nothing rides
+    /// a peer session.
+    pub peer_sessions: SessionSink,
 }
 
 /// The concrete session body brought up for the active profile, holding what
@@ -866,6 +1029,8 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         id_prefix,
         control,
         config,
+        peers,
+        peer_sessions,
     } = settings;
     let client_id = crate::identity::derive_client_id(id_prefix.as_deref());
     #[cfg(not(target_os = "linux"))]
@@ -909,7 +1074,13 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
     } else {
         RunMode::Idle
     };
-    active.init_mode(derive_mode(&forwards, &fallback_mode));
+    check_slot_identities(&peers)?;
+    active.init_slots(peer_claims(&peers), derive_mode(&forwards, &fallback_mode))?;
+    // The union of the provider bits, or none at all when this client runs no
+    // peer slot and announces nothing.
+    let announce =
+        (!peers.is_empty()).then(|| peers.iter().fold(0u8, |bits, s| bits | s.provides()));
+    let peer_control = PeerControl::default();
 
     let ppp = PppStatus::default();
     // Written by this loop (park, dial, backoff) and by the session bodies
@@ -954,7 +1125,16 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         }
         // Idle and offline profiles run no session body; the admin socket
         // stays up and a mutation fires the cancel to bring the next body up.
-        if matches!(mode, RunMode::Idle | RunMode::Offline) {
+        // An idle client with peer slots still dials: the body is what has
+        // nothing to run, while the control session under it is what every
+        // pairing goes through. The offline park keeps its whole-client
+        // meaning, punched pairs included.
+        let park = match mode {
+            RunMode::Offline => true,
+            RunMode::Idle => peers.is_empty(),
+            _ => false,
+        };
+        if park {
             link.set(LinkStatus::Offline);
             cancel.notified().await;
             continue;
@@ -990,6 +1170,19 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         };
         #[cfg(target_os = "linux")]
         let mut exit_routes: Option<ExitRoutes> = None;
+
+        // The psk that pairs a slot, authenticates its probe, and keys its
+        // inner handshake is the active profile's, so the slots live exactly
+        // as long as this profile does and the switch below awaits them.
+        // Pairing rides the control session the forwards body opens; a device
+        // or pppoe body opens none, so the slots wait for a body that does.
+        if !peers.is_empty() && !matches!(mode, RunMode::Forwards | RunMode::Idle) {
+            crate::elog!(
+                "the active tap/tun/pppoe session opens no control channel, so no peer session \
+                 can pair; peer slots pair while this client runs forwards or sits idle"
+            );
+        }
+        let peer_slots = peerslot::spawn(&peers, &client_id, &peer_control, &peer_sessions);
 
         let mut udp_health = UdpHealth::default();
         let mut backoff = Backoff::default();
@@ -1058,6 +1251,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 tcp,
                 udp,
                 transport: target.transport,
+                peer_announce: announce,
             });
             // Auto only: skip the UDP probe while a flap cooldown is active. Forced
             // Udp/Tcp ignore `try_udp` and keep their fixed path.
@@ -1073,17 +1267,22 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 let body = body.clone();
                 let ppp = ppp.clone();
                 let link = link.clone();
+                let peer_control = peer_control.clone();
                 AbortOnDrop(tokio::spawn(async move {
                     match body {
                         Body::Device(tap) => bridge_session(client, tap, try_udp, link).await,
                         Body::Pppoe(pp) => pppoe_session(client, pp, ppp, try_udp, link).await,
-                        Body::Forwards => session(client, try_udp, link).await,
+                        Body::Forwards => session(client, try_udp, link, peer_control).await,
                     }
                 }))
             };
             #[cfg(not(target_os = "linux"))]
-            let mut session_task =
-                AbortOnDrop(tokio::spawn(session(client, try_udp, link.clone())));
+            let mut session_task = AbortOnDrop(tokio::spawn(session(
+                client,
+                try_udp,
+                link.clone(),
+                peer_control.clone(),
+            )));
             let joined = tokio::select! {
                 _ = cancel.notified() => None,
                 r = &mut session_task.0 => Some(r),
@@ -1139,6 +1338,13 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 _ = cancel.notified() => break,
                 _ = sleep(backoff.delay()) => {}
             }
+        }
+        // A profile switch is a barrier: the incoming set claims what the
+        // outgoing one holds, so every slot's teardown completes before the
+        // next iteration admits anything.
+        for mut slot in peer_slots {
+            slot.0.abort();
+            let _ = (&mut slot.0).await;
         }
     }
 }
@@ -1784,6 +1990,7 @@ async fn session(
     client: Arc<Client>,
     try_udp: bool,
     link: LinkCell,
+    peer: PeerControl,
 ) -> (Result<()>, UdpOutcome, bool) {
     let mode = client.transport;
 
@@ -1809,7 +2016,7 @@ async fn session(
                     Ok((r, w)) => {
                         link.set(LinkStatus::Connected);
                         return (
-                            control_loop(client, Link::Tcp, r, w).await,
+                            control_loop(client, Link::Tcp, r, w, peer).await,
                             UdpOutcome::Unhealthy,
                             true,
                         );
@@ -1828,7 +2035,7 @@ async fn session(
         }
     };
 
-    let result = control_loop(client, via, r, w).await;
+    let result = control_loop(client, via, r, w, peer).await;
     // Health is measured from when the UDP control channel came up to when it
     // returned; a short-lived UDP session is a flap. TCP-fallback paths report
     // their UDP verdict above, so `started` here is always the UDP case.
@@ -1883,6 +2090,7 @@ async fn control_loop(
     link: Link,
     mut r: crate::noise::NoiseReader,
     w: crate::noise::NoiseWriter,
+    peer: PeerControl,
 ) -> Result<()> {
     let link = Arc::new(link);
     let cancel = match link.as_ref() {
@@ -1908,6 +2116,17 @@ async fn control_loop(
         tx.try_send(Msg::FwdOptions { entries: options }.encode())
             .ok();
     }
+    // Peer support is announced once per control session, alongside the
+    // forward options, carrying the union of the provider bits. The slots pair
+    // through the session only once the ack comes back.
+    let peer_ack = Arc::new(AtomicBool::new(false));
+    if let Some(provides) = client.peer_announce {
+        tx.try_send(Msg::PeerAnnounce { provides }.encode()).ok();
+    }
+    // Filled when the ack arrives; dropping it at teardown bumps the
+    // generation, which fails every peer cycle that has not settled on a
+    // punched path.
+    let mut peer_live: Option<crate::peerslot::ControlGuard> = None;
 
     // Every task this session spawns is held through an AbortOnDrop guard, so
     // both a normal teardown and a server switch aborting the whole session
@@ -1967,6 +2186,22 @@ async fn control_loop(
         }
     };
 
+    // A server that does not answer the announce has no peer support, which
+    // fails every peer slot for this control session. The next one announces
+    // again and re-decides, so the verdict never outlives a server upgrade.
+    let _peer_watchdog = client.peer_announce.map(|_| {
+        let acked = peer_ack.clone();
+        AbortOnDrop(tokio::spawn(async move {
+            sleep(FWD_OPTIONS_ACK_TIMEOUT).await;
+            if !acked.load(Ordering::Relaxed) {
+                crate::elog!(
+                    "server did not acknowledge peer support; no peer session can pair over \
+                     this control session; upgrade the server to a release that supports peers"
+                );
+            }
+        }))
+    });
+
     // Guards for in-flight forward tasks spawned for this control session, so a
     // teardown aborts black-holed forwards instead of leaking them.
     let mut forwards: Vec<AbortOnDrop> = Vec::new();
@@ -2004,6 +2239,31 @@ async fn control_loop(
             }) => Some((Proto::Tcp, port, id, Some((peer, local)))),
             Ok(Msg::FwdOptionsAck) => {
                 ack.store(true, Ordering::Relaxed);
+                None
+            }
+            Ok(Msg::PeerAnnounceAck { observed }) => {
+                peer_ack.store(true, Ordering::Relaxed);
+                if peer_live.is_none() {
+                    crate::elog!("peer support acknowledged; control address {observed}");
+                    peer_live = Some(peer.install(crate::peerslot::ControlSession {
+                        tx: tx.clone(),
+                        server: client.server.clone(),
+                        psk: client.psk,
+                        sess: match link.as_ref() {
+                            Link::Udp(sess, _, _) => Some(sess.clone()),
+                            Link::Tcp => None,
+                        },
+                    }));
+                }
+                None
+            }
+            Ok(
+                m @ (Msg::PeerResult { .. }
+                | Msg::PeerProbe { .. }
+                | Msg::PeerInfo { .. }
+                | Msg::PeerRelayOpen { .. }),
+            ) => {
+                peer.route(m);
                 None
             }
             Ok(_) => None,
@@ -2321,7 +2581,7 @@ mod tests {
         assert!(!active.stop_pppoe("wan", RunMode::Forwards));
         assert_eq!(active.admin_view().1, SessionMode::Forwards);
 
-        active.set_mode(pppoe_mode("wan"));
+        active.set_mode(pppoe_mode("wan")).unwrap();
         assert_eq!(active.admin_view().1, SessionMode::Pppoe);
         // Wrong name: the running session stays.
         assert!(!active.stop_pppoe("dsl", RunMode::Forwards));
@@ -2390,13 +2650,17 @@ mod tests {
         assert!(!active.disconnect(), "already offline must be refused");
 
         // A named connect retargets and installs the boot body.
-        assert!(active.connect(Some(target("b")), RunMode::Forwards));
+        assert!(active
+            .connect(Some(target("b")), RunMode::Forwards)
+            .unwrap());
         let (t, mode, _cancel) = active.begin();
         assert_eq!(t.name, "b");
         assert_eq!(mode.session_mode(), SessionMode::Forwards);
 
         // With a session body up, connect changes nothing.
-        assert!(!active.connect(Some(target("c")), RunMode::Forwards));
+        assert!(!active
+            .connect(Some(target("c")), RunMode::Forwards)
+            .unwrap());
         assert_eq!(active.admin_view().0, "b");
         assert_eq!(active.admin_view().1, SessionMode::Forwards);
     }
@@ -2437,7 +2701,7 @@ mod tests {
             .await
             .expect("kick must fire the cancel in forwards mode");
 
-        active.set_mode(pppoe_mode("wan"));
+        active.set_mode(pppoe_mode("wan")).unwrap();
         let (_t, _m, cancel) = active.begin();
         active.kick_if_forwards();
         assert!(
@@ -2582,7 +2846,7 @@ mod tests {
 
         for parked in [pppoe_mode("wan"), RunMode::Offline] {
             let mode = parked.session_mode();
-            active.set_mode(parked);
+            active.set_mode(parked).unwrap();
             let (_t, _m, cancel) = active.begin();
             active.serve_forwards();
             assert!(
@@ -2673,6 +2937,143 @@ mod tests {
         let (tcp, _) = fwds.maps();
         assert_eq!(tcp.keys().copied().collect::<Vec<_>>(), [80]);
         assert_eq!(fwds.entries().len(), 3);
+    }
+
+    fn provider_slot(bit: u8, device: Option<&str>) -> PeerSlotSpec {
+        PeerSlotSpec::Provider {
+            provides: bit,
+            device: device.map(Into::into),
+        }
+    }
+
+    fn consumer_slot(peer: &str, device: Option<&str>, default_route: bool) -> PeerSlotSpec {
+        PeerSlotSpec::Consumer {
+            peer_id: peer.into(),
+            want: crate::proto::PROVIDES_EXIT,
+            device: device.map(Into::into),
+            default_route,
+        }
+    }
+
+    fn tap_body(name: &str) -> RunMode {
+        RunMode::Device(DeviceConfig::Tap(TapConfig {
+            name: name.into(),
+            mtu: 1400,
+            bridge: None,
+        }))
+    }
+
+    // A device a peer slot holds refuses the body that would open it, naming
+    // both, and leaves the running slots alone.
+    #[test]
+    fn a_body_cannot_take_a_device_a_peer_slot_holds() {
+        let peers = peer_claims(&[provider_slot(crate::proto::PROVIDES_SEGMENT, Some("eth1"))]);
+        let claims = SlotClaims::new(peers).unwrap();
+        let err = claims.admit_body(tap_body("eth1").claims()).unwrap_err();
+        assert!(err.contains("eth1"), "{err}");
+        assert!(err.contains("segment provider"), "{err}");
+        // An unrelated device is admitted.
+        claims.admit_body(tap_body("ztap0").claims()).unwrap();
+    }
+
+    // Default-route programming is its own claim: a consumer installing the
+    // half-defaults and a pppoe session swapping the default cannot both own
+    // the host's routing, whatever devices they open.
+    #[test]
+    fn the_default_route_takes_one_holder() {
+        let peers = peer_claims(&[consumer_slot("office", Some("zn0"), true)]);
+        let claims = SlotClaims::new(peers).unwrap();
+        let RunMode::Pppoe { name, config } = pppoe_mode("wan") else {
+            unreachable!("pppoe_mode builds a pppoe body")
+        };
+        let mut swapping = (*config).clone();
+        swapping.default_route = true;
+        let err = claims
+            .admit_body(
+                RunMode::Pppoe {
+                    name,
+                    config: Arc::new(swapping),
+                }
+                .claims(),
+            )
+            .unwrap_err();
+        assert!(err.contains("default route"), "{err}");
+        // The same session without the default swap runs beside the consumer.
+        claims.admit_body(pppoe_mode("wan").claims()).unwrap();
+    }
+
+    // Two peer slots naming one interface contend with each other, and the
+    // refusal names both holders.
+    #[test]
+    fn two_peer_slots_cannot_name_one_interface() {
+        let err = SlotClaims::new(peer_claims(&[
+            consumer_slot("office", Some("eth1"), false),
+            provider_slot(crate::proto::PROVIDES_SEGMENT, Some("eth1")),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("eth1"), "{err}");
+        assert!(err.contains("consumer for office"), "{err}");
+        assert!(err.contains("segment provider"), "{err}");
+    }
+
+    // Inbound frames fan out by slot identity: a consumer by the peer and
+    // capability it asks for, a provider by its capability. A set holding the
+    // same identity twice is unroutable, so it is refused.
+    #[test]
+    fn duplicate_slot_identities_are_refused() {
+        let err = check_slot_identities(&[
+            consumer_slot("office", None, false),
+            consumer_slot("office", None, false),
+        ])
+        .unwrap_err();
+        assert!(err.contains("office"), "{err}");
+        check_slot_identities(&[
+            consumer_slot("office", None, false),
+            consumer_slot("depot", None, false),
+        ])
+        .unwrap();
+
+        assert!(check_slot_identities(&[
+            provider_slot(crate::proto::PROVIDES_EXIT, None),
+            provider_slot(crate::proto::PROVIDES_EXIT, None),
+        ])
+        .is_err());
+        check_slot_identities(&[
+            provider_slot(crate::proto::PROVIDES_EXIT, None),
+            provider_slot(crate::proto::PROVIDES_SEGMENT, Some("eth1")),
+        ])
+        .unwrap();
+    }
+
+    // Every slot's interface is named in config, so a contended set is
+    // decidable before anything opens: startup fails instead of running with
+    // a slot silently missing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn boot_refuses_a_contended_slot_set() {
+        let settings = ClientSettings {
+            servers: vec![target("a")],
+            tcp: vec![],
+            udp: vec![],
+            tap: Some(TapConfig {
+                name: "eth1".into(),
+                mtu: 1400,
+                bridge: None,
+            }),
+            tun: None,
+            pppoe: vec![],
+            autostart: None,
+            id_prefix: Some("t".into()),
+            control: None,
+            config: None,
+            peers: vec![provider_slot(crate::proto::PROVIDES_SEGMENT, Some("eth1"))],
+            peer_sessions: None,
+        };
+        let err = run_switchable(ActiveTarget::new(target("a")), settings)
+            .await
+            .expect_err("a contended slot set must fail startup")
+            .to_string();
+        assert!(err.contains("eth1"), "{err}");
     }
 
     // A path that completes the TCP handshake but never sends Noise msg2 must

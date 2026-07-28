@@ -380,11 +380,14 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                 return (false, format!("no configured pppoe session named `{name}`"));
             };
             // Runtime-only: which session runs is never written back.
-            state.active.set_mode(RunMode::Pppoe {
+            let spawned = state.active.set_mode(RunMode::Pppoe {
                 name,
                 config: config.clone(),
             });
-            (true, String::new())
+            match spawned {
+                Ok(()) => (true, String::new()),
+                Err(e) => (false, e),
+            }
         }
         ClientMsg::StopSession { name } => {
             // Runtime-only, valid only against the running pppoe body; the
@@ -487,11 +490,15 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                 }
             }
             let named = target.is_some();
-            if !state.active.connect(target, state.boot_mode()) {
-                return (
-                    false,
-                    "a session is already up; select-server retargets a running client".into(),
-                );
+            match state.active.connect(target, state.boot_mode()) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return (
+                        false,
+                        "a session is already up; select-server retargets a running client".into(),
+                    )
+                }
+                Err(e) => return (false, e),
             }
             if named {
                 persist(state, move |cfg| cfg.active = Some(name)).await
@@ -914,7 +921,7 @@ mod tests {
             path.clone(),
             crate::clientcfg::parse_client(text).unwrap(),
         ));
-        state.active.set_mode(RunMode::Forwards);
+        state.active.set_mode(RunMode::Forwards).unwrap();
 
         // Each refusal mirrors a parser/validate rule and changes nothing:
         // a duplicate key, proxy on udp, a shapeless target, and a target
@@ -1033,7 +1040,7 @@ mod tests {
             path.clone(),
             crate::clientcfg::parse_client(text).unwrap(),
         ));
-        state.active.set_mode(RunMode::Forwards);
+        state.active.set_mode(RunMode::Forwards).unwrap();
 
         // No such key: the port on the wrong proto, and a port never declared.
         let before = std::fs::read_to_string(&path).unwrap();

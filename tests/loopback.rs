@@ -1487,6 +1487,8 @@ fn client_settings(
         id_prefix: Some(id.into()),
         control: sock.map(|p| zeronat::clientctl::ControlPath::Explicit(p.to_path_buf())),
         config: None,
+        peers: vec![],
+        peer_sessions: None,
     }
 }
 
@@ -3214,8 +3216,10 @@ async fn peer_rendezvous_pairs_and_invalidates() {
             }
         };
         assert_ne!(pair2, pair1);
-        // A tcp-transport pair settles relay-only at once; drain its PeerInfo
-        // so the next connect reads its own result.
+        // A tcp-transport pair is announced by its PeerProbe and settles
+        // relay-only at once; drain both frames so the next connect reads its
+        // own result.
+        recv_peer_probe(&mut c2r, pair2, "prov").await;
         assert_eq!(recv_peer_info(&mut c2r, pair2).await, Vec::new());
 
         // c1 registered earlier and its control session is gone (the re-pair
@@ -3470,11 +3474,12 @@ async fn peer_probe_deadline_marks_silent_party_relay_only() {
         .expect("probe deadline flow did not complete within 30s");
 }
 
-// TCP-transport clients never probe: pairing over the tcp control transport
-// sends no PeerProbe, and both parties get an immediate PeerInfo with an
-// empty (relay-only) candidate list.
+// TCP-transport clients never probe, but they are still told about the pair:
+// each party gets a PeerProbe naming the peer and the capability, which is
+// what lets a node announcing both bits place the pair, followed at once by a
+// PeerInfo with an empty (relay-only) candidate list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn peer_probe_skips_tcp_transport_clients() {
+async fn peer_probe_attributes_a_pair_on_the_tcp_transport() {
     let body = async {
         let control = free_tcp_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
@@ -3485,8 +3490,9 @@ async fn peer_probe_skips_tcp_transport_clients() {
         let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
         assert_eq!(status, PeerStatus::Accepted);
 
-        // The very next frame on each channel is the PeerInfo; no PeerProbe
-        // precedes it.
+        let c_probe = recv_peer_probe(&mut cr, pair_id, "prov").await;
+        let p_probe = recv_peer_probe(&mut pr, pair_id, "c").await;
+        assert_ne!(c_probe, p_probe);
         assert_eq!(recv_peer_info(&mut cr, pair_id).await, Vec::new());
         assert_eq!(recv_peer_info(&mut pr, pair_id).await, Vec::new());
     };
@@ -4134,6 +4140,10 @@ async fn relay_pair(control: u16) -> RelayPair {
 
     let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
     assert_eq!(status, PeerStatus::Accepted);
+    // Both parties hear of the pair through a PeerProbe; on the tcp transport
+    // neither probes, so the PeerInfo follows with no candidates.
+    recv_peer_probe(&mut cr, pair_id, "prov").await;
+    recv_peer_probe(&mut pr, pair_id, "c").await;
     assert_eq!(recv_peer_info(&mut cr, pair_id).await, Vec::new());
     assert_eq!(recv_peer_info(&mut pr, pair_id).await, Vec::new());
 
@@ -4793,4 +4803,270 @@ async fn peer_inner_session_dies_on_missed_keepalives() {
     timeout(Duration::from_secs(240), body)
         .await
         .expect("inner liveness flow did not complete within 240s");
+}
+
+/// The next live peer session a client's slot hands out.
+async fn next_slot_session(
+    rx: &mut tokio::sync::mpsc::Receiver<zeronat::client::PeerSlotSession>,
+) -> zeronat::client::PeerSlotSession {
+    timeout(Duration::from_secs(90), rx.recv())
+        .await
+        .expect("no peer slot came up")
+        .expect("the slot sink closed")
+}
+
+/// One frame across a live peer session, asserting it arrives whole.
+async fn cross_peer_frame(
+    from: &zeronat::client::PeerSlotSession,
+    to: &mut zeronat::client::PeerSlotSession,
+    frame: &[u8],
+) {
+    from.outbound.send(frame.to_vec()).await.unwrap();
+    let got = timeout(Duration::from_secs(20), to.inbound.recv())
+        .await
+        .expect("the frame never crossed the peer session")
+        .expect("the peer session closed");
+    assert_eq!(got, frame);
+}
+
+/// Two clients running concurrent slots against one server: a consumer serving
+/// its forwards on the server slot plus a peer slot asking a second client for
+/// the exit bit, that second client announcing it with no session body of its
+/// own. Drives a frame each way over the peer session while a forwarded
+/// connection stays open.
+async fn run_two_slot_test(transport: zeronat::client::Transport) {
+    let body = async {
+        let control = free_tcp_port();
+        let public_tcp = free_tcp_port();
+        let local_tcp = free_tcp_port();
+        tokio::spawn(tcp_echo(local_tcp));
+
+        let consumer_id = zeronat::identity::derive_client_id(Some("consumer"));
+        let provider_id = zeronat::identity::derive_client_id(Some("provider"));
+
+        // Two clients are connected, so the forward needs an explicit route.
+        let mut settings = cli_settings(control, vec![public_tcp], vec![]);
+        settings.routes = vec![zeronat::server::RouteSpec {
+            bind_ip: Ipv4Addr::LOCALHOST,
+            proto: Proto::Tcp,
+            port: public_tcp,
+            client_id: consumer_id.clone(),
+            source: Source::Runtime,
+        }];
+        tokio::spawn(zeronat::server::run(settings));
+
+        let target = || zeronat::client::ServerTarget {
+            name: "home".into(),
+            addr: format!("127.0.0.1:{control}"),
+            secret: SECRET.into(),
+            transport,
+        };
+
+        let (prov_tx, mut prov_rx) = tokio::sync::mpsc::channel(4);
+        let mut provider = client_settings(vec![target()], vec![], "provider", None);
+        provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
+            provides: PROVIDES_EXIT,
+            device: None,
+        }];
+        provider.peer_sessions = Some(prov_tx);
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(target()),
+            provider,
+        ));
+
+        let (cons_tx, mut cons_rx) = tokio::sync::mpsc::channel(4);
+        let mut consumer = client_settings(
+            vec![target()],
+            vec![fwd(public_tcp, local_tcp)],
+            "consumer",
+            None,
+        );
+        consumer.peers = vec![zeronat::client::PeerSlotSpec::Consumer {
+            peer_id: provider_id.clone(),
+            want: PROVIDES_EXIT,
+            device: None,
+            default_route: false,
+        }];
+        consumer.peer_sessions = Some(cons_tx);
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(target()),
+            consumer,
+        ));
+
+        wait_clients(control, 2).await;
+        // The server slot carries traffic first; the connection stays open
+        // for the rest of the test.
+        let mut forwarded = wait_tcp_path(public_tcp).await;
+
+        let mut consumer_slot = next_slot_session(&mut cons_rx).await;
+        let mut provider_slot = next_slot_session(&mut prov_rx).await;
+        assert_eq!(consumer_slot.peer_id, provider_id);
+        assert_eq!(provider_slot.peer_id, consumer_id);
+        assert_eq!(consumer_slot.want, PROVIDES_EXIT);
+        assert_eq!(provider_slot.want, PROVIDES_EXIT);
+
+        cross_peer_frame(&consumer_slot, &mut provider_slot, b"consumer-to-provider").await;
+        cross_peer_frame(&provider_slot, &mut consumer_slot, b"provider-to-consumer").await;
+
+        // The forward is untouched by the peer session running beside it.
+        forwarded.write_all(b"still-forwarding").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = forwarded.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"still-forwarding");
+    };
+
+    timeout(Duration::from_secs(180), body)
+        .await
+        .expect("two-slot flow did not complete within 180s");
+}
+
+// The udp control transport lets both parties probe, so the pair punches and
+// the peer session runs over the direct path while the forwards keep flowing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_slot_runs_beside_the_server_slot() {
+    run_two_slot_test(zeronat::client::Transport::Udp).await;
+}
+
+// The same two slots over the tcp control transport, where neither party
+// probes: both settle relay-only and the peer session runs over the legs the
+// server splices.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_slot_pairs_over_the_relay() {
+    run_two_slot_test(zeronat::client::Transport::Tcp).await;
+}
+
+/// The pair and probe ids of the next `PeerProbe` on a control channel, for a
+/// party that learns its pair id from the frame rather than from a result.
+async fn recv_pair_probe(r: &mut zeronat::noise::NoiseReader, peer: &str) -> (u64, u64) {
+    let frame = timeout(Duration::from_secs(30), r.recv())
+        .await
+        .expect("no peer probe")
+        .unwrap();
+    match Msg::decode(&frame).unwrap() {
+        Msg::PeerProbe {
+            pair_id,
+            peer_id,
+            probe_id,
+            provides,
+        } => {
+            assert_eq!(peer_id, peer);
+            assert_eq!(provides, PROVIDES_EXIT);
+            (pair_id, probe_id)
+        }
+        other => panic!("expected peer probe, got {other:?}"),
+    }
+}
+
+// The relay open outlives the punch. Both parties punch and authenticate, but
+// the counterpart reports the relay anyway, which is what a party whose punch
+// landed in the last milliseconds before its peer's deadline does. The server
+// opens the relay off that one report, and the slot must drop the direct path
+// it already holds and finish its inner handshake over the leg instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+
+        let psk = zeronat::noise::derive_psk(SECRET);
+        let server: std::net::SocketAddr = format!("127.0.0.1:{control}").parse().unwrap();
+        let consumer_id = zeronat::identity::derive_client_id(Some("consumer"));
+
+        // The counterpart is driven by hand so its punch outcome and its
+        // report to the server can disagree.
+        let (mut pr, mut pw, _pump) =
+            peer_control_connect_udp(control, "prov", PROVIDES_EXIT).await;
+
+        let (cons_tx, mut cons_rx) = tokio::sync::mpsc::channel(4);
+        let mut consumer = client_settings(
+            vec![zeronat::client::ServerTarget {
+                name: "home".into(),
+                addr: format!("127.0.0.1:{control}"),
+                secret: SECRET.into(),
+                transport: zeronat::client::Transport::Udp,
+            }],
+            vec![],
+            "consumer",
+            None,
+        );
+        consumer.peers = vec![zeronat::client::PeerSlotSpec::Consumer {
+            peer_id: "prov".into(),
+            want: PROVIDES_EXIT,
+            device: None,
+            default_route: false,
+        }];
+        consumer.peer_sessions = Some(cons_tx);
+        let target = zeronat::client::ServerTarget {
+            name: "home".into(),
+            addr: format!("127.0.0.1:{control}"),
+            secret: SECRET.into(),
+            transport: zeronat::client::Transport::Udp,
+        };
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(target),
+            consumer,
+        ));
+
+        let (pair_id, probe_id) = recv_pair_probe(&mut pr, &consumer_id).await;
+        let probe = zeronat::client::probe_candidates(server, &psk, probe_id)
+            .await
+            .expect("counterpart probe");
+        let candidates = recv_peer_info(&mut pr, pair_id).await;
+
+        // The punch settles direct on both ends: the responder only finishes
+        // once the initiator's nomination arrives, so the slot is already
+        // holding its own direct path here.
+        let (swallow, _swallowed) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let outcome = zeronat::punch::punch(
+            probe,
+            &candidates,
+            pair_id,
+            "prov",
+            &consumer_id,
+            &psk,
+            &swallow,
+        )
+        .await;
+        assert!(
+            matches!(outcome, zeronat::punch::PunchOutcome::Direct(_)),
+            "the punch must win before the relay is reported"
+        );
+        drop(outcome);
+
+        // Report the relay instead, and serve the pair over the leg.
+        report_path(&mut pw, pair_id, PathStatus::Relay).await;
+        let leg_id = recv_relay_open(&mut pr, pair_id).await;
+        let (leg, _leg_pump) = dgram_leg(control, leg_id).await;
+        let mut provider = zeronat::peer::PeerSession::provider(
+            zeronat::peer::PeerPath::relay_dgram(leg),
+            &psk,
+            pair_id,
+            &[],
+        )
+        .await
+        .expect("the slot never opened its relay leg");
+
+        // The slot abandoned the direct path and handshaked over the relay,
+        // inside its own cycle rather than after a failed one.
+        let mut slot = next_slot_session(&mut cons_rx).await;
+        slot.outbound
+            .send(b"over-the-relay".to_vec())
+            .await
+            .unwrap();
+        let got = timeout(Duration::from_secs(20), provider.recv())
+            .await
+            .expect("no frame reached the counterpart")
+            .expect("the peer session closed");
+        assert_eq!(got, b"over-the-relay");
+        provider.send(b"and-back").await.unwrap();
+        let back = timeout(Duration::from_secs(20), slot.inbound.recv())
+            .await
+            .expect("no frame reached the slot")
+            .expect("the peer session closed");
+        assert_eq!(back, b"and-back");
+    };
+
+    timeout(Duration::from_secs(120), body)
+        .await
+        .expect("split-report race did not complete within 120s");
 }

@@ -386,6 +386,8 @@ mod pty {
             id_prefix: Some("pty".into()),
             control: Some(zeronat::clientctl::ControlPath::Explicit(sock.clone())),
             config: Some((path.clone(), cfg)),
+            peers: vec![],
+            peer_sessions: None,
         };
         tokio::spawn(zeronat::client::run_switchable(
             zeronat::client::ActiveTarget::new(home),
