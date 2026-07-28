@@ -122,6 +122,7 @@
       <a class="nav-link" href="#admin">Admin</a>
       <a class="nav-link" href="#allports">All ports</a>
       <a class="nav-link" href="#tap">L2 bridge</a>
+      <a class="nav-link" href="#peers">Peer sessions</a>
       <a class="nav-link" href="#dht">DHT discovery</a>
       <a class="nav-link" href="#znpppoe">PPPoE proxy</a>
       <a class="nav-link" href="#build">Build</a>
@@ -338,7 +339,9 @@ password_file = "/etc/zeronat/wan.pass"</code></pre>
       config but stops serving it (default true). A <code>[[pppoe]]</code> entry names a session that
       can be spawned at runtime; one may set <code>autostart = true</code> to dial at boot when no
       forwards are declared. <code>[tap]</code> or <code>[tun]</code> declares a device mode instead,
-      exclusive with forwards and PPPoE.</p>
+      exclusive with forwards and PPPoE. A <code>[tun]</code> carrying <code>exit_via</code> and a
+      <code>[peer]</code> table declare <a href="#peers">peer sessions</a>, which run alongside the
+      forwards and PPPoE sessions.</p>
       <p>A file that declares any servers, forwards, PPPoE sessions, or a device is authoritative for
       the whole client shape: the matching CLI flags are ignored, each with a log line. A file that
       declares none leaves the CLI flags in charge. Scalars apply either way; the file's <code>id</code>
@@ -361,6 +364,9 @@ docker exec -it zeronat /zeronat admin --server &lt;public-ip&gt;:2222 show</cod
       <p>It prints the server, its routes, connected clients, and active listeners. Each client lists
       the forwards it announced with non-default options (<code>tcp:443  +proxy+idle=600</code>), and a
       route shows its forward's options in the OPTIONS column.</p>
+      <p>On a terminal the same command opens an interactive console. Its PAIRS panel lists the peer
+      pairs the server formed: the consumer, the provider, the capability, and whether the pair
+      settled direct or relayed.</p>
       <h3>Client admin</h3>
       <p>Drive a running client over its local admin socket:</p>
 <pre class="v-cli"><code>zeronat client admin                       <span class="c"># interactive console on a terminal</span>
@@ -381,9 +387,12 @@ docker exec -it zeronat /zeronat client admin spawn-pppoe wan</code></pre>
       pins it. Access control is the filesystem: the socket is mode 600 in a 700 directory, so whoever
       can open it drives the client; no secret is needed.</p>
       <p>The console lists the configured server profiles with the link state on the active one, the
-      active session (mode and, for PPPoE, the link phase), and the forwards with their options.
-      Selecting a server tears the current session down and redials it against the new one, with a
-      brief link drop. <code>select-server</code>, server-list edits, and forward edits persist to the
+      active session (mode and, for PPPoE, the link phase), and the forwards with their options. Its
+      PEERS panel, printed as Peer slots by <code>show</code>, lists each peer slot: the capability,
+      the peer on a consumer slot or <code>provider</code> on a providing one, the interface, the
+      link state, and the path once the pair settles. Selecting a server tears the current session
+      down and redials it against the new one, with a brief link drop.
+      <code>select-server</code>, server-list edits, and forward edits persist to the
       config file when the client booted from one; <code>spawn-pppoe</code>/<code>stop-pppoe</code> are
       runtime-only and do not survive a restart.</p>
       <p><code>add-server</code> and <code>remove-server</code> edit the server list on a running
@@ -430,6 +439,38 @@ docker run -d --name zeronat --restart unless-stopped --network host \
       the traffic on the same port and must listen on <code>0.0.0.0</code> or the tunnel address.</p>
       <p>Linux only. The server needs root or <code>CAP_NET_ADMIN</code>, <code>/dev/net/tun</code>, and
       <code>nft</code> or <code>iptables</code> to program the NAT.</p>
+
+      <h3>Exit mode</h3>
+      <p>On top of <code>--tun</code>, the server's <code>--exit</code> makes it a default-route exit:
+      it masquerades the client's outbound traffic onto its own uplink. <code>--exit-iface &lt;IF&gt;</code>
+      names the interface to masquerade out of; without it the server takes the interface its default
+      route uses. <code>[server] exit</code> and <code>exit_iface</code> set both from the config
+      file.</p>
+      <p>On the client, <code>--exit</code> routes this host's IPv4 traffic through the tunnel. The
+      server's address is pinned to the current default route as a /32, and <code>0.0.0.0/1</code>
+      plus <code>128.0.0.0/1</code> point at the tun device, so they beat the host's own default route
+      on prefix length while leaving it in place. <code>--exit-strict</code> goes further: it deletes
+      the original default routes and blackholes IPv6 for as long as the tunnel routes are up, so
+      traffic stops rather than leaking out the uplink if the tunnel drops. The routes come back on
+      teardown; a crash skips it and leaves the host without a default route.</p>
+<pre class="v-cli"><code><span class="c"># Server (VPS): masquerade the client's traffic out eth0:</span>
+ZERONAT_SECRET=s zeronat server --control 2222 --tun --except 22 --exit --exit-iface eth0
+
+<span class="c"># Client: send this host's IPv4 traffic through the server:</span>
+ZERONAT_SECRET=s zeronat client --server &lt;public-ip&gt;:2222 --tun --exit --exit-strict</code></pre>
+<pre class="v-docker"><code><span class="c"># Server (VPS): masquerade the client's traffic out eth0:</span>
+docker run -d --name zeronat --restart unless-stopped --network host \
+  --cap-add NET_ADMIN --device /dev/net/tun \
+  -e ZERONAT_SECRET=s ghcr.io/paltaio/zeronat server --control 2222 --tun --except 22 --exit --exit-iface eth0
+
+<span class="c"># Client: send this host's IPv4 traffic through the server:</span>
+docker run -d --name zeronat --restart unless-stopped --network host \
+  --cap-add NET_ADMIN --device /dev/net/tun \
+  -e ZERONAT_SECRET=s ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tun --exit --exit-strict</code></pre>
+      <p><code>--exit</code> requires <code>--tun</code> on both ends; <code>--exit-iface</code> and
+      <code>--exit-strict</code> require <code>--exit</code>. In the config file,
+      <code>[server] exit_iface</code> and <code>[tun] exit_strict</code> carry the same
+      requirement.</p>
     </section>
 
     <section id="tap">
@@ -464,6 +505,70 @@ pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
       have access, reverting within ~30s if you do not.</p>
     </section>
 
+    <section id="peers">
+      <h2>Peer sessions</h2>
+      <p>Two clients of one server can run a session with each other. One side provides a capability,
+      the other names that side by client id; the server pairs them and both ends try a UDP punch. A
+      pair that punches through runs directly between the two hosts, and one that does not runs over
+      the server. A client on the TCP transport never punches, so its pairs are always relayed.</p>
+      <p>The session inside a pair is Noise-encrypted with the profile's secret, so a relayed pair
+      moves ciphertext the server passes along without opening it. A direct pair and a relayed one
+      look the same to whatever runs over them.</p>
+      <p>Peer slots run beside the client's own session with the server and pair while that client
+      serves forwards or sits idle. Under a <code>--tun</code>, <code>--tap</code>, or PPPoE session
+      the slot is recorded and pairs when the client returns to either.</p>
+
+      <h3>Peer exit</h3>
+      <p>The provider sets <code>exit = true</code> under <code>[peer]</code>, with an optional
+      <code>exit_iface</code> naming the interface to masquerade out of (default: the default-route
+      one). It opens a tun (<code>znx0</code>) on the pair's subnet and masquerades the consumer's
+      traffic onto its uplink. The consumer names the provider with <code>exit_via</code> under
+      <code>[tun]</code>; <code>exit</code> and <code>exit_strict</code> route this host's traffic
+      through the pair the same way they route it through a server. One exit provider serves one
+      consumer at a time; a second is refused while that pair is up.</p>
+<pre><code><span class="c"># provider client.toml: serve one peer an exit</span>
+[peer]
+exit = true
+exit_iface = "eth0"
+
+<span class="c"># consumer client.toml: route through that peer</span>
+[tun]
+exit = true
+exit_strict = true
+exit_via = "office-b1c2"</code></pre>
+      <p>A <code>[tun]</code> that names <code>exit_via</code> describes the peer session, so the
+      same client cannot also run a server tunnel from it, and the table takes no
+      <code>address</code>. <code>dev</code> names the consumer's device (default <code>zn0</code>).
+      The forwards and PPPoE sessions in the same file keep running against the server.</p>
+
+      <h3>L2 segment</h3>
+      <p>A segment provider sets <code>segment</code> under <code>[peer]</code> to the bridge
+      carrying the segment it shares. It opens a TAP (<code>zns0</code>), enslaves it to that bridge,
+      and switches Ethernet frames between the bridge and every consumer attached to it. Several
+      consumers can share one segment provider.</p>
+<pre><code><span class="c"># provider client.toml</span>
+[peer]
+segment = "br0"</code></pre>
+      <p><code>znpppoe --peer &lt;client-id&gt;</code> is the consumer for a segment: it opens its PPPoE
+      sessions over that peer's segment instead of a bridge port on the server. See
+      <a href="#znpppoe">PPPoE proxy</a>.</p>
+
+      <h3>Attaching at runtime</h3>
+      <p>The client admin attaches and detaches peer slots on a running client:</p>
+<pre><code>zeronat client admin attach-provider exit eth0     <span class="c"># serve peers an exit</span>
+zeronat client admin attach-provider segment br0   <span class="c"># serve peers an L2 segment</span>
+zeronat client admin attach-peer office-b1c2 --dev zn0 --exit --exit-strict
+zeronat client admin detach-peer office-b1c2
+zeronat client admin detach-provider exit</code></pre>
+      <p>An attach writes the <code>[tun]</code> or <code>[peer]</code> table it declares to the
+      config file when the client booted from one, so it survives a restart. Detaching a provider
+      takes down the pairs it serves. <code>attach-peer</code> without <code>--exit</code> brings the
+      device up for routes you install yourself.</p>
+      <p>Linux only, on both ends. Each side opens a device, so each needs <code>CAP_NET_ADMIN</code>
+      and <code>/dev/net/tun</code>; an exit provider also needs <code>nft</code> or
+      <code>iptables</code> for the masquerade.</p>
+    </section>
+
     <section id="dht">
       <h2>DHT discovery</h2>
       <p>For a server on a dynamic IP, <code>--server dht</code> publishes its address to the BitTorrent
@@ -495,6 +600,11 @@ ZERONAT_SECRET=s zeronat client --server dht --tcp 443</code></pre>
       <code>proxy_s&lt;token&gt;</code> is sticky (one IP per token).</p>
 <pre><code>curl --socks5 proxy:&lt;proxy-pass&gt;@127.0.0.1:1080 https://ifconfig.me              <span class="c"># rotates</span>
 curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifconfig.me  <span class="c"># sticky</span></code></pre>
+      <p><code>--peer &lt;client-id&gt;</code> attaches the sessions to that client's L2 segment, served by
+      another zeronat client running <code>segment</code> in its <code>[peer]</code> section; the
+      frames ride a peer session between the two. It still names the server with <code>--host</code>
+      or <code>--dht</code>, since the server is what pairs them. See
+      <a href="#peers">Peer sessions</a>.</p>
       <p>Use <code>--host &lt;ip:port&gt;</code> instead of <code>--dht</code> for a fixed server. The ISP must
       allow concurrent PPPoE sessions on the login. Linux image, amd64 and arm64.</p>
     </section>
@@ -522,6 +632,8 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
           <tr><td><code>--udp &lt;PORT&gt;</code></td><td>Public UDP port to expose (repeatable)</td></tr>
           <tr><td><code>--tun</code></td><td>All-ports mode (Linux): forward every port except control plus ICMP to the client</td></tr>
           <tr><td><code>--except &lt;PORT&gt;</code></td><td>Port to keep on the host in <code>--tun</code> mode (repeatable)</td></tr>
+          <tr><td><code>--exit</code></td><td>Exit mode (requires <code>--tun</code>): masquerade the client's outbound traffic through this host</td></tr>
+          <tr><td><code>--exit-iface &lt;IF&gt;</code></td><td>Interface <code>--exit</code> masquerades out of (default: the default-route interface)</td></tr>
           <tr><td><code>--tap &lt;NAME&gt;</code></td><td>L2 bridge mode (Linux): create or attach this TAP device</td></tr>
           <tr><td><code>--tap-mtu &lt;N&gt;</code></td><td>TAP MTU (default 1400)</td></tr>
           <tr><td><code>--bridge &lt;NAME&gt;</code></td><td>Enslave the TAP to this existing bridge</td></tr>
@@ -543,6 +655,8 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
           <tr><td><code>--proxy</code></td><td>Send a PROXY protocol v2 header on every <code>--tcp</code> forward</td></tr>
           <tr><td><code>--transport &lt;MODE&gt;</code></td><td><code>auto</code> | <code>udp</code> | <code>tcp</code> (default auto)</td></tr>
           <tr><td><code>--tun</code></td><td>All-ports mode (Linux): receive every forwarded port on local services</td></tr>
+          <tr><td><code>--exit</code></td><td>Exit mode (requires <code>--tun</code>): route this host's IPv4 traffic through the server</td></tr>
+          <tr><td><code>--exit-strict</code></td><td>Strict exit (requires <code>--exit</code>): delete the default routes and blackhole IPv6 while the routes are up</td></tr>
           <tr><td><code>--tap &lt;NAME&gt;</code></td><td>L2 bridge mode (Linux): create or attach this TAP device</td></tr>
           <tr><td><code>--tap-mtu &lt;N&gt;</code></td><td>TAP MTU (default 1400)</td></tr>
           <tr><td><code>--bridge &lt;NAME&gt;</code></td><td>Enslave the TAP to this existing bridge</td></tr>
@@ -564,6 +678,10 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
           <tr><td><code>disconnect</code></td><td>Tear the session down; nothing dials until <code>connect</code></td></tr>
           <tr><td><code>spawn-pppoe &lt;NAME&gt;</code></td><td>Bring up the named PPPoE session</td></tr>
           <tr><td><code>stop-pppoe &lt;NAME&gt;</code></td><td>Stop the named PPPoE session and return to the base mode</td></tr>
+          <tr><td><code>attach-peer &lt;PEER-ID&gt;</code></td><td>Exit through the named peer; <code>--exit</code> routes this host's IPv4 traffic through the pair, <code>--exit-strict</code> hardens it, <code>--dev &lt;NAME&gt;</code> names the device</td></tr>
+          <tr><td><code>attach-provider exit|segment [&lt;NAME&gt;]</code></td><td>Serve a capability to peers; NAME is the masquerade interface for exit (default: the default-route one) and the bridge for segment, which is required</td></tr>
+          <tr><td><code>detach-peer &lt;PEER-ID&gt;</code></td><td>Remove the consumer slot exiting through that peer</td></tr>
+          <tr><td><code>detach-provider exit|segment</code></td><td>Stop providing a capability; its pairs go down</td></tr>
           <tr><td><code>--socket &lt;PATH&gt;</code></td><td>Admin socket path</td></tr>
         </tbody>
       </table>
