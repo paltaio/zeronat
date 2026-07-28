@@ -14,12 +14,12 @@ use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::client::{
-    derive_mode, ActiveTarget, Forward, PppoeRunConfig, RunMode, ServerTarget, SharedForwards,
-    SharedServers,
+    derive_mode, ActiveTarget, DeviceConfig, Forward, PppoeRunConfig, RunMode, ServerTarget,
+    SharedForwards, SharedServers,
 };
-use crate::clientcfg::{serialize_client, CfgForward, CfgServer, ClientConfig};
-use crate::clientproto::{ClientMsg, ClientSnapshotBody, LinkCell, PppStatus};
-use crate::proto::{proto_name, Proto};
+use crate::clientcfg::{serialize_client, CfgForward, CfgPeer, CfgServer, CfgTun, ClientConfig};
+use crate::clientproto::{ClientMsg, ClientSnapshotBody, LinkCell, PppStatus, SessionMode};
+use crate::proto::{proto_name, Proto, PROVIDES_EXIT, PROVIDES_SEGMENT};
 use crate::Result;
 
 /// Directory hosting the default socket when the client can create it.
@@ -604,8 +604,192 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
             state.active.kick_if_forwards();
             saved
         }
+        ClientMsg::AttachPeer {
+            peer_id,
+            want,
+            dev,
+            exit,
+            exit_strict,
+            iface,
+        } => {
+            // The config lexer rejects control characters in strings, so a
+            // value carrying one could never be saved and read back.
+            for (field, value) in [
+                ("peer", peer_id.as_str()),
+                ("dev", dev.as_str()),
+                ("iface", iface.as_str()),
+            ] {
+                if value.chars().any(char::is_control) {
+                    return (
+                        false,
+                        format!("peer `{field}` must not contain control characters"),
+                    );
+                }
+            }
+            let consumer = !peer_id.is_empty();
+            // One `[tun]` table describes one L3 adapter, so a client whose
+            // device body is a tun has no table left for a consumer slot and
+            // persisting one would save a file boot rejects.
+            if consumer && matches!(state.fallback_mode, RunMode::Device(DeviceConfig::Tun(_))) {
+                return (
+                    false,
+                    "[tun] feeds this client's server slot, so it has no table left for a consumer"
+                        .into(),
+                );
+            }
+            if let Err(msg) = attach_fields(&peer_id, want, &dev, exit, exit_strict, &iface) {
+                return (false, msg);
+            }
+            // The slot is derived from the records this attach saves, so the
+            // file it writes parses back to the slot it attached.
+            let (tun, peer) = if consumer {
+                (
+                    Some(CfgTun {
+                        dev: (!dev.is_empty()).then_some(dev),
+                        address: None,
+                        exit,
+                        exit_strict,
+                        exit_via: Some(peer_id),
+                    }),
+                    None,
+                )
+            } else {
+                let mut record = CfgPeer::default();
+                // The key a provider's capability writes, matched exhaustively
+                // so no undefined bit is filed under a defined one.
+                match want {
+                    PROVIDES_EXIT => {
+                        record.exit = true;
+                        record.exit_iface = (!iface.is_empty()).then_some(iface);
+                    }
+                    PROVIDES_SEGMENT => record.segment = Some(iface),
+                    n => return (false, format!("unknown peer capability byte {n}")),
+                }
+                (None, Some(record))
+            };
+            let slots = match crate::client::peer_slots(tun.as_ref(), peer.as_ref()) {
+                Ok(slots) => slots,
+                Err(e) => return (false, e.to_string()),
+            };
+            // One record declares one slot.
+            let Ok([spec]) = <[_; 1]>::try_from(slots) else {
+                return (false, "an attach declares exactly one slot".into());
+            };
+            // Admission runs under the lock that swaps the session body, so a
+            // slot contending with what is running is answered as a refusal and
+            // nothing is torn down. It is admitted against the boot body too:
+            // that one claims its device at the next start whatever runs now.
+            if let Err(msg) = state.active.attach_peer(spec, &state.boot_mode()) {
+                return (false, msg);
+            }
+            // Slots pair under a forwards or idle body; under any other one the
+            // attach is a record that takes effect when such a body runs.
+            let pairs = matches!(
+                state.active.admin_view().1,
+                SessionMode::Forwards | SessionMode::Idle
+            );
+            let saved = persist(state, move |cfg| {
+                if let Some(tun) = tun {
+                    cfg.tun = Some(tun);
+                }
+                if let Some(peer) = peer {
+                    let saved = cfg.peer.get_or_insert_with(CfgPeer::default);
+                    if peer.exit {
+                        saved.exit = true;
+                        saved.exit_iface = peer.exit_iface;
+                    }
+                    if peer.segment.is_some() {
+                        saved.segment = peer.segment;
+                    }
+                }
+            })
+            .await;
+            match saved {
+                (true, _) if !pairs => (
+                    true,
+                    "recorded; peer slots pair while this client runs forwards or sits idle".into(),
+                ),
+                other => other,
+            }
+        }
+        ClientMsg::DetachPeer { peer_id, want } => {
+            // The key a provider's capability clears, matched exhaustively so
+            // no undefined bit clears a defined one's record.
+            let clear: fn(&mut CfgPeer) = match want {
+                PROVIDES_EXIT => |peer| {
+                    peer.exit = false;
+                    peer.exit_iface = None;
+                },
+                PROVIDES_SEGMENT => |peer| peer.segment = None,
+                n => return (false, format!("unknown peer capability byte {n}")),
+            };
+            if !state.active.detach_peer(&peer_id, want) {
+                return (
+                    false,
+                    format!(
+                        "no attached {}",
+                        crate::peerslot::slot_label(&peer_id, want)
+                    ),
+                );
+            }
+            persist(state, move |cfg| {
+                if peer_id.is_empty() {
+                    let Some(peer) = &mut cfg.peer else { return };
+                    clear(peer);
+                    // A `[peer]` table declaring no provider declares nothing.
+                    if *peer == CfgPeer::default() {
+                        cfg.peer = None;
+                    }
+                } else {
+                    cfg.tun = None;
+                }
+            })
+            .await
+        }
         other => (false, format!("expected a mutation, got {other:?}")),
     }
+}
+
+/// The fields an `AttachPeer` may carry for the role it names. Keys that
+/// belong to the other role are refused rather than ignored: a consumer takes
+/// its `[tun]` keys and a provider its `[peer]` ones.
+fn attach_fields(
+    peer_id: &str,
+    want: u8,
+    dev: &str,
+    exit: bool,
+    exit_strict: bool,
+    iface: &str,
+) -> std::result::Result<(), String> {
+    if peer_id.is_empty() {
+        if !dev.is_empty() || exit || exit_strict {
+            return Err("`dev`, `exit`, and `exit_strict` apply to a consumer slot".into());
+        }
+        match want {
+            PROVIDES_EXIT => {}
+            // A segment provider's tap joins a bridge, which nothing defaults.
+            PROVIDES_SEGMENT if iface.is_empty() => {
+                return Err("a segment provider needs the bridge its tap joins".into())
+            }
+            PROVIDES_SEGMENT => {}
+            n => return Err(format!("unknown peer capability byte {n}")),
+        }
+        return Ok(());
+    }
+    if !iface.is_empty() {
+        return Err("`iface` applies to a provider slot".into());
+    }
+    if want != PROVIDES_EXIT {
+        return Err(
+            "a segment consumer is not a client slot; use `znpppoe --peer <PEER-ID>`".into(),
+        );
+    }
+    // Mirror the `[tun]` parser: the kill switch hardens exit routing, so it
+    // needs exit routing on.
+    if exit_strict && !exit {
+        return Err("`exit_strict` requires `exit`".into());
+    }
+    Ok(())
 }
 
 /// Refusal for a profile this build cannot dial. Dialing a `"dht"` profile
@@ -663,8 +847,9 @@ async fn persist(state: &ControlState, edit: impl FnOnce(&mut ClientConfig)) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{Forward, Transport};
+    use crate::client::{Forward, Transport, DEFAULT_PEER_EXIT_NAME, DEFAULT_PEER_SEGMENT_NAME};
     use crate::clientproto::{LinkStatus, PppPhase, ServerSecret, SessionMode};
+    use crate::proto::PROVIDES_SEGMENT;
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -1377,6 +1562,288 @@ mod tests {
         let (ok, msg) = mutate(&state, ClientMsg::SpawnPppoe { name: "wan".into() }).await;
         assert!(ok, "{msg}");
         assert_eq!(snapshot(&state).mode, SessionMode::Pppoe);
+    }
+
+    fn attach_consumer(peer: &str, dev: &str, exit: bool, exit_strict: bool) -> ClientMsg {
+        ClientMsg::AttachPeer {
+            peer_id: peer.into(),
+            want: PROVIDES_EXIT,
+            dev: dev.into(),
+            exit,
+            exit_strict,
+            iface: String::new(),
+        }
+    }
+
+    fn attach_provider(want: u8, iface: &str) -> ClientMsg {
+        ClientMsg::AttachPeer {
+            peer_id: String::new(),
+            want,
+            dev: String::new(),
+            exit: false,
+            exit_strict: false,
+            iface: iface.into(),
+        }
+    }
+
+    /// Every attach refusal mirrors a config rule or the running slot set, and
+    /// leaves both the slot set and the file untouched.
+    #[tokio::test]
+    async fn attach_peer_refuses_what_the_config_and_the_slots_refuse() {
+        let dir = temp_dir("attachbad");
+        let path = dir.join("client.toml");
+        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n";
+        std::fs::write(&path, text).unwrap();
+        let mut state = idle_state("a");
+        state.persist = Some(Persist::new(
+            path.clone(),
+            crate::clientcfg::parse_client(text).unwrap(),
+        ));
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        let refused = [
+            // Keys belonging to the other role.
+            ClientMsg::AttachPeer {
+                peer_id: "office".into(),
+                want: PROVIDES_EXIT,
+                dev: String::new(),
+                exit: false,
+                exit_strict: false,
+                iface: "wan0".into(),
+            },
+            ClientMsg::AttachPeer {
+                peer_id: String::new(),
+                want: PROVIDES_EXIT,
+                dev: "znx0".into(),
+                exit: false,
+                exit_strict: false,
+                iface: String::new(),
+            },
+            // The kill switch hardens exit routing, so it needs it on.
+            attach_consumer("office", "", false, true),
+            // A segment provider needs the bridge its tap joins, and neither
+            // provider can name its own device.
+            attach_provider(PROVIDES_SEGMENT, ""),
+            attach_provider(PROVIDES_SEGMENT, DEFAULT_PEER_SEGMENT_NAME),
+            attach_provider(PROVIDES_EXIT, DEFAULT_PEER_EXIT_NAME),
+            // A value the config lexer could never read back.
+            attach_consumer("off\nice", "", false, false),
+            // A segment consumer is znpppoe's `--peer`, not a slot the admin
+            // socket attaches.
+            ClientMsg::AttachPeer {
+                peer_id: "office".into(),
+                want: PROVIDES_SEGMENT,
+                dev: String::new(),
+                exit: false,
+                exit_strict: false,
+                iface: String::new(),
+            },
+        ];
+        for req in refused {
+            let desc = format!("{req:?}");
+            let (ok, msg) = mutate(&state, req).await;
+            assert!(!ok, "expected a refusal for {desc}: {msg}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // One `[tun]` table describes one adapter, so any second consumer is
+        // refused; so is a second provider of one capability.
+        let (ok, msg) = mutate(&state, attach_consumer("office", "", true, false)).await;
+        assert!(ok, "{msg}");
+        let (ok, msg) = mutate(&state, attach_consumer("depot", "zn9", false, false)).await;
+        assert!(!ok);
+        assert!(
+            msg.contains("already has the exit consumer for `office`"),
+            "{msg}"
+        );
+        let (ok, msg) = mutate(&state, attach_provider(PROVIDES_EXIT, "")).await;
+        assert!(ok, "{msg}");
+        let (ok, msg) = mutate(&state, attach_provider(PROVIDES_EXIT, "wan0")).await;
+        assert!(!ok);
+        assert!(msg.contains("already has the exit provider"), "{msg}");
+
+        // A device the running body opened is refused to the attaching slot,
+        // which the refusal names, and the body keeps running.
+        let device = idle_state("a");
+        device
+            .active
+            .set_mode(RunMode::Device(crate::client::DeviceConfig::Tap(
+                crate::tap::TapConfig {
+                    name: "zn0".into(),
+                    mtu: 1400,
+                    bridge: None,
+                },
+            )))
+            .unwrap();
+        let (ok, msg) = mutate(&device, attach_consumer("office", "zn0", false, false)).await;
+        assert!(!ok);
+        assert!(msg.contains("device `zn0`"), "{msg}");
+        assert!(msg.contains("exit consumer for `office`"), "{msg}");
+        assert_eq!(snapshot(&device).mode, SessionMode::Device);
+
+        // One `[tun]` table describes one adapter, so a client whose device
+        // body is a tun has none left for a consumer slot.
+        let mut server_tun = idle_state("a");
+        server_tun.fallback_mode =
+            RunMode::Device(crate::client::DeviceConfig::Tun(crate::client::ClientTun {
+                name: "zn0".into(),
+                mtu: 1400,
+                address: None,
+                exit: false,
+                exit_strict: false,
+            }));
+        let (ok, msg) = mutate(&server_tun, attach_consumer("office", "zn1", false, false)).await;
+        assert!(!ok);
+        assert!(msg.contains("[tun]"), "{msg}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A parked client's body claims nothing, so an attach is admitted against
+    /// the body boot derives: what that one opens is refused and the file is
+    /// left as it was, and what it leaves free is recorded for the next body
+    /// that pairs.
+    #[tokio::test]
+    async fn attach_peer_refuses_what_the_boot_body_holds() {
+        let dir = temp_dir("attachpark");
+        let path = dir.join("client.toml");
+        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\n[tap]\ndev = \"zn0\"\n";
+        std::fs::write(&path, text).unwrap();
+        let mut state = idle_state("a");
+        state.fallback_mode =
+            RunMode::Device(crate::client::DeviceConfig::Tap(crate::tap::TapConfig {
+                name: "zn0".into(),
+                mtu: 1400,
+                bridge: None,
+            }));
+        state.persist = Some(Persist::new(
+            path.clone(),
+            crate::clientcfg::parse_client(text).unwrap(),
+        ));
+        let (ok, msg) = mutate(&state, ClientMsg::Disconnect).await;
+        assert!(ok, "{msg}");
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (ok, msg) = mutate(&state, attach_consumer("office", "zn0", false, false)).await;
+        assert!(!ok);
+        assert!(msg.contains("device `zn0`"), "{msg}");
+        assert!(msg.contains("at boot"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // A device the boot body leaves free is attached, and the parked body
+        // pairs nothing, which the acceptance says.
+        let (ok, msg) = mutate(&state, attach_consumer("office", "zn1", false, false)).await;
+        assert!(ok, "{msg}");
+        assert!(msg.contains("peer slots pair"), "{msg}");
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        assert_eq!(
+            on_disk.tun.as_ref().unwrap().exit_via.as_deref(),
+            Some("office")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An accepted attach lands in the slot set and in a file that parses back
+    /// to the same slots; a detach removes both.
+    #[tokio::test]
+    async fn attach_and_detach_peer_slots_persist() {
+        let dir = temp_dir("attachok");
+        let path = dir.join("client.toml");
+        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n";
+        std::fs::write(&path, text).unwrap();
+        let mut state = idle_state("a");
+        state.persist = Some(Persist::new(
+            path.clone(),
+            crate::clientcfg::parse_client(text).unwrap(),
+        ));
+
+        // A consumer with an explicit device and the exit routing on, an exit
+        // provider naming its egress, and a segment provider naming its
+        // bridge: three slots, three config records.
+        let (ok, msg) = mutate(&state, attach_consumer("office-b1c2", "zn1", true, true)).await;
+        assert!(ok, "{msg}");
+        let (ok, msg) = mutate(&state, attach_provider(PROVIDES_EXIT, "wan0")).await;
+        assert!(ok, "{msg}");
+        let (ok, msg) = mutate(&state, attach_provider(PROVIDES_SEGMENT, "br0")).await;
+        assert!(ok, "{msg}");
+
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        let tun = on_disk.tun.as_ref().unwrap();
+        assert_eq!(tun.exit_via.as_deref(), Some("office-b1c2"));
+        assert_eq!(tun.dev.as_deref(), Some("zn1"));
+        assert!(tun.exit && tun.exit_strict);
+        assert_eq!(tun.address, None);
+        let peer = on_disk.peer.as_ref().unwrap();
+        assert!(peer.exit);
+        assert_eq!(peer.exit_iface.as_deref(), Some("wan0"));
+        assert_eq!(peer.segment.as_deref(), Some("br0"));
+
+        // Detaching names the slot the same way attaching did: the peer and
+        // capability for a consumer, the capability alone for a provider.
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::DetachPeer {
+                peer_id: "nobody".into(),
+                want: PROVIDES_EXIT,
+            },
+        )
+        .await;
+        assert!(!ok);
+        assert!(msg.contains("exit consumer for `nobody`"), "{msg}");
+
+        for req in [
+            ClientMsg::DetachPeer {
+                peer_id: "office-b1c2".into(),
+                want: PROVIDES_EXIT,
+            },
+            ClientMsg::DetachPeer {
+                peer_id: String::new(),
+                want: PROVIDES_EXIT,
+            },
+        ] {
+            let (ok, msg) = mutate(&state, req).await;
+            assert!(ok, "{msg}");
+        }
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        assert!(on_disk.tun.is_none());
+        let peer = on_disk.peer.as_ref().unwrap();
+        assert!(!peer.exit);
+        assert_eq!(peer.exit_iface, None);
+        assert_eq!(peer.segment.as_deref(), Some("br0"));
+
+        // Detaching the last provider drops a table that would declare
+        // nothing, and the detached slots are gone from the set.
+        let (ok, msg) = mutate(
+            &state,
+            ClientMsg::DetachPeer {
+                peer_id: String::new(),
+                want: PROVIDES_SEGMENT,
+            },
+        )
+        .await;
+        assert!(ok, "{msg}");
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        assert!(on_disk.peer.is_none());
+        let (ok, _) = mutate(
+            &state,
+            ClientMsg::DetachPeer {
+                peer_id: String::new(),
+                want: PROVIDES_SEGMENT,
+            },
+        )
+        .await;
+        assert!(!ok, "detaching a detached slot must be refused");
+
+        // The device the detached consumer held is free again.
+        let (ok, msg) = mutate(&state, attach_consumer("other", "zn1", false, false)).await;
+        assert!(ok, "{msg}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

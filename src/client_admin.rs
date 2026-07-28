@@ -13,7 +13,7 @@ use crate::client::{Forward, Transport};
 use crate::clientproto::{
     ClientMsg, ClientSnapshotBody, LinkStatus, PppPhase, ServerSecret, SessionMode,
 };
-use crate::proto::{proto_name, Proto};
+use crate::proto::{proto_name, Proto, PROVIDES_EXIT, PROVIDES_SEGMENT};
 use crate::Result;
 
 /// The control socket to talk to: an explicit path is used as given; otherwise
@@ -205,6 +205,97 @@ pub async fn remove_forward(socket: Option<&Path>, spec: &str) -> Result<()> {
     command(socket, ClientMsg::RemoveForward { proto, port }).await
 }
 
+/// `attach-peer PEER-ID [--dev NAME] [--exit] [--exit-strict]`: add a consumer
+/// slot that exits through `PEER-ID`. `--exit` routes the host's IPv4 traffic
+/// through the pair; without it the device comes up for routes the operator
+/// installs.
+pub async fn attach_peer(
+    socket: Option<&Path>,
+    peer_id: String,
+    dev: Option<String>,
+    exit: bool,
+    exit_strict: bool,
+) -> Result<()> {
+    command(
+        socket,
+        ClientMsg::AttachPeer {
+            peer_id: consumer_peer("attach-peer", peer_id)?,
+            want: PROVIDES_EXIT,
+            dev: dev.unwrap_or_default(),
+            exit,
+            exit_strict,
+            iface: String::new(),
+        },
+    )
+    .await
+}
+
+/// `attach-provider exit|segment [NAME]`: add a provider slot. NAME is the
+/// interface an exit provider masquerades out of (the default-route interface
+/// when omitted) and the bridge a segment provider joins, which is required.
+pub async fn attach_provider(
+    socket: Option<&Path>,
+    capability: &str,
+    iface: Option<String>,
+) -> Result<()> {
+    command(
+        socket,
+        ClientMsg::AttachPeer {
+            peer_id: String::new(),
+            want: parse_capability(capability)?,
+            dev: String::new(),
+            exit: false,
+            exit_strict: false,
+            iface: iface.unwrap_or_default(),
+        },
+    )
+    .await
+}
+
+/// `detach-peer PEER-ID`: remove the consumer slot exiting through `PEER-ID`.
+pub async fn detach_peer(socket: Option<&Path>, peer_id: String) -> Result<()> {
+    command(
+        socket,
+        ClientMsg::DetachPeer {
+            peer_id: consumer_peer("detach-peer", peer_id)?,
+            want: PROVIDES_EXIT,
+        },
+    )
+    .await
+}
+
+/// The peer a consumer command names. An empty id is the provider slot on the
+/// wire, which the client would attach or detach instead, so it is refused
+/// here rather than sent.
+fn consumer_peer(command: &str, peer_id: String) -> Result<String> {
+    if peer_id.is_empty() {
+        return Err(format!("{command} must name a peer").into());
+    }
+    Ok(peer_id)
+}
+
+/// `detach-provider exit|segment`: remove the provider slot for one
+/// capability. The pairs it serves go down with it.
+pub async fn detach_provider(socket: Option<&Path>, capability: &str) -> Result<()> {
+    command(
+        socket,
+        ClientMsg::DetachPeer {
+            peer_id: String::new(),
+            want: parse_capability(capability)?,
+        },
+    )
+    .await
+}
+
+/// The capability a provider command names.
+fn parse_capability(capability: &str) -> Result<u8> {
+    match capability {
+        "exit" => Ok(PROVIDES_EXIT),
+        "segment" => Ok(PROVIDES_SEGMENT),
+        other => Err(format!("capability must be exit or segment, got `{other}`").into()),
+    }
+}
+
 /// `connect [NAME]`: leave the offline park and bring up the boot-derived
 /// session body, retargeting first when named. Reports the mode a follow-up
 /// snapshot shows, so a connect on an idle-boot client truthfully answers
@@ -229,17 +320,21 @@ pub async fn disconnect(socket: Option<&Path>) -> Result<()> {
     command(socket, ClientMsg::Disconnect).await
 }
 
-/// Send one mutation and report the verdict: `ok` on stdout when the client
-/// accepts, its refusal message as the error otherwise.
+/// Send one mutation and report the verdict: what the client has to say about
+/// the change it accepted, else `ok`; its refusal message as the error
+/// otherwise.
 async fn command(socket: Option<&Path>, req: ClientMsg) -> Result<()> {
     let path = resolve_socket(socket)?;
     let (ok, msg) = mutate(&path, req).await?;
-    if ok {
-        println!("ok");
-        Ok(())
-    } else {
-        Err(msg.into())
+    if !ok {
+        return Err(msg.into());
     }
+    if msg.is_empty() {
+        println!("ok");
+    } else {
+        println!("{msg}");
+    }
+    Ok(())
 }
 
 /// A `PROTO:PORT` forward key, e.g. `tcp:443`.
@@ -545,6 +640,19 @@ mod tests {
         for bad in ["443", "tcp", "icmp:1", "tcp:0", "tcp:70000", "tcp:x"] {
             assert!(parse_proto_port(bad).is_err(), "{bad} should not parse");
         }
+    }
+
+    /// An empty peer id is the provider slot on the wire, so `attach-peer ""`
+    /// would attach the exit provider and `detach-peer ""` would remove it.
+    #[test]
+    fn consumer_commands_must_name_a_peer() {
+        let err = consumer_peer("attach-peer", String::new()).unwrap_err();
+        assert!(err.to_string().contains("attach-peer"), "{err}");
+        assert!(consumer_peer("detach-peer", String::new()).is_err());
+        assert_eq!(
+            consumer_peer("detach-peer", "office".into()).unwrap(),
+            "office"
+        );
     }
 
     #[test]

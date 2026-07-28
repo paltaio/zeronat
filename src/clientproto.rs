@@ -7,7 +7,9 @@
 //! ride the Noise framing unchanged.
 
 use crate::client::Transport;
-use crate::proto::{proto_byte, proto_from_byte, put_str, take_str, Proto};
+use crate::proto::{
+    proto_byte, proto_from_byte, put_str, take_str, Proto, PROVIDES_EXIT, PROVIDES_SEGMENT,
+};
 use crate::Result;
 
 /// The session body a client runs at any instant: the forwards control loop,
@@ -70,6 +72,15 @@ fn transport_from_byte(n: u8) -> Result<Transport> {
         1 => Ok(Transport::Udp),
         2 => Ok(Transport::Tcp),
         n => Err(format!("unknown transport byte {n}").into()),
+    }
+}
+
+/// A peer slot's capability: exactly one defined provides bit. Zero, several,
+/// or an undefined bit names no slot, so the decoder refuses it.
+fn want_from_byte(n: u8) -> Result<u8> {
+    match n {
+        PROVIDES_EXIT | PROVIDES_SEGMENT => Ok(n),
+        n => Err(format!("unknown peer capability byte {n}").into()),
     }
 }
 
@@ -290,6 +301,28 @@ pub enum ClientMsg {
         proto: Proto,
         port: u16,
     },
+    /// Add a peer slot. A `peer_id` names the peer whose capability the slot
+    /// consumes; empty, the slot provides that capability, and peer ids are
+    /// never empty so the sentinel is free. The remaining fields mirror the
+    /// config records: `dev`, `exit`, and `exit_strict` are the consumer's
+    /// `[tun]` keys, with an empty `dev` meaning the default device name, and
+    /// `iface` is `[peer] exit_iface` for an exit provider and `[peer]
+    /// segment` for a segment provider.
+    AttachPeer {
+        peer_id: String,
+        want: u8,
+        dev: String,
+        exit: bool,
+        exit_strict: bool,
+        iface: String,
+    },
+    /// Remove the peer slot `peer_id` and `want` name: a consumer by the peer
+    /// and capability it asks for, or, with an empty `peer_id`, the provider
+    /// of that capability.
+    DetachPeer {
+        peer_id: String,
+        want: u8,
+    },
 }
 
 impl ClientMsg {
@@ -423,6 +456,31 @@ impl ClientMsg {
                 b.push(13);
                 b.push(proto_byte(*proto));
                 b.extend_from_slice(&port.to_be_bytes());
+                b
+            }
+            ClientMsg::AttachPeer {
+                peer_id,
+                want,
+                dev,
+                exit,
+                exit_strict,
+                iface,
+            } => {
+                let mut b = Vec::new();
+                b.push(14);
+                put_str(&mut b, peer_id);
+                b.push(*want);
+                put_str(&mut b, dev);
+                b.push(u8::from(*exit));
+                b.push(u8::from(*exit_strict));
+                put_str(&mut b, iface);
+                b
+            }
+            ClientMsg::DetachPeer { peer_id, want } => {
+                let mut b = Vec::new();
+                b.push(15);
+                put_str(&mut b, peer_id);
+                b.push(*want);
                 b
             }
         }
@@ -669,6 +727,55 @@ impl ClientMsg {
                 proto: proto_from_byte(b[1])?,
                 port: u16::from_be_bytes([b[2], b[3]]),
             }),
+            Some(14) => {
+                let mut at = 1;
+                let peer_id = take_str(b, &mut at)?;
+                if at >= b.len() {
+                    return Err("truncated attach peer".into());
+                }
+                let want = want_from_byte(b[at])?;
+                at += 1;
+                let dev = take_str(b, &mut at)?;
+                if at + 2 > b.len() {
+                    return Err("truncated attach peer options".into());
+                }
+                let exit = match b[at] {
+                    0 => false,
+                    1 => true,
+                    n => return Err(format!("unknown peer exit byte {n}").into()),
+                };
+                let exit_strict = match b[at + 1] {
+                    0 => false,
+                    1 => true,
+                    n => return Err(format!("unknown peer exit_strict byte {n}").into()),
+                };
+                at += 2;
+                let iface = take_str(b, &mut at)?;
+                if at != b.len() {
+                    return Err("trailing bytes in attach peer".into());
+                }
+                Ok(ClientMsg::AttachPeer {
+                    peer_id,
+                    want,
+                    dev,
+                    exit,
+                    exit_strict,
+                    iface,
+                })
+            }
+            Some(15) => {
+                let mut at = 1;
+                let peer_id = take_str(b, &mut at)?;
+                if at >= b.len() {
+                    return Err("truncated detach peer".into());
+                }
+                let want = want_from_byte(b[at])?;
+                at += 1;
+                if at != b.len() {
+                    return Err("trailing bytes in detach peer".into());
+                }
+                Ok(ClientMsg::DetachPeer { peer_id, want })
+            }
             _ => Err(format!("malformed client message ({} bytes)", b.len()).into()),
         }
     }
@@ -1068,7 +1175,131 @@ mod tests {
         // Unknown tags and the empty frame.
         assert!(ClientMsg::decode(&[]).is_err());
         assert!(ClientMsg::decode(&[0]).is_err());
-        assert!(ClientMsg::decode(&[14]).is_err());
+        assert!(ClientMsg::decode(&[16]).is_err());
+    }
+
+    #[test]
+    fn peer_slot_mutation_roundtrips() {
+        // An exit consumer with every field set, one taking the default
+        // device, an exit provider naming its egress, and a segment provider
+        // naming its bridge.
+        let cases = [
+            ("office-b1c2", PROVIDES_EXIT, "zn1", true, true, ""),
+            ("office-b1c2", PROVIDES_EXIT, "", false, false, ""),
+            ("", PROVIDES_EXIT, "", false, false, "wan0"),
+            ("", PROVIDES_EXIT, "", false, false, ""),
+            ("", PROVIDES_SEGMENT, "", false, false, "br0"),
+        ];
+        for (peer_id, want, dev, exit, exit_strict, iface) in cases {
+            let m = ClientMsg::AttachPeer {
+                peer_id: peer_id.into(),
+                want,
+                dev: dev.into(),
+                exit,
+                exit_strict,
+                iface: iface.into(),
+            };
+            match roundtrip(&m) {
+                ClientMsg::AttachPeer {
+                    peer_id: p,
+                    want: w,
+                    dev: d,
+                    exit: e,
+                    exit_strict: s,
+                    iface: i,
+                } => {
+                    assert_eq!(p, peer_id);
+                    assert_eq!(w, want);
+                    assert_eq!(d, dev);
+                    assert_eq!(e, exit);
+                    assert_eq!(s, exit_strict);
+                    assert_eq!(i, iface);
+                }
+                other => panic!("expected attach peer, got {other:?}"),
+            }
+        }
+
+        for (peer_id, want) in [
+            ("office-b1c2", PROVIDES_EXIT),
+            ("", PROVIDES_EXIT),
+            ("", PROVIDES_SEGMENT),
+        ] {
+            let m = ClientMsg::DetachPeer {
+                peer_id: peer_id.into(),
+                want,
+            };
+            match roundtrip(&m) {
+                ClientMsg::DetachPeer {
+                    peer_id: p,
+                    want: w,
+                } => {
+                    assert_eq!(p, peer_id);
+                    assert_eq!(w, want);
+                }
+                other => panic!("expected detach peer, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn peer_slot_mutations_reject_malformed() {
+        // Byte offsets with one-char strings: 0 tag, 1-3 peer_id ("p"),
+        // 4 want, 5-7 dev ("d"), 8 exit, 9 exit_strict, 10-12 iface ("i").
+        let attach = ClientMsg::AttachPeer {
+            peer_id: "p".into(),
+            want: PROVIDES_EXIT,
+            dev: "d".into(),
+            exit: true,
+            exit_strict: false,
+            iface: "i".into(),
+        }
+        .encode();
+        assert_eq!(attach.len(), 13);
+        for cut in 1..attach.len() {
+            assert!(
+                ClientMsg::decode(&attach[..cut]).is_err(),
+                "cut {cut} should error"
+            );
+        }
+        let mut junk = attach.clone();
+        junk.push(0x00);
+        assert!(ClientMsg::decode(&junk).is_err());
+        // A capability that is not exactly one defined bit names no slot, and
+        // the flags take 0 or 1 only.
+        for (at, bad) in [
+            (4, 0u8),
+            (4, PROVIDES_EXIT | PROVIDES_SEGMENT),
+            (4, 4),
+            (8, 2),
+            (9, 2),
+        ] {
+            let mut corrupt = attach.clone();
+            corrupt[at] = bad;
+            assert!(
+                ClientMsg::decode(&corrupt).is_err(),
+                "byte {at} = {bad} should error"
+            );
+        }
+
+        // Detach: truncation, trailing junk, and the same capability rule.
+        let detach = ClientMsg::DetachPeer {
+            peer_id: "p".into(),
+            want: PROVIDES_SEGMENT,
+        }
+        .encode();
+        assert_eq!(detach.len(), 5);
+        for cut in 1..detach.len() {
+            assert!(
+                ClientMsg::decode(&detach[..cut]).is_err(),
+                "cut {cut} should error"
+            );
+        }
+        let mut junk = detach.clone();
+        junk.push(0x00);
+        assert!(ClientMsg::decode(&junk).is_err());
+        let mut corrupt = detach.clone();
+        *corrupt.last_mut().unwrap() = 0;
+        assert!(ClientMsg::decode(&corrupt).is_err());
     }
 
     #[test]

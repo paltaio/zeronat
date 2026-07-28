@@ -1,18 +1,11 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
+use zeronat::client::{DEFAULT_TAP_MTU, DEFAULT_TUN_NAME};
 use zeronat::clientcfg::{CfgForward, CfgPppoe, CfgServer, ClientConfig};
 use zeronat::proto::{Proto, Source};
 use zeronat::tap::TapConfig;
 use zeronat::{admin, client, client_admin, server, Result};
 
-const DEFAULT_TAP_MTU: usize = 1400;
-const DEFAULT_TUN_NAME: &str = "zn0";
-/// Tun an exit provider brings up for the pair it serves. Distinct from the
-/// `[tun]` and `[tap]` defaults, since a node can run one of those on the
-/// server slot while providing exit on a peer slot.
-const DEFAULT_PEER_EXIT_NAME: &str = "znx0";
-/// TAP a segment provider opens on the bridge it serves consumers from.
-const DEFAULT_PEER_SEGMENT_NAME: &str = "zns0";
 const TUN_PREFIX_LEN: u8 = 24;
 
 /// The tunnel `/24` for `secret`: `(network base, server .1, client .2)`.
@@ -111,6 +104,15 @@ client admin options:
   disconnect          Tear the session down; nothing dials until connect
   spawn-pppoe <NAME>  Bring up the named PPPoE session
   stop-pppoe <NAME>   Stop the named PPPoE session and return to the base mode
+  attach-peer <PEER-ID> [--dev <NAME>] [--exit] [--exit-strict]
+                      Exit through the named peer; --exit routes this host's
+                      IPv4 traffic through the pair
+  attach-provider exit|segment [<NAME>]
+                      Serve a capability to peers; NAME is the masquerade
+                      interface for exit (default: the default-route one) and
+                      the bridge for segment, which is required
+  detach-peer <PEER-ID>     Remove the consumer slot exiting through that peer
+  detach-provider exit|segment  Stop providing a capability; its pairs go down
   --socket <PATH>     Admin socket path (default: /run/zeronat/client.sock,
                       else $XDG_RUNTIME_DIR/zeronat/client.sock)
 
@@ -208,6 +210,18 @@ enum ClientAdminCmd {
     Disconnect,
     SpawnPppoe(String),
     StopPppoe(String),
+    AttachPeer {
+        peer: String,
+        dev: Option<String>,
+        exit: bool,
+        exit_strict: bool,
+    },
+    AttachProvider {
+        capability: String,
+        iface: Option<String>,
+    },
+    DetachPeer(String),
+    DetachProvider(String),
 }
 
 /// Whether `admin` with no command should open the interactive console: only
@@ -347,67 +361,6 @@ fn declares_shape(cfg: &ClientConfig) -> bool {
         || cfg.peer.is_some()
 }
 
-/// The peer slots a config declares: one consumer for a `[tun]` naming a peer,
-/// and one provider per bit the `[peer]` table sets.
-fn peer_slots(cfg: &ClientConfig) -> Result<Vec<client::PeerSlotSpec>> {
-    let mut slots = Vec::new();
-    if let Some(tun) = &cfg.tun {
-        if let Some(peer_id) = &tun.exit_via {
-            slots.push(client::PeerSlotSpec::Consumer {
-                peer_id: peer_id.clone(),
-                want: zeronat::proto::PROVIDES_EXIT,
-                adapter: Some(client::ConsumerAdapter::Exit(client::ExitVia {
-                    device: tun
-                        .dev
-                        .clone()
-                        .unwrap_or_else(|| DEFAULT_TUN_NAME.to_string()),
-                    mtu: DEFAULT_TAP_MTU,
-                    exit: tun.exit,
-                    exit_strict: tun.exit_strict,
-                })),
-            });
-        }
-    }
-    if let Some(peer) = &cfg.peer {
-        if peer.exit {
-            // Masquerading onto the tun the pair rides would send the
-            // consumer's traffic back into the tunnel carrying it.
-            if peer.exit_iface.as_deref() == Some(DEFAULT_PEER_EXIT_NAME) {
-                return Err(format!(
-                    "[peer] exit_iface cannot be the exit provider's own tun {DEFAULT_PEER_EXIT_NAME}"
-                )
-                .into());
-            }
-            slots.push(client::PeerSlotSpec::Provider {
-                provides: zeronat::proto::PROVIDES_EXIT,
-                adapter: Some(client::ProviderAdapter::Exit(client::PeerExit {
-                    device: DEFAULT_PEER_EXIT_NAME.to_string(),
-                    mtu: DEFAULT_TAP_MTU,
-                    iface: peer.exit_iface.clone(),
-                })),
-            });
-        }
-        if let Some(bridge) = &peer.segment {
-            // The tap joins the named bridge, and a device cannot join itself.
-            if bridge == DEFAULT_PEER_SEGMENT_NAME {
-                return Err(format!(
-                    "[peer] segment cannot be the segment provider's own tap {DEFAULT_PEER_SEGMENT_NAME}"
-                )
-                .into());
-            }
-            slots.push(client::PeerSlotSpec::Provider {
-                provides: zeronat::proto::PROVIDES_SEGMENT,
-                adapter: Some(client::ProviderAdapter::Segment(client::PeerSegment {
-                    device: DEFAULT_PEER_SEGMENT_NAME.to_string(),
-                    mtu: DEFAULT_TAP_MTU,
-                    bridge: bridge.clone(),
-                })),
-            });
-        }
-    }
-    Ok(slots)
-}
-
 /// The `[[servers]]` entry to dial at boot: `[client].active` when set (its
 /// target is guaranteed by `validate`), else the first entry.
 fn active_server(cfg: &ClientConfig) -> Result<&CfgServer> {
@@ -533,6 +486,9 @@ fn parse_args() -> Result<Cmd> {
         let mut pos: Vec<String> = Vec::new();
         let mut socket: Option<std::path::PathBuf> = None;
         let mut transport: Option<String> = None;
+        let mut dev: Option<String> = None;
+        let mut exit = false;
+        let mut exit_strict = false;
 
         while let Some(flag) = iter.next() {
             match flag.as_str() {
@@ -546,6 +502,11 @@ fn parse_args() -> Result<Cmd> {
                 "--transport" => {
                     transport = Some(iter.next().ok_or("--transport requires a value")?);
                 }
+                "--dev" => {
+                    dev = Some(iter.next().ok_or("--dev requires a value")?);
+                }
+                "--exit" => exit = true,
+                "--exit-strict" => exit_strict = true,
                 other if other.starts_with('-') => {
                     eprintln!("error: unknown flag '{other}'");
                     std::process::exit(1);
@@ -561,6 +522,9 @@ fn parse_args() -> Result<Cmd> {
         }
         if transport.is_some() && command.as_deref() != Some("add-server") {
             return Err("--transport only applies to add-server".into());
+        }
+        if (dev.is_some() || exit || exit_strict) && command.as_deref() != Some("attach-peer") {
+            return Err("--dev, --exit, and --exit-strict only apply to attach-peer".into());
         }
 
         let mut pos = pos.into_iter();
@@ -611,6 +575,25 @@ fn parse_args() -> Result<Cmd> {
                 Some(ClientAdminCmd::SpawnPppoe(named(&mut pos, "spawn-pppoe")?))
             }
             Some("stop-pppoe") => Some(ClientAdminCmd::StopPppoe(named(&mut pos, "stop-pppoe")?)),
+            Some("attach-peer") => Some(ClientAdminCmd::AttachPeer {
+                peer: named(&mut pos, "attach-peer")?,
+                dev,
+                exit,
+                exit_strict,
+            }),
+            Some("attach-provider") => Some(ClientAdminCmd::AttachProvider {
+                capability: pos
+                    .next()
+                    .ok_or("attach-provider requires exit or segment")?,
+                iface: pos.next(),
+            }),
+            Some("detach-peer") => {
+                Some(ClientAdminCmd::DetachPeer(named(&mut pos, "detach-peer")?))
+            }
+            Some("detach-provider") => Some(ClientAdminCmd::DetachProvider(
+                pos.next()
+                    .ok_or("detach-provider requires exit or segment")?,
+            )),
             Some(other) => return Err(format!("unknown client admin command '{other}'").into()),
         };
         if let Some(extra) = pos.next() {
@@ -1428,7 +1411,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                     mtu: DEFAULT_TAP_MTU,
                     bridge: None,
                 });
-                let peers = peer_slots(&file)?;
+                let peers = client::peer_slots(file.tun.as_ref(), file.peer.as_ref())?;
                 // An unpinned [tun] address is derived from the active
                 // server's secret at each bringup, so a server switch moves
                 // the device onto the new server's subnet. A [tun] naming a
@@ -1703,6 +1686,21 @@ async fn run(cmd: Cmd) -> Result<()> {
                 Some(ClientAdminCmd::StopPppoe(name)) => {
                     client_admin::stop_pppoe(socket, name).await
                 }
+                Some(ClientAdminCmd::AttachPeer {
+                    peer,
+                    dev,
+                    exit,
+                    exit_strict,
+                }) => client_admin::attach_peer(socket, peer, dev, exit, exit_strict).await,
+                Some(ClientAdminCmd::AttachProvider { capability, iface }) => {
+                    client_admin::attach_provider(socket, &capability, iface).await
+                }
+                Some(ClientAdminCmd::DetachPeer(peer)) => {
+                    client_admin::detach_peer(socket, peer).await
+                }
+                Some(ClientAdminCmd::DetachProvider(capability)) => {
+                    client_admin::detach_provider(socket, &capability).await
+                }
             }
         }
         Cmd::Admin {
@@ -1852,55 +1850,6 @@ mod tests {
             secret: zeronat::clientproto::ServerSecret("s".into()),
             transport: zeronat::client::Transport::Auto,
         }
-    }
-
-    // An exit provider takes its own tun name and masquerades out a separate
-    // interface. Naming that tun as the egress would put the consumer's
-    // traffic back into the tunnel carrying it, so the set is refused before
-    // anything opens.
-    #[test]
-    fn an_exit_provider_refuses_its_own_tun_as_the_egress() {
-        let peer = |iface: Option<&str>| ClientConfig {
-            peer: Some(zeronat::clientcfg::CfgPeer {
-                exit: true,
-                exit_iface: iface.map(Into::into),
-                segment: None,
-            }),
-            ..ClientConfig::default()
-        };
-        let Err(err) = peer_slots(&peer(Some(DEFAULT_PEER_EXIT_NAME))) else {
-            panic!("the provider's own tun must be refused as its egress");
-        };
-        assert!(err.to_string().contains(DEFAULT_PEER_EXIT_NAME), "{err}");
-
-        for iface in [None, Some("wan0")] {
-            let slots = peer_slots(&peer(iface)).unwrap();
-            assert_eq!(slots.len(), 1);
-            assert_eq!(slots[0].devices(), [DEFAULT_PEER_EXIT_NAME]);
-        }
-    }
-
-    // A segment provider opens its own tap and joins it to the named bridge,
-    // claiming both. The tap cannot be the bridge it joins.
-    #[test]
-    fn a_segment_provider_claims_its_tap_and_the_bridge_it_joins() {
-        let peer = |segment: &str| ClientConfig {
-            peer: Some(zeronat::clientcfg::CfgPeer {
-                exit: false,
-                exit_iface: None,
-                segment: Some(segment.into()),
-            }),
-            ..ClientConfig::default()
-        };
-        let slots = peer_slots(&peer("br0")).unwrap();
-        assert_eq!(slots.len(), 1);
-        assert_eq!(slots[0].devices(), [DEFAULT_PEER_SEGMENT_NAME, "br0"]);
-        assert!(!slots[0].default_route());
-
-        let Err(err) = peer_slots(&peer(DEFAULT_PEER_SEGMENT_NAME)) else {
-            panic!("the provider's own tap must be refused as its bridge");
-        };
-        assert!(err.to_string().contains(DEFAULT_PEER_SEGMENT_NAME), "{err}");
     }
 
     #[test]

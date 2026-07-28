@@ -421,11 +421,9 @@ impl PeerSlotSpec {
     pub fn label(&self) -> String {
         match self {
             PeerSlotSpec::Consumer { peer_id, want, .. } => {
-                format!("the {} consumer for {peer_id}", provides_name(*want))
+                format!("the {}", slot_label(peer_id, *want))
             }
-            PeerSlotSpec::Provider { provides, .. } => {
-                format!("the {} provider", provides_name(*provides))
-            }
+            PeerSlotSpec::Provider { provides, .. } => format!("the {}", slot_label("", *provides)),
         }
     }
 
@@ -463,12 +461,38 @@ impl PeerSlotSpec {
         }
     }
 
+    /// Whether an attach or detach naming `peer_id` and `want` names this
+    /// slot: a consumer by the peer and capability it asks for, a provider by
+    /// its capability alone, which the empty peer id stands for.
+    pub fn is_named_by(&self, peer_id: &str, want: u8) -> bool {
+        match self {
+            PeerSlotSpec::Consumer {
+                peer_id: peer,
+                want: bit,
+                ..
+            } => peer == peer_id && *bit == want,
+            PeerSlotSpec::Provider { provides, .. } => peer_id.is_empty() && *provides == want,
+        }
+    }
+
     /// The provider bits this slot announces.
     pub fn provides(&self) -> u8 {
         match self {
             PeerSlotSpec::Consumer { .. } => 0,
             PeerSlotSpec::Provider { provides, .. } => *provides,
         }
+    }
+}
+
+/// How a refusal names the slot a peer id and capability ask for: a consumer
+/// by the peer and capability it wants, a provider by its capability alone,
+/// which the empty peer id stands for.
+pub(crate) fn slot_label(peer_id: &str, want: u8) -> String {
+    let capability = provides_name(want);
+    if peer_id.is_empty() {
+        format!("{capability} provider")
+    } else {
+        format!("{capability} consumer for `{peer_id}`")
     }
 }
 

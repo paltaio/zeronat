@@ -2328,6 +2328,108 @@ async fn add_first_forward_promotes_an_idle_client() {
         .expect("idle promotion did not complete within 60s");
 }
 
+/// Attach and detach through the admin commands: a slot set edited at runtime
+/// reaches the reconnect loop, which dials for a peer slot an idle client
+/// would otherwise park instead of, and persists to a file that parses back to
+/// the same slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_admin_attaches_and_detaches_peer_slots() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+
+        // No forwards and no device: the client boots idle and parks, since
+        // nothing it runs needs a control session.
+        let dir = temp_config_dir("peerslot");
+        let path = dir.join("client.toml");
+        let sock = dir.join("client.sock");
+        let text = format!(
+            "[client]\nactive = \"home\"\n\
+             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
+        cfg.validate().unwrap();
+
+        let mut settings = client_settings(
+            vec![server_target("home", control, SECRET)],
+            vec![],
+            "psl",
+            Some(&sock),
+        );
+        settings.config = Some((path.clone(), cfg));
+        tokio::spawn(zeronat::client::run_switchable(
+            zeronat::client::ActiveTarget::new(server_target("home", control, SECRET)),
+            settings,
+        ));
+
+        let snap = wait_client_snapshot(&sock, |s| s.link == LinkStatus::Offline).await;
+        assert_eq!(snap.mode, SessionMode::Idle);
+
+        // Attaching a provider leaves the park: the body still has nothing to
+        // run, while the control session under it is what every pairing goes
+        // through.
+        zeronat::client_admin::attach_provider(Some(&sock), "exit", Some("wan0".into()))
+            .await
+            .expect("attach the exit provider");
+        let snap = wait_client_snapshot(&sock, |s| s.link == LinkStatus::Connected).await;
+        assert_eq!(snap.mode, SessionMode::Idle);
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert!(on_disk.peer.is_some(), "the file gained the [peer] table");
+
+        // A consumer names the peer it exits through, which the file records
+        // as the `[tun]` table feeding that slot.
+        zeronat::client_admin::attach_peer(Some(&sock), "office-b1c2".into(), None, false, false)
+            .await
+            .expect("attach the exit consumer");
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert!(on_disk.tun.is_some(), "the file gained the [tun] table");
+
+        // A second consumer is refused, and the refusal reaches the caller as
+        // an error naming the consumer this client already runs.
+        let err =
+            zeronat::client_admin::attach_peer(Some(&sock), "depot-77a1".into(), None, true, false)
+                .await
+                .expect_err("a second consumer must be refused");
+        assert!(
+            err.to_string()
+                .contains("already has the exit consumer for `office-b1c2`"),
+            "{err}"
+        );
+
+        // Detaching every slot takes the client back to the park, and the file
+        // back to the servers it started with.
+        zeronat::client_admin::detach_peer(Some(&sock), "office-b1c2".into())
+            .await
+            .expect("detach the consumer");
+        zeronat::client_admin::detach_provider(Some(&sock), "exit")
+            .await
+            .expect("detach the provider");
+        wait_client_snapshot(&sock, |s| s.link == LinkStatus::Offline).await;
+        let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
+        on_disk.validate().unwrap();
+        assert!(on_disk.tun.is_none());
+        assert!(on_disk.peer.is_none());
+        assert_eq!(on_disk.servers.len(), 1);
+
+        let err = zeronat::client_admin::detach_provider(Some(&sock), "exit")
+            .await
+            .expect_err("detaching a detached slot must be refused");
+        assert!(
+            err.to_string().contains("no attached exit provider"),
+            "{err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    timeout(Duration::from_secs(60), body)
+        .await
+        .expect("peer attach/detach did not complete within 60s");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_add_forward_lands_after_connect() {
     let body = async {
