@@ -72,40 +72,35 @@ fn fwd(port: u16, target: u16) -> zeronat::client::Forward {
     }
 }
 
-/// Claim a port for this test run. The probe socket closes before the caller
-/// binds the port, so the kernel can re-issue it to a concurrent test; deduping
-/// keeps two tests from ever being given the same port.
-fn claim_port(port: u16) -> bool {
-    use std::sync::{Mutex, OnceLock};
-    static TAKEN: OnceLock<Mutex<std::collections::HashSet<u16>>> = OnceLock::new();
-    TAKEN
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .insert(port)
-}
-
-fn free_tcp_port() -> u16 {
+/// Claim a port for the code under test to bind. A claimed number is probed on
+/// TCP and UDP: the control port carries both, and one protocol being free says
+/// nothing about the other.
+///
+/// `20000..32768` sits below the Linux default `ip_local_port_range`, so on this
+/// platform the kernel does not draw ephemeral source ports from it. Fixed-port
+/// daemons do sit in that window, and a host can be configured with a lower
+/// range; the probes cover both cases.
+///
+/// The guarantees are per process: a number goes out at most once, and both
+/// binds succeeded moments before it was returned. Another process can still
+/// take a claimed port before the caller binds it, so the walk starts at a
+/// pid-derived offset to keep concurrent test runs off each other's numbers.
+fn free_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    const LO: u16 = 20000;
+    const HI: u16 = 32768;
+    const SPAN: u16 = HI - LO;
+    // Coprime with SPAN, so neighbouring pids start far apart.
+    const STRIDE: u64 = 1013;
+    static TAKEN: AtomicU16 = AtomicU16::new(0);
+    let start = (u64::from(std::process::id()) * STRIDE % u64::from(SPAN)) as u16;
     loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if claim_port(port) {
-            return port;
-        }
-    }
-}
-
-fn free_udp_port() -> u16 {
-    loop {
-        let port = std::net::UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if claim_port(port) {
+        let taken = TAKEN.fetch_add(1, Ordering::Relaxed);
+        assert!(taken < SPAN, "test ports exhausted: {LO}..{HI}");
+        let port = LO + (start + taken) % SPAN;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+            && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+        {
             return port;
         }
     }
@@ -234,11 +229,11 @@ struct Tunnel {
 /// Start a server and client mapping one public TCP and one public UDP port to
 /// local echo services. Returns the ports so a test can drive traffic.
 fn start_tunnel(transport: zeronat::client::Transport) -> Tunnel {
-    let control = free_tcp_port();
-    let public_tcp = free_tcp_port();
-    let public_udp = free_udp_port();
-    let local_tcp = free_tcp_port();
-    let local_udp = free_udp_port();
+    let control = free_port();
+    let public_tcp = free_port();
+    let public_udp = free_port();
+    let local_tcp = free_port();
+    let local_udp = free_port();
 
     // Local services behind the client.
     tokio::spawn(tcp_echo(local_tcp));
@@ -479,9 +474,9 @@ async fn tunnel_over_udp_transport() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn udp_control_answers_on_the_dialed_address() {
-    let control = free_tcp_port();
-    let public_tcp = free_tcp_port();
-    let local_tcp = free_tcp_port();
+    let control = free_port();
+    let public_tcp = free_port();
+    let local_tcp = free_port();
     tokio::spawn(tcp_echo(local_tcp));
 
     // Only the control port takes the wildcard bind; the public listener stays
@@ -516,9 +511,9 @@ async fn udp_control_answers_on_the_dialed_address() {
 /// reply's source is pinned; UDP has no second path to fall back to.
 #[cfg(target_os = "linux")]
 async fn run_udp_forward_source_test(transport: zeronat::client::Transport) {
-    let control = free_tcp_port();
-    let public_udp = free_udp_port();
-    let local_udp = free_udp_port();
+    let control = free_port();
+    let public_udp = free_port();
+    let local_udp = free_port();
     tokio::spawn(udp_echo(local_udp));
 
     let mut settings = cli_settings(control, vec![], vec![public_udp]);
@@ -611,10 +606,10 @@ async fn admin_snapshot_over_tcp() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_client_route_switch() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let target1 = free_tcp_port();
-        let target2 = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let target1 = free_port();
+        let target2 = free_port();
         tokio::spawn(tcp_tagged(target1, b"ONE"));
         tokio::spawn(tcp_tagged(target2, b"TWO"));
         let (id1, id2) = start_tagged_pair(control, Proto::Tcp, public_tcp, target1, target2).await;
@@ -656,10 +651,10 @@ async fn multi_client_route_switch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_switch_cuts_established_tcp() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let target1 = free_tcp_port();
-        let target2 = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let target1 = free_port();
+        let target2 = free_port();
         tokio::spawn(tcp_tagged(target1, b"ONE"));
         tokio::spawn(tcp_tagged(target2, b"TWO"));
         let (id1, id2) = start_tagged_pair(control, Proto::Tcp, public_tcp, target1, target2).await;
@@ -704,10 +699,10 @@ async fn route_switch_cuts_established_tcp() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_clear_cuts_established_tcp() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let target1 = free_tcp_port();
-        let target2 = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let target1 = free_port();
+        let target2 = free_port();
         tokio::spawn(tcp_tagged(target1, b"ONE"));
         tokio::spawn(tcp_tagged(target2, b"TWO"));
         let (id1, _id2) =
@@ -751,10 +746,10 @@ async fn route_clear_cuts_established_tcp() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_switch_cuts_established_udp() {
     let body = async {
-        let control = free_tcp_port();
-        let public_udp = free_udp_port();
-        let target1 = free_udp_port();
-        let target2 = free_udp_port();
+        let control = free_port();
+        let public_udp = free_port();
+        let target1 = free_port();
+        let target2 = free_port();
         tokio::spawn(udp_tagged(target1, b"ONE"));
         tokio::spawn(udp_tagged(target2, b"TWO"));
         let (id1, id2) = start_tagged_pair(control, Proto::Udp, public_udp, target1, target2).await;
@@ -832,7 +827,7 @@ async fn listener_add_remove() {
         assert!(!ok, "duplicate AddListener should fail");
 
         // Removing a listener that does not exist must be rejected.
-        let free = free_tcp_port();
+        let free = free_port();
         let (ok, _) = admin_mutate(
             tunnel.control,
             Msg::RemoveListener {
@@ -970,9 +965,9 @@ async fn udp_source_teardown_on_remove() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconnect_same_id_supersede() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_tcp = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_tcp = free_port();
 
         tokio::spawn(tcp_echo(local_tcp));
 
@@ -1051,9 +1046,9 @@ fn temp_config_dir(tag: &str) -> PathBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_autosave_persists_route() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_tcp = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_tcp = free_port();
 
         tokio::spawn(tcp_echo(local_tcp));
 
@@ -1137,9 +1132,9 @@ async fn config_autosave_persists_route() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_listener_remove_refused() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_tcp = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_tcp = free_port();
 
         tokio::spawn(tcp_echo(local_tcp));
 
@@ -1195,9 +1190,9 @@ async fn cli_listener_remove_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_node_does_not_persist() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_tcp = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_tcp = free_port();
 
         tokio::spawn(tcp_echo(local_tcp));
 
@@ -1260,8 +1255,8 @@ async fn save_failure_reports_error() {
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
 
         // A config path whose parent is a regular file: every atomic save fails
         // because the temp file cannot be created under a non-directory.
@@ -1310,9 +1305,9 @@ async fn save_failure_reports_error() {
 /// header first, then payload, and the round-trip itself proves the relay still
 /// works after the header.
 async fn run_proxy_header_test(transport: zeronat::client::Transport) {
-    let control = free_tcp_port();
-    let public_tcp = free_tcp_port();
-    let local_tcp = free_tcp_port();
+    let control = free_port();
+    let public_tcp = free_port();
+    let local_tcp = free_port();
     tokio::spawn(tcp_echo(local_tcp));
     tokio::spawn(zeronat::server::run(cli_settings(
         control,
@@ -1461,9 +1456,9 @@ async fn proxy_forward_refuses_headerless_open() {
     use std::sync::Arc;
 
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_tcp = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_tcp = free_port();
         let local = TcpListener::bind(("127.0.0.1", local_tcp)).await.unwrap();
 
         // A hand-rolled server modeling an old release: it answers Ping with
@@ -1656,11 +1651,11 @@ fn test_pppoe_config() -> zeronat::client::PppoeRunConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_switch_moves_session() {
     let body = async {
-        let control_a = free_tcp_port();
-        let control_b = free_tcp_port();
-        let public_a = free_tcp_port();
-        let public_b = free_tcp_port();
-        let local_echo = free_tcp_port();
+        let control_a = free_port();
+        let control_b = free_port();
+        let public_a = free_port();
+        let public_b = free_port();
+        let local_echo = free_port();
         tokio::spawn(tcp_echo(local_echo));
 
         // Two independent servers with distinct secrets, each exposing its own
@@ -1711,9 +1706,9 @@ async fn server_switch_moves_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_client_future_aborts_session() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_tcp = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_tcp = free_port();
         tokio::spawn(tcp_echo(local_tcp));
         tokio::spawn(zeronat::server::run(cli_settings(
             control,
@@ -1749,9 +1744,9 @@ async fn dropping_client_future_aborts_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_admin_socket_serves_snapshot() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_tcp = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_tcp = free_port();
         tokio::spawn(tcp_echo(local_tcp));
         tokio::spawn(zeronat::server::run(cli_settings(
             control,
@@ -1826,11 +1821,11 @@ async fn client_admin_socket_serves_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_admin_show_renders_forward_options() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let public_udp = free_udp_port();
-        let local_tcp = free_tcp_port();
-        let local_udp = free_udp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let public_udp = free_port();
+        let local_tcp = free_port();
+        let local_udp = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(
             control,
             vec![public_tcp],
@@ -1902,11 +1897,11 @@ async fn client_admin_show_renders_forward_options() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn select_server_moves_session_and_persists() {
     let body = async {
-        let control_a = free_tcp_port();
-        let control_b = free_tcp_port();
-        let public_a = free_tcp_port();
-        let public_b = free_tcp_port();
-        let local_echo = free_tcp_port();
+        let control_a = free_port();
+        let control_b = free_port();
+        let public_a = free_port();
+        let public_b = free_port();
+        let local_echo = free_port();
         tokio::spawn(tcp_echo(local_echo));
         tokio::spawn(zeronat::server::run(cli_settings(
             control_a,
@@ -2005,11 +2000,11 @@ async fn select_server_moves_session_and_persists() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_forward_options_redials_and_persists() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let public_udp = free_udp_port();
-        let local_tcp = free_tcp_port();
-        let local_udp = free_udp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let public_udp = free_port();
+        let local_tcp = free_port();
+        let local_udp = free_port();
         tokio::spawn(tcp_echo(local_tcp));
         tokio::spawn(udp_echo(local_udp));
         tokio::spawn(zeronat::server::run(cli_settings(
@@ -2194,12 +2189,12 @@ async fn set_forward_options_redials_and_persists() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn add_and_remove_forward_move_live_traffic() {
     let body = async {
-        let control = free_tcp_port();
-        let public_a = free_tcp_port();
-        let public_b = free_tcp_port();
-        let public_udp = free_udp_port();
-        let local_echo = free_tcp_port();
-        let local_udp = free_udp_port();
+        let control = free_port();
+        let public_a = free_port();
+        let public_b = free_port();
+        let public_udp = free_port();
+        let local_echo = free_port();
+        let local_udp = free_port();
         tokio::spawn(tcp_echo(local_echo));
         tokio::spawn(udp_echo(local_udp));
         // Both tcp listeners exist up front; only public_a has a forward at
@@ -2365,9 +2360,9 @@ async fn add_and_remove_forward_move_live_traffic() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn add_first_forward_promotes_an_idle_client() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_echo = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_echo = free_port();
         tokio::spawn(tcp_echo(local_echo));
         tokio::spawn(zeronat::server::run(cli_settings(
             control,
@@ -2441,7 +2436,7 @@ async fn add_first_forward_promotes_an_idle_client() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_admin_attaches_and_detaches_peer_slots() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
 
         // No forwards and no device: the client boots idle and parks, since
@@ -2539,9 +2534,9 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_add_forward_lands_after_connect() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_echo = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_echo = free_port();
         tokio::spawn(tcp_echo(local_echo));
         tokio::spawn(zeronat::server::run(cli_settings(
             control,
@@ -2621,9 +2616,9 @@ async fn offline_add_forward_lands_after_connect() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnect_parks_offline_and_connect_restores() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_tcp = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_tcp = free_port();
         tokio::spawn(tcp_echo(local_tcp));
         tokio::spawn(zeronat::server::run(cli_settings(
             control,
@@ -2704,11 +2699,11 @@ async fn disconnect_parks_offline_and_connect_restores() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_named_retargets_and_persists() {
     let body = async {
-        let control_a = free_tcp_port();
-        let control_b = free_tcp_port();
-        let public_a = free_tcp_port();
-        let public_b = free_tcp_port();
-        let local_echo = free_tcp_port();
+        let control_a = free_port();
+        let control_b = free_port();
+        let public_a = free_port();
+        let public_b = free_port();
+        let local_echo = free_port();
         tokio::spawn(tcp_echo(local_echo));
         tokio::spawn(zeronat::server::run(cli_settings(
             control_a,
@@ -2821,11 +2816,11 @@ async fn connect_named_retargets_and_persists() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn add_server_then_select_moves_traffic() {
     let body = async {
-        let control_a = free_tcp_port();
-        let control_b = free_tcp_port();
-        let public_a = free_tcp_port();
-        let public_b = free_tcp_port();
-        let local_echo = free_tcp_port();
+        let control_a = free_port();
+        let control_b = free_port();
+        let public_a = free_port();
+        let public_b = free_port();
+        let local_echo = free_port();
         tokio::spawn(tcp_echo(local_echo));
         tokio::spawn(zeronat::server::run(cli_settings(
             control_a,
@@ -2965,9 +2960,9 @@ async fn add_server_then_select_moves_traffic() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_and_stop_pppoe_swap_the_session_body() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_tcp = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_tcp = free_port();
         tokio::spawn(tcp_echo(local_tcp));
         tokio::spawn(zeronat::server::run(cli_settings(
             control,
@@ -3080,9 +3075,9 @@ async fn spawn_and_stop_pppoe_swap_the_session_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_pppoe_from_offline_brings_the_client_online() {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_tcp = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_tcp = free_port();
         tokio::spawn(tcp_echo(local_tcp));
         tokio::spawn(zeronat::server::run(cli_settings(
             control,
@@ -3158,7 +3153,7 @@ async fn spawn_pppoe_from_offline_brings_the_client_online() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn autostart_pppoe_boots_and_stops_to_idle() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
 
         let dir = temp_config_dir("autostart");
@@ -3391,7 +3386,7 @@ async fn peer_connect(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_rendezvous_pairs_and_invalidates() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
 
         let (_pr, _pw) = peer_control_connect(control, "prov", PROVIDES_EXIT).await;
@@ -3563,7 +3558,7 @@ async fn recv_peer_info(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_probe_discovers_candidates_both_ways() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
 
         let (mut pr, _pw, _pp) = peer_control_connect_udp(control, "prov", PROVIDES_EXIT).await;
@@ -3614,7 +3609,7 @@ async fn peer_probe_discovers_candidates_both_ways() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_probe_socket_queues_peer_datagrams() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
 
         let (mut pr, _pw, _pp) = peer_control_connect_udp(control, "prov", PROVIDES_EXIT).await;
@@ -3658,7 +3653,7 @@ async fn peer_probe_socket_queues_peer_datagrams() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_probe_deadline_marks_silent_party_relay_only() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
 
         let (mut pr, _pw, _pp) = peer_control_connect_udp(control, "prov", PROVIDES_EXIT).await;
@@ -3695,7 +3690,7 @@ async fn peer_probe_deadline_marks_silent_party_relay_only() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_probe_attributes_a_pair_on_the_tcp_transport() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
 
         let (mut pr, _pw) = peer_control_connect(control, "prov", PROVIDES_EXIT).await;
@@ -3912,7 +3907,7 @@ async fn punched_links(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_punch_establishes_direct_session() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
         let parties = punch_parties(control).await;
@@ -3945,7 +3940,7 @@ async fn peer_punch_establishes_direct_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_punch_deadline_reports_relay() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
         let mut parties = punch_parties(control).await;
@@ -4163,7 +4158,7 @@ async fn punch_forwarder(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_punch_binds_one_path_across_two_candidates() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
         let parties = punch_parties(control).await;
@@ -4211,7 +4206,7 @@ async fn peer_punch_binds_one_path_across_two_candidates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_punch_responder_needs_inbound_evidence() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
         let parties = punch_parties(control).await;
@@ -4267,7 +4262,7 @@ async fn peer_punch_responder_needs_inbound_evidence() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_punch_survives_a_lost_nomination() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
         let parties = punch_parties(control).await;
@@ -4435,7 +4430,7 @@ async fn recv_stream_leg(r: &mut zeronat::noise::NoiseReader) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_relay_splices_two_stream_legs() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let pair = relay_pair(control).await;
 
@@ -4459,7 +4454,7 @@ async fn peer_relay_splices_two_stream_legs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_relay_splices_a_stream_leg_to_a_dgram_leg() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let pair = relay_pair(control).await;
 
@@ -4495,7 +4490,7 @@ async fn peer_relay_splices_a_stream_leg_to_a_dgram_leg() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_relay_leg_death_closes_both_legs() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let pair = relay_pair(control).await;
 
@@ -4527,7 +4522,7 @@ async fn peer_relay_leg_death_closes_both_legs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_relay_death_frees_an_exclusive_provider() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let mut pair = relay_pair(control).await;
 
@@ -4569,7 +4564,7 @@ async fn peer_relay_death_frees_an_exclusive_provider() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_relay_dies_with_the_replaced_pair() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let mut pair = relay_pair(control).await;
 
@@ -4605,7 +4600,7 @@ async fn peer_relay_dies_with_the_replaced_pair() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_unclaimed_relay_legs_free_an_exclusive_provider() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let mut pair = relay_pair(control).await;
 
@@ -4649,7 +4644,7 @@ async fn peer_unclaimed_relay_legs_free_an_exclusive_provider() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_relay_opens_while_the_peer_is_still_punching() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
         let mut parties = punch_parties(control).await;
@@ -4694,7 +4689,7 @@ async fn peer_relay_opens_while_the_peer_is_still_punching() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_relay_opens_once_for_both_reports() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let mut pair = relay_pair(control).await;
 
@@ -4772,7 +4767,7 @@ async fn assert_inner_session(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_inner_session_echoes_over_a_punched_path() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
         let parties = punch_parties(control).await;
@@ -4796,7 +4791,7 @@ async fn peer_inner_session_echoes_over_a_punched_path() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_inner_session_echoes_over_two_dgram_relay_legs() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let pair = relay_pair(control).await;
 
@@ -4821,7 +4816,7 @@ async fn peer_inner_session_echoes_over_two_dgram_relay_legs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_inner_session_echoes_over_a_stream_leg_and_a_dgram_leg() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let pair = relay_pair(control).await;
 
@@ -4846,7 +4841,7 @@ async fn peer_inner_session_echoes_over_a_stream_leg_and_a_dgram_leg() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_inner_handshake_survives_a_lossy_path() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let pair = relay_pair(control).await;
 
@@ -4877,7 +4872,7 @@ async fn peer_inner_handshake_survives_a_lossy_path() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_inner_handshake_carries_the_providers_answer() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
         let pair = relay_pair(control).await;
@@ -4915,7 +4910,7 @@ async fn peer_inner_handshake_carries_the_providers_answer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_inner_handshake_ignores_frames_ahead_of_it() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let pair = relay_pair(control).await;
 
@@ -5006,7 +5001,7 @@ async fn next_inner_frame(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_inner_frames_cross_the_relay_sealed() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
         let pair = relay_pair(control).await;
@@ -5049,7 +5044,7 @@ async fn peer_inner_frames_cross_the_relay_sealed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_inner_session_dies_on_missed_keepalives() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
         let pair = relay_pair(control).await;
@@ -5129,9 +5124,9 @@ async fn cross_peer_frame(
 /// `punched`.
 async fn run_two_slot_test(transport: zeronat::client::Transport, punched: bool) {
     let body = async {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let local_tcp = free_tcp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let local_tcp = free_port();
         tokio::spawn(tcp_echo(local_tcp));
 
         let consumer_id = zeronat::identity::derive_client_id(Some("consumer"));
@@ -5248,7 +5243,7 @@ async fn peer_slot_pairs_over_the_relay() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
 
@@ -5382,7 +5377,7 @@ async fn pair_answer(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_exit_provider_refuses_a_pair_it_cannot_serve() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
         let provider_id = zeronat::identity::derive_client_id(Some("provider"));
@@ -5437,7 +5432,7 @@ async fn peer_exit_provider_refuses_a_pair_it_cannot_serve() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_segment_provider_refuses_a_pair_it_cannot_serve() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let psk = zeronat::noise::derive_psk(SECRET);
         let provider_id = zeronat::identity::derive_client_id(Some("provider"));
@@ -5519,7 +5514,7 @@ async fn recv_pair_probe(r: &mut zeronat::noise::NoiseReader, peer: &str) -> (u6
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
     let body = async {
-        let control = free_tcp_port();
+        let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
 
         let psk = zeronat::noise::derive_psk(SECRET);

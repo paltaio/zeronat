@@ -251,20 +251,39 @@ mod pty {
 
     // ---- loopback fixture --------------------------------------------------
 
-    fn free_tcp_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
-    fn free_udp_port() -> u16 {
-        std::net::UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+    /// Claim a port for the code under test to bind. A claimed number is probed
+    /// on TCP and UDP: the control port carries both, and one protocol being
+    /// free says nothing about the other.
+    ///
+    /// `20000..32768` sits below the Linux default `ip_local_port_range`, so on
+    /// this platform the kernel does not draw ephemeral source ports from it.
+    /// Fixed-port daemons do sit in that window, and a host can be configured
+    /// with a lower range; the probes cover both cases.
+    ///
+    /// The guarantees are per process: a number goes out at most once, and
+    /// both binds succeeded moments before it was returned. Another process
+    /// can still take a claimed port before the caller binds it, so the walk
+    /// starts at a pid-derived offset to keep concurrent test runs off each
+    /// other's numbers.
+    fn free_port() -> u16 {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        const LO: u16 = 20000;
+        const HI: u16 = 32768;
+        const SPAN: u16 = HI - LO;
+        // Coprime with SPAN, so neighbouring pids start far apart.
+        const STRIDE: u64 = 1013;
+        static TAKEN: AtomicU16 = AtomicU16::new(0);
+        let start = (u64::from(std::process::id()) * STRIDE % u64::from(SPAN)) as u16;
+        loop {
+            let taken = TAKEN.fetch_add(1, Ordering::Relaxed);
+            assert!(taken < SPAN, "test ports exhausted: {LO}..{HI}");
+            let port = LO + (start + taken) % SPAN;
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+                && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+            {
+                return port;
+            }
+        }
     }
 
     /// Echoes back every chunk it receives, so the echoed stream is a
@@ -401,11 +420,11 @@ mod pty {
     }
 
     async fn scenario() {
-        let control = free_tcp_port();
-        let public_tcp = free_tcp_port();
-        let public_udp = free_udp_port();
-        let local_tcp = free_tcp_port();
-        let local_udp = free_udp_port();
+        let control = free_port();
+        let public_tcp = free_port();
+        let public_udp = free_port();
+        let local_tcp = free_port();
+        let local_udp = free_port();
         tokio::spawn(tcp_echo(local_tcp));
         let client_id = zeronat::identity::derive_client_id(Some("pty"));
         let provider_id = zeronat::identity::derive_client_id(Some("ptyexit"));
@@ -782,12 +801,7 @@ mod pty {
         // The f form adds a forward: proto stays on tcp, port typed, target
         // left blank so the daemon resolves the 127.0.0.1:PORT default. No
         // server listener exists for it, so the asserts are snapshot-driven.
-        let new_port = loop {
-            let p = free_tcp_port();
-            if p != public_tcp && p != public_udp {
-                break p;
-            }
-        };
+        let new_port = free_port();
         send(&mut master, b"f");
         wait_screen(&out, "the add-forward form", 10, |s| {
             row_containing(s, "add forward").is_some()
@@ -821,8 +835,9 @@ mod pty {
             .any(|f| f.port == new_port && f.target == format!("127.0.0.1:{new_port}")));
 
         // x on the new forward's row confirms and removes it. Rows are the
-        // two servers, then tcp forwards sorted by port, then the udp one.
-        let tcp_row = 2 + usize::from(new_port > public_tcp);
+        // two servers, then tcp forwards sorted by port, then the udp one;
+        // ports are claimed in ascending order, so the added one sorts last.
+        let tcp_row = 3;
         send(
             &mut master,
             &[b"\x1b[A".repeat(8), b"\x1b[B".repeat(tcp_row)].concat(),
