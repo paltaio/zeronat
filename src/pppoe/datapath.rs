@@ -147,11 +147,12 @@ pub enum DpPhase {
     Established(engine::Established),
     /// The link was Established and then died (echo timeout, inbound PADT, or the
     /// PPP FSM dropping below Opened). The shell tears down zppp0 and redials in
-    /// place. Distinct from `Dead`, which is a permanent discovery failure that
-    /// bounces the whole tunnel.
+    /// place. Distinct from `Dead`, where discovery never latched a session.
     LinkDown,
-    /// Discovery failed permanently (retries exhausted or PADT before the link
-    /// ever came up).
+    /// Discovery gave up before a session latched: the attempt budget ran out, or
+    /// a PADT arrived before the link came up. The datapath stays Dead and emits
+    /// nothing until the shell calls `reset`, so the shell owns how often a
+    /// failed dial is retried.
     Dead,
 }
 
@@ -175,7 +176,8 @@ pub struct PppoeDatapath<'a> {
     out: Vec<Vec<u8>>,
     /// Inbound IPv4 datagrams pending write to zppp0, FIFO.
     inbound_ip: Vec<Vec<u8>>,
-    /// True once discovery has permanently failed.
+    /// True once discovery gave up before any session latched. Cleared by
+    /// `reset`, which dials from scratch.
     dead: bool,
     /// Ticks since the last Echo-Request, counted only while Established.
     echo_ticks: u32,
@@ -302,8 +304,9 @@ impl<'a> PppoeDatapath<'a> {
     /// redial: same source MAC, Service-Name, and Host-Uniq selector, but a fresh
     /// discovery (new PADI -> new session id) and a fresh PPP session with a new
     /// Magic-Number. Called by the shell after it observes LinkDown and closes
-    /// zppp0. Re-emits the first PADI, so the caller drains `poll_transmit_frame`
-    /// right after.
+    /// zppp0, and to dial again after discovery gave up: the `Dead` latch clears
+    /// with the rest of the session state. Re-emits the first PADI, so the caller
+    /// drains `poll_transmit_frame` right after.
     ///
     /// No PADT is sent to the AC: the old session is already dead and a fresh PADI
     /// starts a new one the BRAS treats independently.
@@ -328,6 +331,7 @@ impl<'a> PppoeDatapath<'a> {
         self.established = None;
         self.out.clear();
         self.inbound_ip.clear();
+        self.dead = false;
         self.echo_ticks = 0;
         self.echo_misses = 0;
         self.echo_outstanding = false;
@@ -1205,6 +1209,39 @@ mod tests {
         let frames = drain_frames(&mut dp);
         let h = parse_session_frame(&frames[0]).expect("session frame");
         assert_eq!(h.session_id, 0x1234);
+        assert!(matches!(dp.phase(), DpPhase::Established(_)));
+    }
+
+    #[test]
+    fn reset_dials_again_after_discovery_gave_up() {
+        let mut dp = fixed_dp();
+        dp.start();
+        let _ = drain_frames(&mut dp);
+
+        // Nothing on the segment answers the PADI: the attempt budget runs out.
+        let mut ticks = 0;
+        while dp.phase() != DpPhase::Dead {
+            dp.on_tick();
+            let _ = drain_frames(&mut dp);
+            ticks += 1;
+            assert!(ticks < 100, "discovery never gave up");
+        }
+
+        // A datapath that gave up is silent: it neither retransmits on a tick nor
+        // answers an inbound frame, so the shell alone decides when to dial again.
+        for _ in 0..100 {
+            assert_eq!(dp.on_tick(), DpPhase::Dead);
+            assert_eq!(dp.on_l2_frame(PADO), DpPhase::Dead);
+            assert!(drain_frames(&mut dp).is_empty());
+        }
+
+        // reset dials from scratch and the session comes up when the AC answers.
+        dp.reset().expect("reset");
+        assert_eq!(dp.phase(), DpPhase::Discovery);
+        let frames = drain_frames(&mut dp);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][15], 0x09); // PADI
+        re_drive_to_established(&mut dp, 0x7788);
         assert!(matches!(dp.phase(), DpPhase::Established(_)));
     }
 
