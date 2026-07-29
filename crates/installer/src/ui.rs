@@ -665,10 +665,8 @@ impl App {
             Key::Down | Key::Char('j') if self.sel + 1 < n => {
                 self.sel += 1;
             }
-            Key::Enter => {
-                if self.apply_selection() {
-                    self.advance();
-                }
+            Key::Enter if self.apply_selection() => {
+                self.advance();
             }
             Key::Esc | Key::Left => self.back(),
             Key::Char('q') => self.quit = true,
