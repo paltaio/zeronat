@@ -101,7 +101,7 @@ pub fn spawn(
     }
     drop(out_tx);
 
-    let task = tokio::spawn(run(uplink, count, creds, out_rx, inbound_txs, est_txs));
+    let task = crate::spawn(run(uplink, count, creds, out_rx, inbound_txs, est_txs));
     (sessions, task)
 }
 
@@ -391,7 +391,7 @@ mod tests {
     fn peer_uplink(sessions: mpsc::Receiver<zeronat::client::PeerSlotSession>) -> Uplink {
         Uplink::Peer {
             sessions,
-            _client: crate::bridge::AbortOnDrop(tokio::spawn(std::future::pending::<()>())),
+            _client: crate::bridge::AbortOnDrop(crate::spawn(std::future::pending::<()>())),
         }
     }
 

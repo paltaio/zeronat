@@ -110,7 +110,7 @@ pub async fn connect(addr: SocketAddr, secret: &str, client_id: &str) -> Result<
     let pump = AbortOnDrop({
         let sess = sess.clone();
         let cancel = cancel.clone();
-        tokio::spawn(async move {
+        crate::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
                 match socket.recv(&mut buf).await {

@@ -74,7 +74,7 @@ pub fn spawn(
 ) -> Handle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<Connect>(CHAN_DEPTH);
     let wake = Arc::new(Notify::new());
-    tokio::spawn(run(
+    crate::spawn(run(
         session,
         mtu,
         rx_buf,

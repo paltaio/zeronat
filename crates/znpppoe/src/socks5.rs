@@ -35,7 +35,7 @@ pub async fn serve(
         };
         let selector = selector.clone();
         let handles = handles.clone();
-        tokio::spawn(async move {
+        crate::spawn(async move {
             let _permit = permit;
             if let Err(e) = handle(sock, &selector, &handles).await {
                 eprintln!("znpppoe: socks5 conn: {e}");

@@ -145,7 +145,7 @@ impl Conn {
         } = self;
         let up = handle.clone();
         let mut rd = rd;
-        let client_to_remote = tokio::spawn(async move {
+        let client_to_remote = crate::spawn(async move {
             let mut buf = vec![0u8; 16 * 1024];
             loop {
                 match rd.read(&mut buf).await {
@@ -162,7 +162,7 @@ impl Conn {
             up.wake();
         });
         let mut wr = wr;
-        let remote_to_client = tokio::spawn(async move {
+        let remote_to_client = crate::spawn(async move {
             while let Some(chunk) = from_rx.recv().await {
                 if wr.write_all(&chunk).await.is_err() {
                     break;

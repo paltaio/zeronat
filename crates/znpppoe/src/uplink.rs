@@ -95,7 +95,7 @@ pub fn peer(server: &str, secret: &str, id_prefix: &str, peer: PeerId<'_>) -> Up
         }],
         peer_sessions: Some(tx),
     };
-    let client = AbortOnDrop(tokio::spawn(async move {
+    let client = AbortOnDrop(crate::spawn(async move {
         match zeronat::client::run_switchable(ActiveTarget::new(target), settings).await {
             Ok(()) => eprintln!("znpppoe: the peer client stopped"),
             Err(e) => eprintln!("znpppoe: the peer client stopped: {e}"),
