@@ -7,6 +7,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::pktinfo::LocalAddr;
+
 pub const CLASS_KCP: u8 = 0x01;
 pub const CLASS_SETUP: u8 = 0x02;
 pub const CLASS_DGRAM: u8 = 0x03;
@@ -83,14 +85,17 @@ fn new_kcp(conv: u32, tx: mpsc::Sender<Vec<u8>>, class: u8) -> Kcp<ChannelWriter
     k
 }
 
-/// Drains the socket-sender channel to the single per-session peer address.
+/// Drains the socket-sender channel to the single per-session peer address. With
+/// a `local` address every packet leaves from it, so a session on a socket bound
+/// to many addresses answers from the one the peer dialed.
 async fn socket_writer(
     socket: Arc<UdpSocket>,
     peer: std::net::SocketAddr,
+    local: Option<LocalAddr>,
     mut rx: mpsc::Receiver<Vec<u8>>,
 ) {
     while let Some(pkt) = rx.recv().await {
-        let _ = socket.send_to(&pkt, peer).await;
+        let _ = crate::pktinfo::send_to(&socket, &pkt, peer, local).await;
     }
 }
 
@@ -432,8 +437,19 @@ pub enum Accepted {
 /// Build a session bound to `peer` and spawn its socket-sender task. Returns the
 /// session plus the receive loop driver inputs. The caller runs `recv_loop`.
 pub fn session(socket: Arc<UdpSocket>, peer: SocketAddr, first_conv: u32) -> Arc<Session> {
+    session_from(socket, peer, None, first_conv)
+}
+
+/// Like [`session`], pinning every packet it sends to the local address the
+/// peer's datagrams arrive on.
+pub fn session_from(
+    socket: Arc<UdpSocket>,
+    peer: SocketAddr,
+    local: Option<LocalAddr>,
+    first_conv: u32,
+) -> Arc<Session> {
     let (send_tx, send_rx) = mpsc::channel(SOCKET_SEND_CAP);
-    tokio::spawn(socket_writer(socket, peer, send_rx));
+    tokio::spawn(socket_writer(socket, peer, local, send_rx));
     Arc::new(Session {
         send_tx,
         convs: Arc::new(Mutex::new(HashMap::new())),

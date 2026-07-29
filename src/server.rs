@@ -13,7 +13,7 @@ use tokio::time::{timeout, Instant};
 use crate::bridge;
 use crate::config;
 use crate::dgram::{DgramRx, DgramTx, Frame};
-use crate::kcp::{route, session, Accepted, ConvGuard, Session};
+use crate::kcp::{route, session_from, Accepted, ConvGuard, Session};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 #[cfg(target_os = "linux")]
@@ -288,12 +288,14 @@ struct PartyProbe {
     path: Option<PathStatus>,
 }
 
-/// A parked public UDP source, the public socket its replies must go out on, the
-/// channel carrying its inbound datagrams, and the relay's idle window, awaiting
-/// the matching UDP-forward setup conv.
+/// A parked public UDP source, the public socket its replies must go out on and
+/// the local address they must leave from, the channel carrying its inbound
+/// datagrams, and the relay's idle window, awaiting the matching UDP-forward
+/// setup conv.
 type UdpPending = (
     Arc<UdpSocket>,
     SocketAddr,
+    Option<crate::pktinfo::LocalAddr>,
     mpsc::Receiver<Vec<u8>>,
     Duration,
 );
@@ -1708,6 +1710,13 @@ async fn spawn_listener(
             let socket = Arc::new(UdpSocket::bind((bind_ip, port)).await.map_err(
                 |e| -> crate::Error { format!("cannot bind {bind_ip}:{port}: {e}").into() },
             )?);
+            // A bind covering more than one local address must answer each source
+            // from the address that source sent to; a forwarded client whose
+            // socket is connected to the dialed address drops every other reply,
+            // and UDP has no fallback path to fail over to.
+            crate::pktinfo::record_local_addr(&socket).map_err(|e| -> crate::Error {
+                format!("cannot record local addresses on {bind_ip}:{port}: {e}").into()
+            })?;
             srv.listeners.lock().unwrap().insert(
                 key,
                 ListenerHandle {
@@ -1874,13 +1883,13 @@ async fn udp_listener(
     loop {
         // A transient recv error must not kill the forwarded UDP port; log, back
         // off briefly, and keep serving. The sweep runs between recvs.
-        let (n, src) = tokio::select! {
+        let (n, src, local) = tokio::select! {
             _ = cancel.notified() => break,
             _ = flush.notified() => {
                 sessions.clear();
                 continue;
             }
-            r = socket.recv_from(&mut buf) => match r {
+            r = crate::pktinfo::recv_from(&socket, &mut buf) => match r {
                 Ok(v) => v,
                 Err(e) => {
                     crate::elog!("udp listener {bind_ip}:{port} recv error: {e}");
@@ -1946,7 +1955,7 @@ async fn udp_listener(
                 tokio::spawn(async move {
                     match timeout(OPEN_TIMEOUT, rx).await {
                         Ok(Ok((nr, nw))) => {
-                            bridge::udp_server(socket, src, drx, nr, nw, idle).await
+                            bridge::udp_server(socket, src, local, drx, nr, nw, idle).await
                         }
                         _ => {
                             srv.pending.lock().unwrap().remove(&id);
@@ -1960,7 +1969,7 @@ async fn udp_listener(
                 srv.udp_pending
                     .lock()
                     .unwrap()
-                    .insert(id, (socket.clone(), src, drx, idle));
+                    .insert(id, (socket.clone(), src, local, drx, idle));
                 if handle
                     .tx
                     .try_send(
@@ -2003,6 +2012,11 @@ async fn bind_control_sockets(
     control_port: u16,
 ) -> Result<(Arc<UdpSocket>, TcpListener)> {
     let udp_control = Arc::new(UdpSocket::bind((bind, control_port)).await?);
+    // A bind covering more than one local address must answer each client from
+    // the address that client dialed, not from the one the route back to it
+    // selects, or a client whose socket is connected to the dialed address drops
+    // every reply.
+    crate::pktinfo::record_local_addr(&udp_control)?;
     let tcp_control = TcpListener::bind((bind, control_port)).await?;
     Ok((udp_control, tcp_control))
 }
@@ -2021,8 +2035,8 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
         // A transient recv error must not kill the control loop or the process;
         // log, back off briefly, and keep serving. The sweep runs between recvs;
         // dropping a session's `Arc` closes its send channel and ends socket_writer.
-        let (n, src) = tokio::select! {
-            r = socket.recv_from(&mut buf) => match r {
+        let (n, src, local) = tokio::select! {
+            r = crate::pktinfo::recv_from(&socket, &mut buf) => match r {
                 Ok(v) => v,
                 Err(e) => {
                     crate::elog!("udp control recv error: {e}");
@@ -2053,7 +2067,7 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
                 if !admit_new_udp_session(sessions.len()) {
                     continue;
                 }
-                (session(socket.clone(), src, 0), false)
+                (session_from(socket.clone(), src, local, 0), false)
             }
         };
 
@@ -2143,7 +2157,9 @@ async fn accept_udp_forward(
     id: u64,
     noise: StatelessNoise,
 ) {
-    let Some((public_socket, public_src, dgram_rx, idle)) = take_udp_pending(&srv, id) else {
+    let Some((public_socket, public_src, public_local, dgram_rx, idle)) =
+        take_udp_pending(&srv, id)
+    else {
         return;
     };
     let noise = Arc::new(noise);
@@ -2151,7 +2167,16 @@ async fn accept_udp_forward(
     let (inbound, _guard) = sess.register_dgram(conv);
     let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
     let rx = DgramRx::new(inbound, noise);
-    crate::bridge::udp_server_stateless(public_socket, public_src, dgram_rx, rx, tx, idle).await;
+    crate::bridge::udp_server_stateless(
+        public_socket,
+        public_src,
+        public_local,
+        dgram_rx,
+        rx,
+        tx,
+        idle,
+    )
+    .await;
 }
 
 fn take_udp_pending(srv: &Server, id: u64) -> Option<UdpPending> {
@@ -2228,7 +2253,13 @@ async fn accept_bridge(
     let Some(_bridge_guard) = sess.try_attach_bridge() else {
         return;
     };
-    let handle = match switch.add_port(2, Some(src)) {
+    // Register the tag before the port exists: the router drops a datagram whose
+    // tag is unregistered, and the client's first frame (the one that proves its
+    // port) can arrive before the attach returns. `_guard` keeps the session
+    // counted live for the whole bridge and drops the registration on every exit
+    // path below.
+    let (inbound, _guard) = sess.register_dgram(conv);
+    let handle = match switch.add_dgram_port(src) {
         Ok(h) => h,
         Err(e) => {
             crate::elog!("rejecting bridge conv: {e}");
@@ -2236,8 +2267,6 @@ async fn accept_bridge(
         }
     };
     let noise = Arc::new(noise);
-    // `_guard` keeps the session counted live for the whole bridge.
-    let (inbound, _guard) = sess.register_dgram(conv);
     let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
     let rx = DgramRx::new(inbound, noise);
     bridge::switch_port_dgram(handle, rx, tx).await;

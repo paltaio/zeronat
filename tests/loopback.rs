@@ -468,6 +468,108 @@ async fn tunnel_over_udp_transport() {
     .expect("udp transport did not pass traffic within 20s");
 }
 
+/// A server bound to every local address answers each client on the address that
+/// client dialed. The route back to the client here selects 127.0.0.1, so a
+/// client that dialed 127.0.0.2 and connected its socket to it sees no reply at
+/// all unless the server pins its reply source, and its UDP handshake times out.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_control_answers_on_the_dialed_address() {
+    let control = free_tcp_port();
+    let public_tcp = free_tcp_port();
+    let local_tcp = free_tcp_port();
+    tokio::spawn(tcp_echo(local_tcp));
+
+    // Only the control port takes the wildcard bind; the public listener stays
+    // on the loopback address every other test drives.
+    let mut settings = cli_settings(control, vec![public_tcp], vec![]);
+    settings.bind = Ipv4Addr::UNSPECIFIED;
+    tokio::spawn(zeronat::server::run(settings));
+    tokio::spawn(zeronat::client::run(
+        format!("127.0.0.2:{control}"),
+        SECRET.into(),
+        vec![fwd(public_tcp, local_tcp)],
+        vec![],
+        zeronat::client::Transport::Udp,
+        None,
+        None,
+        None,
+        Some("alias".into()),
+        None,
+    ));
+
+    timeout(Duration::from_secs(20), wait_clients(control, 1))
+        .await
+        .expect("a client dialing a secondary local address did not register within 20s");
+    timeout(Duration::from_secs(20), wait_tcp_path(public_tcp))
+        .await
+        .expect("the tunnel did not pass traffic within 20s");
+}
+
+/// A forwarded UDP port bound to every local address answers each source on the
+/// address that source sent to. The route back here selects 127.0.0.1, so a
+/// caller whose socket is connected to 127.0.0.2 sees nothing at all unless the
+/// reply's source is pinned; UDP has no second path to fall back to.
+#[cfg(target_os = "linux")]
+async fn run_udp_forward_source_test(transport: zeronat::client::Transport) {
+    let control = free_tcp_port();
+    let public_udp = free_udp_port();
+    let local_udp = free_udp_port();
+    tokio::spawn(udp_echo(local_udp));
+
+    let mut settings = cli_settings(control, vec![], vec![public_udp]);
+    for listener in &mut settings.listeners {
+        listener.bind_ip = Ipv4Addr::UNSPECIFIED;
+    }
+    tokio::spawn(zeronat::server::run(settings));
+    tokio::spawn(zeronat::client::run(
+        format!("127.0.0.1:{control}"),
+        SECRET.into(),
+        vec![],
+        vec![fwd(public_udp, local_udp)],
+        transport,
+        None,
+        None,
+        None,
+        Some("rpi".into()),
+        None,
+    ));
+    wait_clients(control, 1).await;
+
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.connect(("127.0.0.2", public_udp)).await.unwrap();
+    loop {
+        sock.send(b"hello-udp").await.unwrap();
+        let mut buf = [0u8; 64];
+        match timeout(Duration::from_millis(300), sock.recv(&mut buf)).await {
+            Ok(Ok(n)) if &buf[..n] == b"hello-udp" => break,
+            _ => sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_forward_answers_on_the_dialed_address_over_tcp_transport() {
+    timeout(
+        Duration::from_secs(20),
+        run_udp_forward_source_test(zeronat::client::Transport::Tcp),
+    )
+    .await
+    .expect("a source that dialed a secondary local address got no reply within 20s");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_forward_answers_on_the_dialed_address_over_udp_transport() {
+    timeout(
+        Duration::from_secs(20),
+        run_udp_forward_source_test(zeronat::client::Transport::Udp),
+    )
+    .await
+    .expect("a source that dialed a secondary local address got no reply within 20s");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_snapshot_over_tcp() {
     let body = async {

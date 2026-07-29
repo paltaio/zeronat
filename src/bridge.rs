@@ -2,6 +2,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
@@ -38,6 +40,7 @@ use tokio::time::timeout;
 
 use crate::dgram::{DgramRx, DgramTx, Frame};
 use crate::noise::{NoiseReader, NoiseWriter};
+use crate::pktinfo::LocalAddr;
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
 
@@ -222,10 +225,12 @@ pub async fn udp_client(
 
 /// Server side of a UDP stream: forward inbound datagrams (from the public
 /// socket, delivered via `dgram_rx`) to the client, and client datagrams back
-/// out to the original source address.
+/// out to the original source address, from the local address that source sent
+/// to.
 pub async fn udp_server(
     socket: Arc<UdpSocket>,
     src: SocketAddr,
+    local: Option<LocalAddr>,
     mut dgram_rx: mpsc::Receiver<Vec<u8>>,
     mut nr: NoiseReader,
     mut nw: NoiseWriter,
@@ -245,7 +250,8 @@ pub async fn udp_server(
             m = nr.recv() => match m {
                 Ok(m) => {
                     last_in = Instant::now();
-                    m.is_empty() || socket.send_to(&m, src).await.is_ok()
+                    m.is_empty()
+                        || crate::pktinfo::send_to(&socket, &m, src, local).await.is_ok()
                 }
                 Err(_) => false,
             },
@@ -442,6 +448,11 @@ struct SwitchPort {
     /// Observed control transport: 1 = tcp, 2 = udp.
     transport: u8,
     peer: Option<SocketAddr>,
+    /// Whether the client behind this port has been heard from since it
+    /// attached. A stream port is proven the moment it attaches, since the
+    /// stream itself carries the client's liveness; a datagram port starts
+    /// unproven and its first inbound frame proves it.
+    proven: Arc<AtomicBool>,
 }
 
 /// A point-in-time copy of one switch port for the admin fleet view. Plain owned
@@ -470,9 +481,8 @@ pub struct BridgePortInfo {
 /// unicast; delivering learned unicast to the one owning port), and each client
 /// relay learns the source MACs it sends and writes them back to the shared
 /// device. An L3 (`--tun`) device carries raw IPv4 with no Ethernet header and
-/// supports exactly one client: `add_port` admits one port and refuses a second,
-/// so the single-port fast path forwards L3 packets untouched and the
-/// MAC-learning path is never reached.
+/// supports one client at a time: the single-port fast path forwards inbound
+/// packets untouched and egress learns nothing.
 #[cfg(target_os = "linux")]
 pub struct TapSwitch {
     tap: Arc<TapDevice>,
@@ -702,8 +712,11 @@ impl TapSwitch {
     /// A `port_to_port` switch routes the frame among its own ports first, and
     /// writes to the device only when the destination is not a station it has
     /// learned behind another port.
+    ///
+    /// Only an L2 switch learns and routes here: an L3 device's packets have no
+    /// Ethernet header, so their leading bytes are an IP header, not addresses.
     async fn learn_and_write_egress(&self, frame: &[u8], port: u32) -> crate::Result<()> {
-        let Some((dst, src)) = dst_src(frame) else {
+        let Some((dst, src)) = dst_src(frame).filter(|_| self.is_l2) else {
             return self.tap.write_frame(frame).await;
         };
         self.learn(src, port);
@@ -750,28 +763,55 @@ impl TapSwitch {
 
     /// Attach a new client. Allocates a PortId, a bounded egress queue, and a
     /// cancel; the returned `SwitchHandle` is the relay's view of the port and
-    /// detaches it on drop.
+    /// detaches it on drop. The client counts as heard from the moment it
+    /// attaches, which holds for every transport that carries its own liveness:
+    /// a stream, or a peer session with its own keepalive.
     ///
-    /// An L3 (`--tun`) switch supports exactly one client: a second concurrent
-    /// attach is refused with `Err`, so the caller drops that bridge connection
-    /// without disturbing the established one. The cap check and the insert happen
-    /// together under the `ports` lock so two simultaneous attaches cannot both
-    /// pass it.
+    /// An L3 (`--tun`) switch supports exactly one client: while a client that
+    /// has been heard from holds the slot, a second attach is refused with `Err`,
+    /// so the caller drops that bridge connection without disturbing the
+    /// established one.
     pub fn add_port(
         self: &Arc<Self>,
         transport: u8,
         peer: Option<SocketAddr>,
     ) -> crate::Result<SwitchHandle> {
+        self.attach(transport, peer, true)
+    }
+
+    /// Attach a client whose bridge rides the datagram channel. The port starts
+    /// unproven: the datagram handshake completes on the client's first message,
+    /// so a client that gave up waiting for the reply leaves a port behind that
+    /// never carries a frame. An unproven port does not hold a tun switch's
+    /// single client slot: a fresh attach supersedes it.
+    pub fn add_dgram_port(self: &Arc<Self>, peer: SocketAddr) -> crate::Result<SwitchHandle> {
+        self.attach(2, Some(peer), false)
+    }
+
+    /// Build the port and admit it. The admission test and the insert happen
+    /// together under the `ports` lock so two simultaneous attaches cannot both
+    /// pass it.
+    fn attach(
+        self: &Arc<Self>,
+        transport: u8,
+        peer: Option<SocketAddr>,
+        proven: bool,
+    ) -> crate::Result<SwitchHandle> {
         let port_id = self.next_port.fetch_add(1, Ordering::Relaxed);
         let (out_tx, out_rx) = mpsc::channel(SWITCH_PORT_CAP);
         let cancel = Arc::new(Notify::new());
         let stats = PortStats::new();
+        let proven = Arc::new(AtomicBool::new(proven));
+        let mut superseded: Vec<(u32, Arc<Notify>)> = Vec::new();
         {
             let mut ports = self.ports.lock().unwrap();
-            if !self.is_l2 && !ports.is_empty() {
-                return Err(
-                    "tun bridge already has a client; a tun server serves one client".into(),
-                );
+            if !self.is_l2 {
+                if ports.values().any(|p| p.proven.load(Ordering::Acquire)) {
+                    return Err(
+                        "tun bridge already has a client; a tun server serves one client".into(),
+                    );
+                }
+                superseded = ports.drain().map(|(id, p)| (id, p.cancel)).collect();
             }
             ports.insert(
                 port_id,
@@ -782,8 +822,14 @@ impl TapSwitch {
                     name: Mutex::new(None),
                     transport,
                     peer,
+                    proven: proven.clone(),
                 },
             );
+        }
+        // End each superseded port's relay outside the `ports` lock.
+        for (id, cancel) in superseded {
+            cancel.notify_one();
+            self.evict_port(id);
         }
         Ok(SwitchHandle {
             switch: self.clone(),
@@ -791,6 +837,7 @@ impl TapSwitch {
             out_rx: Some(out_rx),
             cancel,
             stats,
+            proven,
         })
     }
 
@@ -868,6 +915,7 @@ pub struct SwitchHandle {
     out_rx: Option<mpsc::Receiver<Vec<u8>>>,
     cancel: Arc<Notify>,
     stats: Arc<PortStats>,
+    proven: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "linux")]
@@ -877,6 +925,12 @@ impl SwitchHandle {
     /// it from an in-band name frame instead.
     pub fn set_name(&self, name: &str) {
         self.switch.set_port_name(self.port_id, name);
+    }
+
+    /// Record that the client behind this port has been heard from, so a later
+    /// attach on a tun switch is refused rather than superseding it.
+    fn prove(&self) {
+        self.proven.store(true, Ordering::Release);
     }
 }
 
@@ -909,6 +963,8 @@ pub async fn switch_port_dgram(mut handle: SwitchHandle, mut rx: DgramRx, tx: Dg
             m = rx.recv() => match m {
                 Some(f) => {
                     last_in = Instant::now();
+                    // Any frame is the client's proof that it is still there.
+                    handle.prove();
                     match f {
                         Frame::Keepalive => true,
                         Frame::Name(n) => {
@@ -1089,10 +1145,12 @@ pub async fn udp_client_stateless(local: UdpSocket, mut rx: DgramRx, tx: DgramTx
     }
 }
 
-/// Server side of a UDP-forward stream over the raw datagram channel.
+/// Server side of a UDP-forward stream over the raw datagram channel. Replies
+/// leave from the local address the public source sent to.
 pub async fn udp_server_stateless(
     socket: Arc<UdpSocket>,
     src: SocketAddr,
+    local: Option<LocalAddr>,
     mut dgram_rx: mpsc::Receiver<Vec<u8>>,
     mut rx: DgramRx,
     tx: DgramTx,
@@ -1115,7 +1173,9 @@ pub async fn udp_server_stateless(
                     match f {
                         Frame::Keepalive => true,
                         Frame::Name(_) => true,
-                        Frame::Data(d) => socket.send_to(&d, src).await.is_ok(),
+                        Frame::Data(d) => {
+                            crate::pktinfo::send_to(&socket, &d, src, local).await.is_ok()
+                        }
                     }
                 }
                 None => false,
@@ -1300,6 +1360,7 @@ mod switch_tests {
     const M2: [u8; 6] = [0x02, 0, 0, 0, 0, 0x02];
     const BCAST: [u8; 6] = [0xff; 6];
     const MCAST: [u8; 6] = [0x01, 0, 0x5e, 0, 0, 0x01];
+    const CLIENT: &str = "198.51.100.7:41000";
 
     /// An L2 switch with no live reader, plus the dummy TAP backing it (kept alive
     /// by the returned guard fd so the device is not closed mid-test). The backing
@@ -1309,6 +1370,13 @@ mod switch_tests {
         let (dev, peer) = crate::tap::TapDevice::socketpair_for_test(1500).unwrap();
         let sw = TapSwitch::detached(Arc::new(dev), true);
         (sw, DeviceFd(peer))
+    }
+
+    /// A tun switch with no reader running, plus the fd that keeps its dummy
+    /// device open for the test.
+    fn test_tun_switch() -> (Arc<TapSwitch>, DeviceFd) {
+        let (dev, peer) = crate::tap::TapDevice::socketpair_for_test(1500).unwrap();
+        (TapSwitch::detached(Arc::new(dev), false), DeviceFd(peer))
     }
 
     // A learned unicast destination is delivered only to the port that owns it,
@@ -1584,9 +1652,7 @@ mod switch_tests {
     // L2 (`--tap`) switch admits many ports.
     #[tokio::test]
     async fn tun_switch_admits_one_port_l2_admits_many() {
-        let (dev, peer) = crate::tap::TapDevice::socketpair_for_test(1500).unwrap();
-        let _g = DeviceFd(peer);
-        let tun = TapSwitch::detached(Arc::new(dev), false);
+        let (tun, _g) = test_tun_switch();
 
         let first = tun.add_port(1, None).expect("first tun port attaches");
         assert!(
@@ -1606,5 +1672,84 @@ mod switch_tests {
             })
             .collect();
         assert_eq!(sw.ports.lock().unwrap().len(), 8);
+    }
+
+    // A datagram bridge port claims the tun switch's one slot before its client
+    // has been heard from, because the datagram handshake completes on the
+    // client's first message: a client that gave up waiting for the reply still
+    // leaves a port behind. The next client takes the slot from that claim
+    // instead of being refused, and the superseded relay is cancelled.
+    #[tokio::test]
+    async fn an_unheard_dgram_claim_gives_way_to_the_next_client() {
+        let (tun, _g) = test_tun_switch();
+
+        let abandoned = tun.add_dgram_port(CLIENT.parse().unwrap()).unwrap();
+        let cancelled = abandoned.cancel.clone();
+        let fresh = tun
+            .add_port(1, None)
+            .expect("a claim nobody has been heard on must not hold the slot");
+        assert!(!tun.ports.lock().unwrap().contains_key(&abandoned.port_id));
+        timeout(Duration::from_secs(5), cancelled.notified())
+            .await
+            .expect("the superseded port's relay must be told to tear down");
+
+        // The superseded handle's drop must not take the port that replaced it.
+        drop(abandoned);
+        assert!(tun.ports.lock().unwrap().contains_key(&fresh.port_id));
+    }
+
+    // One frame from the client is proof enough: from then on the datagram port
+    // holds the tun switch's one slot and a second client is refused.
+    #[tokio::test]
+    async fn a_dgram_client_that_sends_keeps_the_tun_slot() {
+        let (tun, _g) = test_tun_switch();
+        let handle = tun.add_dgram_port(CLIENT.parse().unwrap()).unwrap();
+
+        let psk = crate::noise::derive_psk("switch port dgram");
+        let (a, b) = tokio::io::duplex(8192);
+        let responder =
+            tokio::spawn(
+                async move { crate::noise::server_handshake_stateless(b, &psk, &[]).await },
+            );
+        let client = Arc::new(
+            crate::noise::client_handshake_stateless(a, &psk, 0)
+                .await
+                .unwrap(),
+        );
+        let server = Arc::new(responder.await.unwrap().unwrap().1);
+
+        // One keepalive from the client, routed the way the session's router
+        // hands a datagram to the port: class byte and tag stripped.
+        let (client_out, mut client_pkts) = mpsc::channel(4);
+        DgramTx::new(client_out, 0, client).probe().await.unwrap();
+        let pkt = client_pkts.recv().await.unwrap();
+        let (inbound_tx, inbound_rx) = mpsc::channel(4);
+        inbound_tx.send(pkt[5..].to_vec()).await.unwrap();
+
+        let (out_tx, _out_rx) = mpsc::channel(4);
+        let relay = tokio::spawn(switch_port_dgram(
+            handle,
+            DgramRx::new(inbound_rx, server.clone()),
+            DgramTx::new(out_tx, 0, server),
+        ));
+        timeout(Duration::from_secs(5), async {
+            while !tun
+                .ports
+                .lock()
+                .unwrap()
+                .values()
+                .any(|p| p.proven.load(Ordering::Acquire))
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a frame from the client must prove the port");
+
+        assert!(
+            tun.add_port(1, None).is_err(),
+            "a port whose client has been heard from keeps the slot"
+        );
+        relay.abort();
     }
 }

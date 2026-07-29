@@ -26,6 +26,7 @@ pub(crate) mod peerexit;
 #[cfg(target_os = "linux")]
 pub(crate) mod peersegment;
 pub mod peerslot;
+pub mod pktinfo;
 pub mod pppoe;
 pub mod proto;
 pub mod proxyproto;
