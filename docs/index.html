@@ -520,6 +520,9 @@ pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
       <p>Peer slots run beside the client's own session with the server and pair while that client
       serves forwards or sits idle. Under a <code>--tun</code>, <code>--tap</code>, or PPPoE session
       the slot is recorded and pairs when the client returns to either.</p>
+      <p>A server started with only <code>--control</code> registers clients and pairs them. It
+      carries no forwards, TAP or tun of its own, so the control port is the only one to open.</p>
+<pre><code>ZERONAT_SECRET=somelongsecret zeronat server --control 2222</code></pre>
 
       <h3>Peer exit</h3>
       <p>The provider sets <code>exit = true</code> under <code>[peer]</code>, with an optional

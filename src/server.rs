@@ -428,8 +428,10 @@ impl Server {
     /// teardown or supersession swaps the registry before invalidating pairs,
     /// so a racing insert is either refused here or cleared by that
     /// invalidation. The busy check and the insert share the pair-table lock,
-    /// so two consumers racing for an exclusive provider cannot both pair.
-    /// Lock order is clients before pairs. A failure status carries pair_id 0.
+    /// so two consumers racing for an exclusive provider cannot both pair, and
+    /// the same lock hold drops this consumer's own prior pair for the peer and
+    /// capability it is asking for again. Lock order is clients before pairs. A
+    /// failure status carries pair_id 0.
     fn peer_connect(
         &self,
         consumer_id: &str,
@@ -470,6 +472,23 @@ impl Server {
             return Some((0, PeerStatus::NotProvided));
         }
         let mut pairs = self.pairs.lock().unwrap();
+        // A consumer holds one pair per peer and capability: that triple is the
+        // consumer slot's identity, and a slot asks again only after it has
+        // dropped whatever its last cycle left. The server sees a direct pair
+        // die only through the control session that carries no part of it, so
+        // a pair the consumer abandoned would otherwise answer that consumer's
+        // own retry with `peer_busy` for as long as the session stayed up.
+        // Dropping the replaced pair stops the splice it carried, which closes
+        // both relay legs.
+        for (id, pair) in pairs
+            .extract_if(|_, p| {
+                p.consumer_id == consumer_id && p.provider_id == provider_id && p.want == want
+            })
+            .collect::<Vec<_>>()
+        {
+            self.forget_pair_ids(&pair);
+            crate::elog!("peer pair {id}: replaced by a fresh request");
+        }
         // Exit is exclusive: a tun provider serves one consumer. Segment is
         // multi-consumer, so it is never busy here.
         if want == PROVIDES_EXIT
@@ -1280,12 +1299,13 @@ pub(crate) async fn serve_stream(
                 owned
             };
             // Gated on the real removal so a stale reader's no-op teardown
-            // cannot drop pairs the superseding session created.
+            // cannot drop pairs the superseding session created, nor log a
+            // disconnect for a client the registry still holds a session for.
             if removed {
                 srv.invalidate_pairs(&client_id);
+                crate::elog!("client {client_id} disconnected");
             }
             writer.abort();
-            crate::elog!("client {client_id} disconnected");
             Ok(())
         }
         Msg::AdminHello { version, mode } => {
@@ -2631,6 +2651,62 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             .peer_connect("c2", &c2_tx, "prov", PROVIDES_EXIT)
             .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
+    }
+
+    // A fresh connect replaces the pair its consumer already holds for that
+    // peer and capability, and reclaims the rendezvous ids that pair owned.
+    // Pairs the same consumer holds for another peer, or for another
+    // capability of the same peer, stand.
+    #[tokio::test(start_paused = true)]
+    async fn consumer_pairs_are_replaced_by_a_fresh_connect() {
+        use crate::proto::PROVIDES_SEGMENT;
+        let srv = test_server();
+        let (_prov_tx, _prov_rx) =
+            register_peer_client(&srv, "prov", Some(PROVIDES_EXIT | PROVIDES_SEGMENT));
+        let (_prov2_tx, _prov2_rx) = register_peer_client(&srv, "prov2", Some(PROVIDES_EXIT));
+        let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
+        let (other_tx, _other_rx) = register_peer_client(&srv, "other", Some(0));
+
+        let (first, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        srv.peer_path("c", &c_tx, first, PathStatus::Relay);
+        assert_eq!(srv.relay_legs.lock().unwrap().len(), 2);
+
+        let (second, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        assert_ne!(second, first);
+        let pairs = srv.pairs.lock().unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs.contains_key(&second));
+        drop(pairs);
+        assert!(srv.relay_legs.lock().unwrap().is_empty());
+
+        // The one exclusive slot is held by the live pair, so another consumer
+        // still reads busy.
+        assert_eq!(
+            srv.peer_connect("other", &other_tx, "prov", PROVIDES_EXIT),
+            Some((0, PeerStatus::PeerBusy))
+        );
+
+        // A connect naming a different peer replaces nothing.
+        let (_, status) = srv
+            .peer_connect("c", &c_tx, "prov2", PROVIDES_EXIT)
+            .unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        assert!(
+            srv.pairs.lock().unwrap().contains_key(&second),
+            "the pair for the other peer stands"
+        );
+
+        // Neither does one naming a different capability of the same peer.
+        let (_, status) = srv
+            .peer_connect("c", &c_tx, "prov", PROVIDES_SEGMENT)
+            .unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+        assert!(
+            srv.pairs.lock().unwrap().contains_key(&second),
+            "the exit pair stands while the segment pair opens"
+        );
     }
 
     /// Let the claim deadline lapse and give the reaper it armed a turn.

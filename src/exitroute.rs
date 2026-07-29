@@ -232,7 +232,11 @@ impl ExitRouteGuard {
 impl<S: RouteOps> ExitRouteGuard<S> {
     /// Program the server pin, then the two half-defaults via the tun device,
     /// pin first so no packet to the server can route into the tun in
-    /// between. A failed add removes whatever was already programmed.
+    /// between. An already-exists answer counts as held for any of the three,
+    /// the way the per-dial assert reads it: the pin sits on the uplink and
+    /// survives a crash that took the tun and its half-defaults with it, so
+    /// the next run adopts the leftover instead of failing its first cycle. A
+    /// failed add removes whatever was already programmed.
     pub fn bring_up_with(ops: S, pin: UplinkPin, tun_name: &str) -> crate::Result<Self> {
         let mut guard = ExitRouteGuard {
             pin,
@@ -240,7 +244,10 @@ impl<S: RouteOps> ExitRouteGuard<S> {
             ops,
         };
         for change in guard.changes(true) {
-            guard.ops.apply(&change)?;
+            match guard.ops.apply(&change) {
+                Err(e) if !already_exists(&e) => return Err(e),
+                _ => {}
+            }
         }
         Ok(guard)
     }
@@ -596,6 +603,39 @@ zn0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
             *log.borrow(),
             [
                 pin.change(true),
+                half(true, [0, 0, 0, 0], "zn0"),
+                half(true, [128, 0, 0, 0], "zn0"),
+            ]
+        );
+
+        log.borrow_mut().clear();
+        drop(guard);
+        assert_eq!(
+            *log.borrow(),
+            [
+                half(false, [128, 0, 0, 0], "zn0"),
+                half(false, [0, 0, 0, 0], "zn0"),
+                pin.change(false),
+            ]
+        );
+    }
+
+    // The tun and its half-defaults die with a crashed process while the pin
+    // stays on the uplink, so the next bringup meets a pin it did not
+    // program. It adopts the leftover and removes it on teardown, the way the
+    // per-dial assert reads the same answer.
+    #[test]
+    fn bringup_adopts_a_pin_the_kernel_already_holds() {
+        let (rec, log, fault) = recorder();
+        let pin = plan_server_pin(GW_ROUTE, "zn0", SERVER).unwrap();
+        fault.set(Fault {
+            exists_add: Some(SERVER),
+            ..Fault::default()
+        });
+        let guard = ExitRouteGuard::bring_up_with(rec, pin.clone(), "zn0").unwrap();
+        assert_eq!(
+            *log.borrow(),
+            [
                 half(true, [0, 0, 0, 0], "zn0"),
                 half(true, [128, 0, 0, 0], "zn0"),
             ]

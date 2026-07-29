@@ -1217,12 +1217,8 @@ async fn run(cmd: Cmd) -> Result<()> {
             if tap.is_some() && !listeners.is_empty() {
                 return Err("--tap cannot be combined with --tcp/--udp forwards".into());
             }
-            if !tun && tap.is_none() && listeners.is_empty() {
-                return Err(
-                    "nothing to do: pass --tun, --tap, a --config with listeners, or at least one --tcp/--udp"
-                        .into(),
-                );
-            }
+            // A server with no forwards and no device still registers clients,
+            // pairs them, and splices the relays their pairs fall back to.
 
             let tun = if tun {
                 let (subnet, server_ip, client_ip) = tun_addrs(&secret);
@@ -1248,8 +1244,10 @@ async fn run(cmd: Cmd) -> Result<()> {
                 port: announce_port,
             });
             zeronat::elog!(
-                "zeronat {} server: bind={bind_ip} control={control_port} tap={} tun={} exit={} dht={}",
+                "zeronat {} server: bind={bind_ip} control={control_port} tcp-forwards={} udp-forwards={} tap={} tun={} exit={} dht={}",
                 env!("CARGO_PKG_VERSION"),
+                listeners.iter().filter(|l| l.proto == Proto::Tcp).count(),
+                listeners.iter().filter(|l| l.proto == Proto::Udp).count(),
                 onoff(tap.is_some()),
                 onoff(tun.is_some()),
                 onoff(exit),

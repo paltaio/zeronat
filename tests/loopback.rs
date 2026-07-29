@@ -4560,6 +4560,40 @@ async fn peer_relay_death_frees_an_exclusive_provider() {
         .expect("relay death flow did not complete within 30s");
 }
 
+// A consumer's fresh connect for the same peer and capability replaces the
+// pair it already holds and takes that pair's relay down with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_relay_dies_with_the_replaced_pair() {
+    let body = async {
+        let control = free_tcp_port();
+        tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+        let mut pair = relay_pair(control).await;
+
+        let (mut c_lr, mut c_lw) = stream_leg(control, pair.c_leg).await;
+        let (mut p_lr, _p_lw) = stream_leg(control, pair.p_leg).await;
+        c_lw.send(b"spliced").await.unwrap();
+        assert_eq!(recv_stream_leg(&mut p_lr).await, b"spliced");
+
+        // Nothing on the wire says the consumer abandoned the pair; it just
+        // asks again on the same control session.
+        let (second, status) =
+            peer_connect(&mut pair.cr, &mut pair.cw, "prov", PROVIDES_EXIT).await;
+        assert_eq!(status, PeerStatus::Accepted);
+        assert_ne!(second, pair.pair_id);
+        assert!(
+            timeout(Duration::from_secs(10), c_lr.recv())
+                .await
+                .expect("the replaced pair's leg was never closed")
+                .is_err(),
+            "replacing a pair must close the relay it carried"
+        );
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("pair replacement flow did not complete within 30s");
+}
+
 // A relay whose second leg never arrives frees the exclusive provider it
 // pinned. Both control sessions stay up and healthy, so nothing else would
 // ever clear the pair, and the consumer's own retry would read peer_busy off
