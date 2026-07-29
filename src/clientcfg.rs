@@ -80,7 +80,7 @@ pub struct CfgTun {
     /// up.
     pub exit: bool,
     /// Exit with no fallback: every original default route is deleted and
-    /// IPv6 blackholed while the tunnel is up; a crash leaves the host
+    /// IPv6 goes to loopback while the tunnel is up; a crash leaves the host
     /// without a default route.
     pub exit_strict: bool,
     /// The peer whose internet connection this tunnel exits through, naming

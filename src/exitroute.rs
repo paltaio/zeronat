@@ -7,10 +7,10 @@
 //! through the `crate::route` ioctl helpers behind the [`RouteOps`] seam.
 //!
 //! Strict mode closes the fallbacks the base set leaves open: every original
-//! default route is deleted (restored on teardown) and IPv6 is blackholed
-//! with unreachable routes for `::/1` and `8000::/1`, so no traffic escapes
-//! the tunnel while it is up. A crash skips the teardown and leaves the host
-//! without its default routes.
+//! default route is deleted and `::/1` and `8000::/1` are routed to loopback,
+//! so IPv6 sends fail on the host instead of reaching the uplink while the
+//! tunnel is up. Teardown restores the defaults and removes both `/1` routes;
+//! a crash skips it and leaves the host without its default routes.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -180,8 +180,8 @@ pub enum StrictChange {
         iface: String,
         metric: u32,
     },
-    /// An unreachable route covering one half of IPv6.
-    Unreachable {
+    /// A route covering one half of IPv6, pointed off the uplink.
+    V6Half {
         add: bool,
         dst: Ipv6Addr,
         prefix: u8,
@@ -203,9 +203,7 @@ impl StrictOps for SysRouteOps {
                 iface,
                 metric,
             } => route::modify_route(*add, Ipv4Addr::UNSPECIFIED, 0, *gw, Some(iface), *metric),
-            StrictChange::Unreachable { add, dst, prefix } => {
-                route::modify_route6_unreachable(*add, *dst, *prefix)
-            }
+            StrictChange::V6Half { add, dst, prefix } => route::modify_route6(*add, *dst, *prefix),
         }
     }
 }
@@ -336,7 +334,7 @@ impl<S: RouteOps> Drop for PinGuard<S> {
     }
 }
 
-/// Holds the strict-mode route set: the v6 blackholes and the deleted
+/// Holds the strict-mode route set: the two v6 halves and the deleted
 /// original defaults, undone in reverse on drop.
 pub struct StrictRouteGuard<S: StrictOps = SysRouteOps> {
     /// Every captured default, worst metric first: the deletion order.
@@ -345,7 +343,7 @@ pub struct StrictRouteGuard<S: StrictOps = SysRouteOps> {
 }
 
 impl<S: StrictOps> StrictRouteGuard<S> {
-    /// Program the strict set: the v6 blackholes, then the default deletes
+    /// Program the strict set: the v6 halves, then the default deletes
     /// last, worst metric first and the best last, so a failed earlier step
     /// never leaves the host without its working default. A failed step
     /// drops the guard, which unwinds the whole set.
@@ -366,7 +364,7 @@ impl<S: StrictOps> StrictRouteGuard<S> {
     fn changes(&self, up: bool) -> Vec<StrictChange> {
         let mut v: Vec<StrictChange> = V6_HALF_DEFAULTS
             .iter()
-            .map(|&dst| StrictChange::Unreachable {
+            .map(|&dst| StrictChange::V6Half {
                 add: up,
                 dst,
                 prefix: 1,
@@ -385,7 +383,7 @@ impl<S: StrictOps> StrictRouteGuard<S> {
 }
 
 impl<S: StrictOps> Drop for StrictRouteGuard<S> {
-    /// Restore the defaults first, then remove the v6 blackholes (the
+    /// Restore the defaults first, then remove the v6 halves (the
     /// bringup order reversed). Each step is best-effort so a partially
     /// applied bringup unwinds cleanly; a restore may find its default still
     /// in place when the delete never ran.
@@ -460,9 +458,9 @@ impl<S: RouteOps, T: StrictOps> ExitRoutes<S, T> {
     }
 
     /// Assert the /32 pin for `server` ahead of a dial. The strict set is
-    /// never re-asserted: the v6 unreachable routes are bound to no
-    /// interface, so no uplink flap purges them, and the deleted defaults
-    /// are an absence with nothing to re-add.
+    /// never re-asserted: the v6 halves sit on loopback, so no uplink flap
+    /// purges them, and the deleted defaults are an absence with nothing to
+    /// re-add.
     pub fn assert_pin(&mut self, server: Ipv4Addr) -> crate::Result<()> {
         self.base.assert_pin(server)
     }
@@ -843,7 +841,7 @@ eth1\t076433C6\t00000000\t0005\t0\t0\t100\tFFFFFFFF\t0\t0\t0
     }
 
     fn v6half(hi: u16, add: bool) -> StrictChange {
-        StrictChange::Unreachable {
+        StrictChange::V6Half {
             add,
             dst: Ipv6Addr::new(hi, 0, 0, 0, 0, 0, 0, 0),
             prefix: 1,
@@ -860,7 +858,7 @@ eth1\t076433C6\t00000000\t0005\t0\t0\t100\tFFFFFFFF\t0\t0\t0
     }
 
     #[test]
-    fn strict_bringup_blackholes_v6_then_deletes_the_default_last() {
+    fn strict_bringup_adds_the_v6_halves_then_deletes_the_default_last() {
         let log: MixedLog = Rc::new(RefCell::new(Vec::new()));
         let rec = StrictRec {
             log: log.clone(),
@@ -878,7 +876,7 @@ eth1\t076433C6\t00000000\t0005\t0\t0\t100\tFFFFFFFF\t0\t0\t0
             ]
         );
 
-        // Teardown reversed: the default is back before the blackholes lift.
+        // Teardown reversed: the default is back before the v6 halves lift.
         log.borrow_mut().clear();
         drop(guard);
         assert_eq!(
@@ -971,7 +969,7 @@ zn0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
         assert!(res.is_err());
         // The worst default (wlan0) was already gone when the best delete
         // was refused; the unwind puts both back, best first, then lifts the
-        // blackholes.
+        // v6 halves.
         assert_eq!(
             *log.borrow(),
             [
@@ -1042,7 +1040,7 @@ zn0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
         let original = vec![captured([192, 168, 80, 1], "eth0", 100)];
         let res = ExitRoutes::bring_up_with(base, strict, pin.clone(), "zn0", Some(original));
         assert!(res.is_err());
-        // The base set and the blackholes went in; the refused delete unwinds
+        // The base set and the v6 halves went in; the refused delete unwinds
         // the whole stack, the default restore first (best-effort: here the
         // delete never ran, so it finds the default still in place).
         assert_eq!(

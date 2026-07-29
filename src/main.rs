@@ -62,8 +62,8 @@ client options:
   --exit              Exit mode (requires --tun): route this host's IPv4
                       traffic through the server
   --exit-strict       Strict exit (requires --exit): delete the default routes
-                      and blackhole IPv6 while the routes are up; a crash
-                      leaves the host without a default route
+                      and send IPv6 to loopback while the routes are up; a
+                      crash leaves the host without a default route
   --transport <MODE>  auto|udp|tcp (default: auto)
   --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
   --tap-mtu <N>       TAP/TUN MTU (default: 1400; alias --tun-mtu)

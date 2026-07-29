@@ -566,7 +566,7 @@ pub struct ClientTun {
     /// the tun profile is active.
     pub exit: bool,
     /// Exit with no fallback: every original default route is deleted and
-    /// IPv6 blackholed while the routes are up, both restored on clean
+    /// IPv6 goes to loopback while the routes are up, both undone on clean
     /// teardown.
     pub exit_strict: bool,
 }
@@ -1994,7 +1994,7 @@ pub(crate) async fn exit_server_v4(addr: &str) -> Result<Ipv4Addr> {
 /// Program or refresh the exit routes ahead of a dial against `addr`, and
 /// return the literal target the dial must use. The first call pins the
 /// resolved server over the uplink and installs the half-defaults via
-/// `tun_name` (in strict mode also the v6 blackholes and the deletion of
+/// `tun_name` (in strict mode also the v6 halves and the deletion of
 /// every default route, captured from the same table read as the pin); every
 /// later call re-asserts the /32 pin, moving it when the resolved address
 /// changed.

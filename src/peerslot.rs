@@ -382,7 +382,7 @@ pub struct ExitVia {
     /// installs itself.
     pub exit: bool,
     /// Exit with no fallback: every original default route is deleted and
-    /// IPv6 blackholed while the pair is up, both restored on teardown.
+    /// IPv6 goes to loopback while the pair is up, both undone on teardown.
     pub exit_strict: bool,
 }
 

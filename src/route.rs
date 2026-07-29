@@ -284,13 +284,15 @@ fn no_ipv6_stack(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::EAFNOSUPPORT)
 }
 
-/// Add or delete an unreachable IPv6 route via `SIOCADDRT`/`SIOCDELRT` on a
-/// throwaway `AF_INET6` socket. The route rejects matching traffic
-/// (`RTF_REJECT`) and is bound to no device; the zero metric adds at the
-/// kernel's default priority and deletes at any. A host without an IPv6
-/// stack has nothing to blackhole, so `EAFNOSUPPORT` from the socket open is
-/// success for add and delete alike.
-pub fn modify_route6_unreachable(add: bool, dst: Ipv6Addr, prefix: u8) -> crate::Result<()> {
+/// Add or delete an IPv6 route via `SIOCADDRT`/`SIOCDELRT` on a throwaway
+/// `AF_INET6` socket. The route is bound to no device and asks for
+/// `RTF_REJECT`, which this ioctl cannot express: it lands on loopback, so a
+/// send to a covered address fails on the host with `ENETUNREACH` and never
+/// reaches the uplink. The zero metric adds at the kernel's default priority
+/// and deletes at any. A host without an IPv6 stack has nothing to route
+/// away, so `EAFNOSUPPORT` from the socket open is success for add and
+/// delete alike.
+pub fn modify_route6(add: bool, dst: Ipv6Addr, prefix: u8) -> crate::Result<()> {
     let sock = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
     if sock < 0 {
         let os = io::Error::last_os_error();

@@ -450,9 +450,12 @@ docker run -d --name zeronat --restart unless-stopped --network host \
       server's address is pinned to the current default route as a /32, and <code>0.0.0.0/1</code>
       plus <code>128.0.0.0/1</code> point at the tun device, so they beat the host's own default route
       on prefix length while leaving it in place. <code>--exit-strict</code> goes further: it deletes
-      the original default routes and blackholes IPv6 for as long as the tunnel routes are up, so
-      traffic stops rather than leaking out the uplink if the tunnel drops. The routes come back on
-      teardown; a crash skips it and leaves the host without a default route.</p>
+      the original default routes and puts <code>::/1</code> and <code>8000::/1</code> on loopback
+      for as long as the tunnel routes are up, so traffic stops rather than leaking out the uplink
+      if the tunnel drops. IPv6 sends fail on the host with <code>ENETUNREACH</code>, and the two
+      routes read as ordinary <code>dev lo</code> entries in <code>ip -6 route</code>. Teardown
+      restores the defaults and removes both; a crash skips it and leaves the host without a
+      default route.</p>
 <pre class="v-cli"><code><span class="c"># Server (VPS): masquerade the client's traffic out eth0:</span>
 ZERONAT_SECRET=s zeronat server --control 2222 --tun --except 22 --exit --exit-iface eth0
 
@@ -656,7 +659,7 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
           <tr><td><code>--transport &lt;MODE&gt;</code></td><td><code>auto</code> | <code>udp</code> | <code>tcp</code> (default auto)</td></tr>
           <tr><td><code>--tun</code></td><td>All-ports mode (Linux): receive every forwarded port on local services</td></tr>
           <tr><td><code>--exit</code></td><td>Exit mode (requires <code>--tun</code>): route this host's IPv4 traffic through the server</td></tr>
-          <tr><td><code>--exit-strict</code></td><td>Strict exit (requires <code>--exit</code>): delete the default routes and blackhole IPv6 while the routes are up</td></tr>
+          <tr><td><code>--exit-strict</code></td><td>Strict exit (requires <code>--exit</code>): delete the default routes and put IPv6 on loopback while the routes are up</td></tr>
           <tr><td><code>--tap &lt;NAME&gt;</code></td><td>L2 bridge mode (Linux): create or attach this TAP device</td></tr>
           <tr><td><code>--tap-mtu &lt;N&gt;</code></td><td>TAP MTU (default 1400)</td></tr>
           <tr><td><code>--bridge &lt;NAME&gt;</code></td><td>Enslave the TAP to this existing bridge</td></tr>
