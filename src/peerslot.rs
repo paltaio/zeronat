@@ -624,10 +624,10 @@ pub(crate) fn spawn(
                     peer_id,
                     want,
                     adapter,
-                } => tokio::spawn(consumer_slot(
+                } => crate::spawn(consumer_slot(
                     peer_id, want, adapter, secret, client_id, control, sink, status,
                 )),
-                PeerSlotSpec::Provider { provides, adapter } => tokio::spawn(provider_slot(
+                PeerSlotSpec::Provider { provides, adapter } => crate::spawn(provider_slot(
                     provides, adapter, secret, client_id, control, sink, status,
                 )),
             })
@@ -932,7 +932,7 @@ async fn provider_slot(
                     },
                     busy.clone(),
                 );
-                running.push((pair_id, AbortOnDrop(tokio::spawn(task))));
+                running.push((pair_id, AbortOnDrop(crate::spawn(task))));
                 // The probe frame starts the pair's own cycle, which binds its
                 // socket and reports the candidates under the id it carries.
                 tx.try_send(msg).ok();
@@ -1677,7 +1677,7 @@ mod tests {
         let (tx, mut sent) = mpsc::channel(8);
         let _live = control.install(control_session(tx));
         let status = PeerSlotCell::default();
-        let slot = AbortOnDrop(tokio::spawn(consumer_slot(
+        let slot = AbortOnDrop(crate::spawn(consumer_slot(
             "prov".into(),
             PROVIDES_EXIT,
             None,
@@ -1809,7 +1809,7 @@ mod tests {
         let (tx, _sent) = mpsc::channel(8);
         let _live = control.install(control_session(tx));
         let status = PeerSlotCell::default();
-        let slot = AbortOnDrop(tokio::spawn(provider_slot(
+        let slot = AbortOnDrop(crate::spawn(provider_slot(
             PROVIDES_EXIT,
             None,
             "secret".into(),
@@ -1848,7 +1848,7 @@ mod tests {
         let control = PeerControl::default();
         let (tx, mut sent) = mpsc::channel(8);
         let _live = control.install(control_session(tx));
-        let slot = AbortOnDrop(tokio::spawn(consumer_slot(
+        let slot = AbortOnDrop(crate::spawn(consumer_slot(
             "prov".into(),
             PROVIDES_EXIT,
             None,

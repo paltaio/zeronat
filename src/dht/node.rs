@@ -558,7 +558,7 @@ mod tests {
             unreachable!();
         };
         let seed_id = [9u8; 20];
-        let responder = tokio::spawn(fake_dht_node(sock, seed_id, b"tok"));
+        let responder = crate::spawn(fake_dht_node(sock, seed_id, b"tok"));
 
         // The seed answers round 0's find_node with no discoveries, so the walk
         // ends immediately; only the final get can extract its write token and

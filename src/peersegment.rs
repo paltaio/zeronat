@@ -143,7 +143,7 @@ mod tests {
     /// A test segment with its reader running.
     fn test_segment() -> (Segment, RawFd, AbortOnDrop) {
         let (seg, peer) = Segment::for_test();
-        let reader = AbortOnDrop(tokio::spawn(seg.reader()));
+        let reader = AbortOnDrop(crate::spawn(seg.reader()));
         (seg, peer, reader)
     }
 
@@ -158,8 +158,8 @@ mod tests {
         let _fd = DeviceFd(dev_fd);
         let (mut a, a_provider) = crate::peer::duplex_pair(SECRET, 1).await;
         let (mut b, b_provider) = crate::peer::duplex_pair(SECRET, 2).await;
-        let _port_a = AbortOnDrop(tokio::spawn(seg.attach(a_provider).unwrap()));
-        let _port_b = AbortOnDrop(tokio::spawn(seg.attach(b_provider).unwrap()));
+        let _port_a = AbortOnDrop(crate::spawn(seg.attach(a_provider).unwrap()));
+        let _port_b = AbortOnDrop(crate::spawn(seg.attach(b_provider).unwrap()));
 
         // A's broadcast reaches B and the device, and the switch learns M1
         // behind A's port on the way.
@@ -210,8 +210,8 @@ mod tests {
         let _fd = DeviceFd(dev_fd);
         let (a, a_provider) = crate::peer::duplex_pair(SECRET, 1).await;
         let (mut b, b_provider) = crate::peer::duplex_pair(SECRET, 2).await;
-        let port_a = AbortOnDrop(tokio::spawn(seg.attach(a_provider).unwrap()));
-        let _port_b = AbortOnDrop(tokio::spawn(seg.attach(b_provider).unwrap()));
+        let port_a = AbortOnDrop(crate::spawn(seg.attach(a_provider).unwrap()));
+        let _port_b = AbortOnDrop(crate::spawn(seg.attach(b_provider).unwrap()));
 
         let hello = frame(BCAST, M1, b"learn-m1");
         a.send(&hello).await.unwrap();

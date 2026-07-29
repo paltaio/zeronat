@@ -311,7 +311,7 @@ impl Session {
             key: conv,
         };
         let kcp = new_kcp(conv, self.send_tx.clone(), class);
-        tokio::spawn(async move {
+        crate::spawn(async move {
             let _guard = guard;
             drive_conv(
                 kcp,
@@ -449,7 +449,7 @@ pub fn session_from(
     first_conv: u32,
 ) -> Arc<Session> {
     let (send_tx, send_rx) = mpsc::channel(SOCKET_SEND_CAP);
-    tokio::spawn(socket_writer(socket, peer, local, send_rx));
+    crate::spawn(socket_writer(socket, peer, local, send_rx));
     Arc::new(Session {
         send_tx,
         convs: Arc::new(Mutex::new(HashMap::new())),
@@ -508,12 +508,12 @@ mod tests {
         let srv_run = {
             let srv = srv.clone();
             let srv_sock = srv_sock.clone();
-            tokio::spawn(async move {
+            crate::spawn(async move {
                 let mut buf = [0u8; 65535];
                 loop {
                     let (n, _) = srv_sock.recv_from(&mut buf).await.unwrap();
                     if let Some(Accepted::Stream { stream, .. }) = route(&srv, &buf[..n]) {
-                        tokio::spawn(async move {
+                        crate::spawn(async move {
                             let (mut r, mut w) = server_handshake(stream, &psk).await.unwrap();
                             let msg = r.recv().await.unwrap();
                             w.send(&msg).await.unwrap();
@@ -526,7 +526,7 @@ mod tests {
         let cli_run = {
             let cli = cli.clone();
             let cli_sock = cli_sock.clone();
-            tokio::spawn(async move {
+            crate::spawn(async move {
                 let mut buf = [0u8; 65535];
                 loop {
                     let (n, _) = cli_sock.recv_from(&mut buf).await.unwrap();
@@ -608,7 +608,7 @@ mod tests {
         let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
         let srv_run = {
             let srv = srv.clone();
-            tokio::spawn(async move {
+            crate::spawn(async move {
                 let mut accepted_tx = Some(accepted_tx);
                 let mut buf = [0u8; 65535];
                 loop {
@@ -623,7 +623,7 @@ mod tests {
         };
         let cli_run = {
             let cli = cli.clone();
-            tokio::spawn(async move {
+            crate::spawn(async move {
                 let mut buf = [0u8; 65535];
                 loop {
                     let (n, _) = cli_sock.recv_from(&mut buf).await.unwrap();

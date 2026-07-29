@@ -520,7 +520,7 @@ mod tests {
         let (a, b) = tokio::io::duplex(8192);
 
         let srv =
-            tokio::spawn(async move { server_handshake_stateless(b, &psk, &[]).await.unwrap() });
+            crate::spawn(async move { server_handshake_stateless(b, &psk, &[]).await.unwrap() });
         let cli = client_handshake_stateless(a, &psk, 0xABCD).await.unwrap();
         let (id, srv) = srv.await.unwrap();
         assert_eq!(id, 0xABCD);
@@ -541,7 +541,7 @@ mod tests {
         let psk = derive_psk("correct horse");
         let (a, b) = tokio::io::duplex(2 << 20);
 
-        let srv = tokio::spawn(async move { server_handshake(b, &psk).await.unwrap() });
+        let srv = crate::spawn(async move { server_handshake(b, &psk).await.unwrap() });
         let (mut cr, mut cw) = client_handshake(a, &psk).await.unwrap();
         let (mut sr, mut sw) = srv.await.unwrap();
 
@@ -563,7 +563,7 @@ mod tests {
         let psk = derive_psk("reply payload");
         let (a, b) = tokio::io::duplex(8192);
 
-        let srv = tokio::spawn(async move {
+        let srv = crate::spawn(async move {
             server_handshake_stateless(b, &psk, b"reply bytes")
                 .await
                 .unwrap()
@@ -584,7 +584,7 @@ mod tests {
         let (a, b) = tokio::io::duplex(8192);
         let good = derive_psk("right");
         let bad = derive_psk("wrong");
-        let srv = tokio::spawn(async move { server_handshake(b, &bad).await });
+        let srv = crate::spawn(async move { server_handshake(b, &bad).await });
         let cli = client_handshake(a, &good).await;
         // At least one side must reject the mismatched PSK.
         assert!(cli.is_err() || srv.await.unwrap().is_err());
@@ -603,7 +603,7 @@ mod tests {
         let (a, mut b) = tokio::io::duplex(1 << 16);
 
         let snow_psk = psk;
-        let snow = tokio::spawn(async move {
+        let snow = crate::spawn(async move {
             let mut hs = Builder::new(snow_params())
                 .psk(0, &snow_psk)
                 .build_responder()
@@ -637,7 +637,7 @@ mod tests {
         let (mut a, b) = tokio::io::duplex(1 << 16);
 
         let snow_psk = psk;
-        let snow = tokio::spawn(async move {
+        let snow = crate::spawn(async move {
             let mut hs = Builder::new(snow_params())
                 .psk(0, &snow_psk)
                 .build_initiator()
@@ -674,7 +674,7 @@ mod tests {
         let (mut dg_a, mut dg_b) = tokio::io::duplex(1 << 16);
 
         let snow_psk = psk;
-        let snow = tokio::spawn(async move {
+        let snow = crate::spawn(async move {
             let mut hs = Builder::new(snow_params())
                 .psk(0, &snow_psk)
                 .build_responder()

@@ -11,6 +11,10 @@
 //! service capturing what actually reaches the forward target. The server
 //! console runs on a pty of its own against the same server.
 
+// A test crate cannot see the crate-private spawn helper, and its tasks are not
+// in the shipped binary.
+#![allow(clippy::disallowed_methods)]
+
 #[cfg(all(feature = "tui", unix))]
 mod pty {
     use std::io::{Read, Write};

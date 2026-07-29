@@ -1,3 +1,7 @@
+// A test crate cannot see the crate-private spawn helper, and its tasks are not
+// in the shipped binary.
+#![allow(clippy::disallowed_methods)]
+
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

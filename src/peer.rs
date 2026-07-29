@@ -242,7 +242,7 @@ impl PeerSession {
 
         let (out, mut outbox) = mpsc::channel::<Vec<u8>>(SESSION_QUEUE);
         let (deliver, inbound) = mpsc::channel::<Vec<u8>>(SESSION_QUEUE);
-        let writer = AbortOnDrop(tokio::spawn(async move {
+        let writer = AbortOnDrop(crate::spawn(async move {
             while let Some(frame) = outbox.recv().await {
                 if tx.send(&frame).await.is_err() {
                     break;
@@ -252,7 +252,7 @@ impl PeerSession {
         let keepalive = {
             let noise = noise.clone();
             let out = out.clone();
-            AbortOnDrop(tokio::spawn(async move {
+            AbortOnDrop(crate::spawn(async move {
                 // The handshake just proved liveness, so the first keepalive
                 // waits a full interval.
                 let mut tick = interval_at(Instant::now() + PEER_KEEPALIVE, PEER_KEEPALIVE);
@@ -273,7 +273,7 @@ impl PeerSession {
             let noise = noise.clone();
             let out = out.clone();
             let alive = alive.clone();
-            AbortOnDrop(tokio::spawn(async move {
+            AbortOnDrop(crate::spawn(async move {
                 let _writer = writer;
                 let _keepalive = keepalive;
                 // Anything that opens proves the peer is alive; a frame that
@@ -385,7 +385,7 @@ async fn handshake(
     let mut task = {
         let psk = *psk;
         let refuse = refuse.to_vec();
-        AbortOnDrop(tokio::spawn(async move {
+        AbortOnDrop(crate::spawn(async move {
             match role {
                 Role::Consumer => client_handshake_stateless_reply(theirs, &psk, pair_id).await,
                 Role::Provider => {
@@ -509,7 +509,7 @@ pub(crate) async fn duplex_pair(secret: &str, pair_id: u64) -> (PeerSession, Pee
     let psk = crate::noise::derive_psk(secret);
     let (a, b) = tokio::io::duplex(1 << 16);
     let responder =
-        tokio::spawn(async move { crate::noise::server_handshake(b, &psk).await.unwrap() });
+        crate::spawn(async move { crate::noise::server_handshake(b, &psk).await.unwrap() });
     let initiator = crate::noise::client_handshake(a, &psk).await.unwrap();
     let responder = responder.await.unwrap();
     let ((consumer, answer), provider) = tokio::try_join!(

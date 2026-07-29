@@ -1996,7 +1996,7 @@ mod tests {
 
         let listener = ControlListener::bind(path.clone()).unwrap();
         assert_eq!(dir_mode(&path), 0o600);
-        let serve = tokio::spawn(listener.serve(idle_state("home")));
+        let serve = crate::spawn(listener.serve(idle_state("home")));
 
         let stream = UnixStream::connect(&path).await.unwrap();
         let (mut r, mut w) = crate::noise::client_handshake(stream, &admin_psk())

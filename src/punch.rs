@@ -135,7 +135,7 @@ pub async fn punch(
             sessions.insert(cand, sess);
             let psk = *psk;
             let done = done_tx.clone();
-            attempts.push(AbortOnDrop(tokio::spawn(async move {
+            attempts.push(AbortOnDrop(crate::spawn(async move {
                 if let Ok(noise) = client_handshake_stateless(stream, &psk, pair_id).await {
                     done.send((cand, noise)).await.ok();
                 }
@@ -217,7 +217,7 @@ pub async fn punch(
                     Some(Accepted::Setup { conv: got, stream }) if !initiator && got == conv => {
                         let psk = *psk;
                         let done = done_tx.clone();
-                        attempts.push(AbortOnDrop(tokio::spawn(async move {
+                        attempts.push(AbortOnDrop(crate::spawn(async move {
                             if let Ok((id, noise)) =
                                 server_handshake_stateless(stream, &psk, &[]).await
                             {
@@ -254,7 +254,7 @@ pub async fn punch(
     let rx = DgramRx::new(inbound, noise.clone());
     let keepalive = {
         let tx = DgramTx::new(sess.send_tx(), conv, noise);
-        AbortOnDrop(tokio::spawn(async move {
+        AbortOnDrop(crate::spawn(async move {
             // Every other punch message is a KCP segment and is retransmitted;
             // the initiator's nomination rides the unreliable datagram channel,
             // so it repeats on the punch cadence until the deadline has passed
@@ -286,7 +286,7 @@ pub async fn punch(
     // draining it and routing the winner's datagrams for as long as it lives.
     let pump = {
         let sess = sess.clone();
-        AbortOnDrop(tokio::spawn(async move {
+        AbortOnDrop(crate::spawn(async move {
             while let Some((src, data)) = probe.recv_peer().await {
                 if src == peer {
                     route(&sess, &data);

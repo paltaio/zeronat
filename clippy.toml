@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "tokio::spawn", reason = "call crate::spawn instead" },
+]

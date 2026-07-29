@@ -336,7 +336,7 @@ eth0\t0050A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
         let (mut consumer, provider) = crate::peer::duplex_pair(SECRET, 1).await;
         let (dev, peer) = TapDevice::socketpair_for_test(1500).unwrap();
         let _fd = DeviceFd(peer);
-        let adapter = crate::client::AbortOnDrop(tokio::spawn(run_switch(Arc::new(dev), provider)));
+        let adapter = crate::client::AbortOnDrop(crate::spawn(run_switch(Arc::new(dev), provider)));
 
         let out = packet(0xa1);
         consumer.send(&out).await.unwrap();

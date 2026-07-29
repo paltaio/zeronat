@@ -531,7 +531,7 @@ impl TapSwitch {
     pub fn new(tap: Arc<TapDevice>, is_l2: bool) -> Arc<Self> {
         let sw = Self::detached(tap, is_l2);
         let reader = sw.clone();
-        tokio::spawn(reader.read_loop());
+        crate::spawn(reader.read_loop());
         sw
     }
 
@@ -1214,7 +1214,7 @@ mod tests {
     async fn noise_pair() -> (NoiseReader, NoiseWriter, NoiseReader, NoiseWriter) {
         let psk = derive_psk("bridge relay test");
         let (a, b) = tokio::io::duplex(1 << 16);
-        let srv = tokio::spawn(async move { server_handshake(b, &psk).await.unwrap() });
+        let srv = crate::spawn(async move { server_handshake(b, &psk).await.unwrap() });
         let (cr, cw) = client_handshake(a, &psk).await.unwrap();
         let (sr, sw) = srv.await.unwrap();
         (cr, cw, sr, sw)
@@ -1230,7 +1230,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         // Keep the peer halves alive but inert; dropping them would close the
         // stream and reap via the error path instead of the idle watchdog.
-        let relay = tokio::spawn(stream_relay(
+        let relay = crate::spawn(stream_relay(
             ChanRead(feed_rx),
             ChanWrite(out_tx),
             cr,
@@ -1255,7 +1255,7 @@ mod tests {
         let (_feed_tx, feed_rx) = mpsc::channel::<Vec<u8>>(4);
         let (out_tx, _out_rx) = mpsc::unbounded_channel();
         let start = tokio::time::Instant::now();
-        let relay = tokio::spawn(stream_relay(
+        let relay = crate::spawn(stream_relay(
             ChanRead(feed_rx),
             ChanWrite(out_tx),
             cr,
@@ -1288,7 +1288,7 @@ mod tests {
         let (cr, cw, mut sr, mut sw) = noise_pair().await;
         let (_feed_tx, feed_rx) = mpsc::channel::<Vec<u8>>(4);
         let (out_tx, _out_rx) = mpsc::unbounded_channel();
-        let peer = tokio::spawn(async move {
+        let peer = crate::spawn(async move {
             // Echo a keepalive back for every inbound frame, refreshing last_in.
             while let Ok(_m) = sr.recv().await {
                 if sw.probe().await.is_err() {
@@ -1296,7 +1296,7 @@ mod tests {
                 }
             }
         });
-        let relay = tokio::spawn(stream_relay(
+        let relay = crate::spawn(stream_relay(
             ChanRead(feed_rx),
             ChanWrite(out_tx),
             cr,
@@ -1318,7 +1318,7 @@ mod tests {
         let (cr, cw, mut sr, mut sw) = noise_pair().await;
         let (_feed_tx, feed_rx) = mpsc::channel::<Vec<u8>>(4);
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let relay = tokio::spawn(stream_relay(
+        let relay = crate::spawn(stream_relay(
             ChanRead(feed_rx),
             ChanWrite(out_tx),
             cr,
@@ -1327,7 +1327,7 @@ mod tests {
             std::future::pending(),
         ));
         // Drain inbound on the peer so the relay's nw.send/probe never blocks.
-        let drain = tokio::spawn(async move { while sr.recv().await.is_ok() {} });
+        let drain = crate::spawn(async move { while sr.recv().await.is_ok() {} });
         sw.probe().await.unwrap(); // empty keepalive: must be dropped
         sw.send(b"real-frame").await.unwrap();
         sw.probe().await.unwrap(); // another keepalive
@@ -1708,7 +1708,7 @@ mod switch_tests {
         let psk = crate::noise::derive_psk("switch port dgram");
         let (a, b) = tokio::io::duplex(8192);
         let responder =
-            tokio::spawn(
+            crate::spawn(
                 async move { crate::noise::server_handshake_stateless(b, &psk, &[]).await },
             );
         let client = Arc::new(
@@ -1727,7 +1727,7 @@ mod switch_tests {
         inbound_tx.send(pkt[5..].to_vec()).await.unwrap();
 
         let (out_tx, _out_rx) = mpsc::channel(4);
-        let relay = tokio::spawn(switch_port_dgram(
+        let relay = crate::spawn(switch_port_dgram(
             handle,
             DgramRx::new(inbound_rx, server.clone()),
             DgramTx::new(out_tx, 0, server),

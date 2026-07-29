@@ -1286,7 +1286,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 fallback_mode,
                 persist: config.map(|(path, cfg)| Persist::new(path, cfg)),
             };
-            Some(AbortOnDrop(tokio::spawn(listener.serve(state))))
+            Some(AbortOnDrop(crate::spawn(listener.serve(state))))
         }
         None => None,
     };
@@ -1458,7 +1458,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 let ppp = ppp.clone();
                 let link = link.clone();
                 let peer_control = peer_control.clone();
-                AbortOnDrop(tokio::spawn(async move {
+                AbortOnDrop(crate::spawn(async move {
                     match body {
                         Body::Device(tap) => bridge_session(client, tap, try_udp, link).await,
                         Body::Pppoe(pp) => pppoe_session(client, pp, ppp, try_udp, link).await,
@@ -1467,7 +1467,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 }))
             };
             #[cfg(not(target_os = "linux"))]
-            let mut session_task = AbortOnDrop(tokio::spawn(session(
+            let mut session_task = AbortOnDrop(crate::spawn(session(
                 client,
                 try_udp,
                 link.clone(),
@@ -1603,7 +1603,7 @@ async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop, Arc<
     let pump = {
         let sess = sess.clone();
         let cancel = cancel.clone();
-        tokio::spawn(async move {
+        crate::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
                 match socket.recv(&mut buf).await {
@@ -1705,7 +1705,7 @@ pub async fn probe_candidates(
     let pump = {
         let sess = sess.clone();
         let socket = socket.clone();
-        AbortOnDrop(tokio::spawn(async move {
+        AbortOnDrop(crate::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
                 match socket.recv_from(&mut buf).await {
@@ -1735,7 +1735,7 @@ pub async fn probe_candidates(
     let tx = DgramTx::new(sess.send_tx(), conv, Arc::new(noise));
     let body = encode_sockaddr(local);
     tx.send(&body).await?;
-    let resend = AbortOnDrop(tokio::spawn(async move {
+    let resend = AbortOnDrop(crate::spawn(async move {
         loop {
             sleep(LOCAL_CANDIDATE_RESEND).await;
             if tx.send(&body).await.is_err() {
@@ -2314,7 +2314,7 @@ async fn control_loop(
     // both a normal teardown and a server switch aborting the whole session
     // task reap them instead of leaving them running against a dead server.
     let mut w = w;
-    let _writer = AbortOnDrop(tokio::spawn(async move {
+    let _writer = AbortOnDrop(crate::spawn(async move {
         while let Some(bytes) = rx.recv().await {
             if w.send(&bytes).await.is_err() {
                 break;
@@ -2323,7 +2323,7 @@ async fn control_loop(
     }));
 
     let ping_tx = tx.clone();
-    let _pinger = AbortOnDrop(tokio::spawn(async move {
+    let _pinger = AbortOnDrop(crate::spawn(async move {
         let mut tick = interval(PING_INTERVAL);
         tick.tick().await;
         loop {
@@ -2355,7 +2355,7 @@ async fn control_loop(
                 .collect::<Vec<_>>()
                 .join(", ");
             let ack = ack.clone();
-            Some(AbortOnDrop(tokio::spawn(async move {
+            Some(AbortOnDrop(crate::spawn(async move {
                 sleep(FWD_OPTIONS_ACK_TIMEOUT).await;
                 if !ack.load(Ordering::Relaxed) {
                     crate::elog!(
@@ -2373,7 +2373,7 @@ async fn control_loop(
     // again and re-decides, so the verdict never outlives a server upgrade.
     let _peer_watchdog = client.peer_announce.map(|_| {
         let acked = peer_ack.clone();
-        AbortOnDrop(tokio::spawn(async move {
+        AbortOnDrop(crate::spawn(async move {
             sleep(FWD_OPTIONS_ACK_TIMEOUT).await;
             if !acked.load(Ordering::Relaxed) {
                 crate::elog!(
@@ -2457,7 +2457,7 @@ async fn control_loop(
             // Drop guards of forwards that already finished so the tracking
             // vector stays bounded over a long healthy session.
             forwards.retain(|h| !h.0.is_finished());
-            forwards.push(AbortOnDrop(tokio::spawn(async move {
+            forwards.push(AbortOnDrop(crate::spawn(async move {
                 if let Err(e) = handle_open(client, link, proto, port, id, proxy_addrs).await {
                     crate::elog!("stream {id} ({proto:?} :{port}) failed: {e}");
                 }
@@ -3482,7 +3482,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         // Accept and hold the connection open without ever writing msg2.
-        tokio::spawn(async move {
+        crate::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
             std::future::pending::<()>().await;
             drop(sock);

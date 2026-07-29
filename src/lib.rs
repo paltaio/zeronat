@@ -38,3 +38,18 @@ pub mod tap;
 #[cfg(all(feature = "tui", unix))]
 pub mod tui;
 pub mod upgrade;
+
+/// Spawn a task on the tokio runtime.
+///
+/// A direct `tokio::spawn` instantiates the spawn path and the task vtable for
+/// every future type it is handed; erasing the future first leaves one
+/// instantiation per output type, at the cost of an allocation per task and an
+/// indirect call per poll.
+#[track_caller]
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn spawn<T: Send + 'static>(
+    f: impl std::future::Future<Output = T> + Send + 'static,
+) -> tokio::task::JoinHandle<T> {
+    let f: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>> = Box::pin(f);
+    tokio::spawn(f)
+}

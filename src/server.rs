@@ -615,7 +615,7 @@ impl Server {
             return;
         }
         let srv = self.clone();
-        tokio::spawn(async move {
+        crate::spawn(async move {
             tokio::time::sleep(PAIR_PROBE_DEADLINE).await;
             srv.finish_pair(pair_id);
         });
@@ -768,7 +768,7 @@ impl Server {
         if opened {
             crate::elog!("peer pair {pair_id}: opening the relay");
             let srv = self.clone();
-            tokio::spawn(async move {
+            crate::spawn(async move {
                 tokio::time::sleep(RELAY_CLAIM_DEADLINE).await;
                 srv.reap_unclaimed_relay(pair_id);
             });
@@ -819,7 +819,7 @@ impl Server {
             RelayState::Parked(first) => {
                 let (stop_tx, stop_rx) = oneshot::channel();
                 let srv = self.clone();
-                tokio::spawn(async move {
+                crate::spawn(async move {
                     splice_relay(first, leg, stop_rx).await;
                     srv.end_relay(pair_id);
                 });
@@ -1024,7 +1024,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
             let secret = secret.clone();
             let ip = ann.ip;
             let port = ann.port.unwrap_or(control_port);
-            tokio::spawn(async move {
+            crate::spawn(async move {
                 crate::dht::announce_loop(&secret, ip, port).await;
             });
         }
@@ -1095,7 +1095,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
     {
         let srv = srv.clone();
         let udp_control = udp_control.clone();
-        tokio::spawn(async move {
+        crate::spawn(async move {
             if let Err(e) = udp_control_listener(srv, udp_control).await {
                 crate::elog!("udp control listener stopped: {e}");
             }
@@ -1115,7 +1115,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
             }
         };
         let srv = srv.clone();
-        tokio::spawn(async move {
+        crate::spawn(async move {
             if let Err(e) = handle_incoming(srv, sock, peer).await {
                 crate::elog!("connection from {peer} ended: {e}");
             }
@@ -1183,7 +1183,7 @@ pub(crate) async fn serve_stream(
             }
             crate::elog!("client {client_id} connected");
             let mut w = w;
-            let writer = tokio::spawn(async move {
+            let writer = crate::spawn(async move {
                 while let Some(bytes) = rx.recv().await {
                     if w.send(&bytes).await.is_err() {
                         break;
@@ -1722,7 +1722,7 @@ async fn spawn_listener(
                 },
             );
             let srv = srv.clone();
-            tokio::spawn(async move {
+            crate::spawn(async move {
                 tcp_listener(srv, l, bind_ip, port, cancel, bridges).await;
             });
         }
@@ -1748,7 +1748,7 @@ async fn spawn_listener(
                 },
             );
             let srv = srv.clone();
-            tokio::spawn(async move {
+            crate::spawn(async move {
                 udp_listener(srv, socket, bind_ip, port, cancel, flush).await;
             });
         }
@@ -1848,7 +1848,7 @@ async fn tcp_listener(
             },
         };
         let srv = srv.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::spawn(async move {
             // The accept's peer and local addresses feed a PROXY header when the
             // routed client asked for one; the bound tuple stands in if the
             // kernel cannot report the local side.
@@ -1972,7 +1972,7 @@ async fn udp_listener(
                 };
                 let socket = socket.clone();
                 let srv = srv.clone();
-                tokio::spawn(async move {
+                crate::spawn(async move {
                     match timeout(OPEN_TIMEOUT, rx).await {
                         Ok(Ok((nr, nw))) => {
                             bridge::udp_server(socket, src, local, drx, nr, nw, idle).await
@@ -2009,7 +2009,7 @@ async fn udp_listener(
                     // arrives (vanished/spoofed source). `remove` by id is a no-op
                     // once `take_udp_pending` claimed it, so this is idempotent.
                     let srv = srv.clone();
-                    tokio::spawn(async move {
+                    crate::spawn(async move {
                         tokio::time::sleep(OPEN_TIMEOUT).await;
                         srv.udp_pending.lock().unwrap().remove(&id);
                     });
@@ -2108,7 +2108,7 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
             Some(Accepted::Stream { stream, .. }) => {
                 let srv = srv.clone();
                 let psk = srv.psk;
-                tokio::spawn(async move {
+                crate::spawn(async move {
                     let Ok(permit) = srv.handshakes.clone().acquire_owned().await else {
                         return;
                     };
@@ -2124,7 +2124,7 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
                 let srv = srv.clone();
                 let sess2 = sess.clone();
                 let psk = srv.psk;
-                tokio::spawn(async move {
+                crate::spawn(async move {
                     let Ok(permit) = srv.handshakes.clone().acquire_owned().await else {
                         return;
                     };
@@ -2469,7 +2469,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let (client_io, server_io) = tokio::io::duplex(8192);
         let psk = srv.psk;
 
-        let client = tokio::spawn(async move {
+        let client = crate::spawn(async move {
             let (_cr, _cw) = crate::noise::client_handshake(client_io, &psk)
                 .await
                 .expect("client handshake");
@@ -2496,7 +2496,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let (client_io, server_io) = tokio::io::duplex(8192);
         let psk = srv.psk;
 
-        let client = tokio::spawn(async move {
+        let client = crate::spawn(async move {
             let (_cr, mut cw) = crate::noise::client_handshake(client_io, &psk)
                 .await
                 .expect("client handshake");
@@ -2855,7 +2855,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let observed: SocketAddr = "203.0.113.7:4321".parse().unwrap();
 
         let srv2 = srv.clone();
-        let server = tokio::spawn(async move {
+        let server = crate::spawn(async move {
             let (r, w) = crate::noise::server_handshake(server_io, &psk)
                 .await
                 .expect("server handshake");
@@ -2913,7 +2913,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let psk = srv.psk;
 
         let srv2 = srv.clone();
-        let server = tokio::spawn(async move {
+        let server = crate::spawn(async move {
             let (r, w) = crate::noise::server_handshake(server_io, &psk)
                 .await
                 .expect("server handshake");
