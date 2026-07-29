@@ -14,6 +14,7 @@ pub mod engine;
 #[cfg(target_os = "linux")]
 pub mod netcfg;
 pub mod ppp;
+pub mod redial;
 pub mod session;
 #[cfg(target_os = "linux")]
 pub mod tunnel;

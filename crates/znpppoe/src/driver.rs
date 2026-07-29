@@ -9,13 +9,14 @@
 //! datapaths and the per-session channels (so the netstacks and SOCKS handles)
 //! stable.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, watch, Notify};
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 
 use zeronat::pppoe::datapath::{DpPhase, PppoeDatapath};
 use zeronat::pppoe::engine::Established;
+use zeronat::pppoe::redial::{self, Redial};
 
 use crate::uplink::{Inbound, Link, LinkTx, Uplink, REBRIDGE_GRACE, UDP_IDLE};
 
@@ -29,12 +30,6 @@ const KEEPALIVE: Duration = Duration::from_secs(20);
 // and a fast download's inbound burst is dropped faster than it is drained.
 const IP_QUEUE: usize = 1024;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
-// Negotiation ticks a session waits before dialing again after discovery gave
-// up. An access concentrator that stops answering usually starts again on its
-// own, so a session that gave up keeps dialing at a falling rate.
-const REDIAL_TICKS: u32 = 3;
-// Ceiling the redial wait doubles up to.
-const REDIAL_TICKS_MAX: u32 = 60;
 
 /// PPPoE credentials and link parameters shared by every session in the process.
 #[derive(Clone)]
@@ -63,55 +58,19 @@ enum Demux {
     Drop,
 }
 
-/// What the driver tracks per session over the life of a channel: whether the
-/// session is up, and the wait pacing a datapath that gave up on discovery.
+/// What the driver tracks per session over the life of a channel: when the
+/// session came up, and the wait pacing a datapath that has to dial again.
 #[derive(Default)]
 struct SessionState {
-    up: bool,
+    /// When the session reached Established, or `None` while it is down.
+    up_since: Option<Instant>,
+    /// The wait pacing this session's next dial. On a bridge uplink with every
+    /// session down, `REBRIDGE_GRACE` returns from `session_loop` and starts the
+    /// ladder over before it can climb past the first rung, so there the
+    /// reattach grace sets the redial rate rather than the wait; the higher
+    /// rungs are reached on a peer uplink, or while another session on the
+    /// bridge is up and holding the grace off.
     redial: Redial,
-}
-
-/// Paces how often a session that gave up on discovery dials again. The wait
-/// runs on negotiation ticks and doubles per failed dial; a session that comes
-/// up starts the ladder over.
-struct Redial {
-    /// Ticks left before the next dial, or `None` when no dial is pending.
-    wait: Option<u32>,
-    /// Ticks the next wait is armed for.
-    next: u32,
-}
-
-impl Default for Redial {
-    fn default() -> Self {
-        Redial {
-            wait: None,
-            next: REDIAL_TICKS,
-        }
-    }
-}
-
-impl Redial {
-    /// Start the wait after a failed dial and report how long it is, or `None`
-    /// when a wait is already running.
-    fn arm(&mut self) -> Option<u32> {
-        if self.wait.is_some() {
-            return None;
-        }
-        let ticks = self.next;
-        self.wait = Some(ticks);
-        self.next = (self.next * 2).min(REDIAL_TICKS_MAX);
-        Some(ticks)
-    }
-
-    /// Count one tick off the wait, reporting whether it is time to dial.
-    fn due(&mut self) -> bool {
-        let Some(left) = self.wait else {
-            return false;
-        };
-        let left = left - 1;
-        self.wait = (left > 0).then_some(left);
-        left == 0
-    }
 }
 
 /// Route an inbound L2 frame to a session by destination MAC. A broadcast is
@@ -209,10 +168,16 @@ async fn run(
         // ladder that starts over with it: a new channel can land on a different
         // segment.
         for i in 0..count {
-            let _ = dps[i].reset();
             state[i].redial = Redial::default();
-            if state[i].up {
-                state[i].up = false;
+            if let Err(e) = dps[i].reset() {
+                eprintln!("znpppoe: session {i} dial failed on the new link: {e}");
+                // A failed reset leaves the datapath as the dead channel left it,
+                // session id and all. Release so that id stays off this channel,
+                // and arm the wait: nothing else would dial this session again.
+                let _ = dps[i].release();
+                let _ = state[i].redial.arm();
+            }
+            if state[i].up_since.take().is_some() {
                 est_txs[i].send_replace(None);
             }
         }
@@ -232,8 +197,7 @@ async fn run(
 
         eprintln!("znpppoe: link down; reconnecting");
         for i in 0..count {
-            if state[i].up {
-                state[i].up = false;
+            if state[i].up_since.take().is_some() {
                 est_txs[i].send_replace(None);
             }
         }
@@ -316,7 +280,7 @@ async fn session_loop(
                 // A live session keeps the timer fresh; if every session has been
                 // down past the grace, the channel to the segment is gone and
                 // redialing in place cannot recover, so bounce it to re-attach.
-                if state.iter().any(|s| s.up) {
+                if state.iter().any(|s| s.up_since.is_some()) {
                     last_up = Instant::now();
                 } else if let Some(window) = grace.filter(|w| last_up.elapsed() >= *w) {
                     eprintln!("znpppoe: all sessions down {window:?}; reattaching");
@@ -390,9 +354,8 @@ async fn apply_phase(
 ) {
     match phase {
         DpPhase::Established(est) => {
-            if !state[idx].up {
-                state[idx].up = true;
-                state[idx].redial = Redial::default();
+            if state[idx].up_since.is_none() {
+                state[idx].up_since = Some(Instant::now());
                 eprintln!("znpppoe: session {idx} up, ip={}", est.local_ip);
                 est_txs[idx].send_replace(Some(est));
             }
@@ -401,18 +364,37 @@ async fn apply_phase(
             }
         }
         DpPhase::LinkDown => {
-            if state[idx].up {
-                state[idx].up = false;
-                eprintln!("znpppoe: session {idx} link down, redialing");
+            let up_since = state[idx].up_since.take();
+            if up_since.is_some() {
+                eprintln!("znpppoe: session {idx} link down");
                 est_txs[idx].send_replace(None);
             }
-            let _ = dps[idx].reset();
-            // Send the fresh PADI now rather than waiting a tick.
-            flush_one(idx, dps, tx).await;
+            // A session that held long enough to serve is dialed again at once and
+            // starts the ladder over: that is a link flap. A session that died
+            // before it held is released and paced instead, since an access
+            // concentrator that answers a dial through PADS and tears the session
+            // straight down answers the next dial as fast as it is sent. Either
+            // way the session id leaves the wire here; only the PADI is deferred,
+            // to the tick where `tick_sessions` finds the wait up.
+            if redial::held(up_since) {
+                eprintln!("znpppoe: session {idx} dialing again");
+                state[idx].redial = Redial::default();
+                if let Err(e) = dps[idx].reset() {
+                    eprintln!("znpppoe: session {idx} redial failed: {e}");
+                    // Release so the torn-down id leaves the wire even when no
+                    // fresh dial can be built; the next tick reads LinkDown and
+                    // paces the retry.
+                    let _ = dps[idx].release();
+                }
+                flush_one(idx, dps, tx).await;
+            } else if let Some(ticks) = state[idx].redial.arm() {
+                let _ = dps[idx].release();
+                let wait = NEGO_TICK * ticks;
+                eprintln!("znpppoe: session {idx} died early, dialing again in {wait:?}");
+            }
         }
         DpPhase::Dead => {
-            if state[idx].up {
-                state[idx].up = false;
+            if state[idx].up_since.take().is_some() {
                 est_txs[idx].send_replace(None);
             }
             // The datapath emits nothing while it is dead, so the wait is what
@@ -443,9 +425,9 @@ mod tests {
     use super::*;
 
     use zeronat::pppoe::discovery::{
-        build_padi, parse_discovery_frame, CODE_PADI, CODE_PADO, CODE_PADR, CODE_PADS,
+        build_padi, parse_discovery_frame, CODE_PADI, CODE_PADO, CODE_PADR, CODE_PADS, CODE_PADT,
     };
-    use zeronat::pppoe::session::put_eth_header;
+    use zeronat::pppoe::session::{parse_session_frame, put_eth_header};
     use zeronat::pppoe::{MacAddr, ETHERTYPE_DISCOVERY, VER_TYPE};
 
     fn frame(dst: [u8; 6]) -> Vec<u8> {
@@ -467,20 +449,6 @@ mod tests {
     fn demux_drops_runt_frames() {
         let macs = [[1u8; 6]];
         assert!(matches!(demux(&[1, 1, 1, 1, 1, 1], &macs), Demux::Drop));
-    }
-
-    #[test]
-    fn the_redial_wait_doubles_up_to_the_ceiling() {
-        let mut redial = Redial::default();
-        let mut waits = Vec::new();
-        for _ in 0..7 {
-            let ticks = redial.arm().expect("a wait is already running");
-            waits.push(ticks);
-            for left in (0..ticks).rev() {
-                assert_eq!(redial.due(), left == 0, "the wait dialed with {left} left");
-            }
-        }
-        assert_eq!(waits, [3, 6, 12, 24, 48, 60, 60]);
     }
 
     fn creds() -> Creds {
@@ -573,6 +541,43 @@ mod tests {
             v
         }
 
+        /// Answer the dial the station has outstanding with a PADS assigning
+        /// `session_id`, optionally tearing the fresh session down. Returns the
+        /// frames drained to find the dial; what the answer puts on the channel is
+        /// left for the next drain.
+        async fn answer_dial(&mut self, session_id: u16, tear_down: bool) -> Vec<Vec<u8>> {
+            let sent = self.sent();
+            self.answer(&sent, session_id, tear_down).await;
+            sent
+        }
+
+        /// Answer the dial among `sent`, if there is one, the same way.
+        async fn answer(&mut self, sent: &[Vec<u8>], session_id: u16, tear_down: bool) {
+            let Some(padi) = sent.iter().find(|f| code_is(f, CODE_PADI)) else {
+                return;
+            };
+            let padi = parse_discovery_frame(padi).expect("parse the PADI");
+            let uniq = padi
+                .host_uniq
+                .clone()
+                .expect("the PADI carries a Host-Uniq");
+            let station = padi.eth.src;
+            self.feed(&from_ac(CODE_PADO, station, 0, &uniq)).await;
+            self.feed(&from_ac(CODE_PADS, station, session_id, &uniq))
+                .await;
+            if tear_down {
+                self.tear_down(session_id).await;
+            }
+        }
+
+        /// Tear the station's session down with a PADT from the access
+        /// concentrator that handed it out.
+        async fn tear_down(&mut self, session_id: u16) {
+            let station = self.dps[0].our_mac();
+            self.feed(&from_ac(CODE_PADT, station, session_id, &[]))
+                .await;
+        }
+
         /// Tick until discovery gives up, returning the frames that took.
         async fn dial_until_dead(&mut self) -> Vec<Vec<u8>> {
             let mut sent = self.sent();
@@ -593,6 +598,25 @@ mod tests {
 
     fn count(frames: &[Vec<u8>], code: u8) -> usize {
         frames.iter().filter(|f| code_is(f, code)).count()
+    }
+
+    /// Whether the frame is a 0x8864 session frame carrying `session_id`.
+    fn carries_session(frame: &[u8], session_id: u16) -> bool {
+        parse_session_frame(frame).is_ok_and(|h| h.session_id == session_id)
+    }
+
+    /// How many dials a window of `ticks` negotiation ticks carries at least. The
+    /// waits double from `REDIAL_TICKS`, so the cumulative wait before the nth
+    /// dial is at most `REDIAL_TICKS * (2^n - 1)` ticks: every rung that fits
+    /// inside the window dialed, plus the dial that opened it.
+    fn dials_in(ticks: usize) -> usize {
+        let mut dials = 1;
+        let mut cumulative = redial::REDIAL_TICKS as usize;
+        while cumulative < ticks {
+            dials += 1;
+            cumulative = 2 * cumulative + redial::REDIAL_TICKS as usize;
+        }
+        dials
     }
 
     /// A PADI from another station: the broadcast every station on the segment
@@ -701,6 +725,136 @@ mod tests {
         b.feed(&from_ac(CODE_PADS, padi.eth.src, 0x0042, &host_uniq))
             .await;
         assert_eq!(b.phase(), DpPhase::Ppp, "the PADS latches a session");
+    }
+
+    // An access concentrator that answers a dial through PADS and tears the fresh
+    // session down puts no timer in the loop: it answers the next dial as fast as
+    // it arrives, so what bounds the rate is the station's own wait. Over a window
+    // carrying a thousand answered dials the station dials a handful of times.
+    #[tokio::test]
+    async fn a_station_whose_session_is_torn_down_dials_on_a_widening_wait() {
+        let mut b = Bench::new().await;
+        const TICKS: usize = 200;
+        const PER_TICK: usize = 5;
+        let mut sent = Vec::new();
+        for _ in 0..TICKS {
+            b.tick().await;
+            for _ in 0..PER_TICK {
+                sent.extend(b.answer_dial(0x0042, true).await);
+            }
+        }
+        sent.extend(b.sent());
+        let dials = count(&sent, CODE_PADI);
+        assert!(
+            dials >= dials_in(TICKS),
+            "the station stopped dialing altogether after {dials} PADI"
+        );
+        assert!(
+            dials <= TICKS / 10,
+            "{dials} PADI over {TICKS} ticks is not a paced redial"
+        );
+
+        // The wait paces the station without stranding it: once the segment stops
+        // tearing sessions down, the next dial latches one.
+        for _ in 0..TICKS {
+            b.tick().await;
+            b.answer_dial(0x0042, false).await;
+            if b.phase() == DpPhase::Ppp {
+                return;
+            }
+        }
+        panic!("the station never latched a session again");
+    }
+
+    // A session the access concentrator tears down is off the wire the moment the
+    // PADT lands: the deferred dial paces how soon the station comes back, not how
+    // long it keeps addressing an id the concentrator has released and may have
+    // handed to another subscriber. Run out three rungs of the ladder, where the
+    // LCP restart timer would otherwise re-offer the Configure-Request through the
+    // whole wait.
+    #[tokio::test]
+    async fn a_torn_down_session_id_leaves_the_wire_at_once() {
+        let mut b = Bench::new().await;
+        let mut dial = b.sent();
+        for rung in 0..3u32 {
+            let id = 0x0100 + rung as u16;
+            b.answer(&dial, id, true).await;
+            let _ = b.sent(); // what went out while the session was still alive
+            dial = Vec::new();
+            let mut leaked = 0;
+            for _ in 0..(redial::REDIAL_TICKS << rung) {
+                b.tick().await;
+                let sent = b.sent();
+                leaked += sent.iter().filter(|f| carries_session(f, id)).count();
+                dial.extend(sent);
+            }
+            assert_eq!(
+                leaked, 0,
+                "the station sent {leaked} frames on session {id:#06x} after it was torn down"
+            );
+            assert_eq!(
+                count(&dial, CODE_PADI),
+                1,
+                "the wait did not dial again on rung {}",
+                rung + 1
+            );
+        }
+    }
+
+    // The wait paces a segment that tears sessions down as fast as it hands them
+    // out; a link that was serving and dropped is a flap, and the station dials
+    // again the moment it does.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_session_that_held_redials_at_once() {
+        let mut b = Bench::new().await;
+        let sent = b.answer_dial(0x0042, false).await;
+        assert_eq!(count(&sent, CODE_PADI), 1, "the station never dialed");
+        // The edge the driver records when PPP comes up; the bench stops at PADS.
+        b.state[0].up_since = Some(Instant::now());
+
+        // Torn down before it held: paced like any other early death.
+        b.tear_down(0x0042).await;
+        assert_eq!(
+            count(&b.sent(), CODE_PADI),
+            0,
+            "a session that never held redialed at once"
+        );
+
+        // The wait dials again; let this session hold.
+        for _ in 0..redial::REDIAL_TICKS {
+            b.tick().await;
+        }
+        let sent = b.answer_dial(0x0042, false).await;
+        assert_eq!(count(&sent, CODE_PADI), 1, "the wait never dialed");
+        b.state[0].up_since = Some(Instant::now());
+        tokio::time::advance(redial::SESSION_HELD).await;
+
+        b.tear_down(0x0042).await;
+        let sent = b.answer_dial(0x0042, false).await;
+        assert_eq!(
+            count(&sent, CODE_PADI),
+            1,
+            "a session that held did not redial at once"
+        );
+        b.state[0].up_since = Some(Instant::now());
+
+        // The ladder started over with it, so the next early death waits the first
+        // rung rather than the rung the earlier death climbed to.
+        b.tear_down(0x0042).await;
+        for _ in 0..redial::REDIAL_TICKS - 1 {
+            b.tick().await;
+        }
+        assert_eq!(
+            count(&b.sent(), CODE_PADI),
+            0,
+            "the station dialed before the wait was up"
+        );
+        b.tick().await;
+        assert_eq!(
+            count(&b.sent(), CODE_PADI),
+            1,
+            "the wait did not dial on the first rung"
+        );
     }
 
     fn peer_uplink(sessions: mpsc::Receiver<zeronat::client::PeerSlotSession>) -> Uplink {

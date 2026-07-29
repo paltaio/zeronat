@@ -16,7 +16,7 @@
 //! `session`/`discovery`/`engine`; `on_l2_frame` never indexes a raw byte and
 //! never panics on a malformed frame (the release profile is panic=abort).
 
-use super::discovery::{Action, Discovery, Established as DiscoveryEstablished};
+use super::discovery::{Action, Discovery, Established as DiscoveryEstablished, State};
 use super::engine::{self, FeedOutcome, PppConfig, PppPhase, PppSession};
 use super::session::{build_session_frame, parse_eth_header, parse_session_frame};
 use super::{MacAddr, ETHERTYPE_DISCOVERY, ETHERTYPE_SESSION};
@@ -146,8 +146,9 @@ pub enum DpPhase {
     /// IPCP up; the negotiated IP config is ready, zppp0 can come up / is up.
     Established(engine::Established),
     /// The link was Established and then died (echo timeout, inbound PADT, or the
-    /// PPP FSM dropping below Opened). The shell tears down zppp0 and redials in
-    /// place. Distinct from `Dead`, where discovery never latched a session.
+    /// PPP FSM dropping below Opened). The shell tears down zppp0, releases the
+    /// session, and dials again in place, at once or on a wait it paces. Distinct
+    /// from `Dead`, where discovery never latched a session.
     LinkDown,
     /// Discovery gave up before a session latched: the attempt budget ran out, or
     /// a PADT arrived before the link came up. The datapath stays Dead and emits
@@ -176,9 +177,6 @@ pub struct PppoeDatapath<'a> {
     out: Vec<Vec<u8>>,
     /// Inbound IPv4 datagrams pending write to zppp0, FIFO.
     inbound_ip: Vec<Vec<u8>>,
-    /// True once discovery gave up before any session latched. Cleared by
-    /// `reset`, which dials from scratch.
-    dead: bool,
     /// Ticks since the last Echo-Request, counted only while Established.
     echo_ticks: u32,
     /// Consecutive Echo-Request intervals with no matching reply observed.
@@ -250,7 +248,6 @@ impl<'a> PppoeDatapath<'a> {
             established: None,
             out: Vec::new(),
             inbound_ip: Vec::new(),
-            dead: false,
             echo_ticks: 0,
             echo_misses: 0,
             echo_outstanding: false,
@@ -300,28 +297,19 @@ impl<'a> PppoeDatapath<'a> {
         self.apply_discovery_action(action);
     }
 
-    /// Tear down the current session and return to Discovery for an in-session
-    /// redial: same source MAC, Service-Name, and Host-Uniq selector, but a fresh
-    /// discovery (new PADI -> new session id) and a fresh PPP session with a new
-    /// Magic-Number. Called by the shell after it observes LinkDown and closes
-    /// zppp0, and to dial again after discovery gave up: the `Dead` latch clears
-    /// with the rest of the session state. Re-emits the first PADI, so the caller
-    /// drains `poll_transmit_frame` right after.
+    /// Drop the session the AC handed out and the PPP state built on it: the
+    /// session id and AC address, the PPP FSM (rebuilt with a new Magic-Number),
+    /// and everything queued for that session in either direction. Discovery is
+    /// left where it is, so nothing dials.
     ///
-    /// No PADT is sent to the AC: the old session is already dead and a fresh PADI
-    /// starts a new one the BRAS treats independently.
+    /// A released datapath is inert: with no session id it frames nothing on a
+    /// tick, drops every 0x8864 frame carrying the released id, and queues no
+    /// inbound IP. The phase stays `LinkDown` until `reset` dials again, so a
+    /// shell that paces its redial releases the id the moment the link goes down
+    /// and still owns when the next PADI goes out.
     ///
-    /// Errors only if the system RNG fails while drawing the new Magic-Number,
-    /// which on Linux does not happen in practice; the shell then tears down the
-    /// tunnel and the reconnect loop redials from scratch.
-    pub fn reset(&mut self) -> super::Result<()> {
-        self.discovery = Discovery::new(
-            self.our_mac,
-            self.service_name.clone(),
-            self.host_uniq.clone(),
-            self.retransmit_ticks,
-            self.max_attempts,
-        );
+    /// Errors only if the system RNG fails while drawing the new Magic-Number.
+    pub fn release(&mut self) -> super::Result<()> {
         let mut cfg = PppConfig::with_random_magic(self.username, self.password)?;
         cfg.mru = self.mru;
         cfg.request_dns = self.request_dns;
@@ -331,11 +319,36 @@ impl<'a> PppoeDatapath<'a> {
         self.established = None;
         self.out.clear();
         self.inbound_ip.clear();
-        self.dead = false;
         self.echo_ticks = 0;
         self.echo_misses = 0;
         self.echo_outstanding = false;
         self.inbound_seen = false;
+        Ok(())
+    }
+
+    /// Release the current session and return to Discovery for an in-session
+    /// redial: same source MAC, Service-Name, and Host-Uniq selector, but a fresh
+    /// discovery (new PADI -> new session id) and a fresh PPP session with a new
+    /// Magic-Number. Called by the shell after it observes LinkDown and closes
+    /// zppp0, and to dial again after discovery gave up: the fresh FSM leaves the
+    /// Dead phase behind with the rest of the session state. Re-emits the first
+    /// PADI, so the caller drains `poll_transmit_frame` right after.
+    ///
+    /// No PADT is sent to the AC: the old session is already dead and a fresh PADI
+    /// starts a new one the BRAS treats independently.
+    ///
+    /// Errors only if the system RNG fails while drawing the new Magic-Number,
+    /// which on Linux does not happen in practice; the shell then tears down the
+    /// tunnel and the reconnect loop redials from scratch.
+    pub fn reset(&mut self) -> super::Result<()> {
+        self.release()?;
+        self.discovery = Discovery::new(
+            self.our_mac,
+            self.service_name.clone(),
+            self.host_uniq.clone(),
+            self.retransmit_ticks,
+            self.max_attempts,
+        );
         self.link_down = false;
         self.link_down_reason = None;
 
@@ -490,11 +503,16 @@ impl<'a> PppoeDatapath<'a> {
 
     /// Current phase.
     pub fn phase(&self) -> DpPhase {
-        if self.dead {
-            return DpPhase::Dead;
-        }
+        // A link that came down stays LinkDown until the shell dials again, even
+        // once `release` has dropped the session and a late PADT has left
+        // discovery Dead: the shell owns that recovery, not the reconnect loop.
         if self.link_down {
             return DpPhase::LinkDown;
+        }
+        // Discovery gave up with no session to tear down. Read off the FSM, so a
+        // `reset` that rebuilds it leaves this phase behind.
+        if self.discovery.state() == State::Dead && self.session.is_none() {
+            return DpPhase::Dead;
         }
         if let Some(est) = self.established {
             return DpPhase::Established(est);
@@ -550,7 +568,8 @@ impl<'a> PppoeDatapath<'a> {
     }
 
     /// Act on a discovery `Action`: queue frames to send, latch the session and
-    /// open PPP on Established, or mark dead on Failed.
+    /// open PPP on Established, or mark the link down on a Failed that tore a
+    /// latched session down.
     fn apply_discovery_action(&mut self, action: Action) {
         match action {
             Action::Send(bytes) => self.out.push(bytes),
@@ -558,14 +577,12 @@ impl<'a> PppoeDatapath<'a> {
             Action::Established(est) => self.on_discovery_established(est),
             // A discovery failure once a session has latched (inbound PADT for our
             // session, or a post-Established failure) is a recoverable link-down:
-            // the shell redials in place. Before any session latches it stays a
-            // hard discovery death that bounces the tunnel.
+            // the shell redials in place. Before any session latches the FSM is
+            // left Dead, which `phase` reports as a hard discovery death.
             Action::Failed => {
                 if self.established.is_some() || self.session.is_some() {
                     self.link_down = true;
                     self.link_down_reason = Some("padt");
-                } else {
-                    self.dead = true;
                 }
             }
         }
@@ -667,7 +684,6 @@ mod tests {
             established: None,
             out: Vec::new(),
             inbound_ip: Vec::new(),
-            dead: false,
             echo_ticks: 0,
             echo_misses: 0,
             echo_outstanding: false,
@@ -1280,6 +1296,39 @@ mod tests {
         assert!(!dp.echo_outstanding);
         assert_eq!(dp.echo_misses, 0);
         assert_eq!(dp.echo_ticks, 0);
+    }
+
+    #[test]
+    fn a_released_session_is_inert() {
+        use crate::pppoe::ppp::{MAX_CONFIGURE, RESTART_TICKS};
+        let mut dp = fixed_dp();
+        drive_to_established(&mut dp);
+        let _ = drain_frames(&mut dp);
+        assert_eq!(dp.on_l2_frame(&padt_from_ac(SESSION_ID)), DpPhase::LinkDown);
+        let _ = drain_frames(&mut dp);
+        dp.release().expect("release");
+
+        // Past the LCP restart budget, where the retransmit timer would otherwise
+        // re-offer the Configure-Request: nothing goes out, a session frame
+        // carrying the released id is dropped rather than queued for zppp0, and
+        // the phase the shell waits on holds.
+        let mut ip = PPP_PROTO_IPV4.to_vec();
+        ip.extend_from_slice(&[0x45, 0x00, 0x00, 0x14]);
+        for _ in 0..RESTART_TICKS * MAX_CONFIGURE {
+            assert_eq!(dp.on_tick(), DpPhase::LinkDown);
+            assert_eq!(dp.on_l2_frame(&from_ac(&ip)), DpPhase::LinkDown);
+            assert!(drain_frames(&mut dp).is_empty());
+            assert!(dp.inbound_ip.is_empty());
+        }
+
+        // The deferred dial still recovers into a fresh session.
+        dp.reset().expect("reset");
+        assert_eq!(dp.phase(), DpPhase::Discovery);
+        let frames = drain_frames(&mut dp);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][15], 0x09); // PADI
+        re_drive_to_established(&mut dp, 0x4321);
+        assert!(matches!(dp.phase(), DpPhase::Established(_)));
     }
 
     /// Re-drive a post-reset datapath from Discovery to Established, assigning
