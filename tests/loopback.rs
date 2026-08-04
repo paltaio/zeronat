@@ -3464,6 +3464,10 @@ async fn peer_control_connect_udp(
     let (mut r, mut w, pump) = loop {
         let socket = std::sync::Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
         socket.connect(server).await.unwrap();
+        if zeronat::admission::admit(&socket, server).await.is_err() {
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
         let sess = session(socket.clone(), server, 1);
         let pump = {
             let sess = sess.clone();
@@ -4038,6 +4042,8 @@ async fn probe_resends_local_candidate_until_peer_info() {
         // the observed address into message two, then report every candidate
         // frame that arrives instead of settling on the first.
         let responder = tokio::spawn(async move {
+            let cookies = zeronat::admission::CookieJar::new().unwrap();
+            let mut admitted = std::collections::HashSet::new();
             let mut sessions: std::collections::HashMap<
                 std::net::SocketAddr,
                 std::sync::Arc<zeronat::kcp::Session>,
@@ -4045,11 +4051,29 @@ async fn probe_resends_local_candidate_until_peer_info() {
             let mut buf = vec![0u8; 65535];
             loop {
                 let (n, src) = socket.recv_from(&mut buf).await.unwrap();
+                match buf[..n].split_first() {
+                    Some((&zeronat::admission::CLASS_HELLO, _))
+                        if n >= zeronat::admission::HELLO_LEN =>
+                    {
+                        socket.send_to(&cookies.challenge(src), src).await.unwrap();
+                        continue;
+                    }
+                    Some((&zeronat::admission::CLASS_ADMIT, body)) => {
+                        if cookies.verify(src, body).is_some() {
+                            admitted.insert(src);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                if !sessions.contains_key(&src) && !admitted.remove(&src) {
+                    continue;
+                }
                 let sess = sessions
                     .entry(src)
                     .or_insert_with(|| zeronat::kcp::session(socket.clone(), src, 0))
                     .clone();
-                if let Some(zeronat::kcp::Accepted::Setup { conv, stream }) =
+                if let Some(zeronat::kcp::Accepted::Setup { conv, stream, .. }) =
                     zeronat::kcp::route(&sess, &buf[..n])
                 {
                     let frames_tx = frames_tx.clone();
@@ -4392,6 +4416,7 @@ async fn dgram_leg_via(
     let psk = zeronat::noise::derive_psk(SECRET);
     let socket = std::sync::Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
     socket.connect(server).await.unwrap();
+    zeronat::admission::admit(&socket, server).await.unwrap();
     let sess = session(socket.clone(), server, 1);
     let pump = {
         let sess = sess.clone();
@@ -5725,4 +5750,268 @@ async fn handshake_timeout_frees_stalled_slots() {
     // The server's 10s handshake timeout reaps every stalled slot without the
     // peers ever closing their sockets.
     drop(handshake_within(control, &psk, Duration::from_secs(15)).await);
+}
+
+const UDP_SOURCE_BUDGET: usize = 64;
+const UDP_FLOOD_SOURCES: usize = UDP_SOURCE_BUDGET + 8;
+const UDP_FLOOD_CONVS_PER_SOURCE: u32 = 8;
+
+async fn challenge_cookie(socket: &UdpSocket, server: std::net::SocketAddr) -> Vec<u8> {
+    let mut hello = [0u8; zeronat::admission::HELLO_LEN];
+    hello[0] = zeronat::admission::CLASS_HELLO;
+    timeout(Duration::from_secs(5), async {
+        let mut buf = [0u8; 128];
+        loop {
+            socket.send_to(&hello, server).await.unwrap();
+            match timeout(Duration::from_millis(200), socket.recv_from(&mut buf)).await {
+                Ok(Ok((n, src)))
+                    if src == server
+                        && n == 1 + zeronat::admission::COOKIE_LEN
+                        && buf[0] == zeronat::admission::CLASS_CHALLENGE =>
+                {
+                    return buf[..n].to_vec();
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("server did not return an admission challenge")
+}
+
+async fn send_partial_noise_frame(
+    socket: std::sync::Arc<UdpSocket>,
+    server: std::net::SocketAddr,
+    conv: u32,
+) -> (
+    std::sync::Arc<zeronat::kcp::Session>,
+    zeronat::kcp::KcpStream,
+) {
+    let sess = zeronat::kcp::session(socket, server, 1);
+    let mut stream = sess.open_conv_with(zeronat::kcp::CLASS_KCP, conv);
+    stream.write_all(&[0, 32]).await.unwrap();
+    (sess, stream)
+}
+
+async fn assert_no_udp_control_reply(socket: &UdpSocket) {
+    let mut buf = [0u8; 1500];
+    assert!(
+        timeout(Duration::from_millis(500), socket.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "unadmitted KCP traffic received a server reply"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_preauth_flood_stays_within_global_budgets() {
+    let control = free_port();
+    tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+    let server = std::net::SocketAddr::from(([127, 0, 0, 1], control));
+
+    let mut sockets = Vec::with_capacity(UDP_FLOOD_SOURCES);
+    for _ in 0..UDP_FLOOD_SOURCES {
+        let socket = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        zeronat::admission::admit(&socket, server).await.unwrap();
+        sockets.push(socket);
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut receivers = Vec::with_capacity(sockets.len());
+    for (source, socket) in sockets.iter().enumerate() {
+        let socket = socket.clone();
+        receivers.push(tokio::spawn(async move {
+            let mut accepted = std::collections::HashSet::new();
+            let mut buf = [0u8; 1500];
+            loop {
+                let packet = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await;
+                let Ok(Ok((n, src))) = packet else {
+                    break;
+                };
+                if src == server && n > kcp::KCP_OVERHEAD && buf[0] == zeronat::kcp::CLASS_KCP {
+                    accepted.insert((source, kcp::get_conv(&buf[1..n])));
+                }
+            }
+            accepted
+        }));
+    }
+
+    let mut sessions = Vec::with_capacity(sockets.len());
+    let mut streams = Vec::new();
+    for socket in &sockets {
+        sessions.push(zeronat::kcp::session(socket.clone(), server, 1));
+    }
+    for conv in 1..=UDP_FLOOD_CONVS_PER_SOURCE {
+        for sess in &sessions {
+            let mut stream = sess.open_conv_with(zeronat::kcp::CLASS_KCP, conv);
+            stream.write_all(&[0, 32]).await.unwrap();
+            streams.push(stream);
+        }
+    }
+
+    let mut accepted = std::collections::HashSet::new();
+    for receiver in receivers {
+        accepted.extend(receiver.await.unwrap());
+    }
+    let accepted_sources = accepted
+        .iter()
+        .map(|(source, _)| *source)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(accepted_sources.len(), UDP_SOURCE_BUDGET);
+    assert_eq!(accepted.len(), HANDSHAKE_BUDGET);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_and_expired_udp_cookies_allocate_no_kcp_state() {
+    let control = free_port();
+    tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+    let server = std::net::SocketAddr::from(([127, 0, 0, 1], control));
+
+    let expired_socket = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let challenge = challenge_cookie(&expired_socket, server).await;
+    let mut admitted = challenge.clone();
+    admitted[0] = zeronat::admission::CLASS_ADMIT;
+
+    let invalid_socket = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let mut invalid = vec![0u8; 1 + zeronat::admission::COOKIE_LEN];
+    invalid[0] = zeronat::admission::CLASS_ADMIT;
+    invalid_socket.send_to(&invalid, server).await.unwrap();
+    let (invalid_sess, invalid_stream) =
+        send_partial_noise_frame(invalid_socket.clone(), server, 1).await;
+    assert_no_udp_control_reply(&invalid_socket).await;
+    invalid_sess.close();
+    drop(invalid_stream);
+
+    sleep(Duration::from_secs(4)).await;
+    expired_socket.send_to(&admitted, server).await.unwrap();
+    sleep(Duration::from_secs(1)).await;
+    let (expired_sess, expired_stream) =
+        send_partial_noise_frame(expired_socket.clone(), server, 1).await;
+    assert_no_udp_control_reply(&expired_socket).await;
+    expired_sess.close();
+    drop(expired_stream);
+
+    expired_socket.send_to(&admitted, server).await.unwrap();
+    let (replayed_sess, replayed_stream) =
+        send_partial_noise_frame(expired_socket.clone(), server, 2).await;
+    assert_no_udp_control_reply(&expired_socket).await;
+    replayed_sess.close();
+    drop(replayed_stream);
+
+    sleep(Duration::from_secs(25)).await;
+    expired_socket.send_to(&admitted, server).await.unwrap();
+    let (stale_sess, stale_stream) =
+        send_partial_noise_frame(expired_socket.clone(), server, 3).await;
+    assert_no_udp_control_reply(&expired_socket).await;
+    stale_sess.close();
+    drop(stale_stream);
+
+    zeronat::admission::admit(&expired_socket, server)
+        .await
+        .unwrap();
+    let (_live_sess, _live_stream) =
+        send_partial_noise_frame(expired_socket.clone(), server, 4).await;
+    let mut buf = [0u8; 1500];
+    let (n, src) = timeout(Duration::from_secs(2), expired_socket.recv_from(&mut buf))
+        .await
+        .expect("valid admission received no KCP reply")
+        .unwrap();
+    assert_eq!(src, server);
+    assert!(n > kcp::KCP_OVERHEAD);
+    assert_eq!(buf[0], zeronat::kcp::CLASS_KCP);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v1_role_frames_are_rejected_by_v2_server() {
+    let control = free_port();
+    let public = free_port();
+    tokio::spawn(zeronat::server::run(cli_settings(
+        control,
+        vec![public],
+        vec![],
+    )));
+
+    let (mut r, mut w) = admin_connect(control).await;
+    w.send(
+        &Msg::ClientHello {
+            version: 1,
+            client_id: "v1-client".into(),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(timeout(Duration::from_secs(2), r.recv()).await, Ok(Err(_))),
+        "v1 hello did not fail closed"
+    );
+
+    let snap = fetch_snapshot(control).await;
+    assert!(snap.clients.iter().all(|c| c.client_id != "v1-client"));
+
+    let (mut control_r, mut control_w) = admin_connect(control).await;
+    control_w
+        .send(
+            &Msg::ClientHello {
+                version: zeronat::identity::PROTO_VERSION,
+                client_id: "v2-client".into(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    control_w.send(&Msg::Ping.encode()).await.unwrap();
+    assert!(matches!(
+        Msg::decode(
+            &timeout(Duration::from_secs(2), control_r.recv())
+                .await
+                .expect("server did not register the v2 client")
+                .unwrap()
+        ),
+        Ok(Msg::Pong)
+    ));
+    let _public_conn = TcpStream::connect(("127.0.0.1", public)).await.unwrap();
+    let id = match Msg::decode(
+        &timeout(Duration::from_secs(2), control_r.recv())
+            .await
+            .expect("server did not open the data stream")
+            .unwrap(),
+    )
+    .unwrap()
+    {
+        Msg::Open { id, .. } => id,
+        other => panic!("expected open, got {other:?}"),
+    };
+
+    let (mut data_r, mut data_w) = admin_connect(control).await;
+    data_w
+        .send(
+            &Msg::Data {
+                version: 1,
+                id,
+                name: None,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            timeout(Duration::from_secs(2), data_r.recv()).await,
+            Ok(Err(_))
+        ),
+        "v1 data role did not fail closed"
+    );
+
+    let (mut legacy_r, mut legacy_w) = admin_connect(control).await;
+    let mut legacy_data = vec![3];
+    legacy_data.extend_from_slice(&id.to_be_bytes());
+    legacy_w.send(&legacy_data).await.unwrap();
+    assert!(
+        matches!(
+            timeout(Duration::from_secs(2), legacy_r.recv()).await,
+            Ok(Err(_))
+        ),
+        "legacy versionless data role did not fail closed"
+    );
 }

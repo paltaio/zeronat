@@ -142,7 +142,8 @@ pub struct FwdOptionEntry {
 /// `FwdOptions` and never acks), and `Open` for each new public connection,
 /// replaced by `OpenProxy` on TCP ports the client flagged `proxy` (TCP-only by
 /// construction, so it carries no proto byte).
-/// Data channel (client -> server, first message): `Data` carrying the stream id.
+/// Data channel (client -> server, first message): `Data` carrying the protocol
+/// version and stream id.
 /// Admin channel (admin -> server): `AdminHello` mode 0 -> `Snapshot`; mode 1 ->
 /// one mutation message (`AddListener`/`RemoveListener`/`SetRoute`/`ClearRoute`),
 /// answered by `MutationResult`.
@@ -162,6 +163,7 @@ pub enum Msg {
         id: u64,
     },
     Data {
+        version: u8,
         id: u64,
         /// Client label when this `Data` opens a bridge attach; `None` for a
         /// forward-data stream, which carries no label. A bridge attach sends the
@@ -684,9 +686,10 @@ impl Msg {
                 b.extend_from_slice(&id.to_be_bytes());
                 b
             }
-            Msg::Data { id, name } => {
-                let mut b = Vec::with_capacity(9);
+            Msg::Data { version, id, name } => {
+                let mut b = Vec::with_capacity(10);
                 b.push(3);
+                b.push(*version);
                 b.extend_from_slice(&id.to_be_bytes());
                 if let Some(name) = name {
                     put_str(&mut b, name);
@@ -927,19 +930,20 @@ impl Msg {
                 let id = u64::from_be_bytes(b[4..12].try_into().unwrap());
                 Ok(Msg::Open { proto, port, id })
             }
-            Some(3) if b.len() >= 9 => {
-                let id = u64::from_be_bytes(b[1..9].try_into().unwrap());
-                let name = if b.len() == 9 {
+            Some(3) if b.len() >= 10 => {
+                let version = b[1];
+                let id = u64::from_be_bytes(b[2..10].try_into().unwrap());
+                let name = if b.len() == 10 {
                     None
                 } else {
-                    let mut at = 9;
+                    let mut at = 10;
                     let name = take_str(b, &mut at)?;
                     if at != b.len() {
                         return Err("trailing bytes in data".into());
                     }
                     Some(name)
                 };
-                Ok(Msg::Data { id, name })
+                Ok(Msg::Data { version, id, name })
             }
             Some(4) => Ok(Msg::Pong),
             Some(5) => {
@@ -1457,12 +1461,17 @@ mod tests {
 
     #[test]
     fn data_carries_optional_name() {
-        // A forward-data frame carries no label: 9 bytes, decodes to None.
-        let bare = Msg::Data { id: 7, name: None };
+        // A forward-data frame carries no label: 10 bytes, decodes to None.
+        let bare = Msg::Data {
+            version: 2,
+            id: 7,
+            name: None,
+        };
         let enc = bare.encode();
-        assert_eq!(enc.len(), 9);
+        assert_eq!(enc.len(), 10);
         match Msg::decode(&enc) {
-            Ok(Msg::Data { id, name }) => {
+            Ok(Msg::Data { version, id, name }) => {
+                assert_eq!(version, 2);
                 assert_eq!(id, 7);
                 assert!(name.is_none());
             }
@@ -1470,11 +1479,13 @@ mod tests {
         }
         // A named frame roundtrips.
         let named = Msg::Data {
+            version: 2,
             id: u64::MAX,
             name: Some("br-1a2b".into()),
         };
         match roundtrip(&named) {
-            Msg::Data { id, name } => {
+            Msg::Data { version, id, name } => {
+                assert_eq!(version, 2);
                 assert_eq!(id, u64::MAX);
                 assert_eq!(name.as_deref(), Some("br-1a2b"));
             }
@@ -1482,8 +1493,9 @@ mod tests {
         }
         // A truncated name length prefix and trailing junk after a valid name both
         // error rather than panic.
-        assert!(Msg::decode(&[3, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        assert!(Msg::decode(&[3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
         let mut bad = Msg::Data {
+            version: 2,
             id: 1,
             name: Some("x".into()),
         }
@@ -1981,11 +1993,16 @@ mod tests {
             other => panic!("expected open, got {other:?}"),
         }
 
-        let data = Msg::Data { id: 42, name: None };
+        let data = Msg::Data {
+            version: 2,
+            id: 42,
+            name: None,
+        };
         let bytes = data.encode();
-        assert_eq!(bytes.len(), 9);
+        assert_eq!(bytes.len(), 10);
         match Msg::decode(&bytes).unwrap() {
-            Msg::Data { id, name } => {
+            Msg::Data { version, id, name } => {
+                assert_eq!(version, 2);
                 assert_eq!(id, 42);
                 assert!(name.is_none());
             }

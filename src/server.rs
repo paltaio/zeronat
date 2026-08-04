@@ -10,10 +10,13 @@ use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Instant};
 
+use crate::admission::{CookieJar, CLASS_ADMIT, CLASS_HELLO, HELLO_LEN};
 use crate::bridge;
 use crate::config;
 use crate::dgram::{DgramRx, DgramTx, Frame};
-use crate::kcp::{route, session_from, Accepted, ConvGuard, Session};
+use crate::kcp::{
+    admitted_session_from, can_open_session, route, route_admitted, Accepted, ConvGuard, Session,
+};
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 #[cfg(target_os = "linux")]
@@ -67,13 +70,18 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 const UDP_SESSION_TTL: Duration = Duration::from_secs(90);
 /// How often the control loop sweeps idle/empty sessions.
 const UDP_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
-/// Cap on concurrent per-source sessions the public UDP control port retains. A
-/// single operator runs one client (one session), so this sits far above real
-/// usage; it exists only so a flood of distinct source addresses on the public
-/// port cannot grow the session map (and its socket_writer tasks) without bound.
-/// With `kcp::MAX_CONVS_PER_SESSION`, the worst-case conv-driver-buffer ceiling
-/// is MAX_UDP_SESSIONS * MAX_CONVS_PER_SESSION * ~64KB ~= 512 * 256 * 64KB ~= 8GB.
-const MAX_UDP_SESSIONS: usize = 512;
+/// Cap on source sessions retained by the UDP control port.
+const MAX_UDP_SESSIONS: usize = 64;
+/// Cap on verified source tuples waiting to send their first KCP packet.
+const MAX_PENDING_UDP_ADMISSIONS: usize = 64;
+/// A verified tuple must start its session promptly. Replaying the same cookie
+/// does not extend this deadline.
+const UDP_ADMISSION_TTL: Duration = Duration::from_secs(5);
+
+struct PendingUdpAdmission {
+    issued: u64,
+    expires: Instant,
+}
 
 /// Admission test for a datagram from an unknown source at the control port: a
 /// new source is admitted only while the session map is below the cap. Known
@@ -81,6 +89,41 @@ const MAX_UDP_SESSIONS: usize = 512;
 /// cannot evict or starve an established session.
 fn admit_new_udp_session(session_count: usize) -> bool {
     session_count < MAX_UDP_SESSIONS
+}
+
+fn record_udp_admission(
+    pending: &mut HashMap<SocketAddr, PendingUdpAdmission>,
+    src: SocketAddr,
+    issued: u64,
+    expires: Instant,
+    now: Instant,
+) -> bool {
+    pending.retain(|_, admission| admission.expires > now);
+    if expires <= now {
+        return false;
+    }
+    if let Some(admission) = pending.get_mut(&src) {
+        if issued > admission.issued {
+            admission.issued = issued;
+            admission.expires = expires;
+        }
+        return true;
+    }
+    if pending.len() >= MAX_PENDING_UDP_ADMISSIONS {
+        return false;
+    }
+    pending.insert(src, PendingUdpAdmission { issued, expires });
+    true
+}
+
+fn take_udp_admission(
+    pending: &mut HashMap<SocketAddr, PendingUdpAdmission>,
+    src: SocketAddr,
+    now: Instant,
+) -> bool {
+    pending
+        .remove(&src)
+        .is_some_and(|admission| admission.expires > now)
 }
 /// Backstop TTL for a per-source data-listener entry. The bridge self-reaps at
 /// `bridge::UDP_IDLE` (120s), closing its channel, which is the precise reclaim
@@ -1352,7 +1395,10 @@ pub(crate) async fn serve_stream(
                 other => Err(format!("unsupported admin mode {other}").into()),
             }
         }
-        Msg::Data { id, name } => {
+        Msg::Data { version, id, name } => {
+            if version != crate::identity::PROTO_VERSION {
+                return Err("unsupported protocol version".into());
+            }
             #[cfg(target_os = "linux")]
             if id == BRIDGE_ID {
                 if let Some(switch) = srv.switch.clone() {
@@ -2062,6 +2108,8 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
     // and the periodic sweep evicts idle or conv-less entries, so the map cannot
     // grow without bound from stray/unroutable traffic on a public port.
     let mut sessions: HashMap<SocketAddr, (Arc<Session>, Instant)> = HashMap::new();
+    let mut pending: HashMap<SocketAddr, PendingUdpAdmission> = HashMap::new();
+    let cookies = CookieJar::new()?;
     let mut buf = vec![0u8; 65535];
     let mut sweep = tokio::time::interval(UDP_SWEEP_INTERVAL);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2082,31 +2130,74 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
             _ = sweep.tick() => {
                 let now = Instant::now();
                 sessions.retain(|_, (sess, last)| {
-                    now.duration_since(*last) < UDP_SESSION_TTL && !sess.is_idle()
+                    let keep = now.duration_since(*last) < UDP_SESSION_TTL && !sess.is_idle();
+                    if !keep {
+                        sess.close();
+                    }
+                    keep
                 });
+                pending.retain(|_, admission| admission.expires > now);
                 continue;
             }
         };
 
-        // Route through the existing session for this source, or a fresh candidate.
-        // A candidate that yields no valid conv is dropped on this iteration, so
-        // stray/unroutable datagrams leave no lasting session or socket_writer task.
-        let (sess, known) = match sessions.get(&src) {
-            Some((sess, _)) => (sess.clone(), true),
-            None => {
-                // Unknown source at the session cap: drop the datagram and build
-                // no candidate session (so no socket_writer task spawns). A flood
-                // of distinct sources cannot grow the map past the cap; existing
-                // sessions keep routing. The sweep reclaims idle entries, freeing
-                // room for new sources once the flood stops.
-                if !admit_new_udp_session(sessions.len()) {
+        let packet = &buf[..n];
+        if let Some((&class, body)) = packet.split_first() {
+            match class {
+                CLASS_HELLO if packet.len() >= HELLO_LEN => {
+                    let challenge = cookies.challenge(src);
+                    let _ = crate::pktinfo::send_to(&socket, &challenge, src, local).await;
                     continue;
                 }
-                (session_from(socket.clone(), src, local, 0), false)
+                CLASS_ADMIT => {
+                    if !sessions.contains_key(&src) && admit_new_udp_session(sessions.len()) {
+                        if let Some((issued, issued_at)) = cookies.verify(src, body) {
+                            record_udp_admission(
+                                &mut pending,
+                                src,
+                                issued,
+                                issued_at + UDP_ADMISSION_TTL,
+                                Instant::now(),
+                            );
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        let (sess, known, first_permit) = match sessions.get(&src) {
+            Some((sess, _)) => (sess.clone(), true, None),
+            None => {
+                if !can_open_session(packet) || !admit_new_udp_session(sessions.len()) {
+                    continue;
+                }
+                let now = Instant::now();
+                if pending
+                    .get(&src)
+                    .is_none_or(|admission| admission.expires <= now)
+                {
+                    pending.remove(&src);
+                    continue;
+                }
+                let Ok(permit) = srv.handshakes.clone().try_acquire_owned() else {
+                    continue;
+                };
+                if !take_udp_admission(&mut pending, src, now) {
+                    continue;
+                }
+                (
+                    admitted_session_from(socket.clone(), src, local, 0, srv.handshakes.clone()),
+                    false,
+                    Some(permit),
+                )
             }
         };
 
-        let accepted = route(&sess, &buf[..n]);
+        let accepted = match first_permit {
+            Some(permit) => route_admitted(&sess, packet, permit),
+            None => route(&sess, packet),
+        };
         if known {
             // Existing session: refresh its activity deadline.
             if let Some(entry) = sessions.get_mut(&src) {
@@ -2120,13 +2211,14 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
         // closes its send channel and ends its socket_writer task.
 
         match accepted {
-            Some(Accepted::Stream { stream, .. }) => {
+            Some(Accepted::Stream {
+                stream,
+                permit: Some(permit),
+                ..
+            }) => {
                 let srv = srv.clone();
                 let psk = srv.psk;
                 crate::spawn(async move {
-                    let Ok(permit) = srv.handshakes.clone().acquire_owned().await else {
-                        return;
-                    };
                     let handshake =
                         timeout(HANDSHAKE_TIMEOUT, server_handshake(stream, &psk)).await;
                     drop(permit);
@@ -2135,14 +2227,15 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
                     }
                 });
             }
-            Some(Accepted::Setup { conv, stream }) => {
+            Some(Accepted::Setup {
+                conv,
+                stream,
+                permit: Some(permit),
+            }) => {
                 let srv = srv.clone();
                 let sess2 = sess.clone();
                 let psk = srv.psk;
                 crate::spawn(async move {
-                    let Ok(permit) = srv.handshakes.clone().acquire_owned().await else {
-                        return;
-                    };
                     // Message 2's payload carries the datagram source address
                     // back to the initiator: a probe reads its public mapping
                     // from it, every other initiator discards it.
@@ -2169,6 +2262,7 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
                     }
                 });
             }
+            Some(_) => {}
             None => {}
         }
     }
@@ -2346,6 +2440,65 @@ mod tests {
         assert!(!admit_new_udp_session(sessions.len()));
         // The established source is a known key: it routes without re-admission.
         assert!(sessions.contains_key(&established));
+    }
+
+    #[test]
+    fn pending_udp_admissions_are_capped_and_expire() {
+        let start = Instant::now();
+        let mut pending = HashMap::new();
+        for port in 1..=MAX_PENDING_UDP_ADMISSIONS as u16 {
+            let src = SocketAddr::from(([127, 0, 0, 1], port));
+            assert!(record_udp_admission(
+                &mut pending,
+                src,
+                1,
+                start + UDP_ADMISSION_TTL,
+                start,
+            ));
+        }
+        let extra = SocketAddr::from(([127, 0, 0, 2], 1));
+        assert!(!record_udp_admission(
+            &mut pending,
+            extra,
+            1,
+            start + UDP_ADMISSION_TTL,
+            start,
+        ));
+
+        let first = SocketAddr::from(([127, 0, 0, 1], 1));
+        assert!(record_udp_admission(
+            &mut pending,
+            first,
+            1,
+            start + UDP_ADMISSION_TTL,
+            start + UDP_ADMISSION_TTL - Duration::from_millis(1),
+        ));
+        assert!(!take_udp_admission(
+            &mut pending,
+            first,
+            start + UDP_ADMISSION_TTL,
+        ));
+        assert!(!record_udp_admission(
+            &mut pending,
+            extra,
+            1,
+            start + UDP_ADMISSION_TTL,
+            start + UDP_ADMISSION_TTL,
+        ));
+        assert!(!pending.contains_key(&extra));
+
+        assert!(record_udp_admission(
+            &mut pending,
+            extra,
+            2,
+            start + UDP_ADMISSION_TTL * 2,
+            start + UDP_ADMISSION_TTL,
+        ));
+        assert!(!take_udp_admission(
+            &mut pending,
+            extra,
+            start + UDP_ADMISSION_TTL * 2,
+        ));
     }
 
     #[tokio::test]

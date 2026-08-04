@@ -1592,6 +1592,7 @@ async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop, Arc<
         .parse()
         .map_err(|_| -> crate::Error { "server must be host:port for UDP".into() })?;
     socket.connect(server).await?;
+    crate::admission::admit(&socket, server).await?;
     let sess = kcp_session(socket.clone(), server, 1);
     // A connected UDP socket whose peer black-holes never errors on recv, so this
     // pump must be aborted on teardown; the returned guard ties it to the caller's
@@ -1697,6 +1698,7 @@ pub async fn probe_candidates(
         throwaway.connect(server).await?;
         SocketAddr::new(throwaway.local_addr()?.ip(), socket.local_addr()?.port())
     };
+    crate::admission::admit(&socket, server).await?;
     let sess = kcp_session(socket.clone(), server, 1);
     // The probe socket is never connected, so it can receive from the peer as
     // well as the server; the pump routes server datagrams into the session
@@ -1787,7 +1789,15 @@ pub async fn relay_leg_stream(
     })
     .await
     .map_err(|_| -> crate::Error { "relay leg connect+handshake timed out".into() })??;
-    nw.send(&Msg::Data { id, name: None }.encode()).await?;
+    nw.send(
+        &Msg::Data {
+            version: crate::identity::PROTO_VERSION,
+            id,
+            name: None,
+        }
+        .encode(),
+    )
+    .await?;
     Ok((nr, nw))
 }
 
@@ -1870,6 +1880,7 @@ async fn bridge_tcp(
     if let Err(e) = nw
         .send(
             &Msg::Data {
+                version: crate::identity::PROTO_VERSION,
                 id: BRIDGE_ID,
                 name: Some(client.client_id.clone()),
             }
@@ -2123,6 +2134,7 @@ async fn pppoe_tcp(
     if let Err(e) = nw
         .send(
             &Msg::Data {
+                version: crate::identity::PROTO_VERSION,
                 id: BRIDGE_ID,
                 name: Some(client.client_id.clone()),
             }
@@ -2550,7 +2562,15 @@ async fn handle_open(
             })
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
-            nw.send(&Msg::Data { id, name: None }.encode()).await?;
+            nw.send(
+                &Msg::Data {
+                    version: crate::identity::PROTO_VERSION,
+                    id,
+                    name: None,
+                }
+                .encode(),
+            )
+            .await?;
             let local = connect_local_tcp(&target, proxy_addrs).await?;
             bridge::tcp(local, nr, nw, idle).await;
         }
@@ -2562,7 +2582,15 @@ async fn handle_open(
             })
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
-            nw.send(&Msg::Data { id, name: None }.encode()).await?;
+            nw.send(
+                &Msg::Data {
+                    version: crate::identity::PROTO_VERSION,
+                    id,
+                    name: None,
+                }
+                .encode(),
+            )
+            .await?;
             let local = UdpSocket::bind("0.0.0.0:0").await?;
             local.connect(&target).await.map_err(|e| -> crate::Error {
                 format!("connecting to local {target}: {e}").into()
@@ -2578,7 +2606,15 @@ async fn handle_open(
             )
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
-            nw.send(&Msg::Data { id, name: None }.encode()).await?;
+            nw.send(
+                &Msg::Data {
+                    version: crate::identity::PROTO_VERSION,
+                    id,
+                    name: None,
+                }
+                .encode(),
+            )
+            .await?;
             let local = connect_local_tcp(&target, proxy_addrs).await?;
             bridge::tcp(local, nr, nw, idle).await;
         }

@@ -214,7 +214,9 @@ pub async fn punch(
                 match route(&sess, &data) {
                     // Only the responder answers a handshake, and only on the
                     // conv both sides derive from the pair id.
-                    Some(Accepted::Setup { conv: got, stream }) if !initiator && got == conv => {
+                    Some(Accepted::Setup {
+                        conv: got, stream, ..
+                    }) if !initiator && got == conv => {
                         let psk = *psk;
                         let done = done_tx.clone();
                         attempts.push(AbortOnDrop(crate::spawn(async move {

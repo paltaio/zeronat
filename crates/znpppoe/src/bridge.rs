@@ -103,6 +103,9 @@ pub async fn connect(addr: SocketAddr, secret: &str, client_id: &str) -> Result<
             .context("bind udp socket")?,
     );
     socket.connect(addr).await.context("connect udp socket")?;
+    zeronat::admission::admit(&socket, addr)
+        .await
+        .map_err(|e| anyhow!("udp source admission failed: {e}"))?;
 
     let sess = kcp_session(socket.clone(), addr, 1);
 

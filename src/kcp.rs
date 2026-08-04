@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use kcp::Kcp;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::pktinfo::LocalAddr;
@@ -40,13 +40,8 @@ pub const BRIDGE_ID: u64 = u64::MAX;
 const SOCKET_SEND_CAP: usize = 1024;
 const APP_CHAN_CAP: usize = 256;
 
-/// Cap on concurrent convs a single peer session may hold open. A legitimate
-/// client carries the control conv plus a handful of TCP/UDP-forward convs, so
-/// this sits orders of magnitude above real usage; it exists only to stop one
-/// source on the public control port from streaming unbounded distinct conv-ids
-/// and spawning a driver (each holds a ~64KB recv buffer) per id. Combined with
-/// `server::MAX_UDP_SESSIONS`, the worst-case driver-buffer ceiling is
-/// MAX_UDP_SESSIONS * MAX_CONVS_PER_SESSION * ~64KB ~= 512 * 256 * 64KB ~= 8GB.
+/// Cap on concurrent convs a single peer session may hold open. The server also
+/// gates every new pre-authentication conv on its global handshake semaphore.
 pub const MAX_CONVS_PER_SESSION: usize = 256;
 
 /// Per-conv idle deadline. A conv with no inbound packet for this long is dead
@@ -296,6 +291,7 @@ pub struct Session {
     // expected; a second concurrent attach is refused so two switch ports never
     // learn and ping-pong the same client's MAC.
     bridge_attached: Arc<AtomicBool>,
+    incoming_permits: Option<Arc<Semaphore>>,
 }
 
 impl Session {
@@ -361,7 +357,13 @@ impl Session {
         (conv, self.spawn_conv(conv, class))
     }
 
-    fn route_kcp(&self, conv: u32, class: u8, payload: Vec<u8>) -> Option<KcpStream> {
+    fn route_kcp(
+        &self,
+        conv: u32,
+        class: u8,
+        payload: Vec<u8>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Option<(KcpStream, Option<OwnedSemaphorePermit>)> {
         {
             let convs = self.convs.lock().unwrap();
             if let Some(tx) = convs.get(&conv) {
@@ -377,12 +379,17 @@ impl Session {
                 return None;
             }
         }
+        let permit = match (permit, &self.incoming_permits) {
+            (Some(permit), _) => Some(permit),
+            (None, Some(permits)) => Some(permits.clone().try_acquire_owned().ok()?),
+            (None, None) => None,
+        };
         // Unknown conv: a peer-initiated connection. Create it, deliver the packet.
         let stream = self.spawn_conv(conv, class);
         if let Some(tx) = self.convs.lock().unwrap().get(&conv) {
             let _ = tx.try_send(payload);
         }
-        Some(stream)
+        Some((stream, permit))
     }
 
     fn route_dgram(&self, tag: u32, body: Vec<u8>) {
@@ -430,8 +437,16 @@ impl Session {
 
 /// What the RX router yields when a peer opens a new conv.
 pub enum Accepted {
-    Stream { conv: u32, stream: KcpStream },
-    Setup { conv: u32, stream: KcpStream },
+    Stream {
+        conv: u32,
+        stream: KcpStream,
+        permit: Option<OwnedSemaphorePermit>,
+    },
+    Setup {
+        conv: u32,
+        stream: KcpStream,
+        permit: Option<OwnedSemaphorePermit>,
+    },
 }
 
 /// Build a session bound to `peer` and spawn its socket-sender task. Returns the
@@ -448,6 +463,28 @@ pub fn session_from(
     local: Option<LocalAddr>,
     first_conv: u32,
 ) -> Arc<Session> {
+    session_from_inner(socket, peer, local, first_conv, None)
+}
+
+/// Build a server-side session whose peer-initiated convs must claim a global
+/// pre-authentication permit before their driver is allocated.
+pub(crate) fn admitted_session_from(
+    socket: Arc<UdpSocket>,
+    peer: SocketAddr,
+    local: Option<LocalAddr>,
+    first_conv: u32,
+    incoming_permits: Arc<Semaphore>,
+) -> Arc<Session> {
+    session_from_inner(socket, peer, local, first_conv, Some(incoming_permits))
+}
+
+fn session_from_inner(
+    socket: Arc<UdpSocket>,
+    peer: SocketAddr,
+    local: Option<LocalAddr>,
+    first_conv: u32,
+    incoming_permits: Option<Arc<Semaphore>>,
+) -> Arc<Session> {
     let (send_tx, send_rx) = mpsc::channel(SOCKET_SEND_CAP);
     crate::spawn(socket_writer(socket, peer, local, send_rx));
     Arc::new(Session {
@@ -457,12 +494,40 @@ pub fn session_from(
         next_conv: Mutex::new(first_conv),
         live: Arc::new(AtomicUsize::new(0)),
         bridge_attached: Arc::new(AtomicBool::new(false)),
+        incoming_permits,
     })
+}
+
+/// Whether a datagram has the outer shape that can open the first conv in a
+/// source session.
+pub(crate) fn can_open_session(datagram: &[u8]) -> bool {
+    let Some((&class, rest)) = datagram.split_first() else {
+        return false;
+    };
+    matches!(class, CLASS_KCP | CLASS_SETUP) && rest.len() >= kcp::KCP_OVERHEAD
 }
 
 /// Feed one received datagram (already addressed to this session's peer) into the
 /// router. Returns `Some(Accepted)` when it opened a new peer-initiated conv.
 pub fn route(session: &Session, datagram: &[u8]) -> Option<Accepted> {
+    route_inner(session, datagram, None)
+}
+
+/// Route the first datagram of an admitted server session using a permit
+/// acquired before the session itself was allocated.
+pub(crate) fn route_admitted(
+    session: &Session,
+    datagram: &[u8],
+    permit: OwnedSemaphorePermit,
+) -> Option<Accepted> {
+    route_inner(session, datagram, Some(permit))
+}
+
+fn route_inner(
+    session: &Session,
+    datagram: &[u8],
+    permit: Option<OwnedSemaphorePermit>,
+) -> Option<Accepted> {
     let (&class, rest) = datagram.split_first()?;
     match class {
         CLASS_KCP | CLASS_SETUP => {
@@ -470,9 +535,17 @@ pub fn route(session: &Session, datagram: &[u8]) -> Option<Accepted> {
                 return None;
             }
             let conv = kcp::get_conv(rest);
-            match session.route_kcp(conv, class, rest.to_vec()) {
-                Some(stream) if class == CLASS_KCP => Some(Accepted::Stream { conv, stream }),
-                Some(stream) => Some(Accepted::Setup { conv, stream }),
+            match session.route_kcp(conv, class, rest.to_vec(), permit) {
+                Some((stream, permit)) if class == CLASS_KCP => Some(Accepted::Stream {
+                    conv,
+                    stream,
+                    permit,
+                }),
+                Some((stream, permit)) => Some(Accepted::Setup {
+                    conv,
+                    stream,
+                    permit,
+                }),
                 None => None,
             }
         }
