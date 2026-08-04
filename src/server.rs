@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::Result;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Notify;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Instant};
 
 use crate::bridge;
@@ -52,6 +52,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// few ping intervals to tolerate a missed ping without falsely tearing down a
 /// healthy idle link.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(90);
+/// Ceiling on concurrent handshakes, shared by the TCP accept loop and the
+/// KCP stream paths. The accept loop claims a permit before spawning a task
+/// and drops the socket when none is free, so stalled TCP peers hold at most
+/// this many pre-authentication sockets and tasks.
 const MAX_INFLIGHT_HANDSHAKES: usize = 256;
 /// Pause after a transient accept/recv error so a persistent failure (e.g. EMFILE
 /// under fd pressure) does not spin the listener loop at 100% CPU.
@@ -1114,19 +1118,30 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
                 continue;
             }
         };
+        // Admission happens at the accept boundary: with every handshake
+        // permit held, the socket is dropped before it can pin a task or fd,
+        // so stalled peers cannot queue unbounded state behind the semaphore.
+        let Ok(permit) = srv.handshakes.clone().try_acquire_owned() else {
+            continue;
+        };
         let srv = srv.clone();
         crate::spawn(async move {
-            if let Err(e) = handle_incoming(srv, sock, peer).await {
+            if let Err(e) = handle_incoming(srv, sock, peer, permit).await {
                 crate::elog!("connection from {peer} ended: {e}");
             }
         });
     }
 }
 
-async fn handle_incoming(srv: Arc<Server>, sock: TcpStream, peer: SocketAddr) -> Result<()> {
+async fn handle_incoming(
+    srv: Arc<Server>,
+    sock: TcpStream,
+    peer: SocketAddr,
+    permit: OwnedSemaphorePermit,
+) -> Result<()> {
     sock.set_nodelay(true).ok();
     let (r, w) = {
-        let _permit = srv.handshakes.clone().acquire_owned().await?;
+        let _permit = permit;
         match timeout(HANDSHAKE_TIMEOUT, server_handshake(sock, &srv.psk)).await {
             Ok(res) => res?,
             Err(_) => return Err("handshake timed out".into()),

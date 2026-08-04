@@ -5618,3 +5618,111 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
         .await
         .expect("split-report race did not complete within 120s");
 }
+
+/// The server's inflight-handshake budget; keep in sync with
+/// `MAX_INFLIGHT_HANDSHAKES` in `src/server.rs`.
+const HANDSHAKE_BUDGET: usize = 256;
+
+/// Retry a full control-port Noise handshake until it succeeds or `deadline`
+/// passes.
+async fn handshake_within(
+    control: u16,
+    psk: &[u8; 32],
+    deadline: Duration,
+) -> (zeronat::noise::NoiseReader, zeronat::noise::NoiseWriter) {
+    timeout(deadline, async {
+        loop {
+            if let Ok(sock) = TcpStream::connect(("127.0.0.1", control)).await {
+                sock.set_nodelay(true).ok();
+                if let Ok(Ok(pair)) = timeout(
+                    Duration::from_secs(2),
+                    zeronat::noise::client_handshake(sock, psk),
+                )
+                .await
+                {
+                    return pair;
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no handshake slot became available before the deadline")
+}
+
+/// Fill the control port's handshake budget with peers that connect and never
+/// send a byte, returning the held sockets.
+async fn stall_handshake_budget(control: u16) -> Vec<TcpStream> {
+    let mut stalled = Vec::with_capacity(HANDSHAKE_BUDGET);
+    for _ in 0..HANDSHAKE_BUDGET {
+        stalled.push(TcpStream::connect(("127.0.0.1", control)).await.unwrap());
+    }
+    stalled
+}
+
+/// Assert the server sheds `conn` promptly instead of retaining it behind the
+/// exhausted handshake budget.
+async fn assert_conn_shed(mut conn: TcpStream) {
+    let mut buf = [0u8; 1];
+    match timeout(Duration::from_secs(3), conn.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("over-budget connection received {n} bytes"),
+        Err(_) => panic!("over-budget connection was retained past the shed window"),
+    }
+}
+
+/// With the handshake budget exhausted by stalled peers, excess control
+/// connections are dropped at the accept boundary, and a slot freed by a
+/// failed or completed handshake admits the next connection.
+#[tokio::test]
+async fn control_accept_drops_excess_preauth_sockets() {
+    let control = free_port();
+    tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+
+    // Server is up once one full handshake completes; success releases its
+    // slot, leaving the budget whole.
+    let psk = zeronat::noise::derive_psk(SECRET);
+    drop(handshake_within(control, &psk, Duration::from_secs(10)).await);
+
+    let mut stalled = stall_handshake_budget(control).await;
+
+    // Every connection past the budget must be shed, not queued.
+    for _ in 0..8 {
+        let conn = TcpStream::connect(("127.0.0.1", control)).await.unwrap();
+        assert_conn_shed(conn).await;
+    }
+
+    // The stalled peers still hold their sockets: the shed connections above
+    // prove the retained pre-authentication set is capped at the budget.
+    let mut buf = [0u8; 1];
+    assert!(
+        matches!(stalled[0].try_read(&mut buf), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "a stalled in-budget connection was dropped during the fast phase"
+    );
+
+    // A peer abandoning its stalled handshake frees exactly one slot.
+    drop(stalled.pop());
+    drop(handshake_within(control, &psk, Duration::from_secs(5)).await);
+
+    // That handshake's completion returned its slot for the next connection.
+    drop(handshake_within(control, &psk, Duration::from_secs(5)).await);
+}
+
+/// Stalled peers that sit on handshake slots past the handshake timeout are
+/// evicted by the server and their slots become reusable.
+#[tokio::test]
+async fn handshake_timeout_frees_stalled_slots() {
+    let control = free_port();
+    tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+
+    let psk = zeronat::noise::derive_psk(SECRET);
+    drop(handshake_within(control, &psk, Duration::from_secs(10)).await);
+
+    let _stalled = stall_handshake_budget(control).await;
+    let conn = TcpStream::connect(("127.0.0.1", control)).await.unwrap();
+    assert_conn_shed(conn).await;
+
+    // The server's 10s handshake timeout reaps every stalled slot without the
+    // peers ever closing their sockets.
+    drop(handshake_within(control, &psk, Duration::from_secs(15)).await);
+}
