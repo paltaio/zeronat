@@ -66,7 +66,7 @@ impl DgramTx {
     }
 
     fn frame(&self, plaintext: &[u8]) -> Result<()> {
-        let body = self.noise.seal(plaintext); // [nonce:8][ct]
+        let body = self.noise.seal(plaintext)?; // [nonce:8][ct]
         let mut pkt = Vec::with_capacity(1 + 4 + body.len());
         pkt.push(CLASS_DGRAM);
         pkt.extend_from_slice(&self.tag.to_be_bytes());
@@ -112,5 +112,38 @@ impl DgramRx {
                 Err(_) => continue, // drop undecryptable datagrams, keep going
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::noise::{client_handshake_stateless, derive_psk, server_handshake_stateless};
+
+    #[tokio::test]
+    async fn receiver_drops_replayed_frames_and_continues() {
+        let psk = derive_psk("datagram replay fixture");
+        let (a, b) = tokio::io::duplex(8192);
+        let responder =
+            crate::spawn(async move { server_handshake_stateless(b, &psk, &[]).await.unwrap() });
+        let initiator = Arc::new(client_handshake_stateless(a, &psk, 7).await.unwrap());
+        let (_, responder) = responder.await.unwrap();
+        let responder = Arc::new(responder);
+
+        let (wire_tx, mut wire_rx) = mpsc::channel(4);
+        let sender = DgramTx::new(wire_tx, 9, initiator);
+        sender.send(b"first").await.unwrap();
+        sender.send(b"second").await.unwrap();
+        let first = wire_rx.recv().await.unwrap();
+        let second = wire_rx.recv().await.unwrap();
+
+        let (inbound_tx, inbound_rx) = mpsc::channel(4);
+        inbound_tx.send(first[5..].to_vec()).await.unwrap();
+        inbound_tx.send(first[5..].to_vec()).await.unwrap();
+        inbound_tx.send(second[5..].to_vec()).await.unwrap();
+        let mut receiver = DgramRx::new(inbound_rx, responder);
+
+        assert!(matches!(receiver.recv().await, Some(Frame::Data(data)) if data == b"first"));
+        assert!(matches!(receiver.recv().await, Some(Frame::Data(data)) if data == b"second"));
     }
 }

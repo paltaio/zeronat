@@ -5922,7 +5922,7 @@ async fn invalid_and_expired_udp_cookies_allocate_no_kcp_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v1_role_frames_are_rejected_by_v2_server() {
+async fn prior_role_frames_are_rejected_by_current_server() {
     let control = free_port();
     let public = free_port();
     tokio::spawn(zeronat::server::run(cli_settings(
@@ -5932,10 +5932,11 @@ async fn v1_role_frames_are_rejected_by_v2_server() {
     )));
 
     let (mut r, mut w) = admin_connect(control).await;
+    let prior_version = zeronat::identity::PROTO_VERSION - 1;
     w.send(
         &Msg::ClientHello {
-            version: 1,
-            client_id: "v1-client".into(),
+            version: prior_version,
+            client_id: "prior-client".into(),
         }
         .encode(),
     )
@@ -5943,18 +5944,18 @@ async fn v1_role_frames_are_rejected_by_v2_server() {
     .unwrap();
     assert!(
         matches!(timeout(Duration::from_secs(2), r.recv()).await, Ok(Err(_))),
-        "v1 hello did not fail closed"
+        "prior-version hello did not fail closed"
     );
 
     let snap = fetch_snapshot(control).await;
-    assert!(snap.clients.iter().all(|c| c.client_id != "v1-client"));
+    assert!(snap.clients.iter().all(|c| c.client_id != "prior-client"));
 
     let (mut control_r, mut control_w) = admin_connect(control).await;
     control_w
         .send(
             &Msg::ClientHello {
                 version: zeronat::identity::PROTO_VERSION,
-                client_id: "v2-client".into(),
+                client_id: "current-client".into(),
             }
             .encode(),
         )
@@ -5965,7 +5966,7 @@ async fn v1_role_frames_are_rejected_by_v2_server() {
         Msg::decode(
             &timeout(Duration::from_secs(2), control_r.recv())
                 .await
-                .expect("server did not register the v2 client")
+                .expect("server did not register the current client")
                 .unwrap()
         ),
         Ok(Msg::Pong)
@@ -5987,7 +5988,7 @@ async fn v1_role_frames_are_rejected_by_v2_server() {
     data_w
         .send(
             &Msg::Data {
-                version: 1,
+                version: prior_version,
                 id,
                 name: None,
             }
@@ -6000,7 +6001,7 @@ async fn v1_role_frames_are_rejected_by_v2_server() {
             timeout(Duration::from_secs(2), data_r.recv()).await,
             Ok(Err(_))
         ),
-        "v1 data role did not fail closed"
+        "prior-version data role did not fail closed"
     );
 
     let (mut legacy_r, mut legacy_w) = admin_connect(control).await;

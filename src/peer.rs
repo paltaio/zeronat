@@ -258,11 +258,10 @@ impl PeerSession {
                 let mut tick = interval_at(Instant::now() + PEER_KEEPALIVE, PEER_KEEPALIVE);
                 loop {
                     tick.tick().await;
-                    if out
-                        .send(session_frame(&noise, KIND_KEEPALIVE, &[]))
-                        .await
-                        .is_err()
-                    {
+                    let Ok(frame) = session_frame(&noise, KIND_KEEPALIVE, &[]) else {
+                        break;
+                    };
+                    if out.send(frame).await.is_err() {
                         break;
                     }
                 }
@@ -341,7 +340,7 @@ impl PeerSession {
             .into());
         }
         self.out
-            .send(session_frame(&self.noise, KIND_DATA, frame))
+            .send(session_frame(&self.noise, KIND_DATA, frame)?)
             .await
             .map_err(|_| -> Error { "peer session closed".into() })
     }
@@ -355,15 +354,15 @@ impl PeerSession {
 
 /// Seal one frame for the session: the frame byte, then the kind-tagged
 /// plaintext under the session keys.
-fn session_frame(noise: &StatelessNoise, kind: u8, payload: &[u8]) -> Vec<u8> {
+fn session_frame(noise: &StatelessNoise, kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
     let mut plaintext = Vec::with_capacity(1 + payload.len());
     plaintext.push(kind);
     plaintext.extend_from_slice(payload);
-    let sealed = noise.seal(&plaintext);
+    let sealed = noise.seal(&plaintext)?;
     let mut frame = Vec::with_capacity(1 + sealed.len());
     frame.push(FRAME_SESSION);
     frame.extend_from_slice(&sealed);
-    frame
+    Ok(frame)
 }
 
 /// Run the inner handshake over the path, repeating the last message sent

@@ -14,6 +14,9 @@ const MAX_PLAINTEXT: usize = MAX_MSG - 16;
 const HASHLEN: usize = 32;
 const DHLEN: usize = 32;
 const TAGLEN: usize = 16;
+const REPLAY_WINDOW_LEN: u64 = 128;
+// Stateless peers authenticate the protocol version as part of the Noise transcript.
+const STATELESS_PROLOGUE: [u8; 1] = [crate::identity::PROTO_VERSION];
 
 pub type Noise = (NoiseReader, NoiseWriter);
 
@@ -191,10 +194,11 @@ struct Keys {
 async fn run_initiator(
     stream: &mut BoxStream,
     psk: &[u8; 32],
+    prologue: &[u8],
     payload1: &[u8],
 ) -> Result<(Keys, Vec<u8>)> {
     let mut ss = SymmetricState::new();
-    ss.mix_hash(&[]); // MixHash(prologue) with the empty prologue.
+    ss.mix_hash(prologue);
 
     // Message 1: tokens [psk, e]
     ss.mix_key_and_hash(psk);
@@ -237,10 +241,11 @@ async fn run_initiator(
 async fn run_responder(
     stream: &mut BoxStream,
     psk: &[u8; 32],
+    prologue: &[u8],
     payload2: &[u8],
 ) -> Result<(Keys, Vec<u8>)> {
     let mut ss = SymmetricState::new();
-    ss.mix_hash(&[]); // MixHash(prologue) with the empty prologue.
+    ss.mix_hash(prologue);
 
     // Message 1: tokens [psk, e]
     let msg1 = read_frame(stream).await?;
@@ -284,7 +289,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut stream: BoxStream = Box::new(stream);
-    let (keys, _payload2) = run_initiator(&mut stream, psk, &[]).await?;
+    let (keys, _payload2) = run_initiator(&mut stream, psk, &[], &[]).await?;
     Ok(finish(stream, keys))
 }
 
@@ -293,7 +298,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut stream: BoxStream = Box::new(stream);
-    let (keys, _payload) = run_responder(&mut stream, psk, &[]).await?;
+    let (keys, _payload) = run_responder(&mut stream, psk, &[], &[]).await?;
     Ok(finish(stream, keys))
 }
 
@@ -418,22 +423,71 @@ pub struct StatelessNoise {
     send_key: [u8; 32],
     recv_key: [u8; 32],
     send_nonce: Mutex<u64>,
+    recv_window: Mutex<ReplayWindow>,
+}
+
+#[derive(Default)]
+struct ReplayWindow {
+    highest: Option<u64>,
+    seen: u128,
+}
+
+impl ReplayWindow {
+    fn check_and_mark(&mut self, nonce: u64) -> Result<()> {
+        let Some(highest) = self.highest else {
+            self.highest = Some(nonce);
+            self.seen = 1;
+            return Ok(());
+        };
+
+        if nonce > highest {
+            let advance = nonce - highest;
+            self.seen = if advance >= REPLAY_WINDOW_LEN {
+                1
+            } else {
+                (self.seen << advance) | 1
+            };
+            self.highest = Some(nonce);
+            return Ok(());
+        }
+
+        let age = highest - nonce;
+        if age >= REPLAY_WINDOW_LEN {
+            return Err("stateless datagram is outside the replay window".into());
+        }
+        let mask = 1u128 << age;
+        if self.seen & mask != 0 {
+            return Err("replayed stateless datagram".into());
+        }
+        self.seen |= mask;
+        Ok(())
+    }
 }
 
 impl StatelessNoise {
     /// Encrypt `plaintext` into a `[nonce:8][ciphertext]` datagram body.
-    pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after the directional nonce space is exhausted or if
+    /// the nonce state is unavailable.
+    pub fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let nonce = {
-            let mut n = self.send_nonce.lock().unwrap();
+            let mut n = self
+                .send_nonce
+                .lock()
+                .map_err(|_| -> Error { "stateless send nonce lock poisoned".into() })?;
             let v = *n;
-            *n = n.wrapping_add(1);
+            *n = n
+                .checked_add(1)
+                .ok_or_else(|| -> Error { "stateless send nonce exhausted".into() })?;
             v
         };
         let ct = aead_encrypt(&self.send_key, nonce, &[], plaintext);
         let mut out = Vec::with_capacity(8 + ct.len());
         out.extend_from_slice(&nonce.to_be_bytes());
         out.extend_from_slice(&ct);
-        out
+        Ok(out)
     }
 
     /// Decrypt a `[nonce:8][ciphertext]` datagram body.
@@ -441,9 +495,16 @@ impl StatelessNoise {
         if datagram.len() < 8 + TAGLEN {
             return Err("short datagram".into());
         }
-        let nonce = u64::from_be_bytes(datagram[..8].try_into().unwrap());
-        aead_decrypt(&self.recv_key, nonce, &[], &datagram[8..])
-            .map_err(|_| -> Error { "stateless decrypt failed".into() })
+        let mut nonce_bytes = [0u8; 8];
+        nonce_bytes.copy_from_slice(&datagram[..8]);
+        let nonce = u64::from_be_bytes(nonce_bytes);
+        let plaintext = aead_decrypt(&self.recv_key, nonce, &[], &datagram[8..])
+            .map_err(|_| -> Error { "stateless decrypt failed".into() })?;
+        self.recv_window
+            .lock()
+            .map_err(|_| -> Error { "stateless replay window lock poisoned".into() })?
+            .check_and_mark(nonce)?;
+        Ok(plaintext)
     }
 }
 
@@ -472,12 +533,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut stream: BoxStream = Box::new(stream);
-    let (keys, reply) = run_initiator(&mut stream, psk, &id.to_be_bytes()).await?;
+    let (keys, reply) =
+        run_initiator(&mut stream, psk, &STATELESS_PROLOGUE, &id.to_be_bytes()).await?;
     Ok((
         StatelessNoise {
             send_key: keys.send_key,
             recv_key: keys.recv_key,
             send_nonce: Mutex::new(0),
+            recv_window: Mutex::new(ReplayWindow::default()),
         },
         reply,
     ))
@@ -495,7 +558,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut stream: BoxStream = Box::new(stream);
-    let (keys, payload) = run_responder(&mut stream, psk, reply).await?;
+    let (keys, payload) = run_responder(&mut stream, psk, &STATELESS_PROLOGUE, reply).await?;
     if payload.len() < 8 {
         return Err("missing stream id in handshake payload".into());
     }
@@ -506,6 +569,7 @@ where
             send_key: keys.send_key,
             recv_key: keys.recv_key,
             send_nonce: Mutex::new(0),
+            recv_window: Mutex::new(ReplayWindow::default()),
         },
     ))
 }
@@ -513,6 +577,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn stateless_pair() -> (StatelessNoise, StatelessNoise) {
+        let psk = derive_psk("stateless replay fixture");
+        let (a, b) = tokio::io::duplex(8192);
+        let responder =
+            crate::spawn(async move { server_handshake_stateless(b, &psk, &[]).await.unwrap() });
+        let initiator = client_handshake_stateless(a, &psk, 7).await.unwrap();
+        let (_, responder) = responder.await.unwrap();
+        (initiator, responder)
+    }
+
+    fn seal_at(noise: &StatelessNoise, nonce: u64, plaintext: &[u8]) -> Vec<u8> {
+        let ciphertext = aead_encrypt(&noise.send_key, nonce, &[], plaintext);
+        let mut datagram = Vec::with_capacity(8 + ciphertext.len());
+        datagram.extend_from_slice(&nonce.to_be_bytes());
+        datagram.extend_from_slice(&ciphertext);
+        datagram
+    }
 
     #[tokio::test]
     async fn stateless_roundtrip_out_of_order() {
@@ -526,14 +608,92 @@ mod tests {
         assert_eq!(id, 0xABCD);
 
         // Client -> server: two datagrams, delivered out of order.
-        let d0 = cli.seal(b"first");
-        let d1 = cli.seal(b"second");
+        let d0 = cli.seal(b"first").unwrap();
+        let d1 = cli.seal(b"second").unwrap();
         assert_eq!(srv.open(&d1).unwrap(), b"second");
         assert_eq!(srv.open(&d0).unwrap(), b"first");
 
         // Server -> client back.
-        let r = srv.seal(b"reply");
+        let r = srv.seal(b"reply").unwrap();
         assert_eq!(cli.open(&r).unwrap(), b"reply");
+    }
+
+    #[tokio::test]
+    async fn stateless_rejects_duplicate_datagrams() {
+        let (initiator, responder) = stateless_pair().await;
+        let datagram = initiator.seal(b"once").unwrap();
+
+        assert_eq!(responder.open(&datagram).unwrap(), b"once");
+        assert!(responder.open(&datagram).is_err());
+    }
+
+    #[tokio::test]
+    async fn stateless_replay_window_accepts_reordering_and_rejects_old_datagrams() {
+        let (initiator, responder) = stateless_pair().await;
+        let first = seal_at(&initiator, 0, b"first");
+        let latest = seal_at(&initiator, 128, b"latest");
+        let reordered = seal_at(&initiator, 127, b"reordered");
+
+        assert_eq!(responder.open(&latest).unwrap(), b"latest");
+        assert_eq!(responder.open(&reordered).unwrap(), b"reordered");
+        assert!(responder.open(&first).is_err());
+    }
+
+    #[tokio::test]
+    async fn stateless_replay_window_does_not_wrap() {
+        let (initiator, responder) = stateless_pair().await;
+        let last = seal_at(&initiator, u64::MAX, b"last");
+        let wrapped = seal_at(&initiator, 0, b"wrapped");
+
+        assert_eq!(responder.open(&last).unwrap(), b"last");
+        assert!(responder.open(&wrapped).is_err());
+    }
+
+    #[tokio::test]
+    async fn stateless_send_nonce_does_not_wrap() {
+        let (initiator, _) = stateless_pair().await;
+        *initiator.send_nonce.lock().unwrap() = u64::MAX - 1;
+
+        let last = initiator.seal(b"last").unwrap();
+        assert_eq!(
+            u64::from_be_bytes(last[..8].try_into().unwrap()),
+            u64::MAX - 1
+        );
+        assert!(initiator.seal(b"wrapped").is_err());
+        assert!(initiator.seal(b"wrapped again").is_err());
+    }
+
+    #[test]
+    fn stateless_replay_window_has_fixed_inline_state() {
+        assert!(!std::mem::needs_drop::<ReplayWindow>());
+        assert_eq!(
+            std::mem::size_of::<ReplayWindow>(),
+            std::mem::size_of::<Option<u64>>() + std::mem::size_of::<u128>()
+        );
+    }
+
+    #[tokio::test]
+    async fn stateless_mixed_protocol_versions_fail_closed() {
+        let psk = derive_psk("stateless version fixture");
+        let (legacy, current) = tokio::io::duplex(8192);
+        let legacy_initiator = async {
+            let mut stream: BoxStream = Box::new(legacy);
+            run_initiator(&mut stream, &psk, &[], &7u64.to_be_bytes()).await
+        };
+        let current_responder = server_handshake_stateless(current, &psk, &[]);
+        let (legacy_result, current_result) = tokio::join!(legacy_initiator, current_responder);
+        assert!(legacy_result.is_err());
+        assert!(current_result.is_err());
+
+        let (current, legacy) = tokio::io::duplex(8192);
+        let current_initiator = client_handshake_stateless(current, &psk, 7);
+        let legacy_responder = async {
+            let mut stream: BoxStream = Box::new(legacy);
+            run_responder(&mut stream, &psk, &[], &[]).await
+        };
+        let (current_result, legacy_result) = tokio::join!(current_initiator, legacy_responder);
+        assert!(current_result.is_err());
+        assert!(legacy_result.is_err());
     }
 
     #[tokio::test]
@@ -573,9 +733,9 @@ mod tests {
         let (id, srv) = srv.await.unwrap();
         assert_eq!(id, 7);
 
-        let d = cli.seal(b"up");
+        let d = cli.seal(b"up").unwrap();
         assert_eq!(srv.open(&d).unwrap(), b"up");
-        let d = srv.seal(b"down");
+        let d = srv.seal(b"down").unwrap();
         assert_eq!(cli.open(&d).unwrap(), b"down");
     }
 
@@ -676,6 +836,7 @@ mod tests {
         let snow_psk = psk;
         let snow = crate::spawn(async move {
             let mut hs = Builder::new(snow_params())
+                .prologue(&STATELESS_PROLOGUE)
                 .psk(0, &snow_psk)
                 .build_responder()
                 .unwrap();
@@ -712,7 +873,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, b"sealed by snow");
-        let dg = cli.seal(b"datagram from ours");
+        let dg = cli.seal(b"datagram from ours").unwrap();
         write_frame(&mut dg_a, &dg).await.unwrap();
         let reply = read_frame(&mut dg_a).await.unwrap();
         assert_eq!(cli.open(&reply).unwrap(), b"datagram from snow");
