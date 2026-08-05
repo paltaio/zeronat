@@ -5,8 +5,10 @@
 //! the host, not inside the container.
 
 use crate::Result;
+use std::fs::File;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use zeronat_install_support::DownloadFile;
 
 const ENV_FILE: &str = "/etc/zeronat/.env";
 const COMPOSE_FILE: &str = "/etc/zeronat/compose.yml";
@@ -16,6 +18,52 @@ const CONTAINER: &str = "zeronat";
 const IMAGE: &str = "ghcr.io/paltaio/zeronat:latest";
 const RELEASE_BASE: &str = "https://github.com/paltaio/zeronat/releases/latest/download";
 const LATEST_URL: &str = "https://github.com/paltaio/zeronat/releases/latest";
+
+trait UpgradeRunner {
+    fn run(&mut self, privileged: bool, program: &str, args: &[&str]) -> std::io::Result<Output>;
+    fn run_with_stdin(
+        &mut self,
+        privileged: bool,
+        program: &str,
+        args: &[&str],
+        input: &File,
+    ) -> std::io::Result<Output>;
+    fn run_with_stdout(
+        &mut self,
+        privileged: bool,
+        program: &str,
+        args: &[&str],
+        output: &File,
+    ) -> std::io::Result<Output>;
+}
+
+struct CommandRunner;
+
+impl UpgradeRunner for CommandRunner {
+    fn run(&mut self, privileged: bool, program: &str, args: &[&str]) -> std::io::Result<Output> {
+        exec(privileged, program, args)
+    }
+
+    fn run_with_stdin(
+        &mut self,
+        privileged: bool,
+        program: &str,
+        args: &[&str],
+        input: &File,
+    ) -> std::io::Result<Output> {
+        exec_with_stdin(privileged, program, args, input)
+    }
+
+    fn run_with_stdout(
+        &mut self,
+        privileged: bool,
+        program: &str,
+        args: &[&str],
+        output: &File,
+    ) -> std::io::Result<Output> {
+        exec_with_stdout(privileged, program, args, output)
+    }
+}
 
 /// Check for a newer release and, unless `check_only`, upgrade every zeronat
 /// deployment found on this host (the systemd binary and/or a docker container).
@@ -150,31 +198,43 @@ fn docker_mode() -> Option<DockerMode> {
 // ---- apply ---------------------------------------------------------------
 
 fn upgrade_systemd(latest: &str) -> Result<()> {
+    upgrade_systemd_with(latest, &mut CommandRunner)
+}
+
+fn upgrade_systemd_with(latest: &str, runner: &mut dyn UpgradeRunner) -> Result<()> {
     if !have("curl") {
         return Err("curl is required to download the new binary".into());
     }
     let target = arch_target()?;
     println!("systemd: downloading zeronat-{target} ({latest})");
     let url = format!("{RELEASE_BASE}/zeronat-{target}");
-    let tmp = temp_path();
-    let dl = exec(
-        false,
-        "curl",
-        &["-fsSL", &url, "-o", &tmp, "--max-time", "180"],
-    )
-    .map_err(|e| format!("running curl: {e}"))?;
+    let mut download = DownloadFile::create()?;
+    let dl = runner
+        .run_with_stdout(
+            false,
+            "curl",
+            &["-fsSL", &url, "--max-time", "180"],
+            download.output(),
+        )
+        .map_err(|e| format!("running curl: {e}"))?;
     if !dl.status.success() {
-        let _ = std::fs::remove_file(&tmp);
         return Err(format!("download failed (no release asset for {target}?)").into());
     }
-    let inst = exec(true, "install", &["-m", "0755", &tmp, BIN_PATH]);
-    let _ = std::fs::remove_file(&tmp);
-    let inst = inst.map_err(|e| format!("running install: {e}"))?;
+    let input = download.prepare_install()?;
+    let inst = runner
+        .run_with_stdin(
+            true,
+            "install",
+            &["-m", "0755", "/dev/stdin", BIN_PATH],
+            input,
+        )
+        .map_err(|e| format!("running install: {e}"))?;
     if !inst.status.success() {
         return Err(format!("installing {BIN_PATH}: {}", errtext(&inst)).into());
     }
     println!("systemd: restarting service");
-    let res = exec(true, "systemctl", &["restart", "zeronat"])
+    let res = runner
+        .run(true, "systemctl", &["restart", "zeronat"])
         .map_err(|e| format!("running systemctl: {e}"))?;
     if !res.status.success() {
         return Err(format!("systemctl restart: {}", errtext(&res)).into());
@@ -415,10 +475,40 @@ fn dk(mode: DockerMode, args: &[&str]) -> std::io::Result<Output> {
 }
 
 fn exec(privileged: bool, program: &str, args: &[&str]) -> std::io::Result<Output> {
+    command(privileged, program, args).output()
+}
+
+fn exec_with_stdin(
+    privileged: bool,
+    program: &str,
+    args: &[&str],
+    input: &File,
+) -> std::io::Result<Output> {
+    command(privileged, program, args)
+        .stdin(Stdio::from(input.try_clone()?))
+        .output()
+}
+
+fn exec_with_stdout(
+    privileged: bool,
+    program: &str,
+    args: &[&str],
+    output: &File,
+) -> std::io::Result<Output> {
+    command(privileged, program, args)
+        .stdout(Stdio::from(output.try_clone()?))
+        .output()
+}
+
+fn command(privileged: bool, program: &str, args: &[&str]) -> Command {
     if privileged && !is_root() {
-        Command::new("sudo").arg(program).args(args).output()
+        let mut command = Command::new("sudo");
+        command.arg(program).args(args);
+        command
     } else {
-        Command::new(program).args(args).output()
+        let mut command = Command::new(program);
+        command.args(args);
+        command
     }
 }
 
@@ -445,26 +535,92 @@ fn errtext(out: &Output) -> String {
     }
 }
 
-fn temp_path() -> String {
-    std::env::temp_dir()
-        .join(format!("zeronat-upgrade-{}", std::process::id()))
-        .to_string_lossy()
-        .to_string()
-}
-
 #[cfg(unix)]
 fn is_root() -> bool {
-    // geteuid never fails and reads no memory.
-    unsafe { libc::geteuid() == 0 }
+    effective_uid() == 0
 }
 #[cfg(not(unix))]
 fn is_root() -> bool {
     false
 }
 
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no failure mode and does not dereference memory.
+    unsafe { libc::geteuid() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+
+    struct FakeUpgradeRunner {
+        commands: Vec<String>,
+        installed: Vec<u8>,
+    }
+
+    impl UpgradeRunner for FakeUpgradeRunner {
+        fn run(&mut self, _: bool, program: &str, args: &[&str]) -> std::io::Result<Output> {
+            self.commands.push(format!("{program} {}", args.join(" ")));
+            Ok(success())
+        }
+
+        fn run_with_stdin(
+            &mut self,
+            _: bool,
+            program: &str,
+            args: &[&str],
+            input: &File,
+        ) -> std::io::Result<Output> {
+            input.try_clone()?.read_to_end(&mut self.installed)?;
+            self.run(false, program, args)
+        }
+
+        fn run_with_stdout(
+            &mut self,
+            _: bool,
+            program: &str,
+            args: &[&str],
+            output: &File,
+        ) -> std::io::Result<Output> {
+            output.try_clone()?.write_all(b"downloaded binary")?;
+            self.run(false, program, args)
+        }
+    }
+
+    fn success() -> Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn systemd_upgrade_installs_the_held_download() {
+        let mut runner = FakeUpgradeRunner {
+            commands: Vec::new(),
+            installed: Vec::new(),
+        };
+
+        upgrade_systemd_with("0.25.1", &mut runner).unwrap();
+
+        assert_eq!(runner.installed, b"downloaded binary");
+        assert!(runner
+            .commands
+            .iter()
+            .any(|command| command.starts_with("curl -fsSL ") && !command.contains(" -o ")));
+        assert!(runner
+            .commands
+            .iter()
+            .any(|command| { command == "install -m 0755 /dev/stdin /usr/local/bin/zeronat" }));
+        assert!(runner
+            .commands
+            .contains(&"systemctl restart zeronat".to_string()));
+    }
 
     #[test]
     fn version_from_url_extracts_tag() {

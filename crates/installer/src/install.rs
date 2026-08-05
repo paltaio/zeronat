@@ -2,7 +2,9 @@
 //! same steps the shell installer performs. Each action reports a line so the
 //! TUI can show live progress; an error short-circuits with a message.
 
+use std::fs::File;
 use std::process::Output;
+use zeronat_install_support::DownloadFile;
 
 use crate::bridge;
 use crate::sys::{self, errtext, ok};
@@ -65,10 +67,43 @@ pub trait Runner {
     fn step(&mut self, desc: String);
     fn info(&mut self, msg: String);
     fn run(&mut self, privileged: bool, program: &str, args: &[&str]) -> Result<Output, String>;
+    fn run_with_stdin(
+        &mut self,
+        privileged: bool,
+        program: &str,
+        args: &[&str],
+        input: &File,
+    ) -> Result<Output, String>;
+    fn run_with_stdout(
+        &mut self,
+        privileged: bool,
+        program: &str,
+        args: &[&str],
+        output: &File,
+    ) -> Result<Output, String>;
     /// Ask the operator to confirm within `secs`, used to keep a risky bridge.
     /// Interactive runners read a key with a countdown; headless runners verify
     /// connectivity instead. Returns true to keep, false to let it revert.
     fn confirm(&mut self, prompt: &str, secs: u32) -> bool;
+}
+
+fn download_binary(r: &mut dyn Runner, url: &str, target: &str) -> Result<(), String> {
+    let mut download = DownloadFile::create()?;
+    let out = r.run_with_stdout(false, "curl", &["-fsSL", url], download.output())?;
+    if !ok(&out) {
+        return Err(format!("download failed (no release asset for {target}?)"));
+    }
+    let input = download.prepare_install()?;
+    let out = r.run_with_stdin(
+        true,
+        "install",
+        &["-m", "0755", "/dev/stdin", BIN_PATH],
+        input,
+    )?;
+    if !ok(&out) {
+        return Err(format!("install binary: {}", errtext(&out)));
+    }
+    Ok(())
 }
 
 /// Write `content` to `dest` with `mode` as root: stage a temp file and let the
@@ -574,20 +609,9 @@ fn upgrade_systemd(r: &mut dyn Runner) -> Result<(), String> {
     let target = sys::arch_target()?;
     r.info(format!("target {target}"));
     let url = format!("{RELEASE_BASE}/zeronat-{target}");
-    let tmp = std::env::temp_dir().join(format!("zeronat-up-{}", std::process::id()));
-    let tmps = tmp.to_string_lossy().to_string();
 
     r.step("downloading latest binary".into());
-    let out = r.run(false, "curl", &["-fsSL", &url, "-o", &tmps])?;
-    if !ok(&out) {
-        return Err(format!("download failed (no release asset for {target}?)"));
-    }
-    let inst = r.run(true, "install", &["-m", "0755", &tmps, BIN_PATH]);
-    let _ = std::fs::remove_file(&tmp);
-    let out = inst?;
-    if !ok(&out) {
-        return Err(format!("install binary: {}", errtext(&out)));
-    }
+    download_binary(r, &url, target)?;
 
     r.step("restarting service".into());
     let out = r.run(true, "systemctl", &["restart", "zeronat"])?;
@@ -887,20 +911,9 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Starte
     let target = sys::arch_target()?;
     r.info(format!("target {target}"));
     let url = format!("{RELEASE_BASE}/zeronat-{target}");
-    let tmp = std::env::temp_dir().join(format!("zeronat-dl-{}", std::process::id()));
-    let tmps = tmp.to_string_lossy().to_string();
 
     r.step("downloading zeronat binary".into());
-    let out = r.run(false, "curl", &["-fsSL", &url, "-o", &tmps])?;
-    if !ok(&out) {
-        return Err(format!("download failed (no release asset for {target}?)"));
-    }
-    let inst = r.run(true, "install", &["-m", "0755", &tmps, BIN_PATH]);
-    let _ = std::fs::remove_file(&tmp);
-    let out = inst?;
-    if !ok(&out) {
-        return Err(format!("install binary: {}", errtext(&out)));
-    }
+    download_binary(r, &url, target)?;
 
     r.step("writing systemd unit".into());
     let mode = match cfg.mode {
@@ -961,6 +974,9 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Starte
 mod tests {
     use super::{check_forwards, console_cmd, install_systemd, peer_steps, subcmd, Runner};
     use crate::ui::{Config, Kind, Method, Mode};
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+    use std::path::PathBuf;
     use std::process::Output;
 
     fn cfg() -> Config {
@@ -984,9 +1000,102 @@ mod tests {
                 stderr: Vec::new(),
             })
         }
+        fn run_with_stdin(
+            &mut self,
+            _: bool,
+            program: &str,
+            args: &[&str],
+            input: &std::fs::File,
+        ) -> Result<Output, String> {
+            let mut input = input.try_clone().unwrap();
+            let mut bytes = Vec::new();
+            input.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"downloaded binary");
+            self.run(false, program, args)
+        }
+        fn run_with_stdout(
+            &mut self,
+            _: bool,
+            program: &str,
+            args: &[&str],
+            output: &std::fs::File,
+        ) -> Result<Output, String> {
+            output
+                .try_clone()
+                .unwrap()
+                .write_all(b"downloaded binary")
+                .unwrap();
+            self.run(false, program, args)
+        }
         fn confirm(&mut self, _: &str, _: u32) -> bool {
             true
         }
+    }
+
+    struct FailedDownloadRunner {
+        path: Option<PathBuf>,
+    }
+
+    impl Runner for FailedDownloadRunner {
+        fn step(&mut self, _: String) {}
+        fn info(&mut self, _: String) {}
+        fn run(&mut self, _: bool, _: &str, _: &[&str]) -> Result<Output, String> {
+            use std::os::unix::process::ExitStatusExt;
+
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+        fn run_with_stdin(
+            &mut self,
+            _: bool,
+            _: &str,
+            _: &[&str],
+            _: &std::fs::File,
+        ) -> Result<Output, String> {
+            panic!("failed download must not be installed")
+        }
+        fn run_with_stdout(
+            &mut self,
+            _: bool,
+            _: &str,
+            _: &[&str],
+            output: &std::fs::File,
+        ) -> Result<Output, String> {
+            use std::os::unix::process::ExitStatusExt;
+
+            let fd_path = format!("/proc/self/fd/{}", output.as_raw_fd());
+            self.path = Some(std::fs::read_link(fd_path).unwrap());
+            output
+                .try_clone()
+                .unwrap()
+                .write_all(b"partial download")
+                .unwrap();
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: b"download failed".to_vec(),
+            })
+        }
+        fn confirm(&mut self, _: &str, _: u32) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn systemd_install_cleans_failed_download() {
+        let mut r = FailedDownloadRunner { path: None };
+        let mut c = cfg();
+        c.mode = Mode::Server;
+
+        let result = install_systemd(&c, "server", &mut r);
+        let path = r.path.expect("curl should receive an output file");
+        let remained = path.parent().unwrap().exists();
+
+        assert!(result.is_err());
+        assert!(!remained, "failed download directory should be removed");
     }
 
     #[test]

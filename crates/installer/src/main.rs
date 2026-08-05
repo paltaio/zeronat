@@ -41,6 +41,21 @@ impl LiveRunner<'_> {
         let view = progress_view(&self.log, Status::Working, ch, w as usize, h as usize);
         let _ = self.renderer.draw(self.tty, view, w, h);
     }
+
+    fn wait_for_command(
+        &mut self,
+        command: impl FnOnce() -> Result<std::process::Output, String> + Send + 'static,
+    ) -> Result<std::process::Output, String> {
+        let handle = std::thread::spawn(command);
+        while !handle.is_finished() {
+            self.spin = self.spin.wrapping_add(1);
+            self.redraw();
+            std::thread::sleep(std::time::Duration::from_millis(90));
+        }
+        handle
+            .join()
+            .unwrap_or_else(|_| Err("command thread panicked".into()))
+    }
 }
 
 impl install::Runner for LiveRunner<'_> {
@@ -63,18 +78,46 @@ impl install::Runner for LiveRunner<'_> {
     ) -> Result<std::process::Output, String> {
         let prog = program.to_string();
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let handle = std::thread::spawn(move || {
+        self.wait_for_command(move || {
             let aref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
             sys::run(privileged, &prog, &aref)
-        });
-        while !handle.is_finished() {
-            self.spin = self.spin.wrapping_add(1);
-            self.redraw();
-            std::thread::sleep(std::time::Duration::from_millis(90));
-        }
-        handle
-            .join()
-            .unwrap_or_else(|_| Err("command thread panicked".into()))
+        })
+    }
+
+    fn run_with_stdin(
+        &mut self,
+        privileged: bool,
+        program: &str,
+        args: &[&str],
+        input: &std::fs::File,
+    ) -> Result<std::process::Output, String> {
+        let prog = program.to_string();
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let input = input
+            .try_clone()
+            .map_err(|e| format!("failed to prepare command input: {e}"))?;
+        self.wait_for_command(move || {
+            let aref: Vec<&str> = argv.iter().map(String::as_str).collect();
+            sys::run_with_stdin(privileged, &prog, &aref, input)
+        })
+    }
+
+    fn run_with_stdout(
+        &mut self,
+        privileged: bool,
+        program: &str,
+        args: &[&str],
+        output: &std::fs::File,
+    ) -> Result<std::process::Output, String> {
+        let prog = program.to_string();
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let output = output
+            .try_clone()
+            .map_err(|e| format!("failed to prepare command output: {e}"))?;
+        self.wait_for_command(move || {
+            let aref: Vec<&str> = argv.iter().map(String::as_str).collect();
+            sys::run_with_stdout(privileged, &prog, &aref, output)
+        })
     }
 
     fn confirm(&mut self, prompt: &str, secs: u32) -> bool {
@@ -390,6 +433,32 @@ impl install::Runner for PlainRunner {
         args: &[&str],
     ) -> Result<std::process::Output, String> {
         sys::run(privileged, program, args)
+    }
+
+    fn run_with_stdin(
+        &mut self,
+        privileged: bool,
+        program: &str,
+        args: &[&str],
+        input: &std::fs::File,
+    ) -> Result<std::process::Output, String> {
+        let input = input
+            .try_clone()
+            .map_err(|e| format!("failed to prepare command input: {e}"))?;
+        sys::run_with_stdin(privileged, program, args, input)
+    }
+
+    fn run_with_stdout(
+        &mut self,
+        privileged: bool,
+        program: &str,
+        args: &[&str],
+        output: &std::fs::File,
+    ) -> Result<std::process::Output, String> {
+        let output = output
+            .try_clone()
+            .map_err(|e| format!("failed to prepare command output: {e}"))?;
+        sys::run_with_stdout(privileged, program, args, output)
     }
 
     fn confirm(&mut self, _prompt: &str, secs: u32) -> bool {

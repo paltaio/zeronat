@@ -5,7 +5,8 @@
 use std::process::{Command, Output};
 
 pub fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    // SAFETY: geteuid has no failure mode and does not dereference memory.
+    (unsafe { libc::geteuid() }) == 0
 }
 
 pub fn have(cmd: &str) -> bool {
@@ -97,12 +98,44 @@ pub fn ensure_privilege() -> Result<(), String> {
 
 /// Run a command, escalating with sudo when `privileged` and not already root.
 pub fn run(privileged: bool, program: &str, args: &[&str]) -> Result<Output, String> {
-    let out = if privileged && !is_root() {
-        Command::new("sudo").arg(program).args(args).output()
-    } else {
-        Command::new(program).args(args).output()
-    };
+    let out = command(privileged, program, args).output();
     out.map_err(|e| format!("failed to run {program}: {e}"))
+}
+
+pub fn run_with_stdin(
+    privileged: bool,
+    program: &str,
+    args: &[&str],
+    input: std::fs::File,
+) -> Result<Output, String> {
+    let out = command(privileged, program, args)
+        .stdin(std::process::Stdio::from(input))
+        .output();
+    out.map_err(|e| format!("failed to run {program}: {e}"))
+}
+
+pub fn run_with_stdout(
+    privileged: bool,
+    program: &str,
+    args: &[&str],
+    output: std::fs::File,
+) -> Result<Output, String> {
+    let out = command(privileged, program, args)
+        .stdout(std::process::Stdio::from(output))
+        .output();
+    out.map_err(|e| format!("failed to run {program}: {e}"))
+}
+
+fn command(privileged: bool, program: &str, args: &[&str]) -> Command {
+    if privileged && !is_root() {
+        let mut command = Command::new("sudo");
+        command.arg(program).args(args);
+        command
+    } else {
+        let mut command = Command::new(program);
+        command.args(args);
+        command
+    }
 }
 
 pub fn ok(out: &Output) -> bool {
