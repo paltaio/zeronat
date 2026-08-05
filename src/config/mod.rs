@@ -33,11 +33,18 @@ pub struct CfgRoute {
     pub client: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CfgClient {
+    pub id: String,
+    pub secret: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ServerConfig {
     pub id: Option<String>,
     pub control: Option<String>,
     pub admin_secret: Option<String>,
+    pub clients: Vec<CfgClient>,
     /// Exit mode: masquerade the tunnel client's outbound traffic.
     pub exit: Option<bool>,
     /// Egress interface for exit mode; unset auto-detects the default route.
@@ -52,6 +59,7 @@ enum Section {
     Server,
     Listener,
     Route,
+    Client,
 }
 
 /// One in-progress array-of-tables record. Fields are filled as keys are seen
@@ -62,6 +70,8 @@ struct PartialRecord {
     proto: Option<Proto>,
     port: Option<u16>,
     client: Option<String>,
+    id: Option<String>,
+    secret: Option<String>,
 }
 
 pub fn parse(text: &str) -> Result<ServerConfig> {
@@ -110,6 +120,7 @@ pub fn parse(text: &str) -> Result<ServerConfig> {
                 }
                 "[listeners]" => section = Section::Listener,
                 "[routes]" => section = Section::Route,
+                "[clients]" => section = Section::Client,
                 other => {
                     return Err(err(n, &format!("unknown table header [{other}]")));
                 }
@@ -159,6 +170,16 @@ pub fn parse(text: &str) -> Result<ServerConfig> {
                     "client" => record.client = Some(parse_string(value, n)?),
                     other => {
                         return Err(err(n, &format!("unknown key `{other}` in [[routes]]")));
+                    }
+                }
+            }
+            Section::Client => {
+                reject_dup(&mut record_keys, key, n)?;
+                match key {
+                    "id" => record.id = Some(parse_string(value, n)?),
+                    "secret" => record.secret = Some(parse_string(value, n)?),
+                    other => {
+                        return Err(err(n, &format!("unknown key `{other}` in [[clients]]")));
                     }
                 }
             }
@@ -243,6 +264,20 @@ fn close_record(
                 client,
             });
         }
+        Section::Client => {
+            let id = record
+                .id
+                .take()
+                .ok_or_else(|| err(n, "client missing `id`"))?;
+            if id.is_empty() {
+                return Err(err(n, "client `id` must not be empty"));
+            }
+            let secret = record
+                .secret
+                .take()
+                .ok_or_else(|| err(n, "client missing `secret`"))?;
+            cfg.clients.push(CfgClient { id, secret });
+        }
         Section::None | Section::Server => {}
     }
     Ok(())
@@ -289,6 +324,17 @@ pub fn serialize(cfg: &ServerConfig) -> String {
         if let Some(iface) = &cfg.exit_iface {
             out.push_str(&format!("exit_iface = {}\n", quote(iface)));
         }
+    }
+
+    let mut clients = cfg.clients.clone();
+    clients.sort_by(|a, b| a.id.cmp(&b.id));
+    for client in &clients {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("[[clients]]\n");
+        out.push_str(&format!("id = {}\n", quote(&client.id)));
+        out.push_str(&format!("secret = {}\n", quote(&client.secret)));
     }
 
     let mut listeners = cfg.listeners.clone();
@@ -355,6 +401,10 @@ mod tests {
             id: Some("oci".into()),
             control: Some("0.0.0.0:2222".into()),
             admin_secret: Some("admin-secret".into()),
+            clients: vec![CfgClient {
+                id: "rpi-1".into(),
+                secret: "client-secret".into(),
+            }],
             exit: Some(true),
             exit_iface: Some("eth0".into()),
             listeners: vec![
@@ -414,6 +464,7 @@ mod tests {
             id: None,
             control: None,
             admin_secret: None,
+            clients: Vec::new(),
             exit: None,
             exit_iface: None,
             listeners: vec![

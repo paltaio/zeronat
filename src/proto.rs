@@ -24,6 +24,8 @@ pub const PROVIDES_EXIT: u8 = 1 << 0;
 pub const PROVIDES_SEGMENT: u8 = 1 << 1;
 
 const PROVIDES_MASK: u8 = PROVIDES_EXIT | PROVIDES_SEGMENT;
+pub const CAPABILITY_LEN: usize = 32;
+pub type Capability = [u8; CAPABILITY_LEN];
 
 /// Outcome of a `PeerConnect`, reported to the consumer in `PeerResult`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,19 +163,21 @@ pub enum Msg {
         proto: Proto,
         port: u16,
         id: u64,
+        capability: Capability,
     },
     Data {
         version: u8,
         id: u64,
-        /// Client label when this `Data` opens a bridge attach; `None` for a
-        /// forward-data stream, which carries no label. A bridge attach sends the
-        /// client's id so the server's fleet view can name the port.
-        name: Option<String>,
+        capability: Capability,
     },
     Pong,
     ClientHello {
         version: u8,
         client_id: String,
+    },
+    ClientHelloAck {
+        client_id: String,
+        bridge_capability: Capability,
     },
     AdminHello {
         version: u8,
@@ -212,6 +216,7 @@ pub enum Msg {
     OpenProxy {
         port: u16,
         id: u64,
+        capability: Capability,
         /// The public connection's real source address.
         peer: SocketAddr,
         /// The public listener address the connection arrived on.
@@ -248,6 +253,7 @@ pub enum Msg {
         /// This party's server-assigned probe id, carried in the punch
         /// probe's handshake app id.
         probe_id: u64,
+        probe_capability: Capability,
         /// The pair's capability: the consumer's `want` bit, forwarded to
         /// both parties.
         provides: u8,
@@ -261,6 +267,7 @@ pub enum Msg {
         pair_id: u64,
         /// This party's relay leg id, claimed with `Data`.
         id: u64,
+        capability: Capability,
     },
     PeerPath {
         pair_id: u64,
@@ -419,6 +426,16 @@ pub(crate) fn take_str(b: &[u8], at: &mut usize) -> Result<String> {
         .map_err(|_| -> crate::Error { "invalid utf-8 in string".into() })?;
     *at += len;
     Ok(s)
+}
+
+fn take_capability(b: &[u8], at: &mut usize) -> Result<Capability> {
+    if *at + CAPABILITY_LEN > b.len() {
+        return Err("truncated capability".into());
+    }
+    let mut capability = [0; CAPABILITY_LEN];
+    capability.copy_from_slice(&b[*at..*at + CAPABILITY_LEN]);
+    *at += CAPABILITY_LEN;
+    Ok(capability)
 }
 
 /// Append the 4 octets of an IPv4 address.
@@ -678,22 +695,30 @@ impl Msg {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Msg::Ping => vec![1],
-            Msg::Open { proto, port, id } => {
-                let mut b = Vec::with_capacity(12);
+            Msg::Open {
+                proto,
+                port,
+                id,
+                capability,
+            } => {
+                let mut b = Vec::with_capacity(12 + CAPABILITY_LEN);
                 b.push(2);
                 b.push(proto_byte(*proto));
                 b.extend_from_slice(&port.to_be_bytes());
                 b.extend_from_slice(&id.to_be_bytes());
+                b.extend_from_slice(capability);
                 b
             }
-            Msg::Data { version, id, name } => {
-                let mut b = Vec::with_capacity(10);
+            Msg::Data {
+                version,
+                id,
+                capability,
+            } => {
+                let mut b = Vec::with_capacity(10 + CAPABILITY_LEN);
                 b.push(3);
                 b.push(*version);
                 b.extend_from_slice(&id.to_be_bytes());
-                if let Some(name) = name {
-                    put_str(&mut b, name);
-                }
+                b.extend_from_slice(capability);
                 b
             }
             Msg::Pong => vec![4],
@@ -837,13 +862,15 @@ impl Msg {
             Msg::OpenProxy {
                 port,
                 id,
+                capability,
                 peer,
                 local,
             } => {
-                let mut b = Vec::with_capacity(49);
+                let mut b = Vec::with_capacity(81);
                 b.push(15);
                 b.extend_from_slice(&port.to_be_bytes());
                 b.extend_from_slice(&id.to_be_bytes());
+                b.extend_from_slice(capability);
                 put_sockaddr(&mut b, *peer);
                 put_sockaddr(&mut b, *local);
                 b
@@ -880,6 +907,7 @@ impl Msg {
                 pair_id,
                 peer_id,
                 probe_id,
+                probe_capability,
                 provides,
             } => {
                 let mut b = Vec::new();
@@ -887,6 +915,7 @@ impl Msg {
                 b.extend_from_slice(&pair_id.to_be_bytes());
                 put_str(&mut b, peer_id);
                 b.extend_from_slice(&probe_id.to_be_bytes());
+                b.extend_from_slice(probe_capability);
                 b.push(*provides);
                 b
             }
@@ -904,11 +933,16 @@ impl Msg {
                 }
                 b
             }
-            Msg::PeerRelayOpen { pair_id, id } => {
-                let mut b = Vec::with_capacity(17);
+            Msg::PeerRelayOpen {
+                pair_id,
+                id,
+                capability,
+            } => {
+                let mut b = Vec::with_capacity(17 + CAPABILITY_LEN);
                 b.push(22);
                 b.extend_from_slice(&pair_id.to_be_bytes());
                 b.extend_from_slice(&id.to_be_bytes());
+                b.extend_from_slice(capability);
                 b
             }
             Msg::PeerPath { pair_id, status } => {
@@ -918,32 +952,45 @@ impl Msg {
                 b.push(path_status_byte(*status));
                 b
             }
+            Msg::ClientHelloAck {
+                client_id,
+                bridge_capability,
+            } => {
+                let mut b = Vec::new();
+                b.push(24);
+                put_str(&mut b, client_id);
+                b.extend_from_slice(bridge_capability);
+                b
+            }
         }
     }
 
     pub fn decode(b: &[u8]) -> Result<Msg> {
         match b.first() {
             Some(1) => Ok(Msg::Ping),
-            Some(2) if b.len() == 12 => {
+            Some(2) if b.len() == 12 + CAPABILITY_LEN => {
                 let proto = proto_from_byte(b[1])?;
                 let port = u16::from_be_bytes([b[2], b[3]]);
                 let id = u64::from_be_bytes(b[4..12].try_into().unwrap());
-                Ok(Msg::Open { proto, port, id })
+                let mut at = 12;
+                let capability = take_capability(b, &mut at)?;
+                Ok(Msg::Open {
+                    proto,
+                    port,
+                    id,
+                    capability,
+                })
             }
-            Some(3) if b.len() >= 10 => {
+            Some(3) if b.len() == 10 + CAPABILITY_LEN => {
                 let version = b[1];
                 let id = u64::from_be_bytes(b[2..10].try_into().unwrap());
-                let name = if b.len() == 10 {
-                    None
-                } else {
-                    let mut at = 10;
-                    let name = take_str(b, &mut at)?;
-                    if at != b.len() {
-                        return Err("trailing bytes in data".into());
-                    }
-                    Some(name)
-                };
-                Ok(Msg::Data { version, id, name })
+                let mut at = 10;
+                let capability = take_capability(b, &mut at)?;
+                Ok(Msg::Data {
+                    version,
+                    id,
+                    capability,
+                })
             }
             Some(4) => Ok(Msg::Pong),
             Some(5) => {
@@ -1144,12 +1191,13 @@ impl Msg {
             }
             Some(14) if b.len() == 1 => Ok(Msg::FwdOptionsAck),
             Some(15) => {
-                if b.len() < 11 {
+                if b.len() < 11 + CAPABILITY_LEN {
                     return Err("truncated proxy open".into());
                 }
                 let port = u16::from_be_bytes([b[1], b[2]]);
                 let id = u64::from_be_bytes(b[3..11].try_into().unwrap());
                 let mut at = 11;
+                let capability = take_capability(b, &mut at)?;
                 let peer = take_sockaddr(b, &mut at)?;
                 let local = take_sockaddr(b, &mut at)?;
                 if at != b.len() {
@@ -1158,6 +1206,7 @@ impl Msg {
                 Ok(Msg::OpenProxy {
                     port,
                     id,
+                    capability,
                     peer,
                     local,
                 })
@@ -1214,12 +1263,14 @@ impl Msg {
                 let pair_id = u64::from_be_bytes(b[1..9].try_into().unwrap());
                 let mut at = 9;
                 let peer_id = take_str(b, &mut at)?;
-                if at + 9 > b.len() {
+                if at + 9 + CAPABILITY_LEN > b.len() {
                     return Err("truncated peer probe".into());
                 }
                 let probe_id = u64::from_be_bytes(b[at..at + 8].try_into().unwrap());
-                let provides = want_from_byte(b[at + 8])?;
-                at += 9;
+                at += 8;
+                let probe_capability = take_capability(b, &mut at)?;
+                let provides = want_from_byte(b[at])?;
+                at += 1;
                 if at != b.len() {
                     return Err("trailing bytes in peer probe".into());
                 }
@@ -1227,6 +1278,7 @@ impl Msg {
                     pair_id,
                     peer_id,
                     probe_id,
+                    probe_capability,
                     provides,
                 })
             }
@@ -1249,15 +1301,33 @@ impl Msg {
                     candidates,
                 })
             }
-            Some(22) if b.len() == 17 => {
+            Some(22) if b.len() == 17 + CAPABILITY_LEN => {
                 let pair_id = u64::from_be_bytes(b[1..9].try_into().unwrap());
                 let id = u64::from_be_bytes(b[9..17].try_into().unwrap());
-                Ok(Msg::PeerRelayOpen { pair_id, id })
+                let mut at = 17;
+                let capability = take_capability(b, &mut at)?;
+                Ok(Msg::PeerRelayOpen {
+                    pair_id,
+                    id,
+                    capability,
+                })
             }
             Some(23) if b.len() == 10 => {
                 let pair_id = u64::from_be_bytes(b[1..9].try_into().unwrap());
                 let status = path_status_from_byte(b[9])?;
                 Ok(Msg::PeerPath { pair_id, status })
+            }
+            Some(24) => {
+                let mut at = 1;
+                let client_id = take_str(b, &mut at)?;
+                if at + CAPABILITY_LEN != b.len() {
+                    return Err("invalid client hello ack capability".into());
+                }
+                let bridge_capability = take_capability(b, &mut at)?;
+                Ok(Msg::ClientHelloAck {
+                    client_id,
+                    bridge_capability,
+                })
             }
             _ => Err(format!("malformed message ({} bytes)", b.len()).into()),
         }
@@ -1460,46 +1530,30 @@ mod tests {
     }
 
     #[test]
-    fn data_carries_optional_name() {
-        // A forward-data frame carries no label: 10 bytes, decodes to None.
-        let bare = Msg::Data {
+    fn data_carries_capability() {
+        let capability = [7; CAPABILITY_LEN];
+        let data = Msg::Data {
             version: 2,
             id: 7,
-            name: None,
+            capability,
         };
-        let enc = bare.encode();
-        assert_eq!(enc.len(), 10);
+        let enc = data.encode();
+        assert_eq!(enc.len(), 10 + CAPABILITY_LEN);
         match Msg::decode(&enc) {
-            Ok(Msg::Data { version, id, name }) => {
+            Ok(Msg::Data {
+                version,
+                id,
+                capability: got,
+            }) => {
                 assert_eq!(version, 2);
                 assert_eq!(id, 7);
-                assert!(name.is_none());
+                assert_eq!(got, capability);
             }
             other => panic!("expected data, got {other:?}"),
         }
-        // A named frame roundtrips.
-        let named = Msg::Data {
-            version: 2,
-            id: u64::MAX,
-            name: Some("br-1a2b".into()),
-        };
-        match roundtrip(&named) {
-            Msg::Data { version, id, name } => {
-                assert_eq!(version, 2);
-                assert_eq!(id, u64::MAX);
-                assert_eq!(name.as_deref(), Some("br-1a2b"));
-            }
-            other => panic!("expected data, got {other:?}"),
-        }
-        // A truncated name length prefix and trailing junk after a valid name both
-        // error rather than panic.
+        // A short capability and trailing junk both fail closed.
         assert!(Msg::decode(&[3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
-        let mut bad = Msg::Data {
-            version: 2,
-            id: 1,
-            name: Some("x".into()),
-        }
-        .encode();
+        let mut bad = enc;
         bad.push(0xAA);
         assert!(Msg::decode(&bad).is_err());
     }
@@ -1930,17 +1984,20 @@ mod tests {
             match roundtrip(&Msg::OpenProxy {
                 port: 443,
                 id: u64::MAX,
+                capability: [5; CAPABILITY_LEN],
                 peer,
                 local,
             }) {
                 Msg::OpenProxy {
                     port,
                     id,
+                    capability,
                     peer: p,
                     local: l,
                 } => {
                     assert_eq!(port, 443);
                     assert_eq!(id, u64::MAX);
+                    assert_eq!(capability, [5; CAPABILITY_LEN]);
                     assert_eq!(p, peer);
                     assert_eq!(l, local);
                 }
@@ -1954,12 +2011,13 @@ mod tests {
         let good = Msg::OpenProxy {
             port: 443,
             id: 7,
+            capability: [5; CAPABILITY_LEN],
             peer: "203.0.113.5:51820".parse().unwrap(),
             local: "[2001:db8::2]:443".parse().unwrap(),
         }
         .encode();
-        // 1 tag + 2 port + 8 id + 7 (v4 addr) + 19 (v6 addr).
-        assert_eq!(good.len(), 37);
+        // 1 tag + 2 port + 8 id + capability + 7 (v4 addr) + 19 (v6 addr).
+        assert_eq!(good.len(), 37 + CAPABILITY_LEN);
         for cut in 1..good.len() {
             assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
         }
@@ -1968,12 +2026,12 @@ mod tests {
         assert!(Msg::decode(&junk).is_err());
         // The peer's family byte sits right after the port and id.
         let mut bad_family = good.clone();
-        bad_family[11] = 5;
+        bad_family[11 + CAPABILITY_LEN] = 5;
         assert!(Msg::decode(&bad_family).is_err());
     }
 
     #[test]
-    fn legacy_tags_unchanged() {
+    fn core_tags_roundtrip() {
         assert_eq!(Msg::Ping.encode(), vec![1]);
         assert_eq!(Msg::Pong.encode(), vec![4]);
 
@@ -1981,32 +2039,23 @@ mod tests {
             proto: Proto::Udp,
             port: 443,
             id: 7,
+            capability: [6; CAPABILITY_LEN],
         };
         let bytes = open.encode();
-        assert_eq!(bytes.len(), 12);
+        assert_eq!(bytes.len(), 12 + CAPABILITY_LEN);
         match Msg::decode(&bytes).unwrap() {
-            Msg::Open { proto, port, id } => {
+            Msg::Open {
+                proto,
+                port,
+                id,
+                capability,
+            } => {
                 assert_eq!(proto, Proto::Udp);
                 assert_eq!(port, 443);
                 assert_eq!(id, 7);
+                assert_eq!(capability, [6; CAPABILITY_LEN]);
             }
             other => panic!("expected open, got {other:?}"),
-        }
-
-        let data = Msg::Data {
-            version: 2,
-            id: 42,
-            name: None,
-        };
-        let bytes = data.encode();
-        assert_eq!(bytes.len(), 10);
-        match Msg::decode(&bytes).unwrap() {
-            Msg::Data { version, id, name } => {
-                assert_eq!(version, 2);
-                assert_eq!(id, 42);
-                assert!(name.is_none());
-            }
-            other => panic!("expected data, got {other:?}"),
         }
 
         // Hello (tag 0) is gone: byte 0 must decode to Err.
@@ -2170,6 +2219,7 @@ mod tests {
                 pair_id: 3,
                 peer_id: "office-b1c2".into(),
                 probe_id: u64::MAX,
+                probe_capability: [5; CAPABILITY_LEN],
                 provides: want,
             };
             match roundtrip(&m) {
@@ -2177,11 +2227,13 @@ mod tests {
                     pair_id,
                     peer_id,
                     probe_id,
+                    probe_capability,
                     provides,
                 } => {
                     assert_eq!(pair_id, 3);
                     assert_eq!(peer_id, "office-b1c2");
                     assert_eq!(probe_id, u64::MAX);
+                    assert_eq!(probe_capability, [5; CAPABILITY_LEN]);
                     assert_eq!(provides, want);
                 }
                 other => panic!("expected peer probe, got {other:?}"),
@@ -2195,11 +2247,12 @@ mod tests {
             pair_id: 3,
             peer_id: "a".into(),
             probe_id: 4,
+            probe_capability: [5; CAPABILITY_LEN],
             provides: PROVIDES_EXIT,
         }
         .encode();
-        // 1 tag + 8 pair_id + 3 (peer_id) + 8 probe_id + 1 provides.
-        assert_eq!(good.len(), 21);
+        // 1 tag + 8 pair_id + 3 (peer_id) + 8 probe_id + capability + 1 provides.
+        assert_eq!(good.len(), 21 + CAPABILITY_LEN);
         for cut in 1..good.len() {
             assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
         }
@@ -2210,7 +2263,7 @@ mod tests {
         // zero bits, both bits, and an undefined bit all error.
         for provides in [0x00, PROVIDES_MASK, 0x04] {
             let mut bad_provides = good.clone();
-            bad_provides[20] = provides;
+            *bad_provides.last_mut().unwrap() = provides;
             assert!(Msg::decode(&bad_provides).is_err());
         }
     }
@@ -2285,13 +2338,19 @@ mod tests {
         let m = Msg::PeerRelayOpen {
             pair_id: 9,
             id: u64::MAX,
+            capability: [6; CAPABILITY_LEN],
         };
         let enc = m.encode();
-        assert_eq!(enc.len(), 17);
+        assert_eq!(enc.len(), 17 + CAPABILITY_LEN);
         match Msg::decode(&enc).unwrap() {
-            Msg::PeerRelayOpen { pair_id, id } => {
+            Msg::PeerRelayOpen {
+                pair_id,
+                id,
+                capability,
+            } => {
                 assert_eq!(pair_id, 9);
                 assert_eq!(id, u64::MAX);
+                assert_eq!(capability, [6; CAPABILITY_LEN]);
             }
             other => panic!("expected peer relay open, got {other:?}"),
         }

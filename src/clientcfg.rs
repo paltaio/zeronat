@@ -29,6 +29,7 @@ pub struct CfgServer {
     /// `"dht"` or `host:port`.
     pub addr: String,
     pub secret: ServerSecret,
+    pub credential: ServerSecret,
     pub transport: Transport,
 }
 
@@ -136,6 +137,9 @@ impl ClientConfig {
         for s in &self.servers {
             crate::secret::decode(&s.secret.0)
                 .map_err(|e| -> crate::Error { format!("server `{}` {e}", s.name).into() })?;
+            crate::secret::decode(&s.credential.0).map_err(|e| -> crate::Error {
+                format!("server `{}` client credential {e}", s.name).into()
+            })?;
             if !names.insert(&s.name) {
                 return Err(format!("duplicate server name `{}`", s.name).into());
             }
@@ -209,6 +213,7 @@ struct PartialRecord {
     name: Option<String>,
     addr: Option<String>,
     secret: Option<String>,
+    credential: Option<String>,
     transport: Option<Transport>,
     proto: Option<Proto>,
     port: Option<u16>,
@@ -334,6 +339,7 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
                     "name" => record.name = Some(parse_string(value, n)?),
                     "addr" => record.addr = Some(parse_string(value, n)?),
                     "secret" => record.secret = Some(parse_string(value, n)?),
+                    "credential" => record.credential = Some(parse_string(value, n)?),
                     "transport" => record.transport = Some(parse_transport(value, n)?),
                     other => {
                         return Err(err(n, &format!("unknown key `{other}` in [[servers]]")));
@@ -447,10 +453,12 @@ fn close_record(
                 .secret
                 .take()
                 .ok_or_else(|| err(n, "server missing `secret`"))?;
+            let credential = record.credential.take().unwrap_or_else(|| secret.clone());
             cfg.servers.push(CfgServer {
                 name,
                 addr,
                 secret: ServerSecret(secret),
+                credential: ServerSecret(credential),
                 transport: record.transport.take().unwrap_or(Transport::Auto),
             });
         }
@@ -622,6 +630,7 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
         out.push_str(&format!("name = {}\n", quote(&s.name)));
         out.push_str(&format!("addr = {}\n", quote(&s.addr)));
         out.push_str(&format!("secret = {}\n", quote(&s.secret.0)));
+        out.push_str(&format!("credential = {}\n", quote(&s.credential.0)));
         if s.transport != Transport::Auto {
             out.push_str(&format!(
                 "transport = {}\n",
@@ -733,12 +742,14 @@ mod tests {
                     name: "home".into(),
                     addr: "dht".into(),
                     secret: ServerSecret(TEST_SECRET.into()),
+                    credential: ServerSecret(TEST_SECRET.into()),
                     transport: Transport::Auto,
                 },
                 CfgServer {
                     name: "oci".into(),
                     addr: "203.0.113.10:2222".into(),
                     secret: ServerSecret(OTHER_SECRET.into()),
+                    credential: ServerSecret(OTHER_SECRET.into()),
                     transport: Transport::Tcp,
                 },
             ],
@@ -830,6 +841,7 @@ mod tests {
                 name: "home".into(),
                 addr: "dht".into(),
                 secret: ServerSecret(TEST_SECRET.into()),
+                credential: ServerSecret(TEST_SECRET.into()),
                 transport: Transport::Auto,
             }],
             tap: Some(CfgTap {

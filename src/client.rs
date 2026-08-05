@@ -29,7 +29,8 @@ use crate::kcp::{
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{
-    client_handshake_remote, client_handshake_stateless, client_handshake_stateless_reply, AuthRole,
+    client_handshake_remote, client_handshake_stateless_claim,
+    client_handshake_stateless_claim_reply, AuthRole,
 };
 use crate::peerslot;
 use crate::peerslot::PeerControl;
@@ -350,6 +351,7 @@ impl SharedForwards {
 struct Client {
     server: String,
     psk: [u8; 32],
+    credential_psk: [u8; 32],
     client_id: String,
     tcp: HashMap<u16, ForwardTarget>,
     udp: HashMap<u16, ForwardTarget>,
@@ -439,6 +441,7 @@ pub struct ServerTarget {
     pub name: String,
     pub addr: String,
     pub secret: String,
+    pub credential: String,
     pub transport: Transport,
 }
 
@@ -486,12 +489,10 @@ impl SharedServers {
     }
 
     /// Whether a profile with exactly these fields is configured.
-    fn contains(&self, name: &str, addr: &str, secret: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|s| s.name == name && s.addr == addr && s.secret == secret)
+    fn contains(&self, name: &str, addr: &str, secret: &str, credential: &str) -> bool {
+        self.inner.lock().unwrap().iter().any(|s| {
+            s.name == name && s.addr == addr && s.secret == secret && s.credential == credential
+        })
     }
 
     /// Snapshot view: config fields only, the per-server secret stays behind.
@@ -513,24 +514,29 @@ impl SharedServers {
 /// identity carries the resolver cache.
 struct DialState {
     psk: [u8; 32],
+    credential_psk: [u8; 32],
     discovery: Discovery,
 }
 
-/// Dial state kept across switches, keyed by the whole `(name, addr, secret)`
-/// triple: returning to an unchanged profile reuses its PSK and discovery,
-/// while a remove-then-add under the same name with a new secret or address
-/// derives fresh state instead of hitting a stale memo. `prune` drops entries
-/// for removed profiles, so the memo stays bounded by the configured set.
+/// Dial state kept across switches, keyed by the whole profile, including its
+/// network and client credentials. Returning to an unchanged profile reuses its
+/// PSK and discovery, while a remove-then-add under the same name with a new
+/// secret or address derives fresh state instead of hitting a stale memo.
+/// `prune` drops entries for removed profiles, so the memo stays bounded by the
+/// configured set.
 #[derive(Default)]
-struct DialMemo(HashMap<(String, String, String), DialState>);
+struct DialMemo(HashMap<(String, String, String, String), DialState>);
 
 impl DialMemo {
     /// Drop entries whose profile is gone, keeping the active target's, so
     /// remove/add cycles cannot grow the memo past the configured set.
     fn prune(&mut self, servers: &SharedServers, active: &ServerTarget) {
-        self.0.retain(|(name, addr, secret), _| {
-            (*name == active.name && *addr == active.addr && *secret == active.secret)
-                || servers.contains(name, addr, secret)
+        self.0.retain(|(name, addr, secret, credential), _| {
+            (*name == active.name
+                && *addr == active.addr
+                && *secret == active.secret
+                && *credential == active.credential)
+                || servers.contains(name, addr, secret, credential)
         });
     }
 
@@ -539,11 +545,13 @@ impl DialMemo {
             target.name.clone(),
             target.addr.clone(),
             target.secret.clone(),
+            target.credential.clone(),
         );
         match self.0.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
             std::collections::hash_map::Entry::Vacant(e) => Ok(e.insert(DialState {
                 psk: crate::noise::derive_psk(&target.secret),
+                credential_psk: crate::noise::derive_psk(&target.credential),
                 discovery: Discovery::new(&target.addr, &target.secret)?,
             })),
         }
@@ -877,6 +885,7 @@ impl ActiveTarget {
     fn normalize_secret(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         state.target.secret = crate::secret::normalize(&state.target.secret)?;
+        state.target.credential = crate::secret::normalize(&state.target.credential)?;
         Ok(())
     }
 
@@ -1107,6 +1116,7 @@ impl ActiveTarget {
 pub async fn run(
     server: String,
     secret: String,
+    credential: String,
     tcp: Vec<Forward>,
     udp: Vec<Forward>,
     transport: Transport,
@@ -1120,6 +1130,7 @@ pub async fn run(
         name: server.clone(),
         addr: server,
         secret,
+        credential,
         transport,
     };
     // A CLI-declared pppoe session gets a fixed handle so admin can name it.
@@ -1216,6 +1227,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
     active.normalize_secret()?;
     for target in &mut servers {
         target.secret = crate::secret::normalize(&target.secret)?;
+        target.credential = crate::secret::normalize(&target.credential)?;
     }
     let client_id = crate::identity::derive_client_id(id_prefix.as_deref());
     #[cfg(not(target_os = "linux"))]
@@ -1376,13 +1388,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                  can pair; peer slots pair while this client runs forwards or sits idle"
             );
         }
-        let peer_slots = peerslot::spawn(
-            &peers,
-            &client_id,
-            &target.secret,
-            &peer_control,
-            &peer_sessions,
-        );
+        let peer_slots = peerslot::spawn(&peers, &target.secret, &peer_control, &peer_sessions);
 
         let mut udp_health = UdpHealth::default();
         let mut backoff = Backoff::default();
@@ -1447,6 +1453,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
             let client = Arc::new(Client {
                 server: addr,
                 psk: state.psk,
+                credential_psk: state.credential_psk,
                 client_id: client_id.clone(),
                 tcp,
                 udp,
@@ -1697,7 +1704,7 @@ impl ProbeSession {
 pub async fn probe_candidates(
     server: SocketAddr,
     psk: &[u8; 32],
-    probe_id: u64,
+    (probe_id, probe_capability): (u64, crate::proto::Capability),
 ) -> Result<ProbeSession> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     // The route-source address toward the server: the wildcard-bound probe
@@ -1739,7 +1746,7 @@ pub async fn probe_candidates(
     let stream = sess.open_conv_with(CLASS_SETUP, conv);
     let (noise, reply) = tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
-        client_handshake_stateless_reply(stream, psk, probe_id),
+        client_handshake_stateless_claim_reply(stream, psk, probe_id, &probe_capability),
     )
     .await
     .map_err(|_| -> crate::Error { "probe handshake timed out".into() })??;
@@ -1775,6 +1782,53 @@ pub struct RelayDgramLeg {
     guard: ConvGuard,
 }
 
+struct BridgeLease {
+    client_id: String,
+    capability: crate::proto::Capability,
+    _task: AbortOnDrop,
+}
+
+async fn bridge_lease(
+    client_id: &str,
+    mut r: crate::noise::NoiseReader,
+    mut w: crate::noise::NoiseWriter,
+) -> Result<BridgeLease> {
+    w.send(
+        &Msg::ClientHello {
+            version: crate::identity::PROTO_VERSION,
+            client_id: client_id.to_string(),
+        }
+        .encode(),
+    )
+    .await?;
+    let frame = tokio_timeout(CONTROL_TIMEOUT, r.recv())
+        .await
+        .map_err(|_| -> crate::Error { "client authorization timed out".into() })??;
+    let Msg::ClientHelloAck {
+        client_id,
+        bridge_capability,
+    } = Msg::decode(&frame)?
+    else {
+        return Err("server did not authorize the client session".into());
+    };
+    let task = AbortOnDrop(crate::spawn(async move {
+        loop {
+            sleep(PING_INTERVAL).await;
+            if w.send(&Msg::Ping.encode()).await.is_err() {
+                return;
+            }
+            if !matches!(tokio_timeout(CONTROL_TIMEOUT, r.recv()).await, Ok(Ok(_))) {
+                return;
+            }
+        }
+    }));
+    Ok(BridgeLease {
+        client_id,
+        capability: bridge_capability,
+        _task: task,
+    })
+}
+
 impl RelayDgramLeg {
     /// Split into the two frame halves and the tag registration they need held
     /// for the leg's life.
@@ -1791,6 +1845,7 @@ pub async fn relay_leg_stream(
     server: &str,
     psk: &[u8; 32],
     id: u64,
+    capability: crate::proto::Capability,
 ) -> Result<crate::noise::Noise> {
     let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
         let sock = TcpStream::connect(server).await?;
@@ -1803,7 +1858,7 @@ pub async fn relay_leg_stream(
         &Msg::Data {
             version: crate::identity::PROTO_VERSION,
             id,
-            name: None,
+            capability,
         }
         .encode(),
     )
@@ -1815,13 +1870,18 @@ pub async fn relay_leg_stream(
 /// the leg `id`, then the datagram channel under the matching tag, following
 /// the UDP-forward rule for both. One datagram carries one inner frame, so the
 /// server's splice keeps frame boundaries against a stream leg.
-pub async fn relay_leg_dgram(sess: &Session, psk: &[u8; 32], id: u64) -> Result<RelayDgramLeg> {
+pub async fn relay_leg_dgram(
+    sess: &Session,
+    psk: &[u8; 32],
+    id: u64,
+    capability: crate::proto::Capability,
+) -> Result<RelayDgramLeg> {
     let conv = (id as u32) | SETUP_CONV_BIT;
     let stream = sess.open_conv_with(CLASS_SETUP, conv);
     let noise = Arc::new(
         tokio_timeout(
             OPEN_HANDSHAKE_TIMEOUT,
-            client_handshake_stateless(stream, psk, id),
+            client_handshake_stateless_claim(stream, psk, id, &capability),
         )
         .await
         .map_err(|_| -> crate::Error { "relay leg handshake timed out".into() })??,
@@ -1848,10 +1908,25 @@ async fn bridge_udp(
         Ok(v) => v,
         Err(e) => return (Err(e), false),
     };
+    let (_control_conv, control_stream) = sess.open_conv(CLASS_KCP);
+    let (control_r, control_w) = match tokio_timeout(
+        UDP_HANDSHAKE_TIMEOUT,
+        client_handshake_remote(control_stream, &client.credential_psk, AuthRole::Client),
+    )
+    .await
+    {
+        Ok(Ok(noise)) => noise,
+        Ok(Err(e)) => return (Err(e), false),
+        Err(_) => return (Err("udp control handshake timed out".into()), false),
+    };
+    let lease = match bridge_lease(&client.client_id, control_r, control_w).await {
+        Ok(lease) => lease,
+        Err(e) => return (Err(e), false),
+    };
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
     let noise = match tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
-        client_handshake_stateless(stream, &client.psk, BRIDGE_ID),
+        client_handshake_stateless_claim(stream, &client.psk, BRIDGE_ID, &lease.capability),
     )
     .await
     {
@@ -1867,10 +1942,10 @@ async fn bridge_udp(
     let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
     let rx = DgramRx::new(inbound, noise);
     // Announce this client's label so the server's fleet view names the port.
-    let _ = tx.send_name(&client.client_id).await;
+    let _ = tx.send_name(&lease.client_id).await;
     // `cancel` fires only when the RX pump sees the peer vanish (server restart),
     // tearing the bridge down at once instead of stalling until the next reconnect.
-    bridge::tap_dgram(tap, rx, tx, cancel, &client.client_id).await;
+    bridge::tap_dgram(tap, rx, tx, cancel, &lease.client_id).await;
     (Ok(()), true)
 }
 
@@ -1882,17 +1957,36 @@ async fn bridge_tcp(
     tap: Arc<TapDevice>,
     link: &LinkCell,
 ) -> (Result<()>, bool) {
-    let ((nr, mut nw), _peer) =
-        match connect_and_handshake(&client.server, &client.psk, OPEN_HANDSHAKE_TIMEOUT).await {
-            Ok(v) => v,
-            Err(e) => return (Err(e), false),
-        };
+    let ((control_r, control_w), _peer) = match connect_and_handshake(
+        &client.server,
+        &client.credential_psk,
+        OPEN_HANDSHAKE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return (Err(e), false),
+    };
+    let lease = match bridge_lease(&client.client_id, control_r, control_w).await {
+        Ok(lease) => lease,
+        Err(e) => return (Err(e), false),
+    };
+    let ((nr, mut nw), _peer) = match connect_and_handshake(
+        &client.server,
+        &client.credential_psk,
+        OPEN_HANDSHAKE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return (Err(e), false),
+    };
     if let Err(e) = nw
         .send(
             &Msg::Data {
                 version: crate::identity::PROTO_VERSION,
                 id: BRIDGE_ID,
-                name: Some(client.client_id.clone()),
+                capability: lease.capability,
             }
             .encode(),
         )
@@ -2089,10 +2183,25 @@ async fn pppoe_udp(
         Ok(v) => v,
         Err(e) => return (Err(e), false),
     };
+    let (_control_conv, control_stream) = sess.open_conv(CLASS_KCP);
+    let (control_r, control_w) = match tokio_timeout(
+        UDP_HANDSHAKE_TIMEOUT,
+        client_handshake_remote(control_stream, &client.credential_psk, AuthRole::Client),
+    )
+    .await
+    {
+        Ok(Ok(noise)) => noise,
+        Ok(Err(e)) => return (Err(e), false),
+        Err(_) => return (Err("udp control handshake timed out".into()), false),
+    };
+    let lease = match bridge_lease(&client.client_id, control_r, control_w).await {
+        Ok(lease) => lease,
+        Err(e) => return (Err(e), false),
+    };
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
     let noise = match tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
-        client_handshake_stateless(stream, &client.psk, BRIDGE_ID),
+        client_handshake_stateless_claim(stream, &client.psk, BRIDGE_ID, &lease.capability),
     )
     .await
     {
@@ -2108,7 +2217,7 @@ async fn pppoe_udp(
     let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
     let rx = DgramRx::new(inbound, noise);
     // Announce this client's label so the server's fleet view names the port.
-    let _ = tx.send_name(&client.client_id).await;
+    let _ = tx.send_name(&lease.client_id).await;
     // UDP requires a literal ip:port, so the configured server is the real peer.
     let server_ip = server_v4(&client.server);
     let result = crate::pppoe::tunnel::run_dgram(
@@ -2117,7 +2226,7 @@ async fn pppoe_udp(
         rx,
         tx,
         cancel,
-        &client.client_id,
+        &lease.client_id,
     )
     .await;
     (result, true)
@@ -2136,17 +2245,36 @@ async fn pppoe_tcp(
         Ok(dp) => dp,
         Err(e) => return (Err(e), false),
     };
-    let ((nr, mut nw), peer) =
-        match connect_and_handshake(&client.server, &client.psk, OPEN_HANDSHAKE_TIMEOUT).await {
-            Ok(v) => v,
-            Err(e) => return (Err(e), false),
-        };
+    let ((control_r, control_w), _control_peer) = match connect_and_handshake(
+        &client.server,
+        &client.credential_psk,
+        OPEN_HANDSHAKE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return (Err(e), false),
+    };
+    let lease = match bridge_lease(&client.client_id, control_r, control_w).await {
+        Ok(lease) => lease,
+        Err(e) => return (Err(e), false),
+    };
+    let ((nr, mut nw), peer) = match connect_and_handshake(
+        &client.server,
+        &client.credential_psk,
+        OPEN_HANDSHAKE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return (Err(e), false),
+    };
     if let Err(e) = nw
         .send(
             &Msg::Data {
                 version: crate::identity::PROTO_VERSION,
                 id: BRIDGE_ID,
-                name: Some(client.client_id.clone()),
+                capability: lease.capability,
             }
             .encode(),
         )
@@ -2181,7 +2309,7 @@ async fn udp_session(
     let (_conv, stream) = sess.open_conv(CLASS_KCP);
     let noise = tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
-        client_handshake_remote(stream, &client.psk, AuthRole::Client),
+        client_handshake_remote(stream, &client.credential_psk, AuthRole::Client),
     )
     .await
     .map_err(|_| -> crate::Error { "udp handshake timed out".into() })??;
@@ -2284,8 +2412,12 @@ async fn connect_and_handshake(
 
 /// Dial the TCP control connection and run the Noise handshake.
 async fn tcp_control(client: Arc<Client>) -> Result<crate::noise::Noise> {
-    let (noise, _peer) =
-        connect_and_handshake(&client.server, &client.psk, OPEN_HANDSHAKE_TIMEOUT).await?;
+    let (noise, _peer) = connect_and_handshake(
+        &client.server,
+        &client.credential_psk,
+        OPEN_HANDSHAKE_TIMEOUT,
+    )
+    .await?;
     crate::elog!("connected to {}", client.server);
     Ok(noise)
 }
@@ -2334,6 +2466,7 @@ async fn control_loop(
     // generation, which fails every peer cycle that has not settled on a
     // punched path.
     let mut peer_live: Option<crate::peerslot::ControlGuard> = None;
+    let mut authorized_client_id: Option<String> = None;
 
     // Every task this session spawns is held through an AbortOnDrop guard, so
     // both a normal teardown and a server switch aborting the whole session
@@ -2435,27 +2568,46 @@ async fn control_loop(
             },
         };
         let open = match Msg::decode(&msg) {
-            Ok(Msg::Open { proto, port, id }) => Some((proto, port, id, None)),
+            Ok(Msg::Open {
+                proto,
+                port,
+                id,
+                capability,
+            }) => Some((proto, port, id, capability, None)),
             // TCP-only by construction: the server sends OpenProxy exclusively
             // for TCP ports this client flagged proxy.
             Ok(Msg::OpenProxy {
                 port,
                 id,
+                capability,
                 peer,
                 local,
-            }) => Some((Proto::Tcp, port, id, Some((peer, local)))),
+            }) => Some((Proto::Tcp, port, id, capability, Some((peer, local)))),
             Ok(Msg::FwdOptionsAck) => {
                 ack.store(true, Ordering::Relaxed);
+                None
+            }
+            Ok(Msg::ClientHelloAck { client_id, .. }) => {
+                if authorized_client_id.replace(client_id).is_some() {
+                    break Err("server repeated the client authorization".into());
+                }
                 None
             }
             Ok(Msg::PeerAnnounceAck { observed }) => {
                 peer_ack.store(true, Ordering::Relaxed);
                 if peer_live.is_none() {
+                    let Some(client_id) = authorized_client_id.clone() else {
+                        break Err(
+                            "server acknowledged peer support before client authorization".into(),
+                        );
+                    };
                     crate::elog!("peer support acknowledged; control address {observed}");
                     peer_live = Some(peer.install(crate::peerslot::ControlSession {
                         tx: tx.clone(),
                         server: client.server.clone(),
+                        client_id,
                         psk: client.psk,
+                        credential_psk: client.credential_psk,
                         sess: match link.as_ref() {
                             Link::Udp(sess, _, _) => Some(sess.clone()),
                             Link::Tcp => None,
@@ -2476,14 +2628,16 @@ async fn control_loop(
             Ok(_) => None,
             Err(e) => break Err(e),
         };
-        if let Some((proto, port, id, proxy_addrs)) = open {
+        if let Some((proto, port, id, capability, proxy_addrs)) = open {
             let client = client.clone();
             let link = link.clone();
             // Drop guards of forwards that already finished so the tracking
             // vector stays bounded over a long healthy session.
             forwards.retain(|h| !h.0.is_finished());
             forwards.push(AbortOnDrop(crate::spawn(async move {
-                if let Err(e) = handle_open(client, link, proto, port, id, proxy_addrs).await {
+                if let Err(e) =
+                    handle_open(client, link, proto, port, id, capability, proxy_addrs).await
+                {
                     crate::elog!("stream {id} ({proto:?} :{port}) failed: {e}");
                 }
             })));
@@ -2539,6 +2693,7 @@ async fn handle_open(
     proto: Proto,
     port: u16,
     id: u64,
+    capability: crate::proto::Capability,
     proxy_addrs: Option<(SocketAddr, SocketAddr)>,
 ) -> Result<()> {
     let fwd = match proto {
@@ -2571,7 +2726,7 @@ async fn handle_open(
             let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
                 let sock = TcpStream::connect(&client.server).await?;
                 sock.set_nodelay(true).ok();
-                client_handshake_remote(sock, &client.psk, AuthRole::Client).await
+                client_handshake_remote(sock, &client.credential_psk, AuthRole::Client).await
             })
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
@@ -2579,7 +2734,7 @@ async fn handle_open(
                 &Msg::Data {
                     version: crate::identity::PROTO_VERSION,
                     id,
-                    name: None,
+                    capability,
                 }
                 .encode(),
             )
@@ -2591,7 +2746,7 @@ async fn handle_open(
             let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
                 let sock = TcpStream::connect(&client.server).await?;
                 sock.set_nodelay(true).ok();
-                client_handshake_remote(sock, &client.psk, AuthRole::Client).await
+                client_handshake_remote(sock, &client.credential_psk, AuthRole::Client).await
             })
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
@@ -2599,7 +2754,7 @@ async fn handle_open(
                 &Msg::Data {
                     version: crate::identity::PROTO_VERSION,
                     id,
-                    name: None,
+                    capability,
                 }
                 .encode(),
             )
@@ -2615,7 +2770,7 @@ async fn handle_open(
             let (_conv, stream) = sess.open_conv(CLASS_KCP);
             let (nr, mut nw) = tokio_timeout(
                 OPEN_HANDSHAKE_TIMEOUT,
-                client_handshake_remote(stream, &client.psk, AuthRole::Client),
+                client_handshake_remote(stream, &client.credential_psk, AuthRole::Client),
             )
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
@@ -2623,7 +2778,7 @@ async fn handle_open(
                 &Msg::Data {
                     version: crate::identity::PROTO_VERSION,
                     id,
-                    name: None,
+                    capability,
                 }
                 .encode(),
             )
@@ -2637,7 +2792,7 @@ async fn handle_open(
             let noise = Arc::new(
                 tokio_timeout(
                     OPEN_HANDSHAKE_TIMEOUT,
-                    client_handshake_stateless(stream, &client.psk, id),
+                    client_handshake_stateless_claim(stream, &client.psk, id, &capability),
                 )
                 .await
                 .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??,
@@ -2704,6 +2859,7 @@ mod tests {
             name: name.into(),
             addr: "127.0.0.1:1".into(),
             secret: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
+            credential: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
             transport: Transport::Tcp,
         }
     }
@@ -2860,14 +3016,20 @@ mod tests {
         let servers = SharedServers::new(vec![b.clone()]);
         memo.prune(&servers, &a);
         // a survives as the active target, b's stale entry is gone.
-        let keys: Vec<&(String, String, String)> = memo.0.keys().collect();
+        let keys: Vec<&(String, String, String, String)> = memo.0.keys().collect();
         assert_eq!(memo.0.len(), 2, "{keys:?}");
-        assert!(memo
-            .0
-            .contains_key(&(b.name.clone(), b.addr.clone(), b.secret.clone())));
-        assert!(memo
-            .0
-            .contains_key(&(a.name.clone(), a.addr.clone(), a.secret.clone())));
+        assert!(memo.0.contains_key(&(
+            b.name.clone(),
+            b.addr.clone(),
+            b.secret.clone(),
+            b.credential.clone(),
+        )));
+        assert!(memo.0.contains_key(&(
+            a.name.clone(),
+            a.addr.clone(),
+            a.secret.clone(),
+            a.credential.clone(),
+        )));
     }
 
     // Disconnect parks any body (and only refuses a repeat); connect leaves

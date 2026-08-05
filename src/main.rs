@@ -32,6 +32,8 @@ server options:
   --bind <ADDR>       Address to bind on (default: 0.0.0.0)
   --control <PORT>    Control port (default: 2222)
   --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET)
+  --client <ID>:<64-HEX>  Authorize a client id and credential (repeatable; or env
+                      ZERONAT_CLIENT_ID and ZERONAT_CLIENT_SECRET)
   --admin-secret <64-HEX>  Independent remote admin secret (or env
                       ZERONAT_ADMIN_SECRET; remote admin is disabled when unset)
   --id <ID>           Server identity label (default: 0)
@@ -55,6 +57,8 @@ server options:
 client options:
   --server <ADDR>     Server control address host:port, or 'dht' to discover via DHT
   --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET)
+  --credential <64-HEX>  Client credential (or env ZERONAT_CLIENT_SECRET;
+                      defaults to --secret)
   --id <PREFIX>       Client id prefix (default: short hostname)
   --config <PATH>     Load servers/forwards/identity from a config file
   --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT, plus
@@ -143,6 +147,7 @@ enum Cmd {
         bind: Option<Ipv4Addr>,
         control: Option<u16>,
         secret: String,
+        client_credentials: Vec<server::ClientCredentialSpec>,
         admin_secret: Option<String>,
         server_id: Option<String>,
         tcp: Vec<u16>,
@@ -161,6 +166,7 @@ enum Cmd {
     Client {
         server: Option<String>,
         secret: Option<String>,
+        credential: Option<String>,
         id_prefix: Option<String>,
         tcp: Vec<String>,
         udp: Vec<String>,
@@ -619,6 +625,7 @@ fn parse_args() -> Result<Cmd> {
         let mut bind: Option<Ipv4Addr> = None;
         let mut control: Option<u16> = None;
         let mut secret: Option<String> = None;
+        let mut client_credentials = Vec::new();
         let mut admin_secret: Option<String> = None;
         let mut server_id: Option<String> = None;
         let mut tcp: Vec<u16> = Vec::new();
@@ -677,6 +684,18 @@ fn parse_args() -> Result<Cmd> {
                 }
                 "--secret" => {
                     secret = Some(iter.next().ok_or("--secret requires a value")?);
+                }
+                "--client" => {
+                    let value = iter.next().ok_or("--client requires ID:64-HEX")?;
+                    let (client_id, secret) =
+                        value.split_once(':').ok_or("--client requires ID:64-HEX")?;
+                    if client_id.is_empty() {
+                        return Err("--client id must not be empty".into());
+                    }
+                    client_credentials.push(server::ClientCredentialSpec {
+                        client_id: client_id.to_string(),
+                        secret: runtime_secret(secret.to_string())?,
+                    });
                 }
                 "--admin-secret" => {
                     admin_secret = Some(iter.next().ok_or("--admin-secret requires a value")?);
@@ -739,6 +758,25 @@ fn parse_args() -> Result<Cmd> {
                 .ok_or("--secret or ZERONAT_SECRET is required")?,
         )?;
         let admin_secret = admin_secret.or_else(|| std::env::var("ZERONAT_ADMIN_SECRET").ok());
+        if client_credentials.is_empty() {
+            match (
+                std::env::var("ZERONAT_CLIENT_ID").ok(),
+                std::env::var("ZERONAT_CLIENT_SECRET").ok(),
+            ) {
+                (Some(client_id), Some(client_secret)) if !client_id.is_empty() => {
+                    client_credentials.push(server::ClientCredentialSpec {
+                        client_id,
+                        secret: runtime_secret(client_secret)?,
+                    });
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(
+                        "ZERONAT_CLIENT_ID and ZERONAT_CLIENT_SECRET must be set together".into(),
+                    );
+                }
+            }
+        }
 
         if tun && bridge.is_some() {
             return Err("--bridge applies to --tap only, not --tun".into());
@@ -749,6 +787,7 @@ fn parse_args() -> Result<Cmd> {
             bind,
             control,
             secret,
+            client_credentials,
             admin_secret,
             server_id,
             tcp,
@@ -768,6 +807,7 @@ fn parse_args() -> Result<Cmd> {
         // client
         let mut server: Option<String> = None;
         let mut secret: Option<String> = None;
+        let mut credential: Option<String> = None;
         let mut id_prefix: Option<String> = None;
         let mut tcp: Vec<String> = Vec::new();
         let mut udp: Vec<String> = Vec::new();
@@ -812,6 +852,9 @@ fn parse_args() -> Result<Cmd> {
                 }
                 "--secret" => {
                     secret = Some(iter.next().ok_or("--secret requires a value")?);
+                }
+                "--credential" => {
+                    credential = Some(iter.next().ok_or("--credential requires a value")?);
                 }
                 "--id" => {
                     id_prefix = Some(iter.next().ok_or("--id requires a value")?);
@@ -889,6 +932,7 @@ fn parse_args() -> Result<Cmd> {
         Ok(Cmd::Client {
             server,
             secret,
+            credential,
             id_prefix,
             tcp,
             udp,
@@ -1046,6 +1090,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             bind,
             control,
             secret,
+            client_credentials,
             admin_secret,
             server_id,
             tcp,
@@ -1136,6 +1181,21 @@ async fn run(cmd: Cmd) -> Result<()> {
                 .or(cli_admin_secret)
                 .map(runtime_secret)
                 .transpose()?;
+
+            let client_credentials = if file.clients.is_empty() {
+                client_credentials
+            } else {
+                if !client_credentials.is_empty() {
+                    zeronat::elog!("config [[clients]] overrides --client");
+                }
+                file.clients
+                    .iter()
+                    .map(|client| server::ClientCredentialSpec {
+                        client_id: client.id.clone(),
+                        secret: client.secret.clone(),
+                    })
+                    .collect()
+            };
 
             let (cli_exit, cli_exit_iface) = (exit, exit_iface);
             if file.exit == Some(false) && cli_exit {
@@ -1307,6 +1367,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 bind: bind_ip,
                 control_port,
                 secret,
+                client_credentials,
                 admin_secret,
                 server_id,
                 tap,
@@ -1318,6 +1379,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 file_id,
                 file_control,
                 file_admin_secret,
+                file_clients: file.clients,
                 file_exit,
                 file_exit_iface,
             })
@@ -1326,6 +1388,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Client {
             server,
             secret,
+            credential,
             id_prefix,
             tcp,
             udp,
@@ -1406,6 +1469,9 @@ async fn run(cmd: Cmd) -> Result<()> {
                 }
                 if secret.is_some() {
                     zeronat::elog!("config overrides --secret");
+                }
+                if credential.is_some() {
+                    zeronat::elog!("config overrides --credential");
                 }
                 if let Some(v) = &transport {
                     zeronat::elog!("config overrides --transport '{v}'");
@@ -1493,6 +1559,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                         name: s.name.clone(),
                         addr: s.addr.clone(),
                         secret: s.secret.0.clone(),
+                        credential: s.credential.0.clone(),
                         transport: s.transport,
                     })
                     .collect();
@@ -1500,6 +1567,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                     name: srv.name.clone(),
                     addr: srv.addr.clone(),
                     secret: srv.secret.0.clone(),
+                    credential: srv.credential.0.clone(),
                     transport: srv.transport,
                 };
 
@@ -1537,6 +1605,11 @@ async fn run(cmd: Cmd) -> Result<()> {
                     secret
                         .or_else(|| std::env::var("ZERONAT_SECRET").ok())
                         .ok_or("--secret or ZERONAT_SECRET is required")?,
+                )?;
+                let credential = runtime_secret(
+                    credential
+                        .or_else(|| std::env::var("ZERONAT_CLIENT_SECRET").ok())
+                        .unwrap_or_else(|| secret.clone()),
                 )?;
                 if tun && bridge.is_some() {
                     return Err("--bridge applies to --tap only, not --tun".into());
@@ -1675,7 +1748,8 @@ async fn run(cmd: Cmd) -> Result<()> {
                     ),
                 }
                 client::run(
-                    server, secret, tcp, udp, transport, tap, tun, pppoe, id_prefix, control,
+                    server, secret, credential, tcp, udp, transport, tap, tun, pppoe, id_prefix,
+                    control,
                 )
                 .await
             }
@@ -1895,6 +1969,7 @@ mod tests {
             name: name.into(),
             addr: format!("{name}.example:2222"),
             secret: zeronat::clientproto::ServerSecret("s".into()),
+            credential: zeronat::clientproto::ServerSecret("s".into()),
             transport: zeronat::client::Transport::Auto,
         }
     }

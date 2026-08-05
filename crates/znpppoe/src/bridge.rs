@@ -11,8 +11,13 @@ use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 
 use zeronat::dgram::{DgramRx, DgramTx};
-use zeronat::kcp::{route, session as kcp_session, Session, BRIDGE_CONV, BRIDGE_ID, CLASS_SETUP};
-use zeronat::noise::{client_handshake_stateless, derive_psk};
+use zeronat::kcp::{
+    route, session as kcp_session, Session, BRIDGE_CONV, BRIDGE_ID, CLASS_KCP, CLASS_SETUP,
+};
+use zeronat::noise::{
+    client_handshake_remote, client_handshake_stateless_claim, derive_psk, AuthRole,
+};
+use zeronat::proto::Msg;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -76,12 +81,13 @@ pub struct Bridge {
     pub hold: BridgeHold,
 }
 
-/// What the send and receive ends need alive under them: the KCP session, the
-/// conv registration guard, and the UDP receive pump.
+/// What the send and receive ends need alive under them: the control session,
+/// KCP session, conv registration guard, and UDP receive pump.
 pub struct BridgeHold {
     _sess: Arc<Session>,
     _guard: zeronat::kcp::ConvGuard,
     _pump: AbortOnDrop,
+    _control: AbortOnDrop,
 }
 
 /// Aborts its task when dropped. Ties a task's lifetime to the scope that owns
@@ -98,7 +104,12 @@ impl Drop for AbortOnDrop {
 /// Dial `addr`, establish the bridge setup conv, run the stateless Noise
 /// handshake, and return the bridge ready to carry L2 frames. `client_id` is
 /// announced so the server's fleet view names the port.
-pub async fn connect(addr: SocketAddr, secret: &str, client_id: &str) -> Result<Bridge> {
+pub async fn connect(
+    addr: SocketAddr,
+    secret: &str,
+    credential: &str,
+    client_id: &str,
+) -> Result<Bridge> {
     let socket = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
             .await
@@ -140,11 +151,55 @@ pub async fn connect(addr: SocketAddr, secret: &str, client_id: &str) -> Result<
         })
     });
 
+    let credential_psk = derive_psk(credential);
+    let (_control_conv, control_stream) = sess.open_conv(CLASS_KCP);
+    let (mut control_r, mut control_w) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        client_handshake_remote(control_stream, &credential_psk, AuthRole::Client),
+    )
+    .await
+    .context("client authorization handshake timed out")?
+    .map_err(|e| anyhow::anyhow!("client authorization handshake failed: {e}"))?;
+    control_w
+        .send(
+            &Msg::ClientHello {
+                version: zeronat::identity::PROTO_VERSION,
+                client_id: client_id.to_string(),
+            }
+            .encode(),
+        )
+        .await
+        .map_err(|e| anyhow!("send client authorization: {e}"))?;
+    let frame = tokio::time::timeout(HANDSHAKE_TIMEOUT, control_r.recv())
+        .await
+        .context("client authorization timed out")?
+        .map_err(|e| anyhow!("read client authorization: {e}"))?;
+    let Msg::ClientHelloAck {
+        bridge_capability, ..
+    } = Msg::decode(&frame).map_err(|e| anyhow::anyhow!(e.to_string()))?
+    else {
+        return Err(anyhow!("server did not authorize the bridge client"));
+    };
+    let control = AbortOnDrop(crate::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if control_w.send(&Msg::Ping.encode()).await.is_err() {
+                return;
+            }
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(30), control_r.recv()).await,
+                Ok(Ok(_))
+            ) {
+                return;
+            }
+        }
+    }));
+
     let psk = derive_psk(secret);
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
     let noise = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        client_handshake_stateless(stream, &psk, BRIDGE_ID),
+        client_handshake_stateless_claim(stream, &psk, BRIDGE_ID, &bridge_capability),
     )
     .await
     .context("bridge handshake timed out")?
@@ -154,7 +209,6 @@ pub async fn connect(addr: SocketAddr, secret: &str, client_id: &str) -> Result<
     let (inbound, guard) = sess.register_dgram(BRIDGE_CONV);
     let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
     let rx = DgramRx::new(inbound, noise);
-    tx.send_name(client_id).await.ok();
 
     Ok(Bridge {
         tx,
@@ -164,6 +218,7 @@ pub async fn connect(addr: SocketAddr, secret: &str, client_id: &str) -> Result<
             _sess: sess,
             _guard: guard,
             _pump: pump,
+            _control: control,
         },
     })
 }
@@ -184,7 +239,7 @@ mod tests {
         let metrics = tokio::runtime::Handle::current().metrics();
         let baseline = metrics.num_alive_tasks();
 
-        assert!(connect(addr, "secret", "test").await.is_err());
+        assert!(connect(addr, "secret", "credential", "test").await.is_err());
 
         for _ in 0..200 {
             tokio::time::advance(Duration::from_secs(2)).await;

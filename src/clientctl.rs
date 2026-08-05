@@ -445,6 +445,7 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                 name: name.clone(),
                 addr: addr.clone(),
                 secret: secret.0.clone(),
+                credential: secret.0.clone(),
                 transport,
             };
             // Name uniqueness also protects the empty-name `Connect` sentinel.
@@ -455,6 +456,7 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                 cfg.servers.push(CfgServer {
                     name,
                     addr,
+                    credential: secret.clone(),
                     secret,
                     transport,
                 })
@@ -880,6 +882,7 @@ mod tests {
             name: name.into(),
             addr: format!("127.0.0.1:{port}"),
             secret: TEST_SECRET.into(),
+            credential: TEST_SECRET.into(),
             transport: Transport::Tcp,
         }
     }
@@ -1392,6 +1395,7 @@ mod tests {
             name: "roam".into(),
             addr: "dht".into(),
             secret: TEST_SECRET.into(),
+            credential: TEST_SECRET.into(),
             transport: Transport::Auto,
         };
         assert!(undialable(&dht, true).is_none());
@@ -1413,6 +1417,7 @@ mod tests {
             name: "roam".into(),
             addr: "dht".into(),
             secret: TEST_SECRET.into(),
+            credential: TEST_SECRET.into(),
             transport: Transport::Auto,
         };
         state.servers = SharedServers::new(vec![server_target("a", 1), dht]);
@@ -1449,6 +1454,7 @@ mod tests {
             name: "roam".into(),
             addr: "dht".into(),
             secret: TEST_SECRET.into(),
+            credential: TEST_SECRET.into(),
             transport: Transport::Auto,
         };
         state.servers = SharedServers::new(vec![server_target("a", 1), dht]);

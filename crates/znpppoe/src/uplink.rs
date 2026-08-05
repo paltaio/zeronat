@@ -67,11 +67,18 @@ pub struct PeerId<'a>(pub &'a str);
 /// session it dials is what the pairing goes through, and the consumer slot
 /// under it asks again whenever a pair dies. The client derives its id from
 /// `id_prefix`, the same id the bridge path labels its port with.
-pub fn peer(server: &str, secret: &str, id_prefix: &str, peer: PeerId<'_>) -> Uplink {
+pub fn peer(
+    server: &str,
+    secret: &str,
+    credential: &str,
+    id_prefix: &str,
+    peer: PeerId<'_>,
+) -> Uplink {
     let target = ServerTarget {
         name: "znpppoe".into(),
         addr: server.to_string(),
         secret: secret.to_string(),
+        credential: credential.to_string(),
         transport: Transport::Auto,
     };
     let (tx, rx) = mpsc::channel(1);
@@ -111,15 +118,17 @@ pub fn peer(server: &str, secret: &str, id_prefix: &str, peer: PeerId<'_>) -> Up
 pub struct Dialer {
     target: Target,
     secret: String,
+    credential: String,
     client_id: String,
     backoff: Duration,
 }
 
 impl Dialer {
-    pub fn new(target: Target, secret: String, client_id: String) -> Self {
+    pub fn new(target: Target, secret: String, credential: String, client_id: String) -> Self {
         Dialer {
             target,
             secret,
+            credential,
             client_id,
             backoff: BACKOFF_START,
         }
@@ -146,7 +155,7 @@ impl Dialer {
     /// One resolve-and-dial attempt.
     async fn attempt(&self) -> Result<Bridge> {
         let addr = self.target.resolve().await?;
-        bridge::connect(addr, &self.secret, &self.client_id)
+        bridge::connect(addr, &self.secret, &self.credential, &self.client_id)
             .await
             .map_err(|e| {
                 // A cached DHT address that stopped answering is re-resolved on

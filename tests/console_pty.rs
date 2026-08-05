@@ -33,6 +33,8 @@ mod pty {
 
     const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
     const OTHER_SECRET: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+    const PROVIDER_SECRET: &str =
+        "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000";
     /// Carries the admin socket path into the re-executed console child.
     const CHILD_ENV: &str = "ZERONAT_CONSOLE_PTY_CHILD";
     /// Carries the server address into the re-executed fleet-console child.
@@ -315,6 +317,16 @@ mod pty {
             control_port: control,
             secret: SECRET.into(),
             admin_secret: Some(OTHER_SECRET.into()),
+            client_credentials: vec![
+                zeronat::server::ClientCredentialSpec {
+                    client_id: routed.to_string(),
+                    secret: SECRET.into(),
+                },
+                zeronat::server::ClientCredentialSpec {
+                    client_id: zeronat::identity::derive_client_id(Some("ptyexit")),
+                    secret: PROVIDER_SECRET.into(),
+                },
+            ],
             server_id: "0".into(),
             tap: None,
             tun: None,
@@ -354,6 +366,7 @@ mod pty {
             file_admin_secret: None,
             file_exit: None,
             file_exit_iface: None,
+            file_clients: vec![],
         }
     }
 
@@ -456,12 +469,14 @@ mod pty {
             name: "home".into(),
             addr: format!("127.0.0.1:{control}"),
             secret: SECRET.into(),
+            credential: SECRET.into(),
             transport: zeronat::client::Transport::Tcp,
         };
         let away = zeronat::client::ServerTarget {
             name: "away".into(),
             addr: "192.0.2.9:9000".into(),
             secret: OTHER_SECRET.into(),
+            credential: OTHER_SECRET.into(),
             transport: zeronat::client::Transport::Tcp,
         };
         // The peer the console client exits through: a second client
@@ -469,8 +484,12 @@ mod pty {
         // and opens no device. Both sinks stay alive for the whole scenario;
         // a dropped one would end the slot that hands its session over.
         let (prov_tx, mut prov_rx) = tokio::sync::mpsc::channel(4);
+        let provider_home = zeronat::client::ServerTarget {
+            credential: PROVIDER_SECRET.into(),
+            ..home.clone()
+        };
         let provider = zeronat::client::ClientSettings {
-            servers: vec![home.clone()],
+            servers: vec![provider_home.clone()],
             tcp: vec![],
             udp: vec![],
             tap: None,
@@ -487,7 +506,7 @@ mod pty {
             peer_sessions: Some(prov_tx),
         };
         tokio::spawn(zeronat::client::run_switchable(
-            zeronat::client::ActiveTarget::new(home.clone()),
+            zeronat::client::ActiveTarget::new(provider_home),
             provider,
         ));
 

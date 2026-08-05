@@ -967,10 +967,7 @@ pub async fn switch_port_dgram(mut handle: SwitchHandle, mut rx: DgramRx, tx: Dg
                     handle.prove();
                     match f {
                         Frame::Keepalive => true,
-                        Frame::Name(n) => {
-                            switch.set_port_name(port_id, &n);
-                            true
-                        }
+                        Frame::Name(_) => true,
                         Frame::Data(d) => {
                             stats.note_rx(d.len());
                             switch.learn_and_write_egress(&d, port_id).await.is_ok()

@@ -61,7 +61,9 @@ const REFUSAL_LINGER: Duration = Duration::from_secs(2);
 pub struct ControlSession {
     pub tx: mpsc::Sender<Vec<u8>>,
     pub server: String,
+    pub client_id: String,
     pub psk: [u8; 32],
+    pub credential_psk: [u8; 32],
     /// The KCP session under a udp control channel. `None` on tcp, where the
     /// party never probes and opens its relay leg as a fresh connection.
     pub sess: Option<Arc<Session>>,
@@ -606,7 +608,6 @@ pub type SessionSink = Option<mpsc::Sender<PeerSlotSession>>;
 /// a slot never outlives the loop that started it.
 pub(crate) fn spawn(
     slots: &[PeerSlot],
-    client_id: &str,
     secret: &str,
     control: &PeerControl,
     sink: &SessionSink,
@@ -614,7 +615,6 @@ pub(crate) fn spawn(
     slots
         .iter()
         .map(|slot| {
-            let client_id = client_id.to_string();
             let secret = secret.to_string();
             let control = control.clone();
             let sink = sink.clone();
@@ -625,10 +625,10 @@ pub(crate) fn spawn(
                     want,
                     adapter,
                 } => crate::spawn(consumer_slot(
-                    peer_id, want, adapter, secret, client_id, control, sink, status,
+                    peer_id, want, adapter, secret, control, sink, status,
                 )),
                 PeerSlotSpec::Provider { provides, adapter } => crate::spawn(provider_slot(
-                    provides, adapter, secret, client_id, control, sink, status,
+                    provides, adapter, secret, control, sink, status,
                 )),
             })
         })
@@ -645,7 +645,6 @@ async fn consumer_slot(
     want: u8,
     adapter: Option<ConsumerAdapter>,
     secret: String,
-    client_id: String,
     control: PeerControl,
     sink: SessionSink,
     status: PeerSlotCell,
@@ -665,8 +664,7 @@ async fn consumer_slot(
         let paired = match adapter.as_ref().map(ConsumerAdapter::precheck) {
             Some(Err(e)) => Err(e),
             _ => {
-                let cycle =
-                    pair_as_consumer(&peer_id, want, &client_id, &session, &mut rx, &control);
+                let cycle = pair_as_consumer(&peer_id, want, &session, &mut rx, &control);
                 tokio::select! {
                     _ = control.wait_gone(generation) => Err("the control session ended".into()),
                     r = timeout(CYCLE_DEADLINE, cycle) => match r {
@@ -721,7 +719,6 @@ async fn consumer_slot(
 async fn pair_as_consumer(
     peer_id: &str,
     want: u8,
-    client_id: &str,
     session: &ControlSession,
     rx: &mut mpsc::Receiver<Msg>,
     control: &PeerControl,
@@ -756,7 +753,7 @@ async fn pair_as_consumer(
     // The binding lives as long as the cycle: the relay open stays
     // authoritative until the inner handshake completes.
     let _pair = control.pair_guard(pair_id);
-    let settled = settle_path(pair_id, peer_id, client_id, session, rx).await?;
+    let settled = settle_path(pair_id, peer_id, &session.client_id, session, rx).await?;
     let (peer, answer, path) =
         handshake_under_relay_authority(settled, Side::Consumer, pair_id, session, rx).await?;
     if !answer.is_empty() {
@@ -818,7 +815,6 @@ async fn provider_slot(
     provides: u8,
     adapter: Option<ProviderAdapter>,
     secret: String,
-    client_id: String,
     control: PeerControl,
     sink: SessionSink,
     status: PeerSlotCell,
@@ -921,7 +917,7 @@ async fn provider_slot(
                         provides,
                         generation,
                     },
-                    client_id.clone(),
+                    session.client_id.clone(),
                     session,
                     pair_rx,
                     control.pair_guard(pair_id),
@@ -1399,10 +1395,14 @@ async fn settle_path(
             Msg::PeerProbe {
                 pair_id: got,
                 probe_id,
+                probe_capability,
                 ..
             } if got == pair_id => {
                 if let Some(server) = udp_server(session)? {
-                    probe = Some(probe_candidates(server, &session.psk, probe_id).await?);
+                    probe = Some(
+                        probe_candidates(server, &session.psk, (probe_id, probe_capability))
+                            .await?,
+                    );
                 }
             }
             Msg::PeerInfo {
@@ -1443,25 +1443,31 @@ async fn settle_path(
             Settled::Relay(wait_relay_open(rx, pair_id).await?)
         }
     };
-    let leg_id = match settled {
+    let (leg_id, capability) = match settled {
         Settled::Punched(PunchOutcome::Direct(link)) => {
             let peer = link.peer;
             return Ok(SettledPath::Direct(PeerPath::direct(link), peer));
         }
         Settled::Punched(PunchOutcome::Relay) => wait_relay_open(rx, pair_id).await?,
-        Settled::Relay(id) => id,
+        Settled::Relay(claim) => claim,
     };
-    Ok(SettledPath::Relayed(open_leg(session, leg_id).await?))
+    Ok(SettledPath::Relayed(
+        open_leg(session, leg_id, capability).await?,
+    ))
 }
 
 /// This party's relay leg, on the channel its control transport carries.
-async fn open_leg(session: &ControlSession, leg_id: u64) -> Result<PeerPath> {
+async fn open_leg(
+    session: &ControlSession,
+    leg_id: u64,
+    capability: crate::proto::Capability,
+) -> Result<PeerPath> {
     match &session.sess {
         Some(sess) => Ok(PeerPath::relay_dgram(
-            relay_leg_dgram(sess, &session.psk, leg_id).await?,
+            relay_leg_dgram(sess, &session.psk, leg_id, capability).await?,
         )),
         None => Ok(PeerPath::relay_stream(
-            relay_leg_stream(&session.server, &session.psk, leg_id).await?,
+            relay_leg_stream(&session.server, &session.credential_psk, leg_id, capability).await?,
         )),
     }
 }
@@ -1496,8 +1502,8 @@ async fn handshake_under_relay_authority(
             Ok((peer_session, answer, PairPath::Direct(peer)))
         }
         // The direct path went down with the losing future above.
-        Raced::Relay(leg_id) => {
-            let leg = open_leg(session, leg_id).await?;
+        Raced::Relay((leg_id, capability)) => {
+            let leg = open_leg(session, leg_id, capability).await?;
             let (peer_session, answer) = inner_handshake(side, leg, &session.psk, pair_id).await?;
             Ok((peer_session, answer, PairPath::Relayed))
         }
@@ -1531,7 +1537,7 @@ enum Side<'a> {
 /// Which way a pair settled before its leg is opened.
 enum Settled {
     Punched(PunchOutcome),
-    Relay(u64),
+    Relay((u64, crate::proto::Capability)),
 }
 
 /// The path a pairing settled on, and whether a relay open can still supersede
@@ -1545,7 +1551,7 @@ enum SettledPath {
 /// Which of the inner handshake and the relay open landed first.
 enum Raced {
     Handshake(Result<(PeerSession, Vec<u8>)>),
-    Relay(u64),
+    Relay((u64, crate::proto::Capability)),
 }
 
 /// The server's udp control address, or `None` when this party's control
@@ -1562,11 +1568,19 @@ fn udp_server(session: &ControlSession) -> Result<Option<SocketAddr>> {
 }
 
 /// The leg id this party's `PeerRelayOpen` carries for `pair_id`.
-async fn wait_relay_open(rx: &mut mpsc::Receiver<Msg>, pair_id: u64) -> Result<u64> {
+async fn wait_relay_open(
+    rx: &mut mpsc::Receiver<Msg>,
+    pair_id: u64,
+) -> Result<(u64, crate::proto::Capability)> {
     loop {
-        if let Msg::PeerRelayOpen { pair_id: got, id } = next_frame(rx).await? {
+        if let Msg::PeerRelayOpen {
+            pair_id: got,
+            id,
+            capability,
+        } = next_frame(rx).await?
+        {
             if got == pair_id {
-                return Ok(id);
+                return Ok((id, capability));
             }
         }
     }
@@ -1642,7 +1656,9 @@ mod tests {
         ControlSession {
             tx,
             server: "127.0.0.1:1".into(),
+            client_id: "c".into(),
             psk: [7u8; 32],
+            credential_psk: [8u8; 32],
             sess: None,
         }
     }
@@ -1682,7 +1698,6 @@ mod tests {
             PROVIDES_EXIT,
             None,
             "secret".into(),
-            "c".into(),
             control.clone(),
             None,
             status.clone(),
@@ -1813,7 +1828,6 @@ mod tests {
             PROVIDES_EXIT,
             None,
             "secret".into(),
-            "prov".into(),
             control.clone(),
             None,
             status.clone(),
@@ -1853,7 +1867,6 @@ mod tests {
             PROVIDES_EXIT,
             None,
             "secret".into(),
-            "c".into(),
             control.clone(),
             None,
             PeerSlotCell::default(),

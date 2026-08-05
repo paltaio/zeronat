@@ -317,15 +317,18 @@ fn check_forwards(cfg: &Config) -> Result<(), String> {
 }
 
 fn env_file(cfg: &Config, sub: &str) -> String {
-    let admin = if cfg.mode == Mode::Server {
-        format!("ZERONAT_ADMIN_SECRET={}\n", cfg.admin_secret)
+    let role = if cfg.mode == Mode::Server {
+        format!(
+            "ZERONAT_CLIENT_ID=client\nZERONAT_CLIENT_SECRET={}\nZERONAT_ADMIN_SECRET={}\n",
+            cfg.secret, cfg.admin_secret
+        )
     } else {
-        String::new()
+        format!("ZERONAT_CLIENT_SECRET={}\n", cfg.secret)
     };
     if cfg.method == Method::Docker && cfg.deploy == Deploy::Compose {
-        format!("ZERONAT_SECRET={}\n{admin}ZERONAT_ARGS={sub}\n", cfg.secret)
+        format!("ZERONAT_SECRET={}\n{role}ZERONAT_ARGS={sub}\n", cfg.secret)
     } else {
-        format!("ZERONAT_SECRET={}\n{admin}", cfg.secret)
+        format!("ZERONAT_SECRET={}\n{role}", cfg.secret)
     }
 }
 
@@ -1156,16 +1159,20 @@ mod tests {
     }
 
     #[test]
-    fn server_env_contains_the_admin_secret_but_client_env_does_not() {
+    fn generated_env_authorizes_the_installed_client() {
         let mut c = cfg();
         c.mode = Mode::Server;
         let server = env_file(&c, "server --control 2222");
         assert!(server.contains(&format!("ZERONAT_SECRET={TEST_SECRET}\n")));
+        assert!(server.contains("ZERONAT_CLIENT_ID=client\n"));
+        assert!(server.contains(&format!("ZERONAT_CLIENT_SECRET={TEST_SECRET}\n")));
         assert!(server.contains(&format!("ZERONAT_ADMIN_SECRET={TEST_ADMIN_SECRET}\n")));
 
         c.mode = Mode::Client;
         let client = env_file(&c, "client --server 127.0.0.1:2222");
         assert!(client.contains(&format!("ZERONAT_SECRET={TEST_SECRET}\n")));
+        assert!(client.contains(&format!("ZERONAT_CLIENT_SECRET={TEST_SECRET}\n")));
+        assert!(!client.contains("ZERONAT_CLIENT_ID="));
         assert!(!client.contains("ZERONAT_ADMIN_SECRET="));
     }
 

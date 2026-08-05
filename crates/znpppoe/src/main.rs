@@ -64,6 +64,7 @@ struct Config {
     dht: bool,
     peer: Option<String>,
     secret: String,
+    credential: String,
     username: String,
     password: String,
     service: String,
@@ -89,7 +90,8 @@ fn usage() -> ! {
          [--sock-rx KIB] [--sock-tx KIB] [--max-conns N]\n\
          --peer attaches the sessions to that client's L2 segment; the default is\n\
          a bridge port on the server\n\
-         env: ZN_SECRET, ZN_USER, ZN_PASSWORD (PPPoE login), ZN_PROXY_USER, ZN_PROXY_PASS\n\
+         env: ZN_SECRET, ZN_CLIENT_SECRET, ZN_USER, ZN_PASSWORD (PPPoE login),\n\
+         ZN_PROXY_USER, ZN_PROXY_PASS\n\
          (proxy auth) required; ZN_SERVICE optional\n\
          SOCKS5 and HTTP CONNECT proxies share auth: password = ZN_PROXY_PASS; username\n\
          <ZN_PROXY_USER> round-robins, _pppoe<K> pins session K, _s<token> is sticky\n\
@@ -211,6 +213,8 @@ fn parse() -> Result<Config> {
         bail!("--peer must name a client id");
     }
     let secret = runtime_secret(std::env::var("ZN_SECRET").context("ZN_SECRET env is required")?)?;
+    let credential =
+        runtime_secret(std::env::var("ZN_CLIENT_SECRET").unwrap_or_else(|_| secret.clone()))?;
     let username = std::env::var("ZN_USER").context("ZN_USER env is required")?;
     let password = std::env::var("ZN_PASSWORD").context("ZN_PASSWORD env is required")?;
     let service = std::env::var("ZN_SERVICE").unwrap_or_default();
@@ -225,6 +229,7 @@ fn parse() -> Result<Config> {
         dht,
         peer,
         secret,
+        credential,
         username,
         password,
         service,
@@ -265,11 +270,18 @@ async fn main() -> Result<()> {
             // The peer is paired through the server, whose discovery reads a
             // dht target as the address `dht`.
             let server = cfg.host.as_deref().unwrap_or("dht");
-            uplink::peer(server, &cfg.secret, &id_prefix, uplink::PeerId(peer))
+            uplink::peer(
+                server,
+                &cfg.secret,
+                &cfg.credential,
+                &id_prefix,
+                uplink::PeerId(peer),
+            )
         }
         None => uplink::Uplink::Server(uplink::Dialer::new(
             bridge::Target::new(cfg.host.as_deref(), cfg.dht, &cfg.secret)?,
             cfg.secret.clone(),
+            cfg.credential.clone(),
             client_id,
         )),
     };

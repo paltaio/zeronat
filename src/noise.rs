@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::{Error, Result};
@@ -16,7 +17,8 @@ const DHLEN: usize = 32;
 const TAGLEN: usize = 16;
 const REPLAY_WINDOW_LEN: u64 = 128;
 const REMOTE_PREFACE_MAGIC: [u8; 2] = *b"ZN";
-const REMOTE_PREFACE_LEN: usize = 4;
+const CLIENT_SELECTOR_LEN: usize = 16;
+const REMOTE_PREFACE_LEN: usize = 4 + CLIENT_SELECTOR_LEN;
 // Stateless peers authenticate the protocol version as part of the Noise transcript.
 const STATELESS_PROLOGUE: [u8; 1] = [crate::identity::PROTO_VERSION];
 
@@ -37,14 +39,32 @@ impl AuthRole {
         }
     }
 
-    fn preface(self) -> [u8; REMOTE_PREFACE_LEN] {
-        [
-            REMOTE_PREFACE_MAGIC[0],
-            REMOTE_PREFACE_MAGIC[1],
-            crate::identity::PROTO_VERSION,
-            self as u8,
-        ]
+    fn preface(self, selector: [u8; CLIENT_SELECTOR_LEN]) -> [u8; REMOTE_PREFACE_LEN] {
+        let mut preface = [0u8; REMOTE_PREFACE_LEN];
+        preface[..2].copy_from_slice(&REMOTE_PREFACE_MAGIC);
+        preface[2] = crate::identity::PROTO_VERSION;
+        preface[3] = self as u8;
+        preface[4..].copy_from_slice(&selector);
+        preface
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthIdentity {
+    Client(String),
+    Admin,
+}
+
+pub type ClientCredentials = HashMap<[u8; CLIENT_SELECTOR_LEN], (String, [u8; 32])>;
+
+pub fn client_selector(psk: &[u8; 32]) -> [u8; CLIENT_SELECTOR_LEN] {
+    let mut h = Blake2s256::new();
+    h.update(b"zeronat-client-credential-selector-v1");
+    h.update(psk);
+    let digest = h.finalize();
+    let mut selector = [0u8; CLIENT_SELECTOR_LEN];
+    selector.copy_from_slice(&digest[..CLIENT_SELECTOR_LEN]);
+    selector
 }
 
 pub type Noise = (NoiseReader, NoiseWriter);
@@ -340,7 +360,11 @@ pub async fn client_handshake_remote<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let preface = role.preface();
+    let selector = match role {
+        AuthRole::Client => client_selector(psk),
+        AuthRole::Admin => [0u8; CLIENT_SELECTOR_LEN],
+    };
+    let preface = role.preface(selector);
     stream.write_all(&preface).await?;
     stream.flush().await?;
     let mut stream: BoxStream = Box::new(stream);
@@ -351,9 +375,9 @@ where
 /// Read the role preface and complete the handshake with that role's configured key.
 pub async fn server_handshake_remote<S>(
     mut stream: S,
-    client_psk: &[u8; 32],
+    clients: &ClientCredentials,
     admin_psk: Option<&[u8; 32]>,
-) -> Result<(AuthRole, Noise)>
+) -> Result<(AuthIdentity, Noise)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -366,13 +390,22 @@ where
         return Err("unsupported protocol version".into());
     }
     let role = AuthRole::from_byte(preface[3])?;
-    let psk = match role {
-        AuthRole::Client => client_psk,
-        AuthRole::Admin => admin_psk.ok_or("remote administration is disabled")?,
+    let (identity, psk) = match role {
+        AuthRole::Client => {
+            let selector: [u8; CLIENT_SELECTOR_LEN] = preface[4..]
+                .try_into()
+                .map_err(|_| -> Error { "invalid client credential selector".into() })?;
+            let (client_id, psk) = clients.get(&selector).ok_or("unknown client credential")?;
+            (AuthIdentity::Client(client_id.clone()), psk)
+        }
+        AuthRole::Admin => (
+            AuthIdentity::Admin,
+            admin_psk.ok_or("remote administration is disabled")?,
+        ),
     };
     let mut stream: BoxStream = Box::new(stream);
     let (keys, _payload) = run_responder(&mut stream, psk, &preface, &[]).await?;
-    Ok((role, finish(stream, keys)))
+    Ok((identity, finish(stream, keys)))
 }
 
 fn finish(stream: BoxStream, keys: Keys) -> Noise {
@@ -595,6 +628,45 @@ where
     Ok(noise)
 }
 
+pub async fn client_handshake_stateless_claim<S>(
+    stream: S,
+    psk: &[u8; 32],
+    id: u64,
+    capability: &crate::proto::Capability,
+) -> Result<StatelessNoise>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (noise, _reply) =
+        client_handshake_stateless_claim_reply(stream, psk, id, capability).await?;
+    Ok(noise)
+}
+
+pub async fn client_handshake_stateless_claim_reply<S>(
+    stream: S,
+    psk: &[u8; 32],
+    id: u64,
+    capability: &crate::proto::Capability,
+) -> Result<(StatelessNoise, Vec<u8>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut payload = Vec::with_capacity(8 + crate::proto::CAPABILITY_LEN);
+    payload.extend_from_slice(&id.to_be_bytes());
+    payload.extend_from_slice(capability);
+    let mut stream: BoxStream = Box::new(stream);
+    let (keys, reply) = run_initiator(&mut stream, psk, &STATELESS_PROLOGUE, &payload).await?;
+    Ok((
+        StatelessNoise {
+            send_key: keys.send_key,
+            recv_key: keys.recv_key,
+            send_nonce: Mutex::new(0),
+            recv_window: Mutex::new(ReplayWindow::default()),
+        },
+        reply,
+    ))
+}
+
 /// Like [`client_handshake_stateless`], also returning the responder's
 /// message-2 payload.
 pub async fn client_handshake_stateless_reply<S>(
@@ -647,9 +719,45 @@ where
     ))
 }
 
+pub async fn server_handshake_stateless_claim<S>(
+    stream: S,
+    psk: &[u8; 32],
+    reply: &[u8],
+) -> Result<(u64, crate::proto::Capability, StatelessNoise)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut stream: BoxStream = Box::new(stream);
+    let (keys, payload) = run_responder(&mut stream, psk, &STATELESS_PROLOGUE, reply).await?;
+    if payload.len() != 8 + crate::proto::CAPABILITY_LEN {
+        return Err("invalid data capability in handshake payload".into());
+    }
+    let mut id_bytes = [0; 8];
+    id_bytes.copy_from_slice(&payload[..8]);
+    let id = u64::from_be_bytes(id_bytes);
+    let mut capability = [0; crate::proto::CAPABILITY_LEN];
+    capability.copy_from_slice(&payload[8..]);
+    Ok((
+        id,
+        capability,
+        StatelessNoise {
+            send_key: keys.send_key,
+            recv_key: keys.recv_key,
+            send_nonce: Mutex::new(0),
+            recv_window: Mutex::new(ReplayWindow::default()),
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn credentials(id: &str, psk: [u8; 32]) -> ClientCredentials {
+        [(client_selector(&psk), (id.to_string(), psk))]
+            .into_iter()
+            .collect()
+    }
 
     async fn stateless_pair() -> (StatelessNoise, StatelessNoise) {
         let psk = derive_psk("stateless replay fixture");
@@ -793,20 +901,25 @@ mod tests {
     async fn remote_handshake_selects_independent_credentials() {
         let client_psk = derive_psk("remote client fixture");
         let admin_psk = derive_psk("remote admin fixture");
+        let clients = credentials("client-a", client_psk);
 
         for (role, psk) in [(AuthRole::Client, client_psk), (AuthRole::Admin, admin_psk)] {
             let (initiator, responder) = tokio::io::duplex(8192);
             let client = client_handshake_remote(initiator, &psk, role);
-            let server = server_handshake_remote(responder, &client_psk, Some(&admin_psk));
+            let server = server_handshake_remote(responder, &clients, Some(&admin_psk));
             let (client, server) = tokio::join!(client, server);
             assert!(client.is_ok());
-            assert_eq!(server.unwrap().0, role);
+            let expected = match role {
+                AuthRole::Client => AuthIdentity::Client("client-a".into()),
+                AuthRole::Admin => AuthIdentity::Admin,
+            };
+            assert_eq!(server.unwrap().0, expected);
         }
 
         for (role, wrong_psk) in [(AuthRole::Client, admin_psk), (AuthRole::Admin, client_psk)] {
             let (initiator, responder) = tokio::io::duplex(8192);
             let client = client_handshake_remote(initiator, &wrong_psk, role);
-            let server = server_handshake_remote(responder, &client_psk, Some(&admin_psk));
+            let server = server_handshake_remote(responder, &clients, Some(&admin_psk));
             let (client, server) = tokio::join!(client, server);
             assert!(client.is_err());
             assert!(server.is_err());
@@ -817,9 +930,10 @@ mod tests {
     async fn remote_admin_handshake_fails_when_unconfigured() {
         let client_psk = derive_psk("remote client fixture");
         let admin_psk = derive_psk("remote admin fixture");
+        let clients = credentials("client-a", client_psk);
         let (initiator, responder) = tokio::io::duplex(8192);
         let client = client_handshake_remote(initiator, &admin_psk, AuthRole::Admin);
-        let server = server_handshake_remote(responder, &client_psk, None);
+        let server = server_handshake_remote(responder, &clients, None);
         let (client, server) = tokio::join!(client, server);
         assert!(client.is_err());
         assert!(server.is_err());
@@ -828,9 +942,10 @@ mod tests {
     #[tokio::test]
     async fn remote_mixed_protocol_versions_fail_closed() {
         let psk = derive_psk("remote version fixture");
+        let clients = credentials("client-a", psk);
         let (legacy, current) = tokio::io::duplex(8192);
         let legacy_client = client_handshake(legacy, &psk);
-        let current_server = server_handshake_remote(current, &psk, None);
+        let current_server = server_handshake_remote(current, &clients, None);
         let (legacy_result, current_result) = tokio::join!(legacy_client, current_server);
         assert!(legacy_result.is_err());
         assert!(current_result.is_err());
@@ -850,17 +965,16 @@ mod tests {
 
         let (mut prior, current) = tokio::io::duplex(8192);
         let prior_client = async {
-            let preface = [
-                REMOTE_PREFACE_MAGIC[0],
-                REMOTE_PREFACE_MAGIC[1],
-                crate::identity::PROTO_VERSION - 1,
-                AuthRole::Client as u8,
-            ];
+            let mut preface = [0u8; REMOTE_PREFACE_LEN];
+            preface[..2].copy_from_slice(&REMOTE_PREFACE_MAGIC);
+            preface[2] = crate::identity::PROTO_VERSION - 1;
+            preface[3] = AuthRole::Client as u8;
+            preface[4..].copy_from_slice(&client_selector(&psk));
             prior.write_all(&preface).await?;
             let mut stream: BoxStream = Box::new(prior);
             run_initiator(&mut stream, &psk, &preface, &[]).await
         };
-        let current_server = server_handshake_remote(current, &psk, None);
+        let current_server = server_handshake_remote(current, &clients, None);
         let (prior_result, current_result) = tokio::join!(prior_client, current_server);
         assert!(prior_result.is_err());
         assert!(current_result.is_err());
