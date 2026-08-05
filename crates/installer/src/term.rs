@@ -8,6 +8,82 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use zntui::key::{parse, Key};
 
+/// Read one line from the controlling terminal with echo and terminal signals
+/// disabled. Ctrl-C is handled as input so the terminal mode is restored before
+/// returning.
+pub fn read_hidden_line(prompt: &str) -> io::Result<String> {
+    let mut file = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    let fd = file.as_raw_fd();
+    // SAFETY: fd is an open descriptor for /dev/tty and termios points to valid
+    // writable storage for the duration of tcgetattr.
+    let original = unsafe {
+        let mut termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut termios) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        termios
+    };
+    let mut hidden = original;
+    hidden.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
+    hidden.c_cc[libc::VMIN] = 1;
+    hidden.c_cc[libc::VTIME] = 0;
+    // SAFETY: fd is the same open terminal descriptor and hidden is initialized
+    // from the termios value returned for it.
+    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &hidden) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    struct RestoreEcho {
+        fd: RawFd,
+        original: libc::termios,
+    }
+    impl Drop for RestoreEcho {
+        fn drop(&mut self) {
+            // SAFETY: fd remains open for this guard's lifetime and original was
+            // obtained from tcgetattr on the same terminal.
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.original);
+            }
+        }
+    }
+    let restore = RestoreEcho { fd, original };
+
+    file.write_all(prompt.as_bytes())?;
+    file.flush()?;
+    let mut bytes = Vec::with_capacity(64);
+    let mut overflow = false;
+    loop {
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte)?;
+        match byte[0] {
+            b'\n' | b'\r' => break,
+            3 => {
+                drop(restore);
+                file.write_all(b"\n")?;
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "prompt cancelled",
+                ));
+            }
+            8 | 127 => {
+                bytes.pop();
+            }
+            value if bytes.len() < 64 => bytes.push(value),
+            _ => overflow = true,
+        }
+    }
+    drop(restore);
+    file.write_all(b"\n")?;
+    if overflow {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "credential is longer than 64 characters",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "credential is not UTF-8"))
+}
+
 pub struct Tty {
     file: File,
     fd: RawFd,

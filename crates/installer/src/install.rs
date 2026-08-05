@@ -237,10 +237,8 @@ fn console_cmd(cfg: &Config) -> Option<String> {
         // The image is FROM scratch with the binary at /zeronat, and the
         // container receives ZERONAT_ADMIN_SECRET from its env file.
         Method::Docker => format!("docker exec -it zeronat /zeronat admin --server {target}"),
-        Method::Systemd => format!(
-            "zeronat admin --server {target} --secret {}",
-            cfg.admin_secret
-        ),
+        // sudo lets admin read the root-owned installer environment file.
+        Method::Systemd => format!("sudo {BIN_PATH} admin --server {target}"),
     })
 }
 
@@ -250,21 +248,19 @@ fn peer_steps(cfg: &Config) -> (String, String) {
         Mode::Server => {
             let server_public = zeronat_secret::server_public(&cfg.secret)
                 .expect("validated server secret must derive a public identity");
-            let credential = zeronat_secret::client_credential(&cfg.secret)
-                .expect("validated server secret must derive a client credential");
             let cmd = if cfg.use_dht {
                 format!(
-                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --dht --server-public {server_public} --credential {credential} {fwd} -y"
+                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --dht --server-public {server_public} --credential-prompt {fwd} -y"
                 )
             } else {
                 let host = sys::pub_ip();
                 format!(
-                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --server-addr {host}:{} --server-public {server_public} --credential {credential} {fwd} -y",
+                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --server-addr {host}:{} --server-public {server_public} --credential-prompt {fwd} -y",
                     cfg.control
                 )
             };
             (
-                "Run this on the client (the machine behind CG-NAT):".into(),
+                "Read ZERONAT_CLIENT_SECRET from /etc/zeronat/.env on the server. Run this on the client and enter that value at the hidden prompt:".into(),
                 cmd,
             )
         }
@@ -1620,7 +1616,7 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Starte
 #[cfg(test)]
 mod tests {
     use super::{
-        check_forwards, compose, console_cmd, deployment_role, env_file, install_systemd,
+        check_forwards, compose, console_cmd, deployment_role, env_file, execute, install_systemd,
         parse_compose_command, peer_steps, subcmd, upgrade, validate_client_config_layout,
         validate_container_env, Runner, COMPOSE_FILE, IMAGE,
     };
@@ -1979,7 +1975,7 @@ mod tests {
         c.method = Method::Systemd;
         assert_eq!(
             console_cmd(&c).unwrap(),
-            format!("zeronat admin --server 127.0.0.1:2222 --secret {TEST_ADMIN_SECRET}")
+            "sudo /usr/local/bin/zeronat admin --server 127.0.0.1:2222"
         );
     }
 
@@ -2207,6 +2203,36 @@ mod tests {
 
         assert!(!cmd.contains(TEST_SECRET), "{cmd}");
         assert!(cmd.contains(&public), "{cmd}");
-        assert!(cmd.contains(&credential), "{cmd}");
+        assert!(!cmd.contains(&credential), "{cmd}");
+        assert!(!cmd.contains("--credential "), "{cmd}");
+        assert!(cmd.contains("--credential-prompt"), "{cmd}");
+    }
+
+    #[test]
+    fn generated_systemd_summary_contains_no_reusable_credential() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.method = Method::Systemd;
+        c.use_dht = true;
+        c.ports = "443/tcp".into();
+        let mut runner = FakeRunner { cmds: Vec::new() };
+
+        let outcome = execute(&c, true, &mut runner).unwrap();
+        let mut summary = outcome
+            .cmds
+            .iter()
+            .map(|entry| entry.cmd.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        summary.push('\n');
+        summary.push_str(&outcome.peer_intro);
+        summary.push('\n');
+        summary.push_str(&outcome.peer_cmd);
+        let credential = zeronat_secret::client_credential(TEST_SECRET).unwrap();
+
+        assert!(!summary.contains(TEST_SECRET), "{summary}");
+        assert!(!summary.contains(TEST_ADMIN_SECRET), "{summary}");
+        assert!(!summary.contains(&credential), "{summary}");
+        assert!(!summary.contains("--secret "), "{summary}");
     }
 }

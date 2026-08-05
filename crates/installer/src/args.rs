@@ -17,6 +17,7 @@ pub struct Parsed {
     pub deploy: Option<String>,
     pub secret: Option<String>,
     pub credential: Option<String>,
+    pub credential_prompt: bool,
     pub server_public: Option<String>,
     pub admin_secret: Option<String>,
     pub control: Option<String>,
@@ -68,6 +69,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             "--deploy" => p.deploy = Some(take(&mut i, a)?),
             "--secret" => p.secret = Some(take(&mut i, a)?),
             "--credential" => p.credential = Some(take(&mut i, a)?),
+            "--credential-prompt" => p.credential_prompt = true,
             "--server-public" => p.server_public = Some(take(&mut i, a)?),
             "--admin-secret" => p.admin_secret = Some(take(&mut i, a)?),
             "--control" => p.control = Some(take(&mut i, a)?),
@@ -87,6 +89,12 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             other => return Err(format!("unknown option: {other} (try --help)")),
         }
         i += 1;
+    }
+    if p.credential_prompt && p.credential.is_some() {
+        return Err("--credential and --credential-prompt are mutually exclusive".into());
+    }
+    if p.credential_prompt && p.mode != Some(Mode::Client) {
+        return Err("--credential-prompt requires --client".into());
     }
     Ok(p)
 }
@@ -418,6 +426,7 @@ mod tests {
         assert_eq!(p.method.as_deref(), Some("systemd"));
         assert_eq!(p.secret.as_deref(), Some("abc"));
         assert_eq!(p.credential.as_deref(), Some(FLAG_SECRET));
+        assert!(!p.credential_prompt);
         assert_eq!(p.server_public.as_deref(), Some(DISK_SECRET));
         assert_eq!(p.admin_secret.as_deref(), Some(ADMIN_SECRET));
         assert_eq!(p.control.as_deref(), Some("3333"));
@@ -429,6 +438,22 @@ mod tests {
         assert_eq!(p.tap.as_deref(), Some("zn0"));
         assert_eq!(p.bridge.as_deref(), Some("br0"));
         assert_eq!(p.tap_mtu.as_deref(), Some("1400"));
+    }
+
+    #[test]
+    fn credential_prompt_is_client_only_and_excludes_a_flag_value() {
+        let p = parse(&s(&["--client", "--credential-prompt"])).unwrap();
+        assert!(p.credential_prompt);
+        assert!(p.credential.is_none());
+
+        assert!(parse(&s(&["--server", "--credential-prompt"])).is_err());
+        assert!(parse(&s(&[
+            "--client",
+            "--credential-prompt",
+            "--credential",
+            FLAG_SECRET,
+        ]))
+        .is_err());
     }
 
     #[test]

@@ -203,6 +203,7 @@ zeronat installer
   --control PORT            tunnel control port (default 2222)
   --secret 64-HEX           server signing secret (server only; default: generated)
   --credential 64-HEX       server-issued client credential (client only)
+  --credential-prompt       read the client credential without echo (client only)
   --server-public 64-HEX    server public identity (client only)
   --admin-secret 64-HEX     server admin secret (default: generated)
   --server-addr HOST[:PORT] (client only) where the server is reachable
@@ -221,7 +222,7 @@ With no options it runs the interactive wizard. --ports, --tap, and --all are mu
 
 fn real_main() -> i32 {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let parsed = match args::parse(&argv) {
+    let mut parsed = match args::parse(&argv) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {e}");
@@ -231,6 +232,17 @@ fn real_main() -> i32 {
     if parsed.help {
         println!("{USAGE}");
         return 0;
+    }
+
+    if parsed.credential_prompt {
+        let credential = match term::read_hidden_line("Client credential: ") {
+            Ok(value) => value,
+            Err(e) => {
+                eprintln!("error: cannot read client credential: {e}");
+                return 1;
+            }
+        };
+        parsed.credential = Some(credential);
     }
 
     let dry = parsed.dry;
