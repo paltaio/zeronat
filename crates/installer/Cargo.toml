@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 zntui = { path = "../tui" }
 zeronat-install-support = { path = "../install-support" }
+zeronat-secret = { path = "../secret" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

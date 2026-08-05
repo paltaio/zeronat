@@ -31,7 +31,8 @@ mod pty {
     use zeronat::proto::{Proto, Source, PROVIDES_EXIT};
     use zeronat::server::{ListenerSpec, ServerSettings};
 
-    const SECRET: &str = "console-pty-test-secret";
+    const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const OTHER_SECRET: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
     /// Carries the admin socket path into the re-executed console child.
     const CHILD_ENV: &str = "ZERONAT_CONSOLE_PTY_CHILD";
     /// Carries the server address into the re-executed fleet-console child.
@@ -442,7 +443,7 @@ mod pty {
         let text = format!(
             "[client]\nactive = \"home\"\n\
              [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
-             [[servers]]\nname = \"away\"\naddr = \"192.0.2.9:9000\"\nsecret = \"other\"\ntransport = \"tcp\"\n\
+             [[servers]]\nname = \"away\"\naddr = \"192.0.2.9:9000\"\nsecret = \"{OTHER_SECRET}\"\ntransport = \"tcp\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = {public_tcp}\ntarget = \"127.0.0.1:{local_tcp}\"\n\
              [[forwards]]\nproto = \"udp\"\nport = {public_udp}\ntarget = \"127.0.0.1:{local_udp}\"\n"
         );
@@ -458,7 +459,7 @@ mod pty {
         let away = zeronat::client::ServerTarget {
             name: "away".into(),
             addr: "192.0.2.9:9000".into(),
-            secret: "other".into(),
+            secret: OTHER_SECRET.into(),
             transport: zeronat::client::Transport::Tcp,
         };
         // The peer the console client exits through: a second client

@@ -979,6 +979,8 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Output;
 
+    const TEST_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
     fn cfg() -> Config {
         Config::new(false, false, None)
     }
@@ -1122,10 +1124,10 @@ mod tests {
             "docker exec -it zeronat /zeronat admin --server 127.0.0.1:2222"
         );
         c.method = Method::Systemd;
-        c.secret = "sek".into();
+        c.secret = TEST_SECRET.into();
         assert_eq!(
             console_cmd(&c).unwrap(),
-            "zeronat admin --server 127.0.0.1:2222 --secret sek"
+            format!("zeronat admin --server 127.0.0.1:2222 --secret {TEST_SECRET}")
         );
     }
 
@@ -1313,7 +1315,7 @@ mod tests {
         c.mode = Mode::Server;
         c.kind = Kind::All;
         c.use_dht = true;
-        c.secret = "s".into();
+        c.secret = TEST_SECRET.into();
         let (_, cmd) = peer_steps(&c);
         assert!(cmd.contains("--client"), "{cmd}");
         assert!(cmd.contains("--all"), "{cmd}");
@@ -1325,7 +1327,7 @@ mod tests {
         c.mode = Mode::Server;
         c.use_dht = true;
         c.ports = "443/tcp".into();
-        c.secret = "deadbeef".into();
+        c.secret = TEST_SECRET.into();
         let (_, cmd) = peer_steps(&c);
         assert!(cmd.contains("get.sh"), "{cmd}");
         assert!(cmd.ends_with(" -y"), "{cmd}");

@@ -8,6 +8,10 @@ use zeronat::{admin, client, client_admin, server, Result};
 
 const TUN_PREFIX_LEN: u8 = 24;
 
+fn runtime_secret(value: String) -> Result<String> {
+    zeronat::secret::normalize(&value).map_err(Into::into)
+}
+
 /// The tunnel `/24` for `secret`: `(network base, server .1, client .2)`.
 fn tun_addrs(secret: &str) -> (Ipv4Addr, Ipv4Addr, Ipv4Addr) {
     let base = zeronat::identity::derive_tun_subnet(secret);
@@ -27,7 +31,7 @@ Subcommands:
 server options:
   --bind <ADDR>       Address to bind on (default: 0.0.0.0)
   --control <PORT>    Control port (default: 2222)
-  --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
+  --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET)
   --id <ID>           Server identity label (default: 0)
   --config <PATH>     Load listeners/routes/identity from a config file
   --tcp <PORT>        Public TCP port to expose (repeatable)
@@ -48,7 +52,7 @@ server options:
 
 client options:
   --server <ADDR>     Server control address host:port, or 'dht' to discover via DHT
-  --secret <SECRET>   Shared secret (or env ZERONAT_SECRET)
+  --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET)
   --id <PREFIX>       Client id prefix (default: short hostname)
   --config <PATH>     Load servers/forwards/identity from a config file
   --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT, plus
@@ -121,7 +125,7 @@ admin options:
                       status and exits when piped or redirected
   show                Print the server's current topology and exit
   --server <ADDR>     Server control address host:port
-  --secret <SECRET>   Shared secret (or env ZERONAT_SECRET, or the ZERONAT_SECRET
+  --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET, or the ZERONAT_SECRET
                       in /etc/zeronat/.env)
 
 upgrade options:
@@ -722,9 +726,11 @@ fn parse_args() -> Result<Cmd> {
             }
         }
 
-        let secret = secret
-            .or_else(|| std::env::var("ZERONAT_SECRET").ok())
-            .ok_or("--secret or ZERONAT_SECRET is required")?;
+        let secret = runtime_secret(
+            secret
+                .or_else(|| std::env::var("ZERONAT_SECRET").ok())
+                .ok_or("--secret or ZERONAT_SECRET is required")?,
+        )?;
 
         if tun && bridge.is_some() {
             return Err("--bridge applies to --tap only, not --tun".into());
@@ -951,10 +957,12 @@ fn parse_args() -> Result<Cmd> {
         }
 
         let server = server.ok_or("--server is required")?;
-        let secret = secret
+        let secret = runtime_secret(
+            secret
             .or_else(|| std::env::var("ZERONAT_SECRET").ok())
             .or_else(zeronat::admin::secret_from_env_file)
-            .ok_or("no secret: pass --secret, set ZERONAT_SECRET, or run where /etc/zeronat/.env has one")?;
+            .ok_or("no secret: pass --secret, set ZERONAT_SECRET, or run where /etc/zeronat/.env has one")?,
+        )?;
 
         let interactive = command.is_none() && interactive_default();
         Ok(Cmd::Admin {
@@ -1494,9 +1502,11 @@ async fn run(cmd: Cmd) -> Result<()> {
                 client::run_switchable(client::ActiveTarget::new(target), settings).await
             } else {
                 let server = server.ok_or("--server is required")?;
-                let secret = secret
-                    .or_else(|| std::env::var("ZERONAT_SECRET").ok())
-                    .ok_or("--secret or ZERONAT_SECRET is required")?;
+                let secret = runtime_secret(
+                    secret
+                        .or_else(|| std::env::var("ZERONAT_SECRET").ok())
+                        .ok_or("--secret or ZERONAT_SECRET is required")?,
+                )?;
                 if tun && bridge.is_some() {
                     return Err("--bridge applies to --tap only, not --tun".into());
                 }
@@ -1722,6 +1732,14 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use zeronat::client::Forward;
+
+    #[test]
+    fn runtime_secret_accepts_only_32_byte_hex() {
+        assert_eq!(runtime_secret("A".repeat(64)).unwrap(), "a".repeat(64));
+        for invalid in ["short".to_string(), "a".repeat(63), "g".repeat(64)] {
+            assert!(runtime_secret(invalid).is_err());
+        }
+    }
 
     fn fwd(port: u16, target: &str, proxy: bool, idle: Option<u64>) -> Forward {
         Forward {

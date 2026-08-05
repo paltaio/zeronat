@@ -17,11 +17,14 @@ Picks Docker or a systemd service, generates the secret, asks what to forward, a
 ## Usage
 
 ```bash
+# Generate this once, then copy the same value to both hosts.
+SECRET="$(openssl rand -hex 32)"
+
 # On the public host:
-ZERONAT_SECRET=somelongsecret zeronat server --control 2222 --tcp 443 --udp 51820
+ZERONAT_SECRET="$SECRET" zeronat server --control 2222 --tcp 443 --udp 51820
 
 # Behind CG-NAT:
-ZERONAT_SECRET=somelongsecret zeronat client --server <public-ip>:2222 --tcp 443 --udp 51820
+ZERONAT_SECRET="$SECRET" zeronat client --server <public-ip>:2222 --tcp 443 --udp 51820
 ```
 
 `--tcp 443` maps to `127.0.0.1:443`. Remap with `--tcp 443:10.0.0.5:443`; `--udp` works the same. Specs take `+` modifiers: `--tcp 443+proxy` hands the target the real client address in a PROXY protocol v2 header (`--proxy` enables it on every TCP forward), and `+idle=SECS` tunes the per-forward idle window. Open the control port (2222, UDP and TCP) on the server's firewall.

@@ -155,20 +155,25 @@
     <section id="start">
       <h2>Quick start</h2>
 <pre class="v-cli"><code><span class="c"># On the public host (VPS):</span>
-ZERONAT_SECRET=somelongsecret zeronat server \
+<span class="c"># Generate this once, then copy the same value to both hosts.</span>
+SECRET="$(openssl rand -hex 32)"
+ZERONAT_SECRET="$SECRET" zeronat server \
   --control 2222 --tcp 443 --tcp 80 --udp 51820
 
 <span class="c"># On the host behind CG-NAT:</span>
-ZERONAT_SECRET=somelongsecret zeronat client \
+ZERONAT_SECRET="$SECRET" zeronat client \
   --server &lt;public-ip&gt;:2222 --tcp 443 --tcp 80 --udp 51820</code></pre>
-<pre class="v-docker"><code><span class="c"># On the public host (VPS):</span>
+<pre class="v-docker"><code><span class="c"># Generate this once, then copy the same value to both hosts.</span>
+SECRET="$(openssl rand -hex 32)"
+
+<span class="c"># On the public host (VPS):</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
-  -e ZERONAT_SECRET=somelongsecret ghcr.io/paltaio/zeronat \
+  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat \
   server --control 2222 --tcp 443 --tcp 80 --udp 51820
 
 <span class="c"># On the host behind CG-NAT; with --network host, 127.0.0.1 targets are host services:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
-  -e ZERONAT_SECRET=somelongsecret ghcr.io/paltaio/zeronat \
+  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat \
   client --server &lt;public-ip&gt;:2222 --tcp 443 --tcp 80 --udp 51820</code></pre>
       <p>Open the control port (2222, both UDP and TCP) on the server's firewall.</p>
     </section>
@@ -313,13 +318,13 @@ active = "home"
 [[servers]]
 name = "home"
 addr = "203.0.113.7:2222"
-secret = "somelongsecret"
+secret = "&lt;64-hex-secret&gt;"
 transport = "auto"
 
 [[servers]]
 name = "backup"
 addr = "dht"
-secret = "otherlongsecret"
+secret = "&lt;different-64-hex-secret&gt;"
 
 [[forwards]]
 proto = "tcp"
@@ -332,6 +337,7 @@ idle = 600
 name = "wan"
 username = "user@isp"
 password_file = "/etc/zeronat/wan.pass"</code></pre>
+      <p>Replace each secret placeholder with 64 hexadecimal characters encoding 32 bytes.</p>
       <p>Each <code>[[servers]]</code> entry is a named profile with its own address, secret, and
       <code>transport</code>; <code>[client].active</code> picks the one to dial (default: the first).
       <code>[[forwards]]</code> entries take the same options as the CLI specs: <code>proxy</code> is
@@ -421,19 +427,19 @@ docker exec -it zeronat /zeronat client admin spawn-pppoe wan</code></pre>
       Both ends need <code>--tun</code>; it cannot be combined with <code>--tcp</code>/<code>--udp</code> or
       <code>--tap</code>.</p>
 <pre class="v-cli"><code><span class="c"># Server (VPS): forward every port to the client, keep SSH on 22:</span>
-ZERONAT_SECRET=s zeronat server --control 2222 --tun --except 22
+ZERONAT_SECRET="$SECRET" zeronat server --control 2222 --tun --except 22
 
 <span class="c"># Client (behind CG-NAT): local services receive on the same port:</span>
-ZERONAT_SECRET=s zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
+ZERONAT_SECRET="$SECRET" zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
 <pre class="v-docker"><code><span class="c"># Server (VPS): forward every port to the client, keep SSH on 22:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-add NET_ADMIN --device /dev/net/tun \
-  -e ZERONAT_SECRET=s ghcr.io/paltaio/zeronat server --control 2222 --tun --except 22
+  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat server --control 2222 --tun --except 22
 
 <span class="c"># Client (behind CG-NAT): local services receive on the same port:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-add NET_ADMIN --device /dev/net/tun \
-  -e ZERONAT_SECRET=s ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
+  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
       <p>Forwarded traffic includes the server's own SSH; keep it reachable with
       <code>--except &lt;ssh-port&gt;</code> (repeatable). The client needs no NAT: local services receive
       the traffic on the same port and must listen on <code>0.0.0.0</code> or the tunnel address.</p>
@@ -457,19 +463,19 @@ docker run -d --name zeronat --restart unless-stopped --network host \
       restores the defaults and removes both; a crash skips it and leaves the host without a
       default route.</p>
 <pre class="v-cli"><code><span class="c"># Server (VPS): masquerade the client's traffic out eth0:</span>
-ZERONAT_SECRET=s zeronat server --control 2222 --tun --except 22 --exit --exit-iface eth0
+ZERONAT_SECRET="$SECRET" zeronat server --control 2222 --tun --except 22 --exit --exit-iface eth0
 
 <span class="c"># Client: send this host's IPv4 traffic through the server:</span>
-ZERONAT_SECRET=s zeronat client --server &lt;public-ip&gt;:2222 --tun --exit --exit-strict</code></pre>
+ZERONAT_SECRET="$SECRET" zeronat client --server &lt;public-ip&gt;:2222 --tun --exit --exit-strict</code></pre>
 <pre class="v-docker"><code><span class="c"># Server (VPS): masquerade the client's traffic out eth0:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-add NET_ADMIN --device /dev/net/tun \
-  -e ZERONAT_SECRET=s ghcr.io/paltaio/zeronat server --control 2222 --tun --except 22 --exit --exit-iface eth0
+  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat server --control 2222 --tun --except 22 --exit --exit-iface eth0
 
 <span class="c"># Client: send this host's IPv4 traffic through the server:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-add NET_ADMIN --device /dev/net/tun \
-  -e ZERONAT_SECRET=s ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tun --exit --exit-strict</code></pre>
+  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tun --exit --exit-strict</code></pre>
       <p><code>--exit</code> requires <code>--tun</code> on both ends; <code>--exit-iface</code> and
       <code>--exit-strict</code> require <code>--exit</code>. In the config file,
       <code>[server] exit_iface</code> and <code>[tun] exit_strict</code> carry the same
@@ -482,20 +488,20 @@ docker run -d --name zeronat --restart unless-stopped --network host \
       segment. It carries anything Ethernet, including PPPoE. Both ends need <code>--tap</code>; it cannot be
       combined with <code>--tcp</code>/<code>--udp</code>.</p>
 <pre class="v-cli"><code><span class="c"># Near the target segment (e.g. the PPPoE concentrator):</span>
-ZERONAT_SECRET=s zeronat server --control 2222 --tap zn0 --bridge br0
+ZERONAT_SECRET="$SECRET" zeronat server --control 2222 --tap zn0 --bridge br0
 
 <span class="c"># Behind CG-NAT, then run e.g. pppd on zn0:</span>
-ZERONAT_SECRET=s zeronat client --server &lt;public-ip&gt;:2222 --tap zn0
+ZERONAT_SECRET="$SECRET" zeronat client --server &lt;public-ip&gt;:2222 --tap zn0
 pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
 <pre class="v-docker"><code><span class="c"># Near the target segment (e.g. the PPPoE concentrator):</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-add NET_ADMIN --device /dev/net/tun \
-  -e ZERONAT_SECRET=s ghcr.io/paltaio/zeronat server --control 2222 --tap zn0 --bridge br0
+  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat server --control 2222 --tap zn0 --bridge br0
 
 <span class="c"># Behind CG-NAT; zn0 lands in the host netns, run pppd on the host:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-add NET_ADMIN --device /dev/net/tun \
-  -e ZERONAT_SECRET=s ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tap zn0
+  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tap zn0
 pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
       <p><code>--bridge &lt;name&gt;</code> enslaves the TAP to an existing bridge; <code>--tap-mtu &lt;n&gt;</code>
       sets the MTU (default 1400). Linux only. Needs <code>CAP_NET_ADMIN</code>: root,
@@ -522,7 +528,7 @@ pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
       the slot is recorded and pairs when the client returns to either.</p>
       <p>A server started with only <code>--control</code> registers clients and pairs them. It
       carries no forwards, TAP or tun of its own, so the control port is the only one to open.</p>
-<pre><code>ZERONAT_SECRET=somelongsecret zeronat server --control 2222</code></pre>
+<pre><code>ZERONAT_SECRET="$SECRET" zeronat server --control 2222</code></pre>
 
       <h3>Peer exit</h3>
       <p>The provider sets <code>exit = true</code> under <code>[peer]</code>, with an optional
@@ -581,10 +587,10 @@ zeronat client admin detach-provider exit</code></pre>
       Mainline DHT and the client looks it up. The lookup key is derived from the shared secret; the
       published address is signed and encrypted.</p>
 <pre><code><span class="c"># Server publishes its address; IP is auto-detected from the DHT:</span>
-ZERONAT_SECRET=s zeronat server --server dht --tcp 443
+ZERONAT_SECRET="$SECRET" zeronat server --server dht --tcp 443
 
 <span class="c"># Client finds the server through the DHT:</span>
-ZERONAT_SECRET=s zeronat client --server dht --tcp 443</code></pre>
+ZERONAT_SECRET="$SECRET" zeronat client --server dht --tcp 443</code></pre>
       <p><code>--announce-ip &lt;ip&gt;</code> overrides the detected IP and <code>--announce-port &lt;port&gt;</code>
       the announced port (default: the control port) when the server sits behind a port-forward. The client
       caches the last-known address and re-queries the DHT only when it stops working.</p>
@@ -597,7 +603,7 @@ ZERONAT_SECRET=s zeronat client --server dht --tcp 443</code></pre>
       privileges. The server is a normal L2 bridge to the PPPoE segment (<code>--tap</code>, see above); the
       proxy credentials are separate from the PPPoE login, and the username selects the egress session.</p>
 <pre><code>docker run -d --name znpppoe -p 127.0.0.1:1080:1080 -p 127.0.0.1:8081:8081 \
-  -e ZN_SECRET=s -e ZN_USER=&lt;pppoe-user&gt; -e ZN_PASSWORD=&lt;pppoe-pass&gt; \
+  -e ZN_SECRET="$SECRET" -e ZN_USER=&lt;pppoe-user&gt; -e ZN_PASSWORD=&lt;pppoe-pass&gt; \
   -e ZN_PROXY_USER=proxy -e ZN_PROXY_PASS=&lt;proxy-pass&gt; \
   ghcr.io/paltaio/znpppoe --dht --connections 50 \
   --socks-listen 0.0.0.0:1080 --http-listen 0.0.0.0:8081</code></pre>
@@ -631,7 +637,7 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
         <tbody>
           <tr><td><code>--bind &lt;ADDR&gt;</code></td><td>Address to bind on (default 0.0.0.0)</td></tr>
           <tr><td><code>--control &lt;PORT&gt;</code></td><td>Control port (default 2222)</td></tr>
-          <tr><td><code>--secret &lt;SECRET&gt;</code></td><td>Shared secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
+          <tr><td><code>--secret &lt;64-HEX&gt;</code></td><td>32-byte hex secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
           <tr><td><code>--id &lt;ID&gt;</code></td><td>Server identity label (default 0)</td></tr>
           <tr><td><code>--config &lt;PATH&gt;</code></td><td>Load listeners, routes, and identity from a config file</td></tr>
           <tr><td><code>--tcp &lt;PORT&gt;</code></td><td>Public TCP port to expose (repeatable)</td></tr>
@@ -653,7 +659,7 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
       <table>
         <tbody>
           <tr><td><code>--server &lt;ADDR&gt;</code></td><td>Server control address <code>host:port</code>, or <code>dht</code> to discover via DHT</td></tr>
-          <tr><td><code>--secret &lt;SECRET&gt;</code></td><td>Shared secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
+          <tr><td><code>--secret &lt;64-HEX&gt;</code></td><td>32-byte hex secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
           <tr><td><code>--id &lt;PREFIX&gt;</code></td><td>Client id prefix (default: short hostname)</td></tr>
           <tr><td><code>--config &lt;PATH&gt;</code></td><td>Load servers, forwards, and identity from a config file</td></tr>
           <tr><td><code>--tcp &lt;SPEC&gt;</code></td><td>Forward TCP: <code>PORT</code> | <code>PORT:LOCALPORT</code> | <code>PORT:HOST:PORT</code>, with optional <code>+proxy</code> and <code>+idle=SECS</code> (repeatable)</td></tr>
@@ -697,7 +703,7 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
         <tbody>
           <tr><td><code>show</code></td><td>Print the server's current topology (default command)</td></tr>
           <tr><td><code>--server &lt;ADDR&gt;</code></td><td>Server control address <code>host:port</code></td></tr>
-          <tr><td><code>--secret &lt;SECRET&gt;</code></td><td>Shared secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
+          <tr><td><code>--secret &lt;64-HEX&gt;</code></td><td>32-byte hex secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
         </tbody>
       </table>
     </section>

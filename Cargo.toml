@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace]
-members = ["crates/tui", "crates/installer", "crates/install-support", "crates/znpppoe"]
+members = ["crates/tui", "crates/installer", "crates/install-support", "crates/secret", "crates/znpppoe"]
 default-members = ["."]
 
 [features]
@@ -28,6 +28,7 @@ sha1 = { version = "0.10", default-features = false, optional = true }
 sha2 = { version = "0.10", default-features = false, features = ["std", "force-soft"], optional = true }
 zntui = { path = "crates/tui", optional = true }
 zeronat-install-support = { path = "crates/install-support" }
+zeronat-secret = { path = "crates/secret" }
 
 # Used by the Linux TAP bridge and the unix interactive console (termios/ioctl).
 [target.'cfg(unix)'.dependencies]

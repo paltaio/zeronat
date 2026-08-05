@@ -17,8 +17,8 @@ use zeronat::clientproto::{
 use zeronat::proto::{Msg, PathStatus, PeerStatus, Proto, Source, PROVIDES_EXIT, PROVIDES_SEGMENT};
 use zeronat::server::{ListenerSpec, ServerSettings};
 
-const SECRET: &str = "integration-test-secret";
-const SECRET_B: &str = "integration-test-secret-b";
+const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+const SECRET_B: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
 
 /// Build a `ServerSettings` for a config-less (runtime-only) server: localhost
 /// bind, removable runtime-sourced listeners, no routes, no config file. The
@@ -3214,15 +3214,17 @@ async fn config_client_with_no_session_body_idles() {
         let dir = temp_config_dir("idleboot");
         let path = dir.join("client.toml");
         let sock = dir.join("client.sock");
-        let text = "[client]\nactive = \"a\"\n\
-                    [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\
-                    [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"t\"\n";
-        std::fs::write(&path, text).unwrap();
-        let cfg = zeronat::clientcfg::parse_client(text).unwrap();
+        let text = format!(
+            "[client]\nactive = \"a\"\n\
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{SECRET}\"\n\
+             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"{SECRET_B}\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
         cfg.validate().unwrap();
 
-        let a = server_target("a", 1, "s");
-        let b = server_target("b", 2, "t");
+        let a = server_target("a", 1, SECRET);
+        let b = server_target("b", 2, SECRET_B);
         let mut settings = client_settings(vec![a.clone(), b], vec![], "idle", Some(&sock));
         settings.config = Some((path.clone(), cfg));
         tokio::spawn(zeronat::client::run_switchable(

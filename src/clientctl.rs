@@ -18,7 +18,9 @@ use crate::client::{
     SharedForwards, SharedServers,
 };
 use crate::clientcfg::{serialize_client, CfgForward, CfgPeer, CfgServer, CfgTun, ClientConfig};
-use crate::clientproto::{ClientMsg, ClientSnapshotBody, LinkCell, PppStatus, SessionMode};
+use crate::clientproto::{
+    ClientMsg, ClientSnapshotBody, LinkCell, PppStatus, ServerSecret, SessionMode,
+};
 use crate::proto::{proto_name, Proto, PROVIDES_EXIT, PROVIDES_SEGMENT};
 use crate::Result;
 
@@ -411,9 +413,6 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
             if name.is_empty() {
                 return (false, "server `name` must not be empty".into());
             }
-            if secret.0.is_empty() {
-                return (false, "server `secret` must not be empty".into());
-            }
             // The config lexer rejects control characters in strings, so a
             // value carrying one could never be saved and read back.
             for (field, value) in [
@@ -428,6 +427,10 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                     );
                 }
             }
+            let secret = match crate::secret::normalize(&secret.0) {
+                Ok(secret) => ServerSecret(secret),
+                Err(e) => return (false, format!("server {e}")),
+            };
             if addr == "dht" {
                 if cfg!(not(feature = "dht")) {
                     return (false, "this build has no dht support; use host:port".into());
@@ -853,6 +856,9 @@ mod tests {
     use crate::proto::PROVIDES_SEGMENT;
     use std::os::unix::fs::PermissionsExt;
 
+    const TEST_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const OTHER_SECRET: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
     fn temp_dir(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -873,7 +879,7 @@ mod tests {
         ServerTarget {
             name: name.into(),
             addr: format!("127.0.0.1:{port}"),
-            secret: "s".into(),
+            secret: TEST_SECRET.into(),
             transport: Transport::Tcp,
         }
     }
@@ -939,11 +945,11 @@ mod tests {
     async fn select_server_validates_and_persists() {
         let dir = temp_dir("selsrv");
         let path = dir.join("client.toml");
-        let cfg = crate::clientcfg::parse_client(
+        let cfg = crate::clientcfg::parse_client(&format!(
             "[client]\nactive = \"a\"\n\
-             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\
-             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"t\"\n",
-        )
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\
+             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"{OTHER_SECRET}\"\n"
+        ))
         .unwrap();
         let mut state = idle_state("a");
         state.servers = SharedServers::new(vec![server_target("a", 1), server_target("b", 2)]);
@@ -984,10 +990,12 @@ mod tests {
     async fn set_forward_options_validates_edits_and_persists() {
         let dir = temp_dir("fwdopt");
         let path = dir.join("client.toml");
-        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\
+        let text = format!(
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\
                     [[forwards]]\nproto = \"tcp\"\nport = 443\ntarget = \"127.0.0.1:444\"\n\
-                    [[forwards]]\nproto = \"udp\"\nport = 53\ntarget = \"127.0.0.1:54\"\n";
-        std::fs::write(&path, text).unwrap();
+                    [[forwards]]\nproto = \"udp\"\nport = 53\ntarget = \"127.0.0.1:54\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
         state.forwards = SharedForwards::new(
             vec![tcp_fwd(443)],
@@ -1001,7 +1009,7 @@ mod tests {
         );
         state.persist = Some(Persist::new(
             path.clone(),
-            crate::clientcfg::parse_client(text).unwrap(),
+            crate::clientcfg::parse_client(&text).unwrap(),
         ));
 
         // Failing validation persists and applies nothing: proxy on udp,
@@ -1098,14 +1106,16 @@ mod tests {
     async fn add_forward_validates_persists_and_promotes() {
         let dir = temp_dir("addfwd");
         let path = dir.join("client.toml");
-        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\
-                    [[forwards]]\nproto = \"tcp\"\nport = 443\ntarget = \"127.0.0.1:444\"\n";
-        std::fs::write(&path, text).unwrap();
+        let text = format!(
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\
+                    [[forwards]]\nproto = \"tcp\"\nport = 443\ntarget = \"127.0.0.1:444\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
         state.forwards = SharedForwards::new(vec![tcp_fwd(443)], Vec::new());
         state.persist = Some(Persist::new(
             path.clone(),
-            crate::clientcfg::parse_client(text).unwrap(),
+            crate::clientcfg::parse_client(&text).unwrap(),
         ));
         state.active.set_mode(RunMode::Forwards).unwrap();
 
@@ -1207,10 +1217,12 @@ mod tests {
     async fn remove_forward_refuses_unknown_and_persists_the_rest() {
         let dir = temp_dir("rmfwd");
         let path = dir.join("client.toml");
-        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\
+        let text = format!(
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\
                     [[forwards]]\nproto = \"tcp\"\nport = 443\ntarget = \"127.0.0.1:444\"\n\
-                    [[forwards]]\nproto = \"udp\"\nport = 53\ntarget = \"127.0.0.1:54\"\n";
-        std::fs::write(&path, text).unwrap();
+                    [[forwards]]\nproto = \"udp\"\nport = 53\ntarget = \"127.0.0.1:54\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
         state.forwards = SharedForwards::new(
             vec![tcp_fwd(443)],
@@ -1224,7 +1236,7 @@ mod tests {
         );
         state.persist = Some(Persist::new(
             path.clone(),
-            crate::clientcfg::parse_client(text).unwrap(),
+            crate::clientcfg::parse_client(&text).unwrap(),
         ));
         state.active.set_mode(RunMode::Forwards).unwrap();
 
@@ -1318,25 +1330,27 @@ mod tests {
     async fn add_server_validates_and_persists() {
         let dir = temp_dir("addsrv");
         let path = dir.join("client.toml");
-        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n";
-        std::fs::write(&path, text).unwrap();
+        let text = format!(
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
         state.servers = SharedServers::new(vec![server_target("a", 1)]);
         state.persist = Some(Persist::new(
             path.clone(),
-            crate::clientcfg::parse_client(text).unwrap(),
+            crate::clientcfg::parse_client(&text).unwrap(),
         ));
 
         // Each refusal mirrors a parser/validate rule and changes nothing.
         let before = std::fs::read_to_string(&path).unwrap();
         let refused = [
-            add_server("", "127.0.0.1:2", "t"),
+            add_server("", "127.0.0.1:2", OTHER_SECRET),
             add_server("b", "127.0.0.1:2", ""),
-            add_server("a", "127.0.0.1:2", "t"),
-            add_server("b", "no-port", "t"),
-            add_server("b", ":1", "t"),
-            add_server("b", "127.0.0.1:0", "t"),
-            add_server("b", "127.0.0.1:99999", "t"),
+            add_server("a", "127.0.0.1:2", OTHER_SECRET),
+            add_server("b", "no-port", OTHER_SECRET),
+            add_server("b", ":1", OTHER_SECRET),
+            add_server("b", "127.0.0.1:0", OTHER_SECRET),
+            add_server("b", "127.0.0.1:99999", OTHER_SECRET),
         ];
         for req in refused {
             let desc = format!("{req:?}");
@@ -1353,7 +1367,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         assert_eq!(snapshot(&state).servers.len(), 1);
 
-        let (ok, msg) = mutate(&state, add_server("b", "127.0.0.1:2", "t")).await;
+        let (ok, msg) = mutate(&state, add_server("b", "127.0.0.1:2", OTHER_SECRET)).await;
         assert!(ok, "{msg}");
         // Live: listed by config fields only and resolvable by name.
         let snap = snapshot(&state);
@@ -1365,7 +1379,7 @@ mod tests {
         on_disk.validate().unwrap();
         assert_eq!(on_disk.servers.len(), 2);
         assert_eq!(on_disk.servers[1].name, "b");
-        assert_eq!(on_disk.servers[1].secret.0, "t");
+        assert_eq!(on_disk.servers[1].secret.0, OTHER_SECRET);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1377,7 +1391,7 @@ mod tests {
         let dht = ServerTarget {
             name: "roam".into(),
             addr: "dht".into(),
-            secret: "s".into(),
+            secret: TEST_SECRET.into(),
             transport: Transport::Auto,
         };
         assert!(undialable(&dht, true).is_none());
@@ -1398,7 +1412,7 @@ mod tests {
         let dht = ServerTarget {
             name: "roam".into(),
             addr: "dht".into(),
-            secret: "s".into(),
+            secret: TEST_SECRET.into(),
             transport: Transport::Auto,
         };
         state.servers = SharedServers::new(vec![server_target("a", 1), dht]);
@@ -1434,7 +1448,7 @@ mod tests {
         let dht = ServerTarget {
             name: "roam".into(),
             addr: "dht".into(),
-            secret: "s".into(),
+            secret: TEST_SECRET.into(),
             transport: Transport::Auto,
         };
         state.servers = SharedServers::new(vec![server_target("a", 1), dht]);
@@ -1467,15 +1481,15 @@ mod tests {
     async fn remove_server_refuses_the_active_and_persists_the_rest() {
         let dir = temp_dir("rmsrv");
         let path = dir.join("client.toml");
-        let text = "[client]\nactive = \"a\"\n\
-                    [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\
-                    [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"t\"\n";
-        std::fs::write(&path, text).unwrap();
+        let text = format!("[client]\nactive = \"a\"\n\
+                    [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\
+                    [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"{OTHER_SECRET}\"\n");
+        std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
         state.servers = SharedServers::new(vec![server_target("a", 1), server_target("b", 2)]);
         state.persist = Some(Persist::new(
             path.clone(),
-            crate::clientcfg::parse_client(text).unwrap(),
+            crate::clientcfg::parse_client(&text).unwrap(),
         ));
 
         // The profile the loop runs (or would dial next) cannot be removed;
@@ -1593,12 +1607,14 @@ mod tests {
     async fn attach_peer_refuses_what_the_config_and_the_slots_refuse() {
         let dir = temp_dir("attachbad");
         let path = dir.join("client.toml");
-        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n";
-        std::fs::write(&path, text).unwrap();
+        let text = format!(
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
         state.persist = Some(Persist::new(
             path.clone(),
-            crate::clientcfg::parse_client(text).unwrap(),
+            crate::clientcfg::parse_client(&text).unwrap(),
         ));
 
         let before = std::fs::read_to_string(&path).unwrap();
@@ -1708,8 +1724,8 @@ mod tests {
     async fn attach_peer_refuses_what_the_boot_body_holds() {
         let dir = temp_dir("attachpark");
         let path = dir.join("client.toml");
-        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n\n[tap]\ndev = \"zn0\"\n";
-        std::fs::write(&path, text).unwrap();
+        let text = format!("[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\n[tap]\ndev = \"zn0\"\n");
+        std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
         state.fallback_mode =
             RunMode::Device(crate::client::DeviceConfig::Tap(crate::tap::TapConfig {
@@ -1719,7 +1735,7 @@ mod tests {
             }));
         state.persist = Some(Persist::new(
             path.clone(),
-            crate::clientcfg::parse_client(text).unwrap(),
+            crate::clientcfg::parse_client(&text).unwrap(),
         ));
         let (ok, msg) = mutate(&state, ClientMsg::Disconnect).await;
         assert!(ok, "{msg}");
@@ -1752,12 +1768,14 @@ mod tests {
     async fn attach_and_detach_peer_slots_persist() {
         let dir = temp_dir("attachok");
         let path = dir.join("client.toml");
-        let text = "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"s\"\n";
-        std::fs::write(&path, text).unwrap();
+        let text = format!(
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
         state.persist = Some(Persist::new(
             path.clone(),
-            crate::clientcfg::parse_client(text).unwrap(),
+            crate::clientcfg::parse_client(&text).unwrap(),
         ));
 
         // A consumer with an explicit device and the exit routing on, an exit

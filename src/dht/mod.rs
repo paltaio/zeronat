@@ -40,19 +40,20 @@ pub struct Identity {
 }
 
 impl Identity {
-    pub fn derive(secret: &str) -> Self {
-        let signing = SigningKey::from_bytes(&blake(b"zeronat-dht-ed25519-v1", secret));
+    pub fn derive(secret: &str) -> Result<Self> {
+        let secret = crate::secret::normalize(secret)?;
+        let signing = SigningKey::from_bytes(&blake(b"zeronat-dht-ed25519-v1", &secret));
         let pubkey = signing.verifying_key().to_bytes();
-        let salt = blake(b"zeronat-dht-salt-v1", secret)[..20].to_vec();
-        let addr_key = blake(b"zeronat-dht-addr-key-v1", secret);
+        let salt = blake(b"zeronat-dht-salt-v1", &secret)[..20].to_vec();
+        let addr_key = blake(b"zeronat-dht-addr-key-v1", &secret);
         let target = bep44::target(&pubkey, Some(&salt));
-        Identity {
+        Ok(Identity {
             signing,
             pubkey,
             salt,
             addr_key,
             target,
-        }
+        })
     }
 }
 
@@ -162,7 +163,13 @@ pub async fn resolve(id: &Identity) -> Result<SocketAddr> {
 /// Republish the server address forever, refreshing the IP each cycle so a
 /// changed WAN address propagates within one interval.
 pub async fn announce_loop(secret: &str, announce_ip: Option<Ipv4Addr>, port: u16) {
-    let id = Identity::derive(secret);
+    let id = match Identity::derive(secret) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::elog!("dht: invalid secret: {e}");
+            return;
+        }
+    };
     // Until the first real publish, retry on a short, growing backoff so a boot
     // that races the network recovers in seconds. After that, settle to the
     // steady interval. A bootstrap/DNS failure returns Err and keeps us in the
@@ -299,9 +306,9 @@ mod tests {
 
     #[test]
     fn identity_is_deterministic() {
-        let a = Identity::derive("secret");
-        let b = Identity::derive("secret");
-        let c = Identity::derive("other");
+        let a = Identity::derive(&"a".repeat(64)).unwrap();
+        let b = Identity::derive(&"a".repeat(64)).unwrap();
+        let c = Identity::derive(&"b".repeat(64)).unwrap();
         assert_eq!(a.pubkey, b.pubkey);
         assert_eq!(a.target, b.target);
         assert_eq!(a.salt, b.salt);
@@ -311,7 +318,7 @@ mod tests {
 
     #[test]
     fn seal_open_roundtrip() {
-        let id = Identity::derive("secret");
+        let id = Identity::derive(&"a".repeat(64)).unwrap();
         let ip = Ipv4Addr::new(203, 0, 113, 7);
         let v = seal_addr(&id.addr_key, ip, 2222, 1700000000);
         assert_eq!(open_addr(&id.addr_key, &v), Some((ip, 2222)));
@@ -319,10 +326,17 @@ mod tests {
 
     #[test]
     fn open_rejects_wrong_key() {
-        let a = Identity::derive("secret");
-        let b = Identity::derive("other");
+        let a = Identity::derive(&"a".repeat(64)).unwrap();
+        let b = Identity::derive(&"b".repeat(64)).unwrap();
         let v = seal_addr(&a.addr_key, Ipv4Addr::LOCALHOST, 1, 5);
         assert_eq!(open_addr(&b.addr_key, &v), None);
+    }
+
+    #[test]
+    fn identity_rejects_invalid_runtime_secrets() {
+        assert!(Identity::derive("short").is_err());
+        assert!(Identity::derive(&"g".repeat(64)).is_err());
+        assert!(Identity::derive(&"a".repeat(64)).is_ok());
     }
 
     #[test]

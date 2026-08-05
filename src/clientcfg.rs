@@ -134,6 +134,8 @@ impl ClientConfig {
     pub fn validate(&self) -> Result<()> {
         let mut names: HashSet<&str> = HashSet::new();
         for s in &self.servers {
+            crate::secret::decode(&s.secret.0)
+                .map_err(|e| -> crate::Error { format!("server `{}` {e}", s.name).into() })?;
             if !names.insert(&s.name) {
                 return Err(format!("duplicate server name `{}`", s.name).into());
             }
@@ -718,6 +720,9 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
 mod tests {
     use super::*;
 
+    const TEST_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const OTHER_SECRET: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
     fn sample() -> ClientConfig {
         ClientConfig {
             id: Some("rpi-2".into()),
@@ -727,13 +732,13 @@ mod tests {
                 CfgServer {
                     name: "home".into(),
                     addr: "dht".into(),
-                    secret: ServerSecret("hunter2".into()),
+                    secret: ServerSecret(TEST_SECRET.into()),
                     transport: Transport::Auto,
                 },
                 CfgServer {
                     name: "oci".into(),
                     addr: "203.0.113.10:2222".into(),
-                    secret: ServerSecret("hunter3".into()),
+                    secret: ServerSecret(OTHER_SECRET.into()),
                     transport: Transport::Tcp,
                 },
             ],
@@ -785,9 +790,37 @@ mod tests {
     #[test]
     fn cfg_debug_redacts_the_server_secret() {
         let s = format!("{:?}", sample());
-        assert!(!s.contains("hunter2"), "{s}");
-        assert!(!s.contains("hunter3"), "{s}");
+        assert!(!s.contains(TEST_SECRET), "{s}");
+        assert!(!s.contains(OTHER_SECRET), "{s}");
         assert!(s.contains("home"));
+    }
+
+    #[test]
+    fn runtime_secret_format_is_strict() {
+        let config = |secret: &str| {
+            format!(
+                "[[servers]]\nname = \"home\"\naddr = \"127.0.0.1:2222\"\nsecret = \"{secret}\"\n"
+            )
+        };
+        for invalid in [
+            "short".to_string(),
+            "a".repeat(63),
+            "a".repeat(65),
+            format!("{}g", "a".repeat(63)),
+            format!("{}é", "a".repeat(63)),
+        ] {
+            let parsed = parse_client(&config(&invalid)).unwrap();
+            assert!(
+                parsed.validate().is_err(),
+                "accepted invalid secret {invalid:?}"
+            );
+        }
+        assert!(parse_client(&config(&"a".repeat(64)))
+            .unwrap()
+            .validate()
+            .is_ok());
+        let uppercase = parse_client(&config(&"A".repeat(64))).unwrap();
+        assert!(uppercase.validate().is_ok());
     }
 
     #[test]
@@ -796,7 +829,7 @@ mod tests {
             servers: vec![CfgServer {
                 name: "home".into(),
                 addr: "dht".into(),
-                secret: ServerSecret("s".into()),
+                secret: ServerSecret(TEST_SECRET.into()),
                 transport: Transport::Auto,
             }],
             tap: Some(CfgTap {
@@ -899,7 +932,7 @@ mod tests {
     #[test]
     fn entry_defaults() {
         let cfg = parse_client(
-            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"s\"\n\
+            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = 8080\n\
              [[pppoe]]\nname = \"wan\"\nusername = \"u\"\n",
         )
@@ -925,7 +958,7 @@ mod tests {
     #[test]
     fn serialize_omits_defaults() {
         let cfg = parse_client(
-            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"s\"\n\
+            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = 8080\n\
              [[pppoe]]\nname = \"wan\"\nusername = \"u\"\n",
         )
@@ -1032,10 +1065,10 @@ mod tests {
     fn semantic_errors_parse_but_fail_validate() {
         let cases = [
             // active names no [[servers]] entry.
-            "[client]\nactive = \"gone\"\n[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"s\"\n",
+            "[client]\nactive = \"gone\"\n[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n",
             // Duplicate server names.
-            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"s\"\n\
-             [[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"t\"\n",
+            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
+             [[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\n",
             // Duplicate (proto, port) forwards.
             "[[forwards]]\nproto = \"tcp\"\nport = 443\n[[forwards]]\nproto = \"tcp\"\nport = 443\n",
             // More than one autostart.
@@ -1092,6 +1125,27 @@ mod tests {
         let path = dir.join("client.toml");
         std::fs::write(&path, "[client\nid = ").unwrap();
         assert!(matches!(load(&path), Err(LoadError::Malformed(_))));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_keeps_invalid_secret_for_fatal_validation() {
+        let dir =
+            std::env::temp_dir().join(format!("zeronat-client-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client.toml");
+        std::fs::write(
+            &path,
+            "[[servers]]\nname = \"home\"\naddr = \"127.0.0.1:2222\"\nsecret = \"short\"\n",
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("server `home`"), "{error}");
+        assert!(error.contains("64 hexadecimal"), "{error}");
+        assert!(path.exists());
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

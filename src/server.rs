@@ -1002,6 +1002,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         file_exit,
         file_exit_iface,
     } = settings;
+    let secret = crate::secret::normalize(&secret)?;
 
     // The TUN NAT guard tears the rules down when this future is dropped: on the
     // SIGTERM/SIGINT cancel in main, or on an early-return error (the accept loop

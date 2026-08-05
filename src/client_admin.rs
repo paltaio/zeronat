@@ -132,7 +132,7 @@ pub async fn add_server(
     addr: String,
     transport: Transport,
 ) -> Result<()> {
-    let secret = ServerSecret(read_secret()?);
+    let secret = ServerSecret(crate::secret::normalize(&read_secret()?)?);
     command(
         socket,
         ClientMsg::AddServer {

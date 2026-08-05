@@ -31,6 +31,7 @@ const UDP: Style = Style::fg(Color::Magenta);
 
 /// Entry point: take over the terminal, drive the event loop, restore on exit.
 pub async fn run(server: String, secret: String) -> Result<()> {
+    let secret = crate::secret::normalize(&secret)?;
     let psk = crate::noise::derive_psk(&secret);
     let _raw = term::RawMode::enter()?;
     let mut keys = input::reader();

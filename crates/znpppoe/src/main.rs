@@ -78,6 +78,10 @@ struct Config {
     max_conns: usize,
 }
 
+fn runtime_secret(value: String) -> Result<String> {
+    zeronat::secret::normalize(&value).map_err(Into::into)
+}
+
 fn usage() -> ! {
     eprintln!(
         "znpppoe (--host IP:PORT | --dht) [--peer CLIENT_ID] [--connections N]\n\
@@ -206,7 +210,7 @@ fn parse() -> Result<Config> {
     if peer.as_deref().is_some_and(str::is_empty) {
         bail!("--peer must name a client id");
     }
-    let secret = std::env::var("ZN_SECRET").context("ZN_SECRET env is required")?;
+    let secret = runtime_secret(std::env::var("ZN_SECRET").context("ZN_SECRET env is required")?)?;
     let username = std::env::var("ZN_USER").context("ZN_USER env is required")?;
     let password = std::env::var("ZN_PASSWORD").context("ZN_PASSWORD env is required")?;
     let service = std::env::var("ZN_SERVICE").unwrap_or_default();
@@ -318,4 +322,18 @@ async fn main() -> Result<()> {
 async fn driver_exit(driver: tokio::task::JoinHandle<()>) -> Result<()> {
     let _ = driver.await;
     bail!("the pppoe driver stopped; no session can come up")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runtime_secret;
+
+    #[test]
+    fn zn_secret_accepts_only_32_byte_hex() {
+        let upper = "A".repeat(64);
+        assert_eq!(runtime_secret(upper).unwrap(), "a".repeat(64));
+        for invalid in ["short".to_string(), "a".repeat(63), "g".repeat(64)] {
+            assert!(runtime_secret(invalid).is_err());
+        }
+    }
 }

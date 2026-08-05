@@ -201,7 +201,7 @@ zeronat installer
   --ports \"443/tcp 80/tcp 51820/udp\"
   --all                     forward every port plus ICMP; keeps SSH on the server
   --control PORT            tunnel control port (default 2222)
-  --secret SECRET           shared secret (default: generated)
+  --secret 64-HEX           32-byte hex secret (default: generated)
   --server-addr HOST[:PORT] (client only) where the server is reachable
   --dht                     find the server over the DHT (dynamic IP, no fixed address)
   --announce-ip IP          (server, with --dht) public IPv4 to announce

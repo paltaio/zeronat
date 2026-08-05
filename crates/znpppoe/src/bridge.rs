@@ -26,10 +26,12 @@ pub enum Target {
 
 impl Target {
     pub fn new(host: Option<&str>, dht: bool, secret: &str) -> Result<Target> {
+        let secret = zeronat::secret::normalize(secret)?;
         if dht {
-            Ok(Target::Dht(Arc::new(zeronat::dht::Identity::derive(
-                secret,
-            ))))
+            Ok(Target::Dht(Arc::new(
+                zeronat::dht::Identity::derive(&secret)
+                    .map_err(|e| anyhow!("invalid ZN_SECRET: {e}"))?,
+            )))
         } else {
             let h = host.context("--host IP:PORT or --dht is required")?;
             Ok(Target::Host(h.parse().with_context(|| {

@@ -606,6 +606,13 @@ impl App {
             } => (name.clone(), addr.clone(), *transport, secret.clone()),
             _ => return Flow::Continue,
         };
+        let secret = match crate::secret::normalize(&secret) {
+            Ok(secret) => secret,
+            Err(e) => {
+                self.set_toast(e.to_string(), true);
+                return Flow::Continue;
+            }
+        };
         self.overlay = Overlay::None;
         // The ok toast names the profile only; the secret is never echoed.
         let req = ClientMsg::AddServer {
@@ -1746,23 +1753,24 @@ mod tests {
 
     #[tokio::test]
     async fn add_form_masks_the_secret() {
+        let fixture = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         let mut app = app_with(snap());
         app.on_key(Key::Char('a')).await;
         assert!(matches!(app.overlay, Overlay::AddServer { .. }));
         for _ in 0..3 {
             app.on_key(Key::Tab).await;
         }
-        for c in "hunter2".chars() {
+        for c in fixture.chars() {
             app.on_key(Key::Char(c)).await;
         }
         let rows = plain_view(&app);
         assert!(
-            rows.iter().any(|r| r.contains("*******")),
+            rows.iter().any(|r| r.contains(&"*".repeat(64))),
             "expected one * per typed char:\n{}",
             rows.join("\n")
         );
         assert!(
-            !rows.iter().any(|r| r.contains("hunter2")),
+            !rows.iter().any(|r| r.contains(fixture)),
             "the secret text must never render"
         );
         // The toggles walk the transport picker without touching the secret.
@@ -1773,7 +1781,7 @@ mod tests {
                 transport, secret, ..
             } => {
                 assert_eq!(*transport, Transport::Udp);
-                assert_eq!(secret, "hunter2");
+                assert_eq!(secret, fixture);
             }
             _ => panic!("expected the add-server form"),
         }
@@ -1785,10 +1793,27 @@ mod tests {
         assert!(app.toast.is_some(), "the failed submit must toast");
         let rows = plain_view(&app);
         assert!(
-            !rows.iter().any(|r| r.contains("hunter2")),
+            !rows.iter().any(|r| r.contains(fixture)),
             "the secret text must never render:\n{}",
             rows.join("\n")
         );
+    }
+
+    #[tokio::test]
+    async fn add_form_rejects_invalid_secret_before_submit() {
+        let mut app = app_with(snap());
+        app.on_key(Key::Char('a')).await;
+        for _ in 0..3 {
+            app.on_key(Key::Tab).await;
+        }
+        for c in "short".chars() {
+            app.on_key(Key::Char(c)).await;
+        }
+        app.on_key(Key::Enter).await;
+        assert!(matches!(app.overlay, Overlay::AddServer { .. }));
+        let (message, is_error, _) = app.toast.clone().expect("a refusal toast");
+        assert!(is_error);
+        assert!(message.contains("64 hexadecimal"), "{message}");
     }
 
     #[tokio::test]

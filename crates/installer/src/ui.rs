@@ -532,9 +532,20 @@ impl App {
                     _ => SecretMode::Enter,
                 };
                 match self.cfg.secret_mode {
-                    SecretMode::Reuse => {
-                        self.cfg.secret = self.cfg.existing_secret.clone().unwrap_or_default()
-                    }
+                    SecretMode::Reuse => match self
+                        .cfg
+                        .existing_secret
+                        .as_deref()
+                        .ok_or_else(|| "no existing secret found".to_string())
+                        .and_then(|value| {
+                            zeronat_secret::normalize(value).map_err(|e| e.to_string())
+                        }) {
+                        Ok(secret) => self.cfg.secret = secret,
+                        Err(e) => {
+                            self.error = Some(e);
+                            return false;
+                        }
+                    },
                     SecretMode::Generate => match crate::sys::gen_secret() {
                         Ok(s) => self.cfg.secret = s,
                         Err(e) => {
@@ -590,13 +601,13 @@ impl App {
                     return false;
                 }
             },
-            Step::SecretEntry => {
-                if v.len() < 8 {
-                    self.error = Some("secret looks too short".into());
+            Step::SecretEntry => match zeronat_secret::normalize(&v) {
+                Ok(secret) => self.cfg.secret = secret,
+                Err(e) => {
+                    self.error = Some(e.to_string());
                     return false;
                 }
-                self.cfg.secret = v;
-            }
+            },
             _ => {}
         }
         true
@@ -813,7 +824,7 @@ impl App {
             Step::ServerAddr => "Server address",
             Step::Control => "Tunnel control port",
             Step::Secret => "Shared secret",
-            Step::SecretEntry => "Enter the shared secret",
+            Step::SecretEntry => "Enter the 64-character hex secret",
             Step::Summary => "Review and install",
         }
     }
@@ -936,7 +947,7 @@ impl App {
             Step::BridgeName => "the TAP is enslaved to this existing bridge".into(),
             Step::ServerAddr => "HOST or HOST:PORT (default port 2222)".into(),
             Step::Control => "the UDP/TCP port the tunnel control runs on".into(),
-            Step::SecretEntry => "must match the secret on the other side".into(),
+            Step::SecretEntry => "64 hex characters; use the same value on both sides".into(),
             _ => String::new(),
         }
     }
@@ -1044,5 +1055,32 @@ impl App {
             h("q", "quit");
         }
         l
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entered_secret_uses_the_runtime_format() {
+        let mut app = App::new(Config::new(false, false, None), None);
+        app.step = Step::SecretEntry;
+        app.input = "short".into();
+        assert!(!app.commit_input());
+        assert!(app.error.as_deref().unwrap().contains("64 hexadecimal"));
+
+        app.input = "A".repeat(64);
+        assert!(app.commit_input());
+        assert_eq!(app.cfg.secret, "a".repeat(64));
+    }
+
+    #[test]
+    fn reused_secret_is_validated() {
+        let mut app = App::new(Config::new(false, false, Some("short".into())), None);
+        app.step = Step::Secret;
+        app.sel = 0;
+        assert!(!app.apply_selection());
+        assert!(app.error.as_deref().unwrap().contains("64 hexadecimal"));
     }
 }

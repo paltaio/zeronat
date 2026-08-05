@@ -393,7 +393,7 @@ impl Discovery {
             #[cfg(feature = "dht")]
             return Ok(Discovery::Dht(Arc::new(crate::dht::Identity::derive(
                 secret,
-            ))));
+            )?)));
             #[cfg(not(feature = "dht"))]
             {
                 let _ = secret;
@@ -874,6 +874,12 @@ impl ActiveTarget {
         }
     }
 
+    fn normalize_secret(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.target.secret = crate::secret::normalize(&state.target.secret)?;
+        Ok(())
+    }
+
     /// Install a session body with no peer slots to admit it against.
     #[cfg(test)]
     fn init_mode(&self, mode: RunMode) {
@@ -1194,7 +1200,7 @@ enum Body {
 /// long as this future runs.
 pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> Result<()> {
     let ClientSettings {
-        servers,
+        mut servers,
         tcp,
         udp,
         tap,
@@ -1207,6 +1213,10 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         peers,
         peer_sessions,
     } = settings;
+    active.normalize_secret()?;
+    for target in &mut servers {
+        target.secret = crate::secret::normalize(&target.secret)?;
+    }
     let client_id = crate::identity::derive_client_id(id_prefix.as_deref());
     #[cfg(not(target_os = "linux"))]
     if tap.is_some() || tun.is_some() {
@@ -2690,7 +2700,7 @@ mod tests {
         ServerTarget {
             name: name.into(),
             addr: "127.0.0.1:1".into(),
-            secret: "s".into(),
+            secret: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
             transport: Transport::Tcp,
         }
     }

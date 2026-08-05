@@ -719,6 +719,7 @@ dependencies = [
  "tokio",
  "x25519-dalek",
  "zeronat-install-support",
+ "zeronat-secret",
  "zntui",
 ]
 
@@ -735,7 +736,15 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "zeronat-install-support",
+ "zeronat-secret",
  "zntui",
+]
+
+[[package]]
+name = "zeronat-secret"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
 ]
 
 [[package]]

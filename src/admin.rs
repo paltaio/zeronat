@@ -25,6 +25,7 @@ fn parse_env_secret(body: &str) -> Option<String> {
 /// Connect to a server's control port, request one snapshot, render it, and exit.
 /// Read-only: the admin path never registers as a client or evicts a live one.
 pub async fn show(server: String, secret: String) -> Result<()> {
+    let secret = crate::secret::normalize(&secret)?;
     let psk = crate::noise::derive_psk(&secret);
     let snap = fetch_snapshot(&server, &psk).await?;
     print!("{}", render(&snap, &server));

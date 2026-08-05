@@ -248,13 +248,14 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
     }
 
     // secret: --secret > on-disk > generated.
-    if let Some(s) = &p.secret {
-        cfg.secret = s.clone();
+    let secret = if let Some(s) = &p.secret {
+        s.clone()
     } else if let Some(s) = &host.existing_secret {
-        cfg.secret = s.clone();
+        s.clone()
     } else {
-        cfg.secret = sys::gen_secret()?;
-    }
+        sys::gen_secret()?
+    };
+    cfg.secret = zeronat_secret::normalize(&secret).map_err(|e| e.to_string())?;
 
     Ok(cfg)
 }
@@ -262,6 +263,9 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FLAG_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const DISK_SECRET: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -433,21 +437,63 @@ mod tests {
     fn secret_precedence() {
         // explicit flag wins over disk
         let p = parse(&s(&[
-            "-y", "--server", "--ports", "80/tcp", "--secret", "flagsec",
+            "-y",
+            "--server",
+            "--ports",
+            "80/tcp",
+            "--secret",
+            FLAG_SECRET,
         ]))
         .unwrap();
         let mut h = host();
-        h.existing_secret = Some("disksec".into());
-        assert_eq!(build(&p, &h, p.headless).unwrap().secret, "flagsec");
+        h.existing_secret = Some(DISK_SECRET.into());
+        assert_eq!(build(&p, &h, p.headless).unwrap().secret, FLAG_SECRET);
 
         // disk wins over generated
         let p = parse(&s(&["-y", "--server", "--ports", "80/tcp"])).unwrap();
-        assert_eq!(build(&p, &h, p.headless).unwrap().secret, "disksec");
+        assert_eq!(build(&p, &h, p.headless).unwrap().secret, DISK_SECRET);
 
         // generated when neither
         let p = parse(&s(&["-y", "--server", "--ports", "80/tcp"])).unwrap();
         let gen = build(&p, &host(), p.headless).unwrap().secret;
         assert_eq!(gen.len(), 64);
+    }
+
+    #[test]
+    fn resolved_secret_format_is_strict() {
+        for invalid in [
+            "short".to_string(),
+            "a".repeat(63),
+            "a".repeat(65),
+            format!("{}g", "a".repeat(63)),
+        ] {
+            let p = parse(&s(&[
+                "-y", "--server", "--ports", "80/tcp", "--secret", &invalid,
+            ]))
+            .unwrap();
+            assert!(
+                build(&p, &host(), p.headless).is_err(),
+                "accepted invalid secret {invalid:?}"
+            );
+
+            let p = parse(&s(&["-y", "--server", "--ports", "80/tcp"])).unwrap();
+            let mut h = host();
+            h.existing_secret = Some(invalid.clone());
+            assert!(
+                build(&p, &h, p.headless).is_err(),
+                "accepted invalid on-disk secret {invalid:?}"
+            );
+        }
+
+        let uppercase = "A".repeat(64);
+        let p = parse(&s(&[
+            "-y", "--server", "--ports", "80/tcp", "--secret", &uppercase,
+        ]))
+        .unwrap();
+        assert_eq!(
+            build(&p, &host(), p.headless).unwrap().secret,
+            "a".repeat(64)
+        );
     }
 
     #[test]
