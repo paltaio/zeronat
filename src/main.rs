@@ -12,6 +12,17 @@ fn runtime_secret(value: String) -> Result<String> {
     zeronat::secret::normalize(&value).map_err(Into::into)
 }
 
+fn runtime_enrollment(server_public: String, credential: String) -> Result<(String, String)> {
+    let server_public = zeronat::secret::normalize(&server_public)
+        .map_err(|_| "server identity must be exactly 64 hexadecimal characters (32 bytes)")?;
+    let credential = zeronat::secret::normalize(&credential)
+        .map_err(|_| "client credential must be exactly 64 hexadecimal characters (32 bytes)")?;
+    if server_public == credential {
+        return Err("server identity and client credential must differ".into());
+    }
+    Ok((server_public, credential))
+}
+
 /// The tunnel `/24` for `secret`: `(network base, server .1, client .2)`.
 fn tun_addrs(secret: &str) -> (Ipv4Addr, Ipv4Addr, Ipv4Addr) {
     let base = zeronat::identity::derive_tun_subnet(secret);
@@ -56,9 +67,9 @@ server options:
 
 client options:
   --server <ADDR>     Server control address host:port, or 'dht' to discover via DHT
-  --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET)
+  --secret <64-HEX>   Server public identity (or env ZERONAT_SECRET)
   --credential <64-HEX>  Client credential (or env ZERONAT_CLIENT_SECRET;
-                      defaults to --secret)
+                      required)
   --id <PREFIX>       Client id prefix (default: short hostname)
   --config <PATH>     Load servers/forwards/identity from a config file
   --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT, plus
@@ -103,7 +114,8 @@ client admin options:
   show                Print the running client's status and exit
   select-server <NAME> Switch the active server profile
   add-server <NAME> <ADDR> [--transport auto|udp|tcp]
-                      Add a server profile; the secret is read from stdin
+                      Add a server profile; read server identity on stdin line
+                      1 and client credential on line 2
   remove-server <NAME> Remove a server profile (the active one is refused)
   enable-forward <PROTO:PORT>  Enable a forward, e.g. tcp:443
   disable-forward <PROTO:PORT> Disable a forward without removing it
@@ -1310,7 +1322,8 @@ async fn run(cmd: Cmd) -> Result<()> {
             // pairs them, and splices the relays their pairs fall back to.
 
             let tun = if tun {
-                let (subnet, server_ip, client_ip) = tun_addrs(&secret);
+                let server_public = zeronat::secret::server_public(&secret)?;
+                let (subnet, server_ip, client_ip) = tun_addrs(&server_public);
                 Some(server::ServerTun {
                     device: zeronat::tap::TunConfig {
                         name: DEFAULT_TUN_NAME.to_string(),
@@ -1591,6 +1604,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                     pppoe,
                     autostart,
                     id_prefix,
+                    peer_secret: file.peer_secret.as_ref().map(|secret| secret.0.clone()),
                     control,
                     // The shape came from the file, so admin mutations
                     // persist back to it.
@@ -1601,15 +1615,13 @@ async fn run(cmd: Cmd) -> Result<()> {
                 client::run_switchable(client::ActiveTarget::new(target), settings).await
             } else {
                 let server = server.ok_or("--server is required")?;
-                let secret = runtime_secret(
+                let (secret, credential) = runtime_enrollment(
                     secret
                         .or_else(|| std::env::var("ZERONAT_SECRET").ok())
                         .ok_or("--secret or ZERONAT_SECRET is required")?,
-                )?;
-                let credential = runtime_secret(
                     credential
                         .or_else(|| std::env::var("ZERONAT_CLIENT_SECRET").ok())
-                        .unwrap_or_else(|| secret.clone()),
+                        .ok_or("--credential or ZERONAT_CLIENT_SECRET is required")?,
                 )?;
                 if tun && bridge.is_some() {
                     return Err("--bridge applies to --tap only, not --tun".into());
@@ -1846,6 +1858,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn runtime_enrollment_requires_distinct_values() {
+        let secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let error = runtime_enrollment(secret.into(), secret.to_ascii_uppercase()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "server identity and client credential must differ"
+        );
+    }
+
     fn fwd(port: u16, target: &str, proxy: bool, idle: Option<u64>) -> Forward {
         Forward {
             port,
@@ -1969,7 +1991,7 @@ mod tests {
             name: name.into(),
             addr: format!("{name}.example:2222"),
             secret: zeronat::clientproto::ServerSecret("s".into()),
-            credential: zeronat::clientproto::ServerSecret("s".into()),
+            credential: zeronat::clientproto::ServerSecret("c".into()),
             transport: zeronat::client::Transport::Auto,
         }
     }

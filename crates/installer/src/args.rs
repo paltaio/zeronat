@@ -16,6 +16,8 @@ pub struct Parsed {
     pub method: Option<String>,
     pub deploy: Option<String>,
     pub secret: Option<String>,
+    pub credential: Option<String>,
+    pub server_public: Option<String>,
     pub admin_secret: Option<String>,
     pub control: Option<String>,
     pub ports: Option<String>,
@@ -38,8 +40,13 @@ pub struct Host {
     pub have_docker: bool,
     pub have_compose: bool,
     pub existing_secret: Option<String>,
+    pub existing_client_secret: Option<String>,
     pub existing_admin_secret: Option<String>,
     pub ssh_port: u16,
+}
+
+pub(crate) fn credential_format_error(name: &str) -> String {
+    format!("{name} must be exactly 64 hexadecimal characters (32 bytes)")
 }
 
 pub fn parse(args: &[String]) -> Result<Parsed, String> {
@@ -60,6 +67,8 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             "--method" => p.method = Some(take(&mut i, a)?),
             "--deploy" => p.deploy = Some(take(&mut i, a)?),
             "--secret" => p.secret = Some(take(&mut i, a)?),
+            "--credential" => p.credential = Some(take(&mut i, a)?),
+            "--server-public" => p.server_public = Some(take(&mut i, a)?),
             "--admin-secret" => p.admin_secret = Some(take(&mut i, a)?),
             "--control" => p.control = Some(take(&mut i, a)?),
             "--ports" => p.ports = Some(take(&mut i, a)?),
@@ -121,6 +130,7 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
         host.have_compose,
         host.existing_secret.clone(),
     );
+    cfg.existing_client_secret = host.existing_client_secret.clone();
     cfg.ssh_port = host.ssh_port;
 
     // mode
@@ -128,6 +138,15 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
         cfg.mode = m;
     } else if headless {
         return Err("choose a side: --server or --client".into());
+    }
+    match cfg.mode {
+        Mode::Server if p.credential.is_some() || p.server_public.is_some() => {
+            return Err("--credential and --server-public apply to clients".into());
+        }
+        Mode::Client if p.secret.is_some() => {
+            return Err("--secret applies to servers; use --credential and --server-public".into());
+        }
+        _ => {}
     }
 
     // method: default docker if present else systemd.
@@ -250,25 +269,72 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
         }
     }
 
-    // secret: --secret > on-disk > generated.
-    let secret = if let Some(s) = &p.secret {
-        s.clone()
-    } else if let Some(s) = &host.existing_secret {
-        s.clone()
-    } else {
-        sys::gen_secret()?
+    cfg.secret = match cfg.mode {
+        Mode::Server => {
+            if let Some(secret) = &p.secret {
+                secret.clone()
+            } else if let Some(secret) = &host.existing_secret {
+                secret.clone()
+            } else {
+                sys::gen_secret()?
+            }
+        }
+        Mode::Client => {
+            if let Some(credential) = &p.credential {
+                credential.clone()
+            } else if let Some(credential) = &host.existing_client_secret {
+                credential.clone()
+            } else if headless {
+                return Err(
+                    "client needs --credential and --server-public enrollment values".into(),
+                );
+            } else {
+                String::new()
+            }
+        }
     };
-    cfg.secret = secret;
-    finalize_credentials(&mut cfg, p, host)?;
+    if cfg.mode == Mode::Client {
+        cfg.server_public = if let Some(public) = &p.server_public {
+            public.clone()
+        } else if let Some(public) = &host.existing_secret {
+            public.clone()
+        } else if headless {
+            return Err("client needs --credential and --server-public enrollment values".into());
+        } else {
+            String::new()
+        };
+    }
+    if cfg.mode == Mode::Server || !cfg.secret.is_empty() || !cfg.server_public.is_empty() {
+        finalize_credentials(&mut cfg, p, host)?;
+    } else {
+        cfg.admin_secret.clear();
+    }
 
     Ok(cfg)
 }
 
-/// Normalize the client secret, then clear the admin secret for clients or
-/// resolve it for servers.
 pub fn finalize_credentials(cfg: &mut Config, p: &Parsed, host: &Host) -> Result<(), String> {
-    cfg.secret = zeronat_secret::normalize(&cfg.secret).map_err(|e| format!("client {e}"))?;
+    if cfg.mode == Mode::Server && cfg.secret.is_empty() {
+        cfg.secret = if let Some(secret) = &p.secret {
+            secret.clone()
+        } else if let Some(secret) = &host.existing_secret {
+            secret.clone()
+        } else {
+            sys::gen_secret()?
+        };
+    }
+    cfg.secret = zeronat_secret::normalize(&cfg.secret).map_err(|_| {
+        credential_format_error(match cfg.mode {
+            Mode::Server => "server secret",
+            Mode::Client => "client credential",
+        })
+    })?;
     if cfg.mode != Mode::Server {
+        cfg.server_public = zeronat_secret::normalize(&cfg.server_public)
+            .map_err(|_| credential_format_error("server identity"))?;
+        if cfg.server_public == cfg.secret {
+            return Err("server identity and client credential must differ".into());
+        }
         cfg.admin_secret.clear();
         return Ok(());
     }
@@ -287,7 +353,7 @@ pub fn finalize_credentials(cfg: &mut Config, p: &Parsed, host: &Host) -> Result
     cfg.admin_secret =
         zeronat_secret::normalize(&admin_secret).map_err(|e| format!("admin {e}"))?;
     if cfg.admin_secret == cfg.secret {
-        return Err("admin secret must differ from the client secret".into());
+        return Err("admin secret must differ from the server secret".into());
     }
     Ok(())
 }
@@ -309,6 +375,7 @@ mod tests {
             have_docker: false,
             have_compose: false,
             existing_secret: None,
+            existing_client_secret: None,
             existing_admin_secret: None,
             ssh_port: 22,
         }
@@ -322,6 +389,10 @@ mod tests {
             "systemd",
             "--secret",
             "abc",
+            "--credential",
+            FLAG_SECRET,
+            "--server-public",
+            DISK_SECRET,
             "--admin-secret",
             ADMIN_SECRET,
             "--control",
@@ -346,6 +417,8 @@ mod tests {
         assert_eq!(p.mode, Some(Mode::Client));
         assert_eq!(p.method.as_deref(), Some("systemd"));
         assert_eq!(p.secret.as_deref(), Some("abc"));
+        assert_eq!(p.credential.as_deref(), Some(FLAG_SECRET));
+        assert_eq!(p.server_public.as_deref(), Some(DISK_SECRET));
         assert_eq!(p.admin_secret.as_deref(), Some(ADMIN_SECRET));
         assert_eq!(p.control.as_deref(), Some("3333"));
         assert_eq!(p.ports.as_deref(), Some("443/tcp 80/tcp"));
@@ -393,7 +466,9 @@ mod tests {
 
     #[test]
     fn missing_value_errs() {
-        assert!(parse(&s(&["--secret"])).is_err());
+        for flag in ["--secret", "--credential", "--server-public"] {
+            assert!(parse(&s(&[flag])).is_err());
+        }
     }
 
     #[test]
@@ -447,6 +522,10 @@ mod tests {
             "1.2.3.4",
             "--ports",
             "443/tcp",
+            "--credential",
+            FLAG_SECRET,
+            "--server-public",
+            DISK_SECRET,
         ]))
         .unwrap();
         let cfg = build(&p, &host(), p.headless).unwrap();
@@ -463,6 +542,10 @@ mod tests {
             "1.2.3.4:9000",
             "--ports",
             "443/tcp",
+            "--credential",
+            FLAG_SECRET,
+            "--server-public",
+            DISK_SECRET,
         ]))
         .unwrap();
         let cfg = build(&p, &host(), p.headless).unwrap();
@@ -532,8 +615,10 @@ mod tests {
             "80/tcp",
             "--server-addr",
             "127.0.0.1:2222",
-            "--secret",
+            "--credential",
             FLAG_SECRET,
+            "--server-public",
+            DISK_SECRET,
         ]))
         .unwrap();
         assert!(build(&p, &h, p.headless).unwrap().admin_secret.is_empty());
@@ -559,14 +644,7 @@ mod tests {
 
     #[test]
     fn client_to_server_wizard_change_resolves_admin_secret() {
-        let p = parse(&s(&[
-            "--client",
-            "--secret",
-            FLAG_SECRET,
-            "--admin-secret",
-            ADMIN_SECRET,
-        ]))
-        .unwrap();
+        let p = parse(&s(&["--client", "--admin-secret", ADMIN_SECRET])).unwrap();
         let h = host();
         let mut cfg = build(&p, &h, false).unwrap();
         assert!(cfg.admin_secret.is_empty());
@@ -575,6 +653,64 @@ mod tests {
         finalize_credentials(&mut cfg, &p, &h).unwrap();
 
         assert_eq!(cfg.admin_secret, ADMIN_SECRET);
+    }
+
+    #[test]
+    fn client_rejects_a_server_signing_secret() {
+        let p = parse(&s(&[
+            "-y",
+            "--client",
+            "--dht",
+            "--ports",
+            "80/tcp",
+            "--secret",
+            FLAG_SECRET,
+        ]))
+        .unwrap();
+        assert_eq!(
+            build(&p, &host(), true).err().unwrap(),
+            "--secret applies to servers; use --credential and --server-public"
+        );
+    }
+
+    #[test]
+    fn client_uses_server_issued_enrollment_values_directly() {
+        let p = parse(&s(&[
+            "-y",
+            "--client",
+            "--dht",
+            "--ports",
+            "80/tcp",
+            "--credential",
+            FLAG_SECRET,
+            "--server-public",
+            DISK_SECRET,
+        ]))
+        .unwrap();
+        let cfg = build(&p, &host(), true).unwrap();
+        assert_eq!(cfg.secret, FLAG_SECRET);
+        assert_eq!(cfg.server_public, DISK_SECRET);
+    }
+
+    #[test]
+    fn client_rejects_shared_enrollment_values() {
+        let p = parse(&s(&[
+            "-y",
+            "--client",
+            "--dht",
+            "--ports",
+            "80/tcp",
+            "--credential",
+            FLAG_SECRET,
+            "--server-public",
+            &FLAG_SECRET.to_ascii_uppercase(),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            build(&p, &host(), true).err().unwrap(),
+            "server identity and client credential must differ"
+        );
     }
 
     #[test]
@@ -594,7 +730,7 @@ mod tests {
 
         assert_eq!(
             finalize_credentials(&mut cfg, &p, &h).unwrap_err(),
-            "admin secret must differ from the client secret"
+            "admin secret must differ from the server secret"
         );
     }
 

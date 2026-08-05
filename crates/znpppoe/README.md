@@ -18,7 +18,7 @@ frames are demultiplexed back to the right session by destination MAC.
 docker build -f crates/znpppoe/Dockerfile -t znpppoe .
 
 docker run --rm -p 127.0.0.1:1080:1080 -p 127.0.0.1:8081:8081 \
-  -e ZN_SECRET=0000 \
+  -e ZN_SECRET="$ZN_SECRET" -e ZN_CLIENT_SECRET="$ZN_CLIENT_SECRET" \
   -e ZN_USER=someuser -e ZN_PASSWORD=somepassword \
   -e ZN_PROXY_USER=proxy -e ZN_PROXY_PASS=proxypass \
   znpppoe --host 192.168.1.100:2222 --connections 50 \
@@ -47,8 +47,9 @@ curl --proxy http://proxy_sjob42:proxypass@127.0.0.1:8081 https://ifconfig.me  #
 ## Flags and environment
 
 - `--host IP:PORT` zeronat server control endpoint (or `--dht`).
-- `--peer CLIENT_ID` client id of the peer serving the L2 segment. The server
-  pairs the two, so name it with `--host` or `--dht`.
+- `--peer PEER_IDENTITY` public identity of the peer serving the L2 segment.
+- `ZN_PEER_SECRET` client-owned peer-session private key. Required with
+  `--peer`.
 - `--connections N` number of PPPoE sessions (default 1).
 - `--socks-listen ADDR` SOCKS5 bind address (default `127.0.0.1:1080`).
 - `--http-listen ADDR` HTTP CONNECT bind address (default `127.0.0.1:8081`).
@@ -56,7 +57,8 @@ curl --proxy http://proxy_sjob42:proxypass@127.0.0.1:8081 https://ifconfig.me  #
 - `--sock-rx KIB` per-connection TCP receive buffer (default 256); it sets the advertised window, so raise it for high bandwidth-delay paths. Below 64 disables window scaling.
 - `--sock-tx KIB` per-connection TCP send buffer (default 64).
 - `--max-conns N` ceiling on concurrent proxied connections (default 1024); bounds total buffer memory.
-- `ZN_SECRET` tunnel secret.
+- `ZN_SECRET` server public identity.
+- `ZN_CLIENT_SECRET` server-issued client credential.
 - `ZN_USER`/`ZN_PASSWORD` PPPoE login; `ZN_SERVICE` optional PPPoE service name.
 - `ZN_PROXY_USER`/`ZN_PROXY_PASS` proxy credentials (separate from the PPPoE
   login).
@@ -65,8 +67,8 @@ curl --proxy http://proxy_sjob42:proxypass@127.0.0.1:8081 https://ifconfig.me  #
 
 - Running N sessions on one credential only works if the ISP permits concurrent
   PPPoE sessions for that login; otherwise give each session its own credential.
-- Pass `--dht` instead of `--host` to find the server by DHT (derived from
-  `ZN_SECRET`, the same identity the server announces under).
+- Pass `--dht` instead of `--host` to find the server by DHT using
+  `ZN_SECRET` and `ZN_CLIENT_SECRET`.
 - Domain targets are resolved with the container's resolver, so the DNS lookup
   does not carry the PPPoE source address (the TCP egress does). The
   `scratch` image carries no `/etc/resolv.conf`, so domain resolution relies on

@@ -27,6 +27,20 @@ const PROVIDES_MASK: u8 = PROVIDES_EXIT | PROVIDES_SEGMENT;
 pub const CAPABILITY_LEN: usize = 32;
 pub type Capability = [u8; CAPABILITY_LEN];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PairAuth {
+    /// Server-issued transcript challenge bound into the peer handshake.
+    pub challenge: [u8; 32],
+}
+
+impl std::fmt::Debug for PairAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairAuth")
+            .field("challenge", &self.challenge)
+            .finish()
+    }
+}
+
 /// Outcome of a `PeerConnect`, reported to the consumer in `PeerResult`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerStatus {
@@ -226,6 +240,8 @@ pub enum Msg {
         /// Capability bitset: `PROVIDES_EXIT` and/or `PROVIDES_SEGMENT`; a
         /// consumer announces with no bits set.
         provides: u8,
+        /// Client-owned static Noise public key.
+        identity: [u8; 32],
     },
     PeerAnnounceAck {
         /// The control socket's source address as the server observed it.
@@ -233,7 +249,7 @@ pub enum Msg {
         observed: SocketAddr,
     },
     PeerConnect {
-        /// The provider's `client_id`.
+        /// The provider's public peer identity.
         peer_id: String,
         /// The requested capability: exactly one provides bit.
         want: u8,
@@ -248,12 +264,13 @@ pub enum Msg {
     },
     PeerProbe {
         pair_id: u64,
-        /// The other party's `client_id`.
+        /// The other party's public peer identity.
         peer_id: String,
         /// This party's server-assigned probe id, carried in the punch
         /// probe's handshake app id.
         probe_id: u64,
         probe_capability: Capability,
+        auth: PairAuth,
         /// The pair's capability: the consumer's `want` bit, forwarded to
         /// both parties.
         provides: u8,
@@ -875,7 +892,12 @@ impl Msg {
                 put_sockaddr(&mut b, *local);
                 b
             }
-            Msg::PeerAnnounce { provides } => vec![16, *provides],
+            Msg::PeerAnnounce { provides, identity } => {
+                let mut b = Vec::with_capacity(34);
+                b.extend_from_slice(&[16, *provides]);
+                b.extend_from_slice(identity);
+                b
+            }
             Msg::PeerAnnounceAck { observed } => {
                 let mut b = Vec::with_capacity(20);
                 b.push(17);
@@ -908,6 +930,7 @@ impl Msg {
                 peer_id,
                 probe_id,
                 probe_capability,
+                auth,
                 provides,
             } => {
                 let mut b = Vec::new();
@@ -916,6 +939,7 @@ impl Msg {
                 put_str(&mut b, peer_id);
                 b.extend_from_slice(&probe_id.to_be_bytes());
                 b.extend_from_slice(probe_capability);
+                b.extend_from_slice(&auth.challenge);
                 b.push(*provides);
                 b
             }
@@ -1211,9 +1235,11 @@ impl Msg {
                     local,
                 })
             }
-            Some(16) if b.len() == 2 => {
+            Some(16) if b.len() == 34 => {
                 let provides = provides_from_byte(b[1])?;
-                Ok(Msg::PeerAnnounce { provides })
+                let mut identity = [0; 32];
+                identity.copy_from_slice(&b[2..34]);
+                Ok(Msg::PeerAnnounce { provides, identity })
             }
             Some(17) => {
                 let mut at = 1;
@@ -1263,12 +1289,15 @@ impl Msg {
                 let pair_id = u64::from_be_bytes(b[1..9].try_into().unwrap());
                 let mut at = 9;
                 let peer_id = take_str(b, &mut at)?;
-                if at + 9 + CAPABILITY_LEN > b.len() {
+                if at + 9 + CAPABILITY_LEN + 32 > b.len() {
                     return Err("truncated peer probe".into());
                 }
                 let probe_id = u64::from_be_bytes(b[at..at + 8].try_into().unwrap());
                 at += 8;
                 let probe_capability = take_capability(b, &mut at)?;
+                let mut challenge = [0; 32];
+                challenge.copy_from_slice(&b[at..at + 32]);
+                at += 32;
                 let provides = want_from_byte(b[at])?;
                 at += 1;
                 if at != b.len() {
@@ -1279,6 +1308,7 @@ impl Msg {
                     peer_id,
                     probe_id,
                     probe_capability,
+                    auth: PairAuth { challenge },
                     provides,
                 })
             }
@@ -2065,10 +2095,21 @@ mod tests {
     #[test]
     fn peer_announce_roundtrip() {
         for provides in [0, PROVIDES_EXIT, PROVIDES_SEGMENT, PROVIDES_MASK] {
-            let enc = Msg::PeerAnnounce { provides }.encode();
-            assert_eq!(enc, vec![16, provides]);
+            let enc = Msg::PeerAnnounce {
+                provides,
+                identity: [3; 32],
+            }
+            .encode();
+            assert_eq!(&enc[..2], &[16, provides]);
+            assert_eq!(&enc[2..], &[3; 32]);
             match Msg::decode(&enc).unwrap() {
-                Msg::PeerAnnounce { provides: got } => assert_eq!(got, provides),
+                Msg::PeerAnnounce {
+                    provides: got,
+                    identity,
+                } => {
+                    assert_eq!(got, provides);
+                    assert_eq!(identity, [3; 32]);
+                }
                 other => panic!("expected peer announce, got {other:?}"),
             }
         }
@@ -2220,6 +2261,7 @@ mod tests {
                 peer_id: "office-b1c2".into(),
                 probe_id: u64::MAX,
                 probe_capability: [5; CAPABILITY_LEN],
+                auth: PairAuth { challenge: [6; 32] },
                 provides: want,
             };
             match roundtrip(&m) {
@@ -2228,12 +2270,14 @@ mod tests {
                     peer_id,
                     probe_id,
                     probe_capability,
+                    auth,
                     provides,
                 } => {
                     assert_eq!(pair_id, 3);
                     assert_eq!(peer_id, "office-b1c2");
                     assert_eq!(probe_id, u64::MAX);
                     assert_eq!(probe_capability, [5; CAPABILITY_LEN]);
+                    assert_eq!(auth.challenge, [6; 32]);
                     assert_eq!(provides, want);
                 }
                 other => panic!("expected peer probe, got {other:?}"),
@@ -2248,11 +2292,12 @@ mod tests {
             peer_id: "a".into(),
             probe_id: 4,
             probe_capability: [5; CAPABILITY_LEN],
+            auth: PairAuth { challenge: [6; 32] },
             provides: PROVIDES_EXIT,
         }
         .encode();
-        // 1 tag + 8 pair_id + 3 (peer_id) + 8 probe_id + capability + 1 provides.
-        assert_eq!(good.len(), 21 + CAPABILITY_LEN);
+        // 1 tag + 8 pair_id + 3 (peer_id) + 8 probe_id + capability + pair auth + 1 provides.
+        assert_eq!(good.len(), 21 + CAPABILITY_LEN + 32);
         for cut in 1..good.len() {
             assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
         }

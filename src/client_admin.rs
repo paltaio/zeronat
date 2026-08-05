@@ -124,21 +124,33 @@ pub async fn stop_pppoe(socket: Option<&Path>, name: String) -> Result<()> {
 }
 
 /// `add-server NAME ADDR [--transport MODE]`: append a server profile. The
-/// secret comes from stdin, never from argv, which leaks through the process
-/// list.
+/// stdin line 1 carries the server identity; line 2 carries the client
+/// credential.
 pub async fn add_server(
     socket: Option<&Path>,
     name: String,
     addr: String,
     transport: Transport,
 ) -> Result<()> {
-    let secret = ServerSecret(crate::secret::normalize(&read_secret()?)?);
+    let (server_public, credential) = read_enrollment()?;
+    let server_public = ServerSecret(
+        crate::secret::normalize(&server_public)
+            .map_err(|_| "server identity must be exactly 64 hexadecimal characters (32 bytes)")?,
+    );
+    let credential =
+        ServerSecret(crate::secret::normalize(&credential).map_err(|_| {
+            "client credential must be exactly 64 hexadecimal characters (32 bytes)"
+        })?);
+    if server_public == credential {
+        return Err("the server identity and client credential must differ".into());
+    }
     command(
         socket,
         ClientMsg::AddServer {
             name,
             addr,
-            secret,
+            server_public,
+            credential,
             transport,
         },
     )
@@ -272,6 +284,9 @@ fn consumer_peer(command: &str, peer_id: String) -> Result<String> {
     if peer_id.is_empty() {
         return Err(format!("{command} must name a peer").into());
     }
+    crate::secret::decode(&peer_id).map_err(|_| -> crate::Error {
+        format!("`{command}` requires a 64-character hexadecimal peer identity").into()
+    })?;
     Ok(peer_id)
 }
 
@@ -356,35 +371,41 @@ fn parse_proto_port(spec: &str) -> Result<(Proto, u16)> {
     Ok((proto, port))
 }
 
-/// Read the secret from stdin: prompted with echo off on a terminal, read
-/// plainly when piped. One line, without the trailing newline.
-fn read_secret() -> Result<String> {
-    use std::io::BufRead;
+fn read_enrollment() -> Result<(String, String)> {
     let tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let server_public = read_enrollment_value(&mut input, tty, "server public identity")?;
+    let credential = read_enrollment_value(&mut input, tty, "client credential")?;
+    Ok((server_public, credential))
+}
+
+fn read_enrollment_value(
+    input: &mut impl std::io::BufRead,
+    tty: bool,
+    label: &str,
+) -> Result<String> {
     if tty {
-        eprint!("secret: ");
+        eprint!("{label}: ");
     }
     let mut line = String::new();
     {
         let _echo_off = if tty { Some(EchoOff::set()?) } else { None };
-        std::io::stdin()
-            .lock()
+        input
             .read_line(&mut line)
-            .map_err(|e| -> crate::Error {
-                format!("reading the secret from stdin: {e}").into()
-            })?;
+            .map_err(|e| -> crate::Error { format!("reading {label} from stdin: {e}").into() })?;
     }
     if tty {
         eprintln!();
     }
-    let secret = line.trim_end_matches(['\r', '\n']).to_string();
-    if secret.is_empty() {
-        return Err("the secret on stdin is empty".into());
+    let value = line.trim_end_matches(['\r', '\n']).to_string();
+    if value.is_empty() {
+        return Err(format!("{label} on stdin is empty").into());
     }
-    Ok(secret)
+    Ok(value)
 }
 
-/// Echo-off guard for the secret prompt: clears ECHO but keeps canonical mode,
+/// Echo-off guard for the enrollment prompts: clears ECHO but keeps canonical mode,
 /// so the read still ends at newline; `Drop` restores the saved settings.
 struct EchoOff(libc::termios);
 
@@ -721,13 +742,12 @@ mod tests {
     /// would attach the exit provider and `detach-peer ""` would remove it.
     #[test]
     fn consumer_commands_must_name_a_peer() {
+        let peer = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let err = consumer_peer("attach-peer", String::new()).unwrap_err();
         assert!(err.to_string().contains("attach-peer"), "{err}");
         assert!(consumer_peer("detach-peer", String::new()).is_err());
-        assert_eq!(
-            consumer_peer("detach-peer", "office".into()).unwrap(),
-            "office"
-        );
+        assert!(consumer_peer("attach-peer", "office".into()).is_err());
+        assert_eq!(consumer_peer("detach-peer", peer.into()).unwrap(), peer);
     }
 
     #[test]

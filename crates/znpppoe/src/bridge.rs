@@ -15,27 +15,37 @@ use zeronat::kcp::{
     route, session as kcp_session, Session, BRIDGE_CONV, BRIDGE_ID, CLASS_KCP, CLASS_SETUP,
 };
 use zeronat::noise::{
-    client_handshake_remote, client_handshake_stateless_claim, derive_psk, AuthRole,
+    client_handshake_remote, client_handshake_stateless_claim_remote, derive_psk, AuthRole,
 };
 use zeronat::proto::Msg;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where the server lives: a fixed address, or a DHT identity resolved at dial
-/// time (and re-resolved on reconnect). The DHT identity is derived from the same
-/// secret the server announces under.
+/// time (and re-resolved on reconnect).
 pub enum Target {
     Host(SocketAddr),
     Dht(Arc<zeronat::dht::Identity>),
 }
 
 impl Target {
-    pub fn new(host: Option<&str>, dht: bool, secret: &str) -> Result<Target> {
-        let secret = zeronat::secret::normalize(secret)?;
+    pub fn new(
+        host: Option<&str>,
+        dht: bool,
+        server_public: &str,
+        credential: &str,
+    ) -> Result<Target> {
+        let server_public = zeronat::secret::normalize(server_public)?;
+        let credential = zeronat::secret::normalize(credential)?;
+        if server_public == credential {
+            return Err(anyhow!(
+                "ZN_SECRET and ZN_CLIENT_SECRET must contain different values"
+            ));
+        }
         if dht {
             Ok(Target::Dht(Arc::new(
-                zeronat::dht::Identity::derive(&secret)
-                    .map_err(|e| anyhow!("invalid ZN_SECRET: {e}"))?,
+                zeronat::dht::Identity::derive(&server_public, &credential)
+                    .map_err(|e| anyhow!("invalid server identity or client credential: {e}"))?,
             )))
         } else {
             let h = host.context("--host IP:PORT or --dht is required")?;
@@ -104,12 +114,7 @@ impl Drop for AbortOnDrop {
 /// Dial `addr`, establish the bridge setup conv, run the stateless Noise
 /// handshake, and return the bridge ready to carry L2 frames. `client_id` is
 /// announced so the server's fleet view names the port.
-pub async fn connect(
-    addr: SocketAddr,
-    secret: &str,
-    credential: &str,
-    client_id: &str,
-) -> Result<Bridge> {
+pub async fn connect(addr: SocketAddr, credential: &str, client_id: &str) -> Result<Bridge> {
     let socket = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
             .await
@@ -195,11 +200,15 @@ pub async fn connect(
         }
     }));
 
-    let psk = derive_psk(secret);
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
     let noise = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        client_handshake_stateless_claim(stream, &psk, BRIDGE_ID, &bridge_capability),
+        client_handshake_stateless_claim_remote(
+            stream,
+            &credential_psk,
+            BRIDGE_ID,
+            &bridge_capability,
+        ),
     )
     .await
     .context("bridge handshake timed out")?
@@ -227,6 +236,20 @@ pub async fn connect(
 mod tests {
     use super::*;
 
+    #[test]
+    fn target_rejects_copied_enrollment_values() {
+        let secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+        let error = match Target::new(Some("127.0.0.1:2222"), false, secret, secret) {
+            Ok(_) => panic!("copied enrollment values must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("ZN_SECRET and ZN_CLIENT_SECRET must contain different values"));
+    }
+
     /// A dial whose handshake times out must not strand any task: the pump
     /// guard aborts on the error return, the conv driver exits at its idle
     /// backstop, and the socket-writer follows once every sender is gone. The
@@ -239,7 +262,7 @@ mod tests {
         let metrics = tokio::runtime::Handle::current().metrics();
         let baseline = metrics.num_alive_tasks();
 
-        assert!(connect(addr, "secret", "credential", "test").await.is_err());
+        assert!(connect(addr, "credential", "test").await.is_err());
 
         for _ in 0..200 {
             tokio::time::advance(Duration::from_secs(2)).await;

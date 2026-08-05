@@ -35,6 +35,7 @@ mod pty {
     const OTHER_SECRET: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
     const PROVIDER_SECRET: &str =
         "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000";
+    const SERVER_SECRET: &str = "22223333444455556666777788889999aaaabbbbccccddddeeeeffff00001111";
     /// Carries the admin socket path into the re-executed console child.
     const CHILD_ENV: &str = "ZERONAT_CONSOLE_PTY_CHILD";
     /// Carries the server address into the re-executed fleet-console child.
@@ -315,7 +316,7 @@ mod pty {
         ServerSettings {
             bind: std::net::Ipv4Addr::LOCALHOST,
             control_port: control,
-            secret: SECRET.into(),
+            secret: SERVER_SECRET.into(),
             admin_secret: Some(OTHER_SECRET.into()),
             client_credentials: vec![
                 zeronat::server::ClientCredentialSpec {
@@ -443,7 +444,11 @@ mod pty {
         let local_udp = free_port();
         tokio::spawn(tcp_echo(local_tcp));
         let client_id = zeronat::identity::derive_client_id(Some("pty"));
-        let provider_id = zeronat::identity::derive_client_id(Some("ptyexit"));
+        let provider_client_id = zeronat::identity::derive_client_id(Some("ptyexit"));
+        let provider_peer_secret = zeronat::secret::encode([42; 32]);
+        let consumer_peer_secret = zeronat::secret::encode([43; 32]);
+        let provider_id = zeronat::secret::encode(zeronat::peer::public_identity(&[42; 32]));
+        let consumer_id = zeronat::secret::encode(zeronat::peer::public_identity(&[43; 32]));
         tokio::spawn(zeronat::server::run(server_settings(
             control, public_tcp, public_udp, &client_id,
         )));
@@ -455,10 +460,11 @@ mod pty {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("client.toml");
         let sock = dir.join("client.sock");
+        let server_public = zeronat::secret::server_public(SERVER_SECRET).unwrap();
         let text = format!(
             "[client]\nactive = \"home\"\n\
-             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
-             [[servers]]\nname = \"away\"\naddr = \"192.0.2.9:9000\"\nsecret = \"{OTHER_SECRET}\"\ntransport = \"tcp\"\n\
+             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{server_public}\"\ncredential = \"{SECRET}\"\ntransport = \"tcp\"\n\
+             [[servers]]\nname = \"away\"\naddr = \"192.0.2.9:9000\"\nsecret = \"{OTHER_SECRET}\"\ncredential = \"{SECRET}\"\ntransport = \"tcp\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = {public_tcp}\ntarget = \"127.0.0.1:{local_tcp}\"\n\
              [[forwards]]\nproto = \"udp\"\nport = {public_udp}\ntarget = \"127.0.0.1:{local_udp}\"\n"
         );
@@ -468,7 +474,7 @@ mod pty {
         let home = zeronat::client::ServerTarget {
             name: "home".into(),
             addr: format!("127.0.0.1:{control}"),
-            secret: SECRET.into(),
+            secret: server_public,
             credential: SECRET.into(),
             transport: zeronat::client::Transport::Tcp,
         };
@@ -476,7 +482,7 @@ mod pty {
             name: "away".into(),
             addr: "192.0.2.9:9000".into(),
             secret: OTHER_SECRET.into(),
-            credential: OTHER_SECRET.into(),
+            credential: SECRET.into(),
             transport: zeronat::client::Transport::Tcp,
         };
         // The peer the console client exits through: a second client
@@ -497,6 +503,7 @@ mod pty {
             pppoe: vec![],
             autostart: None,
             id_prefix: Some("ptyexit".into()),
+            peer_secret: Some(provider_peer_secret),
             control: None,
             config: None,
             peers: vec![zeronat::client::PeerSlotSpec::Provider {
@@ -520,6 +527,7 @@ mod pty {
             pppoe: vec![],
             autostart: None,
             id_prefix: Some("pty".into()),
+            peer_secret: Some(consumer_peer_secret),
             control: Some(zeronat::clientctl::ControlPath::Explicit(sock.clone())),
             config: Some((path.clone(), cfg)),
             peers: vec![zeronat::client::PeerSlotSpec::Consumer {
@@ -585,15 +593,16 @@ mod pty {
             .expect("the provider slot never paired")
             .expect("the provider sink closed");
         assert_eq!(consumer_slot.peer_id, provider_id);
-        assert_eq!(provider_slot.peer_id, client_id);
+        assert_eq!(provider_slot.peer_id, consumer_id);
 
         // The client's peers panel names the slot, the peer it exits through,
         // and the path its pair settled on.
+        let provider_display = &provider_id[..22];
         wait_screen(&out, "the peer slot row", 30, |s| {
-            row_containing(s, &format!("via {provider_id}"))
+            row_containing(s, &format!("via {provider_display}"))
                 .is_some_and(|r| r.contains("connected") && r.contains("relay"))
         });
-        let peer_row = row_containing(&out.screen(), &format!("via {provider_id}")).unwrap();
+        let peer_row = row_containing(&out.screen(), &format!("via {provider_display}")).unwrap();
         assert!(peer_row.contains("exit"), "peer row: {peer_row}");
 
         // The fleet console lists the same pair from the server's side, with
@@ -605,7 +614,7 @@ mod pty {
         wait_screen(&fleet_out, "the fleet pairs panel", 60, |s| {
             s.iter().any(|r| {
                 r.contains(&client_id)
-                    && r.contains(&provider_id)
+                    && r.contains(&provider_client_id)
                     && r.contains("exit")
                     && r.contains("relay")
             })

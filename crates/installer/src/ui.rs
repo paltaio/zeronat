@@ -87,11 +87,13 @@ pub struct Config {
     pub announce_port: String,
     pub server_addr: String,
     pub secret: String,
+    pub server_public: String,
     pub admin_secret: String,
     pub secret_mode: SecretMode,
     pub have_docker: bool,
     pub have_compose: bool,
     pub existing_secret: Option<String>,
+    pub existing_client_secret: Option<String>,
     /// All-traffic mode: keep `ssh_port` on the server instead of forwarding it.
     pub exclude_ssh: bool,
     pub ssh_port: u16,
@@ -122,6 +124,7 @@ impl Config {
             announce_port: String::new(),
             server_addr: String::new(),
             secret: String::new(),
+            server_public: String::new(),
             admin_secret: String::new(),
             secret_mode: if existing_secret.is_some() {
                 SecretMode::Reuse
@@ -131,6 +134,7 @@ impl Config {
             have_docker,
             have_compose,
             existing_secret,
+            existing_client_secret: None,
             exclude_ssh: true,
             ssh_port: 22,
         }
@@ -154,6 +158,7 @@ enum Step {
     Control,
     Secret,
     SecretEntry,
+    ServerPublicEntry,
     Summary,
 }
 
@@ -210,6 +215,15 @@ impl App {
         self.upgrade.as_ref()
     }
 
+    fn can_reuse_credentials(&self) -> bool {
+        match self.cfg.mode {
+            Mode::Server => self.cfg.existing_secret.is_some(),
+            Mode::Client => {
+                self.cfg.existing_secret.is_some() && self.cfg.existing_client_secret.is_some()
+            }
+        }
+    }
+
     // ---- flow ------------------------------------------------------------
 
     fn is_input(step: Step) -> bool {
@@ -221,6 +235,7 @@ impl App {
                 | Step::ServerAddr
                 | Step::Control
                 | Step::SecretEntry
+                | Step::ServerPublicEntry
         )
     }
 
@@ -253,7 +268,8 @@ impl App {
             Step::Control => Step::Secret,
             Step::Secret if self.cfg.secret_mode == SecretMode::Enter => Step::SecretEntry,
             Step::Secret => Step::Summary,
-            Step::SecretEntry => Step::Summary,
+            Step::SecretEntry if self.cfg.mode == Mode::Client => Step::ServerPublicEntry,
+            Step::SecretEntry | Step::ServerPublicEntry => Step::Summary,
             Step::Summary => Step::Summary,
         }
     }
@@ -274,6 +290,7 @@ impl App {
                 Step::BridgeName => self.cfg.bridge.clone(),
                 Step::ServerAddr => self.cfg.server_addr.clone(),
                 Step::Control => self.cfg.control.clone(),
+                Step::ServerPublicEntry => self.cfg.server_public.clone(),
                 _ => String::new(),
             };
         } else {
@@ -447,19 +464,24 @@ impl App {
             },
             Step::Secret => {
                 let mut v = Vec::new();
-                if self.cfg.existing_secret.is_some() {
+                if self.can_reuse_credentials() {
                     v.push(Opt {
                         label: "Reuse existing",
-                        desc: "keep the secret already in /etc/zeronat",
+                        desc: "keep the credentials already in /etc/zeronat",
+                    });
+                }
+                if self.cfg.mode == Mode::Server {
+                    v.push(Opt {
+                        label: "Generate new",
+                        desc: "a fresh random 256-bit secret",
                     });
                 }
                 v.push(Opt {
-                    label: "Generate new",
-                    desc: "a fresh random 256-bit secret",
-                });
-                v.push(Opt {
                     label: "Enter manually",
-                    desc: "paste a secret shared with the other side",
+                    desc: match self.cfg.mode {
+                        Mode::Server => "enter the server signing secret",
+                        Mode::Client => "enter the server-issued enrollment values",
+                    },
                 });
                 v
             }
@@ -481,10 +503,11 @@ impl App {
             Step::SshExclude => (!self.cfg.exclude_ssh) as usize,
             Step::Discovery => self.cfg.use_dht as usize,
             Step::Secret => {
-                let has = self.cfg.existing_secret.is_some();
+                let has = self.can_reuse_credentials();
                 match self.cfg.secret_mode {
                     SecretMode::Reuse => 0,
                     SecretMode::Generate => has as usize,
+                    SecretMode::Enter if self.cfg.mode == Mode::Client => has as usize,
                     SecretMode::Enter => has as usize + 1,
                 }
             }
@@ -526,28 +549,51 @@ impl App {
             Step::SshExclude => self.cfg.exclude_ssh = self.sel == 0,
             Step::Discovery => self.cfg.use_dht = self.sel == 1,
             Step::Secret => {
-                let has = self.cfg.existing_secret.is_some();
-                let n = if has { self.sel } else { self.sel + 1 };
-                self.cfg.secret_mode = match n {
-                    0 => SecretMode::Reuse,
-                    1 => SecretMode::Generate,
+                let has = self.can_reuse_credentials();
+                self.cfg.secret_mode = match (self.cfg.mode, has, self.sel) {
+                    (_, true, 0) => SecretMode::Reuse,
+                    (Mode::Server, _, n) if n == has as usize => SecretMode::Generate,
                     _ => SecretMode::Enter,
                 };
                 match self.cfg.secret_mode {
-                    SecretMode::Reuse => match self
-                        .cfg
-                        .existing_secret
-                        .as_deref()
-                        .ok_or_else(|| "no existing secret found".to_string())
-                        .and_then(|value| {
-                            zeronat_secret::normalize(value).map_err(|e| e.to_string())
-                        }) {
-                        Ok(secret) => self.cfg.secret = secret,
-                        Err(e) => {
-                            self.error = Some(e);
+                    SecretMode::Reuse => {
+                        let secret = match self.cfg.mode {
+                            Mode::Server => self.cfg.existing_secret.as_deref(),
+                            Mode::Client => self.cfg.existing_client_secret.as_deref(),
+                        };
+                        let Some(secret) = secret else {
+                            self.error = Some("no existing credentials found".into());
                             return false;
+                        };
+                        match zeronat_secret::normalize(secret) {
+                            Ok(secret) => self.cfg.secret = secret,
+                            Err(_) => {
+                                self.error = Some(crate::args::credential_format_error(match self
+                                    .cfg
+                                    .mode
+                                {
+                                    Mode::Server => "server secret",
+                                    Mode::Client => "client credential",
+                                }));
+                                return false;
+                            }
                         }
-                    },
+                        if self.cfg.mode == Mode::Client {
+                            let Some(public) = self.cfg.existing_secret.as_deref() else {
+                                self.error = Some("no existing server identity found".into());
+                                return false;
+                            };
+                            match zeronat_secret::normalize(public) {
+                                Ok(public) => self.cfg.server_public = public,
+                                Err(_) => {
+                                    self.error = Some(crate::args::credential_format_error(
+                                        "server identity",
+                                    ));
+                                    return false;
+                                }
+                            }
+                        }
+                    }
                     SecretMode::Generate => match crate::sys::gen_secret() {
                         Ok(s) => self.cfg.secret = s,
                         Err(e) => {
@@ -605,8 +651,18 @@ impl App {
             },
             Step::SecretEntry => match zeronat_secret::normalize(&v) {
                 Ok(secret) => self.cfg.secret = secret,
-                Err(e) => {
-                    self.error = Some(e.to_string());
+                Err(_) => {
+                    self.error = Some(crate::args::credential_format_error(match self.cfg.mode {
+                        Mode::Server => "server secret",
+                        Mode::Client => "client credential",
+                    }));
+                    return false;
+                }
+            },
+            Step::ServerPublicEntry => match zeronat_secret::normalize(&v) {
+                Ok(public) => self.cfg.server_public = public,
+                Err(_) => {
+                    self.error = Some(crate::args::credential_format_error("server identity"));
                     return false;
                 }
             },
@@ -825,8 +881,15 @@ impl App {
             },
             Step::ServerAddr => "Server address",
             Step::Control => "Tunnel control port",
-            Step::Secret => "Shared secret",
-            Step::SecretEntry => "Enter the 64-character hex secret",
+            Step::Secret => match self.cfg.mode {
+                Mode::Server => "Server signing secret",
+                Mode::Client => "Client enrollment",
+            },
+            Step::SecretEntry => match self.cfg.mode {
+                Mode::Server => "Enter the 64-character server secret",
+                Mode::Client => "Enter the 64-character client credential",
+            },
+            Step::ServerPublicEntry => "Enter the 64-character server identity",
             Step::Summary => "Review and install",
         }
     }
@@ -949,7 +1012,8 @@ impl App {
             Step::BridgeName => "the TAP is enslaved to this existing bridge".into(),
             Step::ServerAddr => "HOST or HOST:PORT (default port 2222)".into(),
             Step::Control => "the UDP/TCP port the tunnel control runs on".into(),
-            Step::SecretEntry => "64 hex characters; use the same value on both sides".into(),
+            Step::SecretEntry => "64 hexadecimal characters".into(),
+            Step::ServerPublicEntry => "the public identity from the server enrollment".into(),
             _ => String::new(),
         }
     }
@@ -1012,7 +1076,13 @@ impl App {
             Mode::Server if self.cfg.use_dht => add("discovery", "DHT publish".to_string(), PLAIN),
             Mode::Server => add("control", self.cfg.control.clone(), PLAIN),
         }
-        add("secret", self.cfg.secret.clone(), GOOD);
+        match self.cfg.mode {
+            Mode::Server => add("secret", self.cfg.secret.clone(), GOOD),
+            Mode::Client => {
+                add("credential", self.cfg.secret.clone(), GOOD);
+                add("identity", self.cfg.server_public.clone(), GOOD);
+            }
+        }
     }
 
     fn status_line(&self) -> Line {
@@ -1084,5 +1154,27 @@ mod tests {
         app.sel = 0;
         assert!(!app.apply_selection());
         assert!(app.error.as_deref().unwrap().contains("64 hexadecimal"));
+    }
+
+    #[test]
+    fn client_enrollment_collects_credential_and_server_identity() {
+        let mut cfg = Config::new(false, false, None);
+        cfg.mode = Mode::Client;
+        let mut app = App::new(cfg, None);
+        app.step = Step::Secret;
+        app.sel = 0;
+        assert!(app.apply_selection());
+        assert!(app.next_step() == Step::SecretEntry);
+
+        app.step = Step::SecretEntry;
+        app.input = "a".repeat(64);
+        assert!(app.commit_input());
+        assert!(app.next_step() == Step::ServerPublicEntry);
+
+        app.step = Step::ServerPublicEntry;
+        app.input = "b".repeat(64);
+        assert!(app.commit_input());
+        assert_eq!(app.cfg.secret, "a".repeat(64));
+        assert_eq!(app.cfg.server_public, "b".repeat(64));
     }
 }

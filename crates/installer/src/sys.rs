@@ -159,7 +159,6 @@ pub fn pub_ip() -> String {
     "YOUR_SERVER_IP".to_string()
 }
 
-/// A secret already on disk, so a re-run does not rotate it and break clients.
 pub fn existing_secret() -> Option<String> {
     existing_env_value("ZERONAT_SECRET")
 }
@@ -167,6 +166,11 @@ pub fn existing_secret() -> Option<String> {
 /// An administrative secret already on disk, kept across installer re-runs.
 pub fn existing_admin_secret() -> Option<String> {
     existing_env_value("ZERONAT_ADMIN_SECRET")
+}
+
+/// A client credential already on disk, kept across installer re-runs.
+pub fn existing_client_secret() -> Option<String> {
+    existing_env_value("ZERONAT_CLIENT_SECRET")
 }
 
 fn existing_env_value(key: &str) -> Option<String> {

@@ -571,6 +571,36 @@ impl ReplayWindow {
 }
 
 impl StatelessNoise {
+    fn from_keys(keys: Keys) -> Self {
+        Self {
+            send_key: keys.send_key,
+            recv_key: keys.recv_key,
+            send_nonce: Mutex::new(0),
+            recv_window: Mutex::new(ReplayWindow::default()),
+        }
+    }
+
+    /// Build datagram traffic state from two random keys carried inside the
+    /// authenticated peer handshake.
+    pub fn from_peer_keys(keys: &[u8; 64], initiator: bool) -> Self {
+        let mut initiator_to_responder = [0; 32];
+        initiator_to_responder.copy_from_slice(&keys[..32]);
+        let mut responder_to_initiator = [0; 32];
+        responder_to_initiator.copy_from_slice(&keys[32..]);
+        let keys = if initiator {
+            Keys {
+                send_key: initiator_to_responder,
+                recv_key: responder_to_initiator,
+            }
+        } else {
+            Keys {
+                send_key: responder_to_initiator,
+                recv_key: initiator_to_responder,
+            }
+        };
+        Self::from_keys(keys)
+    }
+
     /// Encrypt `plaintext` into a `[nonce:8][ciphertext]` datagram body.
     ///
     /// # Errors
@@ -656,15 +686,44 @@ where
     payload.extend_from_slice(capability);
     let mut stream: BoxStream = Box::new(stream);
     let (keys, reply) = run_initiator(&mut stream, psk, &STATELESS_PROLOGUE, &payload).await?;
-    Ok((
-        StatelessNoise {
-            send_key: keys.send_key,
-            recv_key: keys.recv_key,
-            send_nonce: Mutex::new(0),
-            recv_window: Mutex::new(ReplayWindow::default()),
-        },
-        reply,
-    ))
+    Ok((StatelessNoise::from_keys(keys), reply))
+}
+
+pub async fn client_handshake_stateless_claim_remote<S>(
+    stream: S,
+    psk: &[u8; 32],
+    id: u64,
+    capability: &crate::proto::Capability,
+) -> Result<StatelessNoise>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (noise, _reply) =
+        client_handshake_stateless_claim_remote_reply(stream, psk, id, capability).await?;
+    Ok(noise)
+}
+
+pub async fn client_handshake_stateless_claim_remote_reply<S>(
+    mut stream: S,
+    psk: &[u8; 32],
+    id: u64,
+    capability: &crate::proto::Capability,
+) -> Result<(StatelessNoise, Vec<u8>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let preface = AuthRole::Client.preface(client_selector(psk));
+    stream.write_all(&preface).await?;
+    stream.flush().await?;
+    let mut payload = Vec::with_capacity(8 + crate::proto::CAPABILITY_LEN);
+    payload.extend_from_slice(&id.to_be_bytes());
+    payload.extend_from_slice(capability);
+    let mut prologue = Vec::with_capacity(preface.len() + STATELESS_PROLOGUE.len());
+    prologue.extend_from_slice(&preface);
+    prologue.extend_from_slice(&STATELESS_PROLOGUE);
+    let mut stream: BoxStream = Box::new(stream);
+    let (keys, reply) = run_initiator(&mut stream, psk, &prologue, &payload).await?;
+    Ok((StatelessNoise::from_keys(keys), reply))
 }
 
 /// Like [`client_handshake_stateless`], also returning the responder's
@@ -680,15 +739,20 @@ where
     let mut stream: BoxStream = Box::new(stream);
     let (keys, reply) =
         run_initiator(&mut stream, psk, &STATELESS_PROLOGUE, &id.to_be_bytes()).await?;
-    Ok((
-        StatelessNoise {
-            send_key: keys.send_key,
-            recv_key: keys.recv_key,
-            send_nonce: Mutex::new(0),
-            recv_window: Mutex::new(ReplayWindow::default()),
-        },
-        reply,
-    ))
+    Ok((StatelessNoise::from_keys(keys), reply))
+}
+
+pub async fn client_handshake_stateless_payload_reply<S>(
+    stream: S,
+    psk: &[u8; 32],
+    payload: &[u8],
+) -> Result<(StatelessNoise, Vec<u8>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut stream: BoxStream = Box::new(stream);
+    let (keys, reply) = run_initiator(&mut stream, psk, &STATELESS_PROLOGUE, payload).await?;
+    Ok((StatelessNoise::from_keys(keys), reply))
 }
 
 /// Responder handshake; returns the peer's `id` and the stateless transport.
@@ -707,16 +771,23 @@ where
     if payload.len() < 8 {
         return Err("missing stream id in handshake payload".into());
     }
-    let id = u64::from_be_bytes(payload[..8].try_into().unwrap());
-    Ok((
-        id,
-        StatelessNoise {
-            send_key: keys.send_key,
-            recv_key: keys.recv_key,
-            send_nonce: Mutex::new(0),
-            recv_window: Mutex::new(ReplayWindow::default()),
-        },
-    ))
+    let mut id_bytes = [0; 8];
+    id_bytes.copy_from_slice(&payload[..8]);
+    let id = u64::from_be_bytes(id_bytes);
+    Ok((id, StatelessNoise::from_keys(keys)))
+}
+
+pub async fn server_handshake_stateless_payload<S>(
+    stream: S,
+    psk: &[u8; 32],
+    reply: &[u8],
+) -> Result<(Vec<u8>, StatelessNoise)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut stream: BoxStream = Box::new(stream);
+    let (keys, payload) = run_responder(&mut stream, psk, &STATELESS_PROLOGUE, reply).await?;
+    Ok((payload, StatelessNoise::from_keys(keys)))
 }
 
 pub async fn server_handshake_stateless_claim<S>(
@@ -737,21 +808,70 @@ where
     let id = u64::from_be_bytes(id_bytes);
     let mut capability = [0; crate::proto::CAPABILITY_LEN];
     capability.copy_from_slice(&payload[8..]);
+    Ok((id, capability, StatelessNoise::from_keys(keys)))
+}
+
+pub async fn server_handshake_stateless_claim_remote<S>(
+    mut stream: S,
+    clients: &ClientCredentials,
+    reply: &[u8],
+) -> Result<(String, u64, crate::proto::Capability, StatelessNoise)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut preface = [0u8; REMOTE_PREFACE_LEN];
+    stream.read_exact(&mut preface).await?;
+    if preface[..2] != REMOTE_PREFACE_MAGIC {
+        return Err("unsupported remote handshake preface".into());
+    }
+    if preface[2] != crate::identity::PROTO_VERSION {
+        return Err("unsupported protocol version".into());
+    }
+    if AuthRole::from_byte(preface[3])? != AuthRole::Client {
+        return Err("stateless claims require a client credential".into());
+    }
+    let selector: [u8; CLIENT_SELECTOR_LEN] = preface[4..]
+        .try_into()
+        .map_err(|_| -> Error { "invalid client credential selector".into() })?;
+    let (client_id, psk) = clients.get(&selector).ok_or("unknown client credential")?;
+    let mut prologue = Vec::with_capacity(preface.len() + STATELESS_PROLOGUE.len());
+    prologue.extend_from_slice(&preface);
+    prologue.extend_from_slice(&STATELESS_PROLOGUE);
+    let mut stream: BoxStream = Box::new(stream);
+    let (keys, payload) = run_responder(&mut stream, psk, &prologue, reply).await?;
+    if payload.len() != 8 + crate::proto::CAPABILITY_LEN {
+        return Err("invalid data capability in handshake payload".into());
+    }
+    let mut id_bytes = [0; 8];
+    id_bytes.copy_from_slice(&payload[..8]);
+    let id = u64::from_be_bytes(id_bytes);
+    let mut capability = [0; crate::proto::CAPABILITY_LEN];
+    capability.copy_from_slice(&payload[8..]);
     Ok((
+        client_id.clone(),
         id,
         capability,
-        StatelessNoise {
-            send_key: keys.send_key,
-            recv_key: keys.recv_key,
-            send_nonce: Mutex::new(0),
-            recv_window: Mutex::new(ReplayWindow::default()),
-        },
+        StatelessNoise::from_keys(keys),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broker_challenge_cannot_open_peer_session_traffic() {
+        let keys = [7; 64];
+        let broker_keys = [9; 64];
+        let initiator = StatelessNoise::from_peer_keys(&keys, true);
+        let responder = StatelessNoise::from_peer_keys(&keys, false);
+        let broker = StatelessNoise::from_peer_keys(&broker_keys, false);
+
+        let sealed = initiator.seal(b"peer traffic").unwrap();
+
+        assert_eq!(responder.open(&sealed).unwrap(), b"peer traffic");
+        assert!(broker.open(&sealed).is_err());
+    }
 
     fn credentials(id: &str, psk: [u8; 32]) -> ClientCredentials {
         [(client_selector(&psk), (id.to_string(), psk))]

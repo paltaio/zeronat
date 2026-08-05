@@ -295,9 +295,8 @@ pub struct ClientSnapshotBody {
     pub peers: Vec<ClientPeerSlotEntry>,
 }
 
-/// Server secret carried by `AddServer` and held by the parsed client config;
-/// `Debug` prints a placeholder so a logged frame or a debug-printed config
-/// never exposes the value.
+/// Enrollment value carried by `AddServer`; `Debug` redacts both the public
+/// server identity and the client credential.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ServerSecret(pub String);
 
@@ -341,12 +340,13 @@ pub enum ClientMsg {
     StopSession {
         name: String,
     },
-    /// Append a server profile. The secret rides the Noise-encrypted local
-    /// socket and never appears in any snapshot.
+    /// Append a server profile. Both enrollment values ride the Noise-encrypted
+    /// local socket and never appear in any snapshot.
     AddServer {
         name: String,
         addr: String,
-        secret: ServerSecret,
+        server_public: ServerSecret,
+        credential: ServerSecret,
         transport: Transport,
     },
     RemoveServer {
@@ -495,14 +495,16 @@ impl ClientMsg {
             ClientMsg::AddServer {
                 name,
                 addr,
-                secret,
+                server_public,
+                credential,
                 transport,
             } => {
                 let mut b = Vec::new();
                 b.push(8);
                 put_str(&mut b, name);
                 put_str(&mut b, addr);
-                put_str(&mut b, &secret.0);
+                put_str(&mut b, &server_public.0);
+                put_str(&mut b, &credential.0);
                 b.push(transport_byte(*transport));
                 b
             }
@@ -770,7 +772,8 @@ impl ClientMsg {
                 let mut at = 1;
                 let name = take_str(b, &mut at)?;
                 let addr = take_str(b, &mut at)?;
-                let secret = ServerSecret(take_str(b, &mut at)?);
+                let server_public = ServerSecret(take_str(b, &mut at)?);
+                let credential = ServerSecret(take_str(b, &mut at)?);
                 if at >= b.len() {
                     return Err("truncated add server".into());
                 }
@@ -782,7 +785,8 @@ impl ClientMsg {
                 Ok(ClientMsg::AddServer {
                     name,
                     addr,
-                    secret,
+                    server_public,
+                    credential,
                     transport,
                 })
             }
@@ -1205,19 +1209,22 @@ mod tests {
             let m = ClientMsg::AddServer {
                 name: "away".into(),
                 addr: "198.51.100.7:9000".into(),
-                secret: ServerSecret("hunter2".into()),
+                server_public: ServerSecret("public".into()),
+                credential: ServerSecret("credential".into()),
                 transport,
             };
             match roundtrip(&m) {
                 ClientMsg::AddServer {
                     name,
                     addr,
-                    secret,
+                    server_public,
+                    credential,
                     transport: got,
                 } => {
                     assert_eq!(name, "away");
                     assert_eq!(addr, "198.51.100.7:9000");
-                    assert_eq!(secret.0, "hunter2");
+                    assert_eq!(server_public.0, "public");
+                    assert_eq!(credential.0, "credential");
                     assert_eq!(got, transport);
                 }
                 other => panic!("expected add server, got {other:?}"),
@@ -1291,7 +1298,8 @@ mod tests {
         let add = ClientMsg::AddServer {
             name: "a".into(),
             addr: "d".into(),
-            secret: ServerSecret("s".into()),
+            server_public: ServerSecret("p".into()),
+            credential: ServerSecret("c".into()),
             transport: Transport::Auto,
         }
         .encode();
@@ -1538,17 +1546,19 @@ mod tests {
     }
 
     // The dispatcher formats unexpected messages into logged error strings,
-    // so a debug-printed `AddServer` must not carry the secret.
+    // so a debug-printed `AddServer` must not carry either enrollment value.
     #[test]
-    fn add_server_debug_redacts_the_secret() {
+    fn add_server_debug_redacts_enrollment_values() {
         let m = ClientMsg::AddServer {
             name: "away".into(),
             addr: "198.51.100.7:9000".into(),
-            secret: ServerSecret("hunter2".into()),
+            server_public: ServerSecret("server-identity".into()),
+            credential: ServerSecret("client-credential".into()),
             transport: Transport::Tcp,
         };
         let s = format!("{m:?}");
-        assert!(!s.contains("hunter2"), "{s}");
+        assert!(!s.contains("server-identity"), "{s}");
+        assert!(!s.contains("client-credential"), "{s}");
         assert!(s.contains("away"));
     }
 }

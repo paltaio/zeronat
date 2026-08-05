@@ -6,6 +6,7 @@
 
 use crate::Result;
 use std::fs::File;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use zeronat_install_support::DownloadFile;
@@ -15,7 +16,8 @@ const COMPOSE_FILE: &str = "/etc/zeronat/compose.yml";
 const BIN_PATH: &str = "/usr/local/bin/zeronat";
 const UNIT_FILE: &str = "/etc/systemd/system/zeronat.service";
 const CONTAINER: &str = "zeronat";
-const IMAGE: &str = "ghcr.io/paltaio/zeronat:latest";
+const IMAGE: &str = "ghcr.io/paltaio/zeronat:protocol-v6";
+const BINARY_ASSET_PREFIX: &str = "zeronat-v6";
 const RELEASE_BASE: &str = "https://github.com/paltaio/zeronat/releases/latest/download";
 const LATEST_URL: &str = "https://github.com/paltaio/zeronat/releases/latest";
 
@@ -81,22 +83,33 @@ pub fn run(check_only: bool) -> Result<()> {
         .into());
     }
 
+    if !check_only {
+        validate_installed_credentials(systemd.is_some(), docker.as_ref())?;
+    }
+
     let latest = latest_version()?;
+    let systemd_newer = systemd
+        .as_ref()
+        .is_some_and(|current| version_newer(&latest, current));
+    let docker_newer = docker
+        .as_ref()
+        .is_some_and(|deployment| version_newer(&latest, &deployment.version));
     let mut applied = false;
 
     if let Some(current) = &systemd {
-        let newer = version_newer(&latest, current);
-        println!("systemd: {}", status_line(current, &latest, newer));
-        if newer && !check_only {
+        println!("systemd: {}", status_line(current, &latest, systemd_newer));
+        if systemd_newer && !check_only {
             upgrade_systemd(&latest)?;
             applied = true;
         }
     }
 
     if let Some(dep) = &docker {
-        let newer = version_newer(&latest, &dep.version);
-        println!("docker:  {}", status_line(&dep.version, &latest, newer));
-        if newer && !check_only {
+        println!(
+            "docker:  {}",
+            status_line(&dep.version, &latest, docker_newer)
+        );
+        if docker_newer && !check_only {
             upgrade_docker(dep)?;
             applied = true;
         }
@@ -110,6 +123,379 @@ pub fn run(check_only: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_installed_credentials(
+    has_systemd: bool,
+    docker: Option<&DockerDeployment>,
+) -> Result<()> {
+    let env = if Path::new(ENV_FILE).exists() {
+        std::fs::read_to_string(ENV_FILE)
+            .map_err(|e| format!("reading {ENV_FILE} before upgrade: {e}"))?
+    } else {
+        String::new()
+    };
+    validate_credential_env(&env)?;
+
+    if has_systemd {
+        let unit = std::fs::read_to_string(UNIT_FILE)
+            .map_err(|e| format!("reading {UNIT_FILE} before upgrade: {e}"))?;
+        let command: Vec<&str> = unit
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("ExecStart="))
+            .map(str::split_whitespace)
+            .map(Iterator::collect)
+            .ok_or_else(|| format!("cannot determine the zeronat command in {UNIT_FILE}"))?;
+        validate_deployment_command(&command, "systemd", &env)?;
+    }
+
+    if let Some(deployment) = docker {
+        if !deployment.compose && !Path::new(ENV_FILE).exists() {
+            return Err(format!(
+                "cannot upgrade the docker deployment without {ENV_FILE}; restore its enrollment values first"
+            )
+            .into());
+        }
+        let command = if deployment.compose {
+            rendered_compose_command(deployment.mode)?
+        } else {
+            direct_docker_command(deployment.mode)?
+        };
+        let command: Vec<&str> = command.iter().map(String::as_str).collect();
+        validate_deployment_command(&command, "docker", &env)?;
+        if !deployment.compose {
+            let current = inspect_container_env(deployment.mode)?;
+            validate_container_env(&current, &env)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_container_env(current: &[String], env_file: &str) -> Result<()> {
+    let configured: std::collections::HashMap<&str, &str> = env_file
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            (!line.is_empty() && !line.starts_with('#'))
+                .then(|| line.split_once('='))
+                .flatten()
+                .map(|(key, value)| (key.trim(), value))
+        })
+        .filter(|(key, _)| !key.is_empty())
+        .collect();
+    let mut current_env = std::collections::HashMap::new();
+    for entry in current {
+        let (key, value) = entry
+            .split_once('=')
+            .ok_or("the running container has a malformed environment entry")?;
+        current_env.insert(key, value);
+    }
+    let mut changed: Vec<&str> = configured
+        .keys()
+        .copied()
+        .filter(|key| current_env.get(key).copied() != configured.get(key).copied())
+        .collect();
+    changed.sort_unstable();
+    changed.dedup();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "cannot recreate the container because {ENV_FILE} differs from the running container for: {}",
+        changed.join(", ")
+    )
+    .into())
+}
+
+fn docker_restart_policy(name: String, retries: String) -> Result<String> {
+    let retries: u64 = retries
+        .parse()
+        .map_err(|_| "cannot determine the docker restart retry count")?;
+    if name == "on-failure" && retries > 0 {
+        Ok(format!("{name}:{retries}"))
+    } else {
+        Ok(name)
+    }
+}
+
+fn protected_env_file(entries: &[String]) -> Result<DownloadFile> {
+    let snapshot = DownloadFile::create()?;
+    let mut output = snapshot.output();
+    for entry in entries {
+        validate_env_file_entry(entry)?;
+        writeln!(output, "{entry}")
+            .map_err(|error| format!("writing the private environment snapshot: {error}"))?;
+    }
+    output
+        .sync_all()
+        .map_err(|error| format!("syncing the private environment snapshot: {error}"))?;
+    Ok(snapshot)
+}
+
+fn validate_env_file_entry(entry: &str) -> Result<()> {
+    const MAX_LINE: usize = 64 * 1024 - 1;
+
+    let (key, value) = entry
+        .split_once('=')
+        .ok_or("the running container has a malformed environment entry")?;
+    let valid_key = key
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if !valid_key
+        || value.contains(['\0', '\n', '\r'])
+        || value.trim() != value
+        || entry.len() > MAX_LINE
+    {
+        return Err(
+            "the running container environment cannot be represented by a protected env file"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_image_env(current: &[String], image: &[String]) -> Result<()> {
+    let current_keys: std::collections::HashSet<&str> = current
+        .iter()
+        .map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(key, _)| key)
+                .ok_or("the running container has a malformed environment entry")
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let mut added = Vec::new();
+    for entry in image {
+        let key = entry
+            .split_once('=')
+            .map(|(key, _)| key)
+            .ok_or("the pulled image has a malformed environment entry")?;
+        if !current_keys.contains(key) {
+            added.push(key);
+        }
+    }
+    added.sort_unstable();
+    added.dedup();
+    if added.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot recreate the container because the pulled image adds environment keys: {}",
+            added.join(", ")
+        )
+        .into())
+    }
+}
+
+fn direct_docker_command(mode: DockerMode) -> Result<Vec<String>> {
+    let out = dk(
+        mode,
+        &[
+            "inspect",
+            "-f",
+            "{{range .Config.Cmd}}{{println .}}{{end}}",
+            CONTAINER,
+        ],
+    )
+    .map_err(|e| format!("inspecting the docker deployment before upgrade: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "inspecting the docker deployment before upgrade: {}",
+            errtext(&out)
+        )
+        .into());
+    }
+    let command: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if command.is_empty() {
+        return Err("cannot determine the zeronat command for the docker deployment".into());
+    }
+    Ok(command)
+}
+
+fn rendered_compose_command(mode: DockerMode) -> Result<Vec<String>> {
+    let mut command = if dk(mode, &["compose", "version"])
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+    {
+        compose_command(
+            mode,
+            "docker",
+            Some("compose"),
+            &[
+                "--env-file",
+                ENV_FILE,
+                "-f",
+                COMPOSE_FILE,
+                "config",
+                "--format",
+                "json",
+            ],
+        )
+    } else if have("docker-compose") {
+        compose_command(
+            mode,
+            "docker-compose",
+            None,
+            &[
+                "--env-file",
+                ENV_FILE,
+                "-f",
+                COMPOSE_FILE,
+                "config",
+                "--format",
+                "json",
+            ],
+        )
+    } else {
+        return Err("a compose file exists but docker compose is not available".into());
+    };
+    let out = command
+        .output()
+        .map_err(|e| format!("rendering {COMPOSE_FILE} before upgrade: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("rendering {COMPOSE_FILE} before upgrade: {}", errtext(&out)).into());
+    }
+    parse_compose_command(&out.stdout)
+}
+
+fn parse_compose_command(body: &[u8]) -> Result<Vec<String>> {
+    let config: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| format!("reading rendered compose configuration: {e}"))?;
+    let command = config
+        .get("services")
+        .and_then(|services| services.get(CONTAINER))
+        .and_then(|service| service.get("command"))
+        .ok_or_else(|| format!("cannot determine the zeronat command in {COMPOSE_FILE}"))?;
+    let command = match command {
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .map(|part| {
+                part.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("invalid zeronat command in {COMPOSE_FILE}"))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        serde_json::Value::String(command) => {
+            command.split_whitespace().map(str::to_string).collect()
+        }
+        _ => return Err(format!("invalid zeronat command in {COMPOSE_FILE}").into()),
+    };
+    if command.is_empty() {
+        return Err(format!("cannot determine the zeronat command in {COMPOSE_FILE}").into());
+    }
+    Ok(command)
+}
+
+fn validate_credential_env(body: &str) -> Result<()> {
+    let identity = env_value(body, "ZERONAT_SECRET");
+    let credential = env_value(body, "ZERONAT_CLIENT_SECRET");
+    if matches!(
+        (identity, credential),
+        (Some(identity), Some(credential))
+            if identity.trim().eq_ignore_ascii_case(credential.trim())
+    ) {
+        return Err(
+            "legacy shared credentials detected; rerun the installer on the server, run its client enrollment command on each client, then retry the upgrade"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn env_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    body.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_deployment_command(args: &[&str], source: &str, env: &str) -> Result<()> {
+    let role_index = usize::from(
+        args.first()
+            .is_some_and(|arg| *arg == "zeronat" || arg.ends_with("/zeronat")),
+    );
+    match args.get(role_index).copied() {
+        Some("server") => return Ok(()),
+        Some("client") => {}
+        _ => {
+            return Err(
+                format!("cannot determine whether the {source} deployment is a client").into(),
+            );
+        }
+    }
+
+    if let Some(config_index) = args.iter().position(|arg| *arg == "--config") {
+        let path = args
+            .get(config_index + 1)
+            .ok_or_else(|| format!("the {source} client command has --config without a path"))?;
+        let body = std::fs::read_to_string(path)
+            .map_err(|e| format!("reading client config {path} before upgrade: {e}"))?;
+        if validate_client_config(path, &body)? {
+            return Ok(());
+        }
+    }
+
+    let identity = value_after(args, "--secret").or_else(|| env_value(env, "ZERONAT_SECRET"));
+    let credential =
+        value_after(args, "--credential").or_else(|| env_value(env, "ZERONAT_CLIENT_SECRET"));
+    validate_enrollment_values(identity, credential, source)
+}
+
+fn value_after<'a>(args: &'a [&str], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|arg| *arg == flag)
+        .and_then(|index| args.get(index + 1).copied())
+}
+
+fn validate_enrollment_values(
+    identity: Option<&str>,
+    credential: Option<&str>,
+    source: &str,
+) -> Result<()> {
+    let action = "rerun the installer on the server, run its client enrollment command on this client, then retry the upgrade";
+    let identity =
+        identity.ok_or_else(|| format!("the {source} client has no server identity; {action}"))?;
+    let credential = credential
+        .ok_or_else(|| format!("the {source} client has no client credential; {action}"))?;
+    let identity = zeronat_secret::normalize(identity).map_err(|_| {
+        format!(
+            "the {source} client's server identity must be exactly 64 hexadecimal characters (32 bytes)"
+        )
+    })?;
+    let credential = zeronat_secret::normalize(credential).map_err(|_| {
+        format!(
+            "the {source} client's credential must be exactly 64 hexadecimal characters (32 bytes)"
+        )
+    })?;
+    if identity == credential {
+        return Err(format!("legacy shared credentials detected; {action}").into());
+    }
+    Ok(())
+}
+
+fn validate_client_config(path: &str, body: &str) -> Result<bool> {
+    let action = "rerun the installer on the server, run its client enrollment command on this client, then retry the upgrade";
+    let classify = |error: crate::Error| {
+        let enrollment_error = crate::clientcfg::is_enrollment_error(&error);
+        let error = error.to_string();
+        if enrollment_error {
+            format!("client config {path} uses legacy enrollment values; {action}")
+        } else {
+            format!("cannot upgrade with client config {path}: {error}")
+        }
+    };
+    let config = crate::clientcfg::parse_client(body).map_err(classify)?;
+    config.validate().map_err(classify)?;
+    Ok(!config.servers.is_empty())
 }
 
 fn status_line(current: &str, latest: &str, newer: bool) -> String {
@@ -206,8 +592,8 @@ fn upgrade_systemd_with(latest: &str, runner: &mut dyn UpgradeRunner) -> Result<
         return Err("curl is required to download the new binary".into());
     }
     let target = arch_target()?;
-    println!("systemd: downloading zeronat-{target} ({latest})");
-    let url = format!("{RELEASE_BASE}/zeronat-{target}");
+    println!("systemd: downloading {BINARY_ASSET_PREFIX}-{target} ({latest})");
+    let url = format!("{RELEASE_BASE}/{BINARY_ASSET_PREFIX}-{target}");
     let mut download = DownloadFile::create()?;
     let dl = runner
         .run_with_stdout(
@@ -245,45 +631,101 @@ fn upgrade_systemd_with(latest: &str, runner: &mut dyn UpgradeRunner) -> Result<
 fn upgrade_docker(dep: &DockerDeployment) -> Result<()> {
     if dep.compose {
         println!("docker:  pulling image via compose");
-        compose(dep.mode, &["-f", COMPOSE_FILE, "pull"])?;
+        compose(
+            dep.mode,
+            &["--env-file", ENV_FILE, "-f", COMPOSE_FILE, "pull"],
+        )?;
         println!("docker:  recreating container");
-        compose(dep.mode, &["-f", COMPOSE_FILE, "up", "-d"])?;
+        compose(
+            dep.mode,
+            &["--env-file", ENV_FILE, "-f", COMPOSE_FILE, "up", "-d"],
+        )?;
     } else {
+        let snapshot = run_snapshot(dep.mode)?;
         println!("docker:  pulling {IMAGE}");
         let pull = dk(dep.mode, &["pull", IMAGE]).map_err(|e| format!("running docker: {e}"))?;
         if !pull.status.success() {
             return Err(format!("docker pull: {}", errtext(&pull)).into());
         }
         println!("docker:  recreating container");
-        recreate_run(dep.mode)?;
+        recreate_run(dep.mode, snapshot)?;
     }
     Ok(())
 }
 
-/// Recreate a plain `docker run` container on the freshly pulled image, carrying
-/// over the run config (command, network, restart policy, caps, devices) read
-/// back from the old container. The secret rides via the installer env file; if
-/// that file is absent we refuse rather than put the secret on argv.
-fn recreate_run(mode: DockerMode) -> Result<()> {
-    // Fail before touching the running container if there is no env file to carry
-    // the secret. Recreating it from the inspected env would expose ZERONAT_SECRET
-    // on the new process's argv (ps, /proc/<pid>/cmdline); refuse instead.
+/// Configuration captured from a plain `docker run` container for recreation.
+struct RunSnapshot {
+    cmd: Vec<String>,
+    env: Vec<String>,
+    caps: Vec<String>,
+    devices: Vec<String>,
+    binds: Vec<String>,
+    network: String,
+    restart: String,
+}
+
+fn run_snapshot(mode: DockerMode) -> Result<RunSnapshot> {
     if !Path::new(ENV_FILE).exists() {
         return Err(format!(
-            "cannot recreate the container without {ENV_FILE}; create it with the \
-             ZERONAT_SECRET line and re-run the upgrade"
+            "cannot recreate the container without {ENV_FILE}; restore the deployment's \
+             enrollment values in it and re-run the upgrade"
         )
         .into());
     }
-    let cmd = inspect_lines(mode, "{{range .Config.Cmd}}{{println .}}{{end}}");
-    let caps = inspect_lines(mode, "{{range .HostConfig.CapAdd}}{{println .}}{{end}}");
-    let devices = inspect_lines(
+    let cmd = inspect_lines_required(mode, "{{range .Config.Cmd}}{{println .}}{{end}}")?;
+    if cmd.is_empty() {
+        return Err("cannot determine the zeronat command for the docker deployment".into());
+    }
+    let env = inspect_container_env(mode)?;
+    let caps = inspect_lines_required(mode, "{{range .HostConfig.CapAdd}}{{println .}}{{end}}")?;
+    let devices = inspect_lines_required(
         mode,
-        "{{range .HostConfig.Devices}}{{println .PathOnHost}}{{end}}",
-    );
-    let network = inspect_one(mode, "{{.HostConfig.NetworkMode}}").unwrap_or_else(|| "host".into());
-    let restart = inspect_one(mode, "{{.HostConfig.RestartPolicy.Name}}")
-        .unwrap_or_else(|| "unless-stopped".into());
+        "{{range .HostConfig.Devices}}{{printf \"%s:%s:%s\\n\" .PathOnHost .PathInContainer .CgroupPermissions}}{{end}}",
+    )?;
+    let binds = inspect_lines_required(mode, "{{range .HostConfig.Binds}}{{println .}}{{end}}")?;
+    let network = inspect_lines_required(mode, "{{.HostConfig.NetworkMode}}")?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let restart_name = inspect_lines_required(mode, "{{.HostConfig.RestartPolicy.Name}}")?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let restart_retries =
+        inspect_lines_required(mode, "{{.HostConfig.RestartPolicy.MaximumRetryCount}}")?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "0".into());
+    let restart = docker_restart_policy(restart_name, restart_retries)?;
+    Ok(RunSnapshot {
+        cmd,
+        env,
+        caps,
+        devices,
+        binds,
+        network,
+        restart,
+    })
+}
+
+fn recreate_run(mode: DockerMode, snapshot: RunSnapshot) -> Result<()> {
+    let RunSnapshot {
+        cmd,
+        env,
+        caps,
+        devices,
+        binds,
+        network,
+        restart,
+    } = snapshot;
+
+    let image_env = inspect_image_env(mode)?;
+    validate_image_env(&env, &image_env)?;
+    let env_file = protected_env_file(&env)?;
+    let env_path = env_file
+        .path()
+        .to_str()
+        .ok_or("the private environment snapshot path is not valid UTF-8")?;
 
     let rm = dk(mode, &["rm", "-f", CONTAINER]).map_err(|e| format!("running docker: {e}"))?;
     if !rm.status.success() {
@@ -307,8 +749,12 @@ fn recreate_run(mode: DockerMode) -> Result<()> {
         args.push("--device".into());
         args.push(d.clone());
     }
+    for bind in &binds {
+        args.push("-v".into());
+        args.push(bind.clone());
+    }
     args.push("--env-file".into());
-    args.push(ENV_FILE.into());
+    args.push(env_path.into());
     args.push(IMAGE.into());
     args.extend(cmd);
 
@@ -320,23 +766,43 @@ fn recreate_run(mode: DockerMode) -> Result<()> {
     Ok(())
 }
 
-fn inspect_lines(mode: DockerMode, fmt: &str) -> Vec<String> {
-    dk(mode, &["inspect", "-f", fmt, CONTAINER])
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+fn inspect_lines_required(mode: DockerMode, fmt: &str) -> Result<Vec<String>> {
+    let out = dk(mode, &["inspect", "-f", fmt, CONTAINER])
+        .map_err(|error| format!("inspecting the docker deployment: {error}"))?;
+    if !out.status.success() {
+        return Err(format!("inspecting the docker deployment: {}", errtext(&out)).into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
-fn inspect_one(mode: DockerMode, fmt: &str) -> Option<String> {
-    inspect_lines(mode, fmt).into_iter().next()
+fn inspect_container_env(mode: DockerMode) -> Result<Vec<String>> {
+    let out = dk(mode, &["inspect", "-f", "{{json .Config.Env}}", CONTAINER])
+        .map_err(|error| format!("inspecting the docker deployment: {error}"))?;
+    if !out.status.success() {
+        return Err(format!("inspecting the docker deployment: {}", errtext(&out)).into());
+    }
+    serde_json::from_slice::<Option<Vec<String>>>(&out.stdout)
+        .map(Option::unwrap_or_default)
+        .map_err(|error| format!("reading the docker environment snapshot: {error}").into())
+}
+
+fn inspect_image_env(mode: DockerMode) -> Result<Vec<String>> {
+    let out = dk(
+        mode,
+        &["image", "inspect", "-f", "{{json .Config.Env}}", IMAGE],
+    )
+    .map_err(|error| format!("inspecting the pulled docker image: {error}"))?;
+    if !out.status.success() {
+        return Err(format!("inspecting the pulled docker image: {}", errtext(&out)).into());
+    }
+    serde_json::from_slice::<Option<Vec<String>>>(&out.stdout)
+        .map(Option::unwrap_or_default)
+        .map_err(|error| format!("reading the pulled image environment: {error}").into())
 }
 
 fn compose(mode: DockerMode, args: &[&str]) -> Result<()> {
@@ -344,17 +810,9 @@ fn compose(mode: DockerMode, args: &[&str]) -> Result<()> {
         .map(|o| o.status.success())
         .unwrap_or(false)
     {
-        let mut full = vec!["compose"];
-        full.extend_from_slice(args);
-        dk(mode, &full)
+        compose_command(mode, "docker", Some("compose"), args).output()
     } else if have("docker-compose") {
-        match mode {
-            DockerMode::Direct => Command::new("docker-compose").args(args).output(),
-            DockerMode::Sudo => Command::new("sudo")
-                .arg("docker-compose")
-                .args(args)
-                .output(),
-        }
+        compose_command(mode, "docker-compose", None, args).output()
     } else {
         return Err("a compose file exists but docker compose is not available".into());
     };
@@ -363,6 +821,32 @@ fn compose(mode: DockerMode, args: &[&str]) -> Result<()> {
         Ok(())
     } else {
         Err(format!("compose: {}", errtext(&out)).into())
+    }
+}
+
+fn compose_command(
+    mode: DockerMode,
+    program: &str,
+    subcommand: Option<&str>,
+    args: &[&str],
+) -> Command {
+    match mode {
+        DockerMode::Direct => {
+            let mut command = Command::new(program);
+            command.env("ZERONAT_IMAGE", IMAGE);
+            command.args(subcommand).args(args);
+            command
+        }
+        DockerMode::Sudo => {
+            let mut command = Command::new("sudo");
+            command
+                .arg("env")
+                .arg(format!("ZERONAT_IMAGE={IMAGE}"))
+                .arg(program)
+                .args(subcommand)
+                .args(args);
+            command
+        }
     }
 }
 
@@ -553,7 +1037,7 @@ fn effective_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
 
     struct FakeUpgradeRunner {
         commands: Vec<String>,
@@ -612,7 +1096,9 @@ mod tests {
         assert!(runner
             .commands
             .iter()
-            .any(|command| command.starts_with("curl -fsSL ") && !command.contains(" -o ")));
+            .any(|command| command.starts_with("curl -fsSL ")
+                && command.contains("/zeronat-v6-")
+                && !command.contains(" -o ")));
         assert!(runner
             .commands
             .iter()
@@ -620,6 +1106,165 @@ mod tests {
         assert!(runner
             .commands
             .contains(&"systemctl restart zeronat".to_string()));
+    }
+
+    #[test]
+    fn legacy_shared_credentials_block_upgrade() {
+        let legacy = "ZERONAT_SECRET=001122\nZERONAT_CLIENT_SECRET=001122\n";
+        let error = validate_credential_env(legacy).unwrap_err().to_string();
+        assert!(error.contains("legacy shared credentials"), "{error}");
+        assert!(error.contains("rerun the installer"), "{error}");
+
+        let current = "ZERONAT_SECRET=001122\nZERONAT_CLIENT_SECRET=aabbcc\n";
+        validate_credential_env(current).unwrap();
+    }
+
+    #[test]
+    fn systemd_legacy_client_config_blocks_upgrade() {
+        let path = std::env::temp_dir().join(format!(
+            "zeronat-upgrade-systemd-config-{}",
+            std::process::id()
+        ));
+        let legacy = "[[servers]]\nname = \"home\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n";
+        std::fs::write(&path, legacy).unwrap();
+        let path_text = path.to_string_lossy();
+        let command = ["/usr/local/bin/zeronat", "client", "--config", &path_text];
+
+        let error = validate_deployment_command(&command, "systemd", "")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("legacy enrollment values"), "{error}");
+        assert!(error.contains("rerun the installer"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn docker_shared_client_config_blocks_upgrade() {
+        let path = std::env::temp_dir().join(format!(
+            "zeronat-upgrade-docker-config-{}",
+            std::process::id()
+        ));
+        let secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let shared = format!(
+            "[[servers]]\nname = \"home\"\naddr = \"dht\"\nsecret = \"{secret}\"\ncredential = \"{}\"\n",
+            secret.to_ascii_uppercase()
+        );
+        std::fs::write(&path, shared).unwrap();
+        let path_text = path.to_string_lossy();
+        let command = ["client", "--config", &path_text];
+
+        let error = validate_deployment_command(&command, "docker", "")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("legacy enrollment values"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn current_client_config_reaches_upgrade() {
+        let secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let credential = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+        let current = format!(
+            "[[servers]]\nname = \"home\"\naddr = \"dht\"\nsecret = \"{secret}\"\ncredential = \"{credential}\"\n"
+        );
+
+        assert!(validate_client_config("client.toml", &current).unwrap());
+    }
+
+    #[test]
+    fn container_environment_requires_recreation_values() {
+        let current = [
+            "ZERONAT_SECRET=current".into(),
+            "MODE=client".into(),
+            "PATH=/usr/local/bin:/usr/bin".into(),
+        ];
+
+        validate_container_env(&current, "ZERONAT_SECRET=current\nMODE=client\n").unwrap();
+
+        let error = validate_container_env(
+            &current,
+            "ZERONAT_SECRET=replacement\nMODE=client\nEXTRA=value\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("ZERONAT_SECRET"), "{error}");
+        assert!(error.contains("EXTRA"), "{error}");
+        assert!(!error.contains("PATH"), "{error}");
+        assert!(!error.contains("current"), "{error}");
+        assert!(!error.contains("replacement"), "{error}");
+    }
+
+    #[test]
+    fn docker_restart_policy_keeps_failure_retry_limit() {
+        assert_eq!(
+            docker_restart_policy("on-failure".into(), "7".into()).unwrap(),
+            "on-failure:7"
+        );
+        assert_eq!(
+            docker_restart_policy("always".into(), "0".into()).unwrap(),
+            "always"
+        );
+    }
+
+    #[test]
+    fn environment_snapshot_refuses_unrepresentable_entries_and_new_image_keys() {
+        assert!(
+            validate_env_file_entry("ZERONAT_ARGS=client --config /etc/zeronat/client.toml")
+                .is_ok()
+        );
+        assert!(validate_env_file_entry("#SECRET=value").is_err());
+        assert!(validate_env_file_entry("SECRET= trailing ").is_err());
+        assert!(validate_env_file_entry(&format!("LONG={}", "x".repeat(64 * 1024))).is_err());
+
+        let current = ["PATH=/old".into(), "SECRET=current".into()];
+        validate_image_env(&current, &["PATH=/new".into()]).unwrap();
+        let error = validate_image_env(&current, &["NEW=value".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("NEW"), "{error}");
+        assert!(!error.contains("value"), "{error}");
+    }
+
+    #[test]
+    fn client_role_is_not_bypassed_by_a_server_argument_value() {
+        let path = std::env::temp_dir().join(format!(
+            "zeronat-upgrade-role-config-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, "").unwrap();
+        let path_text = path.to_string_lossy();
+        let command = ["client", "--config", &path_text, "--name", "server"];
+
+        let error = validate_deployment_command(&command, "systemd", "").unwrap_err();
+
+        assert!(error.to_string().contains("no server identity"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn client_without_config_requires_both_enrollment_values() {
+        let command = ["client"];
+        let env =
+            "ZERONAT_SECRET=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n";
+
+        let error = validate_deployment_command(&command, "docker", env).unwrap_err();
+
+        assert!(
+            error.to_string().contains("no client credential"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rendered_compose_command_selects_the_zeronat_service() {
+        let rendered = br#"{"services":{"other":{"command":["server"]},"zeronat":{"command":["client","--config","/etc/zeronat/client.toml"]}}}"#;
+
+        assert_eq!(
+            parse_compose_command(rendered).unwrap(),
+            ["client", "--config", "/etc/zeronat/client.toml"]
+        );
     }
 
     #[test]

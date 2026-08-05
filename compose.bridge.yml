@@ -1,6 +1,6 @@
 services:
   zeronat:
-    image: ${ZERONAT_IMAGE:-ghcr.io/paltaio/zeronat:latest}
+    image: ${ZERONAT_IMAGE:-ghcr.io/paltaio/zeronat:protocol-v6}
     container_name: zeronat
     network_mode: host
     restart: unless-stopped

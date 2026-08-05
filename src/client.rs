@@ -29,8 +29,8 @@ use crate::kcp::{
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{
-    client_handshake_remote, client_handshake_stateless_claim,
-    client_handshake_stateless_claim_reply, AuthRole,
+    client_handshake_remote, client_handshake_stateless_claim_remote,
+    client_handshake_stateless_claim_remote_reply, AuthRole,
 };
 use crate::peerslot;
 use crate::peerslot::PeerControl;
@@ -350,7 +350,6 @@ impl SharedForwards {
 
 struct Client {
     server: String,
-    psk: [u8; 32],
     credential_psk: [u8; 32],
     client_id: String,
     tcp: HashMap<u16, ForwardTarget>,
@@ -359,6 +358,7 @@ struct Client {
     /// The capability bits to announce once this control session is up, or
     /// `None` when no peer slot is configured and nothing is announced.
     peer_announce: Option<u8>,
+    peer_static: Option<[u8; 32]>,
 }
 
 /// Aborts its task when dropped. Ties a spawned task's lifetime to the scope
@@ -390,15 +390,16 @@ enum Discovery {
 }
 
 impl Discovery {
-    fn new(server: &str, secret: &str) -> Result<Self> {
+    fn new(server: &str, server_public: &str, credential: &str) -> Result<Self> {
         if server == "dht" {
             #[cfg(feature = "dht")]
             return Ok(Discovery::Dht(Arc::new(crate::dht::Identity::derive(
-                secret,
+                server_public,
+                credential,
             )?)));
             #[cfg(not(feature = "dht"))]
             {
-                let _ = secret;
+                let _ = (server_public, credential);
                 return Err("this build has no dht support; pass --server host:port".into());
             }
         }
@@ -445,6 +446,24 @@ pub struct ServerTarget {
     pub transport: Transport,
 }
 
+fn normalize_target_credentials(target: &mut ServerTarget) -> Result<()> {
+    target.secret = crate::secret::normalize(&target.secret)?;
+    target.credential = crate::secret::normalize(&target.credential)?;
+    if target.secret == target.credential {
+        return Err(format!(
+            "server `{}` identity and client credential must differ",
+            target.name
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn target_knows_peer_secret(target: &ServerTarget, peer_secret: &[u8; 32]) -> bool {
+    crate::secret::decode(&target.secret).is_ok_and(|value| value == *peer_secret)
+        || crate::secret::decode(&target.credential).is_ok_and(|value| value == *peer_secret)
+}
+
 /// The selectable server profiles, shared between the admin dispatcher (which
 /// resolves, appends, and removes them) and snapshot views. Lock-only, like
 /// [`SharedForwards`]: no holder ever awaits with the lock taken.
@@ -471,13 +490,14 @@ impl SharedServers {
     }
 
     /// Append a profile; `false` (and no change) when the name is taken.
-    pub(crate) fn add(&self, target: ServerTarget) -> bool {
+    pub(crate) fn add(&self, mut target: ServerTarget) -> Result<bool> {
+        normalize_target_credentials(&mut target)?;
         let mut list = self.inner.lock().unwrap();
         if list.iter().any(|s| s.name == target.name) {
-            return false;
+            return Ok(false);
         }
         list.push(target);
-        true
+        Ok(true)
     }
 
     /// Remove the named profile; `false` when no such profile exists.
@@ -510,10 +530,9 @@ impl SharedServers {
     }
 }
 
-/// Per-server dial state: the derived PSK and the discovery, whose DHT
-/// identity carries the resolver cache.
+/// Per-server dial state: the client credential and the discovery identity,
+/// which carries the resolver cache.
 struct DialState {
-    psk: [u8; 32],
     credential_psk: [u8; 32],
     discovery: Discovery,
 }
@@ -550,9 +569,8 @@ impl DialMemo {
         match self.0.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
             std::collections::hash_map::Entry::Vacant(e) => Ok(e.insert(DialState {
-                psk: crate::noise::derive_psk(&target.secret),
                 credential_psk: crate::noise::derive_psk(&target.credential),
-                discovery: Discovery::new(&target.addr, &target.secret)?,
+                discovery: Discovery::new(&target.addr, &target.secret, &target.credential)?,
             })),
         }
     }
@@ -884,9 +902,7 @@ impl ActiveTarget {
 
     fn normalize_secret(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        state.target.secret = crate::secret::normalize(&state.target.secret)?;
-        state.target.credential = crate::secret::normalize(&state.target.credential)?;
-        Ok(())
+        normalize_target_credentials(&mut state.target)
     }
 
     /// Install a session body with no peer slots to admit it against.
@@ -981,10 +997,12 @@ impl ActiveTarget {
     /// in-flight session task, awaits its teardown, and brings the same body up
     /// against the new target; the brief link drop is inherent to the
     /// teardown-then-bringup.
-    pub fn switch(&self, target: ServerTarget) {
+    pub fn switch(&self, mut target: ServerTarget) -> Result<()> {
+        normalize_target_credentials(&mut target)?;
         let mut s = self.state.lock().unwrap();
         s.target = target;
         s.cancel.notify_one();
+        Ok(())
     }
 
     /// Replace the session body and fire the cancel: the loop tears the
@@ -1017,9 +1035,12 @@ impl ActiveTarget {
     /// is the park's exit, never a retarget of a live session.
     pub fn connect(
         &self,
-        target: Option<ServerTarget>,
+        mut target: Option<ServerTarget>,
         boot: RunMode,
     ) -> std::result::Result<bool, String> {
+        if let Some(target) = &mut target {
+            normalize_target_credentials(target).map_err(|error| error.to_string())?;
+        }
         let mut s = self.state.lock().unwrap();
         if !matches!(s.mode, RunMode::Idle | RunMode::Offline) {
             return Ok(false);
@@ -1150,6 +1171,7 @@ pub async fn run(
             .collect(),
         autostart,
         id_prefix,
+        peer_secret: None,
         control,
         config: None,
         peers: Vec::new(),
@@ -1180,6 +1202,7 @@ pub struct ClientSettings {
     /// Name of the pppoe session to boot when no forwards are declared.
     pub autostart: Option<String>,
     pub id_prefix: Option<String>,
+    pub peer_secret: Option<String>,
     pub control: Option<ControlPath>,
     /// Admin-mutation persistence: the config file and its parsed contents.
     /// `None` on a runtime-only client, whose mutations stay in memory.
@@ -1219,6 +1242,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         pppoe,
         autostart,
         id_prefix,
+        peer_secret,
         control,
         config,
         peers,
@@ -1226,10 +1250,36 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
     } = settings;
     active.normalize_secret()?;
     for target in &mut servers {
-        target.secret = crate::secret::normalize(&target.secret)?;
-        target.credential = crate::secret::normalize(&target.credential)?;
+        normalize_target_credentials(target)?;
     }
     let client_id = crate::identity::derive_client_id(id_prefix.as_deref());
+    let peer_static = peer_secret
+        .as_deref()
+        .map(crate::secret::decode)
+        .transpose()
+        .map_err(|_| -> crate::Error {
+            "client peer secret must be 64 hexadecimal characters".into()
+        })?;
+    if !peers.is_empty() && peer_static.is_none() {
+        return Err("a client peer secret is required when peer sessions are configured".into());
+    }
+    if let Some(peer_static) = peer_static {
+        let active_target = active.state.lock().unwrap().target.clone();
+        if target_knows_peer_secret(&active_target, &peer_static)
+            || servers
+                .iter()
+                .any(|target| target_knows_peer_secret(target, &peer_static))
+        {
+            return Err(
+                "client peer secret must differ from every server identity and client credential"
+                    .into(),
+            );
+        }
+        crate::elog!(
+            "peer identity {}",
+            crate::secret::encode(crate::peer::public_identity(&peer_static))
+        );
+    }
     #[cfg(not(target_os = "linux"))]
     if tap.is_some() || tun.is_some() {
         return Err("L2/L3 tunnel modes (--tap/--tun) are only supported on Linux".into());
@@ -1452,13 +1502,13 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
             let (tcp, udp) = forwards.maps();
             let client = Arc::new(Client {
                 server: addr,
-                psk: state.psk,
                 credential_psk: state.credential_psk,
                 client_id: client_id.clone(),
                 tcp,
                 udp,
                 transport: target.transport,
                 peer_announce: announce,
+                peer_static,
             });
             // Auto only: skip the UDP probe while a flap cooldown is active. Forced
             // Udp/Tcp ignore `try_udp` and keep their fixed path.
@@ -1746,7 +1796,7 @@ pub async fn probe_candidates(
     let stream = sess.open_conv_with(CLASS_SETUP, conv);
     let (noise, reply) = tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
-        client_handshake_stateless_claim_reply(stream, psk, probe_id, &probe_capability),
+        client_handshake_stateless_claim_remote_reply(stream, psk, probe_id, &probe_capability),
     )
     .await
     .map_err(|_| -> crate::Error { "probe handshake timed out".into() })??;
@@ -1881,7 +1931,7 @@ pub async fn relay_leg_dgram(
     let noise = Arc::new(
         tokio_timeout(
             OPEN_HANDSHAKE_TIMEOUT,
-            client_handshake_stateless_claim(stream, psk, id, &capability),
+            client_handshake_stateless_claim_remote(stream, psk, id, &capability),
         )
         .await
         .map_err(|_| -> crate::Error { "relay leg handshake timed out".into() })??,
@@ -1926,7 +1976,12 @@ async fn bridge_udp(
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
     let noise = match tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
-        client_handshake_stateless_claim(stream, &client.psk, BRIDGE_ID, &lease.capability),
+        client_handshake_stateless_claim_remote(
+            stream,
+            &client.credential_psk,
+            BRIDGE_ID,
+            &lease.capability,
+        ),
     )
     .await
     {
@@ -2201,7 +2256,12 @@ async fn pppoe_udp(
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
     let noise = match tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
-        client_handshake_stateless_claim(stream, &client.psk, BRIDGE_ID, &lease.capability),
+        client_handshake_stateless_claim_remote(
+            stream,
+            &client.credential_psk,
+            BRIDGE_ID,
+            &lease.capability,
+        ),
     )
     .await
     {
@@ -2459,8 +2519,15 @@ async fn control_loop(
     // forward options, carrying the union of the provider bits. The slots pair
     // through the session only once the ack comes back.
     let peer_ack = Arc::new(AtomicBool::new(false));
-    if let Some(provides) = client.peer_announce {
-        tx.try_send(Msg::PeerAnnounce { provides }.encode()).ok();
+    if let (Some(provides), Some(peer_static)) = (client.peer_announce, client.peer_static) {
+        tx.try_send(
+            Msg::PeerAnnounce {
+                provides,
+                identity: crate::peer::public_identity(&peer_static),
+            }
+            .encode(),
+        )
+        .ok();
     }
     // Filled when the ack arrives; dropping it at teardown bumps the
     // generation, which fails every peer cycle that has not settled on a
@@ -2606,8 +2673,11 @@ async fn control_loop(
                         tx: tx.clone(),
                         server: client.server.clone(),
                         client_id,
-                        psk: client.psk,
                         credential_psk: client.credential_psk,
+                        peer_static: client.peer_static.ok_or("peer identity is unavailable")?,
+                        peer_id: crate::secret::encode(crate::peer::public_identity(
+                            &client.peer_static.ok_or("peer identity is unavailable")?,
+                        )),
                         sess: match link.as_ref() {
                             Link::Udp(sess, _, _) => Some(sess.clone()),
                             Link::Tcp => None,
@@ -2792,7 +2862,12 @@ async fn handle_open(
             let noise = Arc::new(
                 tokio_timeout(
                     OPEN_HANDSHAKE_TIMEOUT,
-                    client_handshake_stateless_claim(stream, &client.psk, id, &capability),
+                    client_handshake_stateless_claim_remote(
+                        stream,
+                        &client.credential_psk,
+                        id,
+                        &capability,
+                    ),
                 )
                 .await
                 .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??,
@@ -2859,9 +2934,51 @@ mod tests {
             name: name.into(),
             addr: "127.0.0.1:1".into(),
             secret: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
-            credential: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
+            credential: "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100".into(),
             transport: Transport::Tcp,
         }
+    }
+
+    #[test]
+    fn target_boundary_rejects_copied_enrollment_values() {
+        let mut copied = target("copied");
+        copied.credential = copied.secret.clone();
+
+        let error = normalize_target_credentials(&mut copied).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("identity and client credential must differ"));
+    }
+
+    #[tokio::test]
+    async fn switchable_client_rejects_copied_profile_before_dialing() {
+        let active = target("active");
+        let mut copied = target("copied");
+        copied.credential = copied.secret.clone();
+        let settings = ClientSettings {
+            servers: vec![copied],
+            tcp: Vec::new(),
+            udp: Vec::new(),
+            tap: None,
+            tun: None,
+            pppoe: Vec::new(),
+            autostart: None,
+            id_prefix: None,
+            peer_secret: None,
+            control: None,
+            config: None,
+            peers: Vec::new(),
+            peer_sessions: None,
+        };
+
+        let error = run_switchable(ActiveTarget::new(active), settings)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("identity and client credential must differ"));
     }
 
     // A switch must never be lost, wherever it lands relative to a profile
@@ -2870,11 +2987,11 @@ mod tests {
     #[tokio::test]
     async fn switch_is_never_lost_across_begin() {
         let active = ActiveTarget::new(target("a"));
-        active.switch(target("b"));
+        active.switch(target("b")).unwrap();
         let (t, _mode, cancel, _) = active.begin();
         assert_eq!(t.name, "b");
 
-        active.switch(target("c"));
+        active.switch(target("c")).unwrap();
         tokio_timeout(Duration::from_secs(1), cancel.notified())
             .await
             .expect("switch did not fire the profile cancel");
@@ -2978,21 +3095,20 @@ mod tests {
         assert_eq!(active.admin_view().1, SessionMode::Forwards);
     }
 
-    // A stale memo would keep the old PSK and discovery after a
-    // remove-then-add under the same name; the triple key must miss instead.
+    // A stale memo would keep the old discovery after a remove-then-add under
+    // the same name; the profile key must miss instead.
     #[test]
     fn dial_memo_rekeys_on_addr_or_secret_change() {
         let mut memo = DialMemo::default();
         let mut t = target("a");
-        let psk = memo.state(&t).unwrap().psk;
-        // The same triple hits the memo.
+        memo.state(&t).unwrap();
+        // The same profile hits the memo.
         memo.state(&t).unwrap();
         assert_eq!(memo.0.len(), 1);
-        // Same name, new secret: a fresh entry with a fresh PSK.
+        // Same name, new server identity: a fresh entry.
         t.secret = "s2".into();
-        let rekeyed = memo.state(&t).unwrap().psk;
+        memo.state(&t).unwrap();
         assert_eq!(memo.0.len(), 2);
-        assert_ne!(psk, rekeyed);
         // Same name and secret, new address: its own entry too.
         t.addr = "127.0.0.1:2".into();
         memo.state(&t).unwrap();
@@ -3063,8 +3179,11 @@ mod tests {
         let servers = SharedServers::new(vec![target("a")]);
         assert!(servers.get("a").is_some());
         assert!(servers.get("b").is_none());
-        assert!(!servers.add(target("a")), "duplicate names must be refused");
-        assert!(servers.add(target("b")));
+        assert!(
+            !servers.add(target("a")).unwrap(),
+            "duplicate names must be refused"
+        );
+        assert!(servers.add(target("b")).unwrap());
         let names: Vec<String> = servers.entries().into_iter().map(|e| e.name).collect();
         assert_eq!(names, ["a", "b"]);
         assert!(!servers.remove("c"));
@@ -3078,7 +3197,7 @@ mod tests {
     fn switch_preserves_the_session_mode() {
         let active = ActiveTarget::new(target("a"));
         active.init_mode(pppoe_mode("wan"));
-        active.switch(target("b"));
+        active.switch(target("b")).unwrap();
         let (t, mode, _cancel, _) = active.begin();
         assert_eq!(t.name, "b");
         assert_eq!(mode.session_mode(), SessionMode::Pppoe);
@@ -3671,6 +3790,7 @@ mod tests {
             pppoe: vec![],
             autostart: None,
             id_prefix: Some("t".into()),
+            peer_secret: Some(crate::secret::encode([3; 32])),
             control: None,
             config: None,
             peers: vec![segment_provider_slot("zns0", "eth1")],
@@ -3681,6 +3801,22 @@ mod tests {
             .expect_err("a contended slot set must fail startup")
             .to_string();
         assert!(err.contains("eth1"), "{err}");
+    }
+
+    #[test]
+    fn peer_secret_must_not_be_relay_known_material() {
+        let secret = crate::secret::encode([3; 32]);
+        let target = ServerTarget {
+            name: "relay".into(),
+            addr: "dht".into(),
+            secret: secret.to_ascii_uppercase(),
+            credential: crate::secret::encode([4; 32]),
+            transport: Transport::Auto,
+        };
+
+        assert!(target_knows_peer_secret(&target, &[3; 32]));
+        assert!(target_knows_peer_secret(&target, &[4; 32]));
+        assert!(!target_knows_peer_secret(&target, &[5; 32]));
     }
 
     // A path that completes the TCP handshake but never sends Noise msg2 must

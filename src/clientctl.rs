@@ -328,7 +328,9 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
             // One call updates the target and fires the cancel; the session
             // body is preserved and comes back up against the new server. An
             // offline client just re-parks retargeted, nothing is dialed.
-            state.active.switch(target);
+            if let Err(error) = state.active.switch(target) {
+                return (false, error.to_string());
+            }
             persist(state, move |cfg| cfg.active = Some(name)).await
         }
         ClientMsg::SetForwardOptions {
@@ -404,7 +406,8 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
         ClientMsg::AddServer {
             name,
             addr,
-            secret,
+            server_public,
+            credential,
             transport,
         } => {
             // Mirror the parser and validate plus the checks boot hits at
@@ -418,7 +421,8 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
             for (field, value) in [
                 ("name", name.as_str()),
                 ("addr", addr.as_str()),
-                ("secret", secret.0.as_str()),
+                ("server identity", server_public.0.as_str()),
+                ("client credential", credential.0.as_str()),
             ] {
                 if value.chars().any(char::is_control) {
                     return (
@@ -427,10 +431,32 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                     );
                 }
             }
-            let secret = match crate::secret::normalize(&secret.0) {
-                Ok(secret) => ServerSecret(secret),
-                Err(e) => return (false, format!("server {e}")),
+            let server_public = match crate::secret::normalize(&server_public.0) {
+                Ok(public) => ServerSecret(public),
+                Err(_) => {
+                    return (
+                        false,
+                        "server identity must be exactly 64 hexadecimal characters (32 bytes)"
+                            .into(),
+                    );
+                }
             };
+            let credential = match crate::secret::normalize(&credential.0) {
+                Ok(credential) => ServerSecret(credential),
+                Err(_) => {
+                    return (
+                        false,
+                        "client credential must be exactly 64 hexadecimal characters (32 bytes)"
+                            .into(),
+                    );
+                }
+            };
+            if server_public == credential {
+                return (
+                    false,
+                    "server identity and client credential must differ".into(),
+                );
+            }
             if addr == "dht" {
                 if cfg!(not(feature = "dht")) {
                     return (false, "this build has no dht support; use host:port".into());
@@ -444,20 +470,24 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
             let target = ServerTarget {
                 name: name.clone(),
                 addr: addr.clone(),
-                secret: secret.0.clone(),
-                credential: secret.0.clone(),
+                secret: server_public.0.clone(),
+                credential: credential.0.clone(),
                 transport,
             };
             // Name uniqueness also protects the empty-name `Connect` sentinel.
-            if !state.servers.add(target) {
+            let added = match state.servers.add(target) {
+                Ok(added) => added,
+                Err(error) => return (false, error.to_string()),
+            };
+            if !added {
                 return (false, format!("a server named `{name}` already exists"));
             }
             persist(state, move |cfg| {
                 cfg.servers.push(CfgServer {
                     name,
                     addr,
-                    credential: secret.clone(),
-                    secret,
+                    credential,
+                    secret: server_public,
                     transport,
                 })
             })
@@ -719,6 +749,12 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
             }
         }
         ClientMsg::DetachPeer { peer_id, want } => {
+            if !peer_id.is_empty() && crate::secret::decode(&peer_id).is_err() {
+                return (
+                    false,
+                    "peer identity must be 64 hexadecimal characters".into(),
+                );
+            }
             // The key a provider's capability clears, matched exhaustively so
             // no undefined bit clears a defined one's record.
             let clear: fn(&mut CfgPeer) = match want {
@@ -784,6 +820,9 @@ fn attach_fields(
     }
     if !iface.is_empty() {
         return Err("`iface` applies to a provider slot".into());
+    }
+    if crate::secret::decode(peer_id).is_err() {
+        return Err("peer identity must be 64 hexadecimal characters".into());
     }
     if want != PROVIDES_EXIT {
         return Err(
@@ -860,6 +899,7 @@ mod tests {
 
     const TEST_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
     const OTHER_SECRET: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+    const PEER_SECRET: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn temp_dir(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -882,7 +922,7 @@ mod tests {
             name: name.into(),
             addr: format!("127.0.0.1:{port}"),
             secret: TEST_SECRET.into(),
-            credential: TEST_SECRET.into(),
+            credential: OTHER_SECRET.into(),
             transport: Transport::Tcp,
         }
     }
@@ -950,8 +990,8 @@ mod tests {
         let path = dir.join("client.toml");
         let cfg = crate::clientcfg::parse_client(&format!(
             "[client]\nactive = \"a\"\n\
-             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\
-             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"{OTHER_SECRET}\"\n"
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\ncredential = \"{OTHER_SECRET}\"\n\
+             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"{OTHER_SECRET}\"\ncredential = \"{TEST_SECRET}\"\n"
         ))
         .unwrap();
         let mut state = idle_state("a");
@@ -994,7 +1034,7 @@ mod tests {
         let dir = temp_dir("fwdopt");
         let path = dir.join("client.toml");
         let text = format!(
-            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\ncredential = \"{OTHER_SECRET}\"\n\
                     [[forwards]]\nproto = \"tcp\"\nport = 443\ntarget = \"127.0.0.1:444\"\n\
                     [[forwards]]\nproto = \"udp\"\nport = 53\ntarget = \"127.0.0.1:54\"\n"
         );
@@ -1110,7 +1150,7 @@ mod tests {
         let dir = temp_dir("addfwd");
         let path = dir.join("client.toml");
         let text = format!(
-            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\ncredential = \"{OTHER_SECRET}\"\n\
                     [[forwards]]\nproto = \"tcp\"\nport = 443\ntarget = \"127.0.0.1:444\"\n"
         );
         std::fs::write(&path, &text).unwrap();
@@ -1221,7 +1261,7 @@ mod tests {
         let dir = temp_dir("rmfwd");
         let path = dir.join("client.toml");
         let text = format!(
-            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\ncredential = \"{OTHER_SECRET}\"\n\
                     [[forwards]]\nproto = \"tcp\"\nport = 443\ntarget = \"127.0.0.1:444\"\n\
                     [[forwards]]\nproto = \"udp\"\nport = 53\ntarget = \"127.0.0.1:54\"\n"
         );
@@ -1320,11 +1360,12 @@ mod tests {
         assert_eq!(state.base_mode().session_mode(), SessionMode::Idle);
     }
 
-    fn add_server(name: &str, addr: &str, secret: &str) -> ClientMsg {
+    fn add_server(name: &str, addr: &str, server_public: &str) -> ClientMsg {
         ClientMsg::AddServer {
             name: name.into(),
             addr: addr.into(),
-            secret: ServerSecret(secret.into()),
+            server_public: ServerSecret(server_public.into()),
+            credential: ServerSecret(TEST_SECRET.into()),
             transport: Transport::Tcp,
         }
     }
@@ -1334,7 +1375,7 @@ mod tests {
         let dir = temp_dir("addsrv");
         let path = dir.join("client.toml");
         let text = format!(
-            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n"
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\ncredential = \"{OTHER_SECRET}\"\n"
         );
         std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
@@ -1366,7 +1407,18 @@ mod tests {
         assert!(msg.contains("`name`"), "{msg}");
         let (ok, msg) = mutate(&state, add_server("b", "127.0.0.1:2", "se\ncret")).await;
         assert!(!ok);
-        assert!(msg.contains("`secret`"), "{msg}");
+        assert!(msg.contains("`server identity`"), "{msg}");
+        let mut bad_credential = add_server("b", "127.0.0.1:2", OTHER_SECRET);
+        let ClientMsg::AddServer { credential, .. } = &mut bad_credential else {
+            unreachable!();
+        };
+        credential.0 = "short".into();
+        let (ok, msg) = mutate(&state, bad_credential).await;
+        assert!(!ok);
+        assert!(msg.contains("client credential"), "{msg}");
+        let (ok, msg) = mutate(&state, add_server("b", "127.0.0.1:2", TEST_SECRET)).await;
+        assert!(!ok);
+        assert!(msg.contains("must differ"), "{msg}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         assert_eq!(snapshot(&state).servers.len(), 1);
 
@@ -1383,6 +1435,7 @@ mod tests {
         assert_eq!(on_disk.servers.len(), 2);
         assert_eq!(on_disk.servers[1].name, "b");
         assert_eq!(on_disk.servers[1].secret.0, OTHER_SECRET);
+        assert_eq!(on_disk.servers[1].credential.0, TEST_SECRET);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1395,7 +1448,7 @@ mod tests {
             name: "roam".into(),
             addr: "dht".into(),
             secret: TEST_SECRET.into(),
-            credential: TEST_SECRET.into(),
+            credential: OTHER_SECRET.into(),
             transport: Transport::Auto,
         };
         assert!(undialable(&dht, true).is_none());
@@ -1417,7 +1470,7 @@ mod tests {
             name: "roam".into(),
             addr: "dht".into(),
             secret: TEST_SECRET.into(),
-            credential: TEST_SECRET.into(),
+            credential: OTHER_SECRET.into(),
             transport: Transport::Auto,
         };
         state.servers = SharedServers::new(vec![server_target("a", 1), dht]);
@@ -1454,7 +1507,7 @@ mod tests {
             name: "roam".into(),
             addr: "dht".into(),
             secret: TEST_SECRET.into(),
-            credential: TEST_SECRET.into(),
+            credential: OTHER_SECRET.into(),
             transport: Transport::Auto,
         };
         state.servers = SharedServers::new(vec![server_target("a", 1), dht]);
@@ -1488,8 +1541,8 @@ mod tests {
         let dir = temp_dir("rmsrv");
         let path = dir.join("client.toml");
         let text = format!("[client]\nactive = \"a\"\n\
-                    [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\
-                    [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"{OTHER_SECRET}\"\n");
+                    [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\ncredential = \"{OTHER_SECRET}\"\n\
+                    [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"{OTHER_SECRET}\"\ncredential = \"{TEST_SECRET}\"\n");
         std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
         state.servers = SharedServers::new(vec![server_target("a", 1), server_target("b", 2)]);
@@ -1614,7 +1667,7 @@ mod tests {
         let dir = temp_dir("attachbad");
         let path = dir.join("client.toml");
         let text = format!(
-            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n"
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\ncredential = \"{OTHER_SECRET}\"\n"
         );
         std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
@@ -1627,7 +1680,7 @@ mod tests {
         let refused = [
             // Keys belonging to the other role.
             ClientMsg::AttachPeer {
-                peer_id: "office".into(),
+                peer_id: TEST_SECRET.into(),
                 want: PROVIDES_EXIT,
                 dev: String::new(),
                 exit: false,
@@ -1643,7 +1696,7 @@ mod tests {
                 iface: String::new(),
             },
             // The kill switch hardens exit routing, so it needs it on.
-            attach_consumer("office", "", false, true),
+            attach_consumer(TEST_SECRET, "", false, true),
             // A segment provider needs the bridge its tap joins, and neither
             // provider can name its own device.
             attach_provider(PROVIDES_SEGMENT, ""),
@@ -1654,7 +1707,7 @@ mod tests {
             // A segment consumer is znpppoe's `--peer`, not a slot the admin
             // socket attaches.
             ClientMsg::AttachPeer {
-                peer_id: "office".into(),
+                peer_id: TEST_SECRET.into(),
                 want: PROVIDES_SEGMENT,
                 dev: String::new(),
                 exit: false,
@@ -1671,12 +1724,14 @@ mod tests {
 
         // One `[tun]` table describes one adapter, so any second consumer is
         // refused; so is a second provider of one capability.
-        let (ok, msg) = mutate(&state, attach_consumer("office", "", true, false)).await;
+        let (ok, msg) = mutate(&state, attach_consumer(TEST_SECRET, "", true, false)).await;
         assert!(ok, "{msg}");
-        let (ok, msg) = mutate(&state, attach_consumer("depot", "zn9", false, false)).await;
+        let (ok, msg) = mutate(&state, attach_consumer(OTHER_SECRET, "zn9", false, false)).await;
         assert!(!ok);
         assert!(
-            msg.contains("already has the exit consumer for `office`"),
+            msg.contains(&format!(
+                "already has the exit consumer for `{TEST_SECRET}`"
+            )),
             "{msg}"
         );
         let (ok, msg) = mutate(&state, attach_provider(PROVIDES_EXIT, "")).await;
@@ -1698,10 +1753,13 @@ mod tests {
                 },
             )))
             .unwrap();
-        let (ok, msg) = mutate(&device, attach_consumer("office", "zn0", false, false)).await;
+        let (ok, msg) = mutate(&device, attach_consumer(TEST_SECRET, "zn0", false, false)).await;
         assert!(!ok);
         assert!(msg.contains("device `zn0`"), "{msg}");
-        assert!(msg.contains("exit consumer for `office`"), "{msg}");
+        assert!(
+            msg.contains(&format!("exit consumer for `{TEST_SECRET}`")),
+            "{msg}"
+        );
         assert_eq!(snapshot(&device).mode, SessionMode::Device);
 
         // One `[tun]` table describes one adapter, so a client whose device
@@ -1715,7 +1773,11 @@ mod tests {
                 exit: false,
                 exit_strict: false,
             }));
-        let (ok, msg) = mutate(&server_tun, attach_consumer("office", "zn1", false, false)).await;
+        let (ok, msg) = mutate(
+            &server_tun,
+            attach_consumer(TEST_SECRET, "zn1", false, false),
+        )
+        .await;
         assert!(!ok);
         assert!(msg.contains("[tun]"), "{msg}");
 
@@ -1730,7 +1792,7 @@ mod tests {
     async fn attach_peer_refuses_what_the_boot_body_holds() {
         let dir = temp_dir("attachpark");
         let path = dir.join("client.toml");
-        let text = format!("[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\n[tap]\ndev = \"zn0\"\n");
+        let text = format!("[client]\npeer_secret = \"{PEER_SECRET}\"\n\n[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\ncredential = \"{OTHER_SECRET}\"\n\n[tap]\ndev = \"zn0\"\n");
         std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
         state.fallback_mode =
@@ -1747,7 +1809,7 @@ mod tests {
         assert!(ok, "{msg}");
 
         let before = std::fs::read_to_string(&path).unwrap();
-        let (ok, msg) = mutate(&state, attach_consumer("office", "zn0", false, false)).await;
+        let (ok, msg) = mutate(&state, attach_consumer(TEST_SECRET, "zn0", false, false)).await;
         assert!(!ok);
         assert!(msg.contains("device `zn0`"), "{msg}");
         assert!(msg.contains("at boot"), "{msg}");
@@ -1755,14 +1817,14 @@ mod tests {
 
         // A device the boot body leaves free is attached, and the parked body
         // pairs nothing, which the acceptance says.
-        let (ok, msg) = mutate(&state, attach_consumer("office", "zn1", false, false)).await;
+        let (ok, msg) = mutate(&state, attach_consumer(TEST_SECRET, "zn1", false, false)).await;
         assert!(ok, "{msg}");
         assert!(msg.contains("peer slots pair"), "{msg}");
         let on_disk = crate::clientcfg::load(&path).unwrap();
         on_disk.validate().unwrap();
         assert_eq!(
             on_disk.tun.as_ref().unwrap().exit_via.as_deref(),
-            Some("office")
+            Some(TEST_SECRET)
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1775,7 +1837,7 @@ mod tests {
         let dir = temp_dir("attachok");
         let path = dir.join("client.toml");
         let text = format!(
-            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n"
+            "[client]\npeer_secret = \"{PEER_SECRET}\"\n\n[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\ncredential = \"{OTHER_SECRET}\"\n"
         );
         std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
@@ -1787,7 +1849,7 @@ mod tests {
         // A consumer with an explicit device and the exit routing on, an exit
         // provider naming its egress, and a segment provider naming its
         // bridge: three slots, three config records.
-        let (ok, msg) = mutate(&state, attach_consumer("office-b1c2", "zn1", true, true)).await;
+        let (ok, msg) = mutate(&state, attach_consumer(TEST_SECRET, "zn1", true, true)).await;
         assert!(ok, "{msg}");
         let (ok, msg) = mutate(&state, attach_provider(PROVIDES_EXIT, "wan0")).await;
         assert!(ok, "{msg}");
@@ -1797,7 +1859,7 @@ mod tests {
         let on_disk = crate::clientcfg::load(&path).unwrap();
         on_disk.validate().unwrap();
         let tun = on_disk.tun.as_ref().unwrap();
-        assert_eq!(tun.exit_via.as_deref(), Some("office-b1c2"));
+        assert_eq!(tun.exit_via.as_deref(), Some(TEST_SECRET));
         assert_eq!(tun.dev.as_deref(), Some("zn1"));
         assert!(tun.exit && tun.exit_strict);
         assert_eq!(tun.address, None);
@@ -1811,17 +1873,20 @@ mod tests {
         let (ok, msg) = mutate(
             &state,
             ClientMsg::DetachPeer {
-                peer_id: "nobody".into(),
+                peer_id: OTHER_SECRET.into(),
                 want: PROVIDES_EXIT,
             },
         )
         .await;
         assert!(!ok);
-        assert!(msg.contains("exit consumer for `nobody`"), "{msg}");
+        assert!(
+            msg.contains(&format!("exit consumer for `{OTHER_SECRET}`")),
+            "{msg}"
+        );
 
         for req in [
             ClientMsg::DetachPeer {
-                peer_id: "office-b1c2".into(),
+                peer_id: TEST_SECRET.into(),
                 want: PROVIDES_EXIT,
             },
             ClientMsg::DetachPeer {
@@ -1865,7 +1930,7 @@ mod tests {
         assert!(!ok, "detaching a detached slot must be refused");
 
         // The device the detached consumer held is free again.
-        let (ok, msg) = mutate(&state, attach_consumer("other", "zn1", false, false)).await;
+        let (ok, msg) = mutate(&state, attach_consumer(OTHER_SECRET, "zn1", false, false)).await;
         assert!(ok, "{msg}");
 
         std::fs::remove_dir_all(&dir).ok();

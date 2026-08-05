@@ -3,9 +3,11 @@
 //! TUI can show live progress; an error short-circuits with a message.
 
 use std::fs::File;
+use std::io::Write as _;
 use std::process::Output;
 use zeronat_install_support::DownloadFile;
 
+use crate::args::Host;
 use crate::bridge;
 use crate::sys::{self, errtext, ok};
 use crate::ui::{Config, Deploy, Kind, Method, Mode, UpgradeOffer};
@@ -18,7 +20,8 @@ const INSTALL_URL: &str = "https://paltaio.github.io/zeronat/get.sh";
 // Internal fetches (compose templates) hit the repo directly to stay current.
 const RAW_BASE: &str = "https://raw.githubusercontent.com/paltaio/zeronat/main";
 const RELEASE_BASE: &str = "https://github.com/paltaio/zeronat/releases/latest/download";
-const IMAGE: &str = "ghcr.io/paltaio/zeronat:latest";
+const IMAGE: &str = "ghcr.io/paltaio/zeronat:protocol-v6";
+const BINARY_ASSET_PREFIX: &str = "zeronat-v6";
 const ETC_DIR: &str = "/etc/zeronat";
 const ENV_FILE: &str = "/etc/zeronat/.env";
 const COMPOSE_FILE: &str = "/etc/zeronat/compose.yml";
@@ -241,22 +244,23 @@ fn console_cmd(cfg: &Config) -> Option<String> {
     })
 }
 
-/// The intro line and the single-line command to run on the *other* machine,
-/// mirroring the shell installer.
 fn peer_steps(cfg: &Config) -> (String, String) {
     let fwd = forward_flag(cfg);
     match cfg.mode {
         Mode::Server => {
+            let server_public = zeronat_secret::server_public(&cfg.secret)
+                .expect("validated server secret must derive a public identity");
+            let credential = zeronat_secret::client_credential(&cfg.secret)
+                .expect("validated server secret must derive a client credential");
             let cmd = if cfg.use_dht {
                 format!(
-                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --dht --secret {} {fwd} -y",
-                    cfg.secret
+                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --dht --server-public {server_public} --credential {credential} {fwd} -y"
                 )
             } else {
                 let host = sys::pub_ip();
                 format!(
-                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --server-addr {host}:{} --secret {} {fwd} -y",
-                    cfg.control, cfg.secret
+                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --server-addr {host}:{} --server-public {server_public} --credential {credential} {fwd} -y",
+                    cfg.control
                 )
             };
             (
@@ -264,28 +268,7 @@ fn peer_steps(cfg: &Config) -> (String, String) {
                 cmd,
             )
         }
-        Mode::Client => {
-            let disc = if cfg.use_dht {
-                "--dht".to_string()
-            } else {
-                // The server must listen on the port the client dials, which is
-                // the one in the entered address (falling back to the default).
-                let ctrl = cfg
-                    .server_addr
-                    .rsplit_once(':')
-                    .map(|(_, p)| p.to_string())
-                    .unwrap_or_else(|| cfg.control.clone());
-                format!("--control {ctrl}")
-            };
-            let cmd = format!(
-                "curl -fsSL {INSTALL_URL} | sh -s -- --server {disc} --secret {} {fwd} -y",
-                cfg.secret
-            );
-            (
-                "Run this on the server (it must use the same secret):".into(),
-                cmd,
-            )
-        }
+        Mode::Client => (String::new(), String::new()),
     }
 }
 
@@ -316,19 +299,29 @@ fn check_forwards(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn env_file(cfg: &Config, sub: &str) -> String {
+fn env_file(cfg: &Config, sub: &str) -> Result<String, String> {
+    let (runtime_secret, client_credential) = match cfg.mode {
+        Mode::Server => (
+            cfg.secret.clone(),
+            zeronat_secret::client_credential(&cfg.secret)
+                .map_err(|e| format!("client credential: {e}"))?,
+        ),
+        Mode::Client => (cfg.server_public.clone(), cfg.secret.clone()),
+    };
     let role = if cfg.mode == Mode::Server {
         format!(
             "ZERONAT_CLIENT_ID=client\nZERONAT_CLIENT_SECRET={}\nZERONAT_ADMIN_SECRET={}\n",
-            cfg.secret, cfg.admin_secret
+            client_credential, cfg.admin_secret
         )
     } else {
-        format!("ZERONAT_CLIENT_SECRET={}\n", cfg.secret)
+        format!("ZERONAT_CLIENT_SECRET={client_credential}\n")
     };
     if cfg.method == Method::Docker && cfg.deploy == Deploy::Compose {
-        format!("ZERONAT_SECRET={}\n{role}ZERONAT_ARGS={sub}\n", cfg.secret)
+        Ok(format!(
+            "ZERONAT_SECRET={runtime_secret}\n{role}ZERONAT_ARGS={sub}\n"
+        ))
     } else {
-        format!("ZERONAT_SECRET={}\n{role}", cfg.secret)
+        Ok(format!("ZERONAT_SECRET={runtime_secret}\n{role}"))
     }
 }
 
@@ -354,7 +347,7 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
     }
 
     r.step("writing env file".into());
-    let env = env_file(cfg, &sub);
+    let env = env_file(cfg, &sub)?;
     place(r, env.as_bytes(), "0600", ENV_FILE)?;
 
     // Build the host bridge before starting zeronat, so the TAP has a bridge to
@@ -607,7 +600,9 @@ fn dry_run(cfg: &Config, _sub: &str, r: &mut dyn Runner) -> Result<Outcome, Stri
 /// Upgrade the existing install in place: download the latest binary and restart
 /// the service, and/or pull the latest image and recreate the container. Config
 /// (env file, unit, compose file) is left untouched.
-pub fn upgrade(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<Outcome, String> {
+pub fn upgrade(offer: &UpgradeOffer, host: &Host, r: &mut dyn Runner) -> Result<Outcome, String> {
+    validate_upgrade_credentials(host)?;
+    validate_upgrade_deployments(offer, host)?;
     if offer.systemd.is_some() {
         upgrade_systemd(r)?;
     }
@@ -617,10 +612,556 @@ pub fn upgrade(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<Outcome, Stri
     Ok(upgrade_outcome(offer))
 }
 
+pub fn preflight_upgrade(installed: &sys::Installed, host: &Host) -> Result<(), String> {
+    validate_upgrade_credentials(host)?;
+    let offer = UpgradeOffer {
+        latest: String::new(),
+        systemd: installed.systemd.clone(),
+        docker: installed.docker.clone(),
+        compose: installed.compose,
+    };
+    validate_upgrade_deployments(&offer, host)
+}
+
+fn validate_upgrade_credentials(host: &Host) -> Result<(), String> {
+    let legacy = match (&host.existing_secret, &host.existing_client_secret) {
+        (Some(identity), Some(credential)) => {
+            identity.trim().eq_ignore_ascii_case(credential.trim())
+        }
+        _ => false,
+    };
+    if legacy {
+        return Err(
+            "legacy shared credentials detected; rerun the installer on the server, run its client enrollment command on each client, then retry the upgrade"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_upgrade_deployments(offer: &UpgradeOffer, host: &Host) -> Result<(), String> {
+    if offer.systemd.is_some() {
+        let out = sys::run(true, "cat", &[UNIT])?;
+        if !ok(&out) {
+            return Err(format!("reading {UNIT} before upgrade: {}", errtext(&out)));
+        }
+        let unit = String::from_utf8_lossy(&out.stdout);
+        let command: Vec<String> = unit
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("ExecStart="))
+            .map(|line| line.split_whitespace().map(str::to_string).collect())
+            .ok_or_else(|| format!("cannot determine the zeronat command in {UNIT}"))?;
+        validate_upgrade_command(&command, "systemd", host)?;
+    }
+
+    if offer.docker.is_some() {
+        if !offer.compose && host.existing_secret.is_none() {
+            return Err(format!(
+                "cannot upgrade the docker deployment without {ENV_FILE}; restore its enrollment values first"
+            ));
+        }
+        let command = if offer.compose {
+            rendered_compose_command()?
+        } else {
+            direct_docker_command()?
+        };
+        validate_upgrade_command(&command, "docker", host)?;
+        if !offer.compose {
+            let out = sys::run(true, "cat", &[ENV_FILE])?;
+            if !ok(&out) {
+                return Err(format!(
+                    "reading {ENV_FILE} before upgrade: {}",
+                    errtext(&out)
+                ));
+            }
+            let current = inspect_container_env_command()?;
+            validate_container_env(&current, &String::from_utf8_lossy(&out.stdout))?;
+        }
+    }
+    Ok(())
+}
+
+fn inspect_container_env_command() -> Result<Vec<String>, String> {
+    let out = sys::run(
+        true,
+        "docker",
+        &["inspect", "-f", "{{json .Config.Env}}", "zeronat"],
+    )?;
+    if !ok(&out) {
+        return Err(format!(
+            "inspecting the docker deployment: {}",
+            errtext(&out)
+        ));
+    }
+    serde_json::from_slice(&out.stdout)
+        .map_err(|error| format!("reading the docker environment snapshot: {error}"))
+}
+
+fn validate_container_env(current: &[String], env_file: &str) -> Result<(), String> {
+    let configured: std::collections::HashMap<&str, &str> = env_file
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            (!line.is_empty() && !line.starts_with('#'))
+                .then(|| line.split_once('='))
+                .flatten()
+                .map(|(key, value)| (key.trim(), value))
+        })
+        .filter(|(key, _)| !key.is_empty())
+        .collect();
+    let mut current_env = std::collections::HashMap::new();
+    for entry in current {
+        let (key, value) = entry
+            .split_once('=')
+            .ok_or("the running container has a malformed environment entry")?;
+        current_env.insert(key, value);
+    }
+    let mut changed: Vec<&str> = configured
+        .keys()
+        .copied()
+        .filter(|key| current_env.get(key).copied() != configured.get(key).copied())
+        .collect();
+    changed.sort_unstable();
+    changed.dedup();
+    if changed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot recreate the container because {ENV_FILE} differs from the running container for: {}",
+            changed.join(", ")
+        ))
+    }
+}
+
+fn docker_restart_policy(name: String, retries: String) -> Result<String, String> {
+    let retries: u64 = retries
+        .parse()
+        .map_err(|_| "cannot determine the docker restart retry count")?;
+    if name == "on-failure" && retries > 0 {
+        Ok(format!("{name}:{retries}"))
+    } else {
+        Ok(name)
+    }
+}
+
+fn protected_env_file(entries: &[String]) -> Result<DownloadFile, String> {
+    let snapshot = DownloadFile::create()?;
+    let mut output = snapshot.output();
+    for entry in entries {
+        validate_env_file_entry(entry)?;
+        writeln!(output, "{entry}")
+            .map_err(|error| format!("writing the private environment snapshot: {error}"))?;
+    }
+    output
+        .sync_all()
+        .map_err(|error| format!("syncing the private environment snapshot: {error}"))?;
+    Ok(snapshot)
+}
+
+fn validate_env_file_entry(entry: &str) -> Result<(), String> {
+    const MAX_LINE: usize = 64 * 1024 - 1;
+
+    let (key, value) = entry
+        .split_once('=')
+        .ok_or("the running container has a malformed environment entry")?;
+    let valid_key = key
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if !valid_key
+        || value.contains(['\0', '\n', '\r'])
+        || value.trim() != value
+        || entry.len() > MAX_LINE
+    {
+        return Err(
+            "the running container environment cannot be represented by a protected env file"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_image_env(current: &[String], image: &[String]) -> Result<(), String> {
+    let current_keys: std::collections::HashSet<&str> = current
+        .iter()
+        .map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(key, _)| key)
+                .ok_or("the running container has a malformed environment entry")
+        })
+        .collect::<Result<_, _>>()?;
+    let mut added = Vec::new();
+    for entry in image {
+        let key = entry
+            .split_once('=')
+            .map(|(key, _)| key)
+            .ok_or("the pulled image has a malformed environment entry")?;
+        if !current_keys.contains(key) {
+            added.push(key);
+        }
+    }
+    added.sort_unstable();
+    added.dedup();
+    if added.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot recreate the container because the pulled image adds environment keys: {}",
+            added.join(", ")
+        ))
+    }
+}
+
+fn direct_docker_command() -> Result<Vec<String>, String> {
+    let out = sys::run(
+        true,
+        "docker",
+        &[
+            "inspect",
+            "-f",
+            "{{range .Config.Cmd}}{{println .}}{{end}}",
+            "zeronat",
+        ],
+    )?;
+    if !ok(&out) {
+        return Err(format!(
+            "inspecting the docker deployment before upgrade: {}",
+            errtext(&out)
+        ));
+    }
+    let command: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if command.is_empty() {
+        return Err("cannot determine the zeronat command for the docker deployment".into());
+    }
+    Ok(command)
+}
+
+fn rendered_compose_command() -> Result<Vec<String>, String> {
+    let compose = sys::compose_argv();
+    if compose.is_empty() {
+        return Err("docker compose not available".into());
+    }
+    let mut args = vec![format!("ZERONAT_IMAGE={IMAGE}")];
+    args.extend(compose);
+    args.extend([
+        "--env-file".into(),
+        ENV_FILE.into(),
+        "-f".into(),
+        COMPOSE_FILE.into(),
+        "config".into(),
+        "--format".into(),
+        "json".into(),
+    ]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = sys::run(true, "env", &refs)?;
+    if !ok(&out) {
+        return Err(format!(
+            "rendering {COMPOSE_FILE} before upgrade: {}",
+            errtext(&out)
+        ));
+    }
+    parse_compose_command(&out.stdout)
+}
+
+fn parse_compose_command(body: &[u8]) -> Result<Vec<String>, String> {
+    let config: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| format!("reading rendered compose configuration: {e}"))?;
+    let command = config
+        .get("services")
+        .and_then(|services| services.get("zeronat"))
+        .and_then(|service| service.get("command"))
+        .ok_or_else(|| format!("cannot determine the zeronat command in {COMPOSE_FILE}"))?;
+    let command = match command {
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .map(|part| {
+                part.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("invalid zeronat command in {COMPOSE_FILE}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        serde_json::Value::String(command) => {
+            command.split_whitespace().map(str::to_string).collect()
+        }
+        _ => return Err(format!("invalid zeronat command in {COMPOSE_FILE}")),
+    };
+    if command.is_empty() {
+        return Err(format!(
+            "cannot determine the zeronat command in {COMPOSE_FILE}"
+        ));
+    }
+    Ok(command)
+}
+
+fn deployment_role(command: &[String]) -> Option<&str> {
+    let role_index = usize::from(
+        command
+            .first()
+            .is_some_and(|arg| arg == "zeronat" || arg.ends_with("/zeronat")),
+    );
+    command.get(role_index).map(String::as_str)
+}
+
+fn command_value<'a>(command: &'a [String], flag: &str) -> Option<&'a str> {
+    command
+        .iter()
+        .position(|arg| arg == flag)
+        .and_then(|index| command.get(index + 1))
+        .map(String::as_str)
+}
+
+fn validate_upgrade_command(command: &[String], source: &str, host: &Host) -> Result<(), String> {
+    match deployment_role(command) {
+        Some("server") => return Ok(()),
+        Some("client") => {}
+        _ => {
+            return Err(format!(
+                "cannot determine whether the {source} deployment is a client"
+            ));
+        }
+    }
+
+    if let Some(index) = command.iter().position(|arg| arg == "--config") {
+        let path = command
+            .get(index + 1)
+            .ok_or_else(|| format!("the {source} client command has --config without a path"))?;
+        let out = sys::run(true, "cat", &[path])?;
+        if !ok(&out) {
+            return Err(format!(
+                "reading client config {path} before upgrade: {}",
+                errtext(&out)
+            ));
+        }
+        if validate_client_config_layout(path, &String::from_utf8_lossy(&out.stdout))? {
+            return Ok(());
+        }
+    }
+
+    validate_enrollment_values(
+        command_value(command, "--secret").or(host.existing_secret.as_deref()),
+        command_value(command, "--credential").or(host.existing_client_secret.as_deref()),
+        source,
+    )
+}
+
+fn validate_enrollment_values(
+    identity: Option<&str>,
+    credential: Option<&str>,
+    source: &str,
+) -> Result<(), String> {
+    let action = "rerun the installer on the server, run its client enrollment command on this client, then retry the upgrade";
+    let identity =
+        identity.ok_or_else(|| format!("the {source} client has no server identity; {action}"))?;
+    let credential = credential
+        .ok_or_else(|| format!("the {source} client has no client credential; {action}"))?;
+    let identity = zeronat_secret::normalize(identity).map_err(|_| {
+        format!(
+            "the {source} client's server identity must be exactly 64 hexadecimal characters (32 bytes)"
+        )
+    })?;
+    let credential = zeronat_secret::normalize(credential).map_err(|_| {
+        format!(
+            "the {source} client's credential must be exactly 64 hexadecimal characters (32 bytes)"
+        )
+    })?;
+    if identity == credential {
+        return Err(format!("legacy shared credentials detected; {action}"));
+    }
+    Ok(())
+}
+
+fn validate_client_config_layout(path: &str, body: &str) -> Result<bool, String> {
+    let mut in_server = false;
+    let mut found_server = false;
+    let mut secret: Option<String> = None;
+    let mut credential: Option<String> = None;
+    let mut section = "";
+    let mut peer_secret: Option<String> = None;
+    let mut exit_via: Option<String> = None;
+    let mut provides_peer_session = false;
+    let mut server_material = Vec::new();
+    let action = "rerun the installer on the server, run its client enrollment command on this client, then retry the upgrade";
+
+    let finish_server = |secret: &mut Option<String>,
+                         credential: &mut Option<String>,
+                         server_material: &mut Vec<String>|
+     -> Result<(), String> {
+        let Some(secret) = secret.take() else {
+            return Err(format!(
+                "client config {path} has a server without an identity; {action}"
+            ));
+        };
+        let Some(credential) = credential.take() else {
+            return Err(format!(
+                "client config {path} has a server without a credential; {action}"
+            ));
+        };
+        let secret = zeronat_secret::normalize(&secret).map_err(|_| {
+            format!("client config {path} has an invalid server identity; {action}")
+        })?;
+        let credential = zeronat_secret::normalize(&credential).map_err(|_| {
+            format!("client config {path} has an invalid client credential; {action}")
+        })?;
+        if secret == credential {
+            return Err(format!(
+                "client config {path} has shared credentials; {action}"
+            ));
+        }
+        server_material.push(secret);
+        server_material.push(credential);
+        Ok(())
+    };
+
+    for line in body.lines() {
+        let line = strip_config_comment(line).trim();
+        if line == "[[servers]]" {
+            if in_server {
+                finish_server(&mut secret, &mut credential, &mut server_material)?;
+            }
+            in_server = true;
+            section = "server";
+            found_server = true;
+            continue;
+        }
+        if line.starts_with('[') {
+            if in_server {
+                finish_server(&mut secret, &mut credential, &mut server_material)?;
+                in_server = false;
+            }
+            section = match line {
+                "[client]" => "client",
+                "[tun]" => "tun",
+                "[peer]" => "peer",
+                _ => "",
+            };
+            continue;
+        }
+        match section {
+            "server" => {
+                if let Some(value) = config_string(line, "secret")? {
+                    secret = Some(value);
+                }
+                if let Some(value) = config_string(line, "credential")? {
+                    credential = Some(value);
+                }
+            }
+            "client" => {
+                if let Some(value) = config_string(line, "peer_secret")? {
+                    peer_secret = Some(value);
+                }
+            }
+            "tun" => {
+                if let Some(value) = config_string(line, "exit_via")? {
+                    exit_via = Some(value);
+                }
+            }
+            "peer"
+                if config_bool(line, "exit")? == Some(true)
+                    || config_string(line, "segment")?.is_some() =>
+            {
+                provides_peer_session = true;
+            }
+            "peer" => {}
+            _ => {}
+        }
+    }
+    if in_server {
+        finish_server(&mut secret, &mut credential, &mut server_material)?;
+    }
+    if let Some(value) = &peer_secret {
+        let peer_secret = zeronat_secret::normalize(value).map_err(|_| {
+            format!(
+                "client config {path} has an invalid peer_secret; set a client-owned 64-character hexadecimal peer secret before upgrading"
+            )
+        })?;
+        if server_material.iter().any(|value| value == &peer_secret) {
+            return Err(format!(
+                "client config {path} has a peer_secret known by a configured server; replace it with a client-owned secret before upgrading"
+            ));
+        }
+    }
+    if let Some(value) = &exit_via {
+        zeronat_secret::normalize(value).map_err(|_| {
+            format!(
+                "client config {path} has an invalid tun exit_via; set it to the provider's 64-character hexadecimal peer identity before upgrading"
+            )
+        })?;
+    }
+    if (exit_via.is_some() || provides_peer_session) && peer_secret.is_none() {
+        return Err(format!(
+            "client config {path} uses peer sessions without [client] peer_secret; add a client-owned 64-character hexadecimal peer secret before upgrading"
+        ));
+    }
+    Ok(found_server)
+}
+
+fn strip_config_comment(line: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quoted {
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if character == '#' && !quoted {
+            return &line[..index];
+        }
+    }
+    line
+}
+
+fn config_string(line: &str, key: &str) -> Result<Option<String>, String> {
+    let Some((found, value)) = line.split_once('=') else {
+        return Ok(None);
+    };
+    if found.trim() != key {
+        return Ok(None);
+    }
+    let value = value.trim();
+    let Some(value) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return Err(format!("client config has a malformed `{key}` value"));
+    };
+    Ok(Some(value.to_string()))
+}
+
+fn config_bool(line: &str, key: &str) -> Result<Option<bool>, String> {
+    let Some((found, value)) = line.split_once('=') else {
+        return Ok(None);
+    };
+    if found.trim() != key {
+        return Ok(None);
+    }
+    match value.trim() {
+        "true" => Ok(Some(true)),
+        "false" => Ok(Some(false)),
+        _ => Err(format!("client config has a malformed `{key}` value")),
+    }
+}
+
 fn upgrade_systemd(r: &mut dyn Runner) -> Result<(), String> {
     let target = sys::arch_target()?;
     r.info(format!("target {target}"));
-    let url = format!("{RELEASE_BASE}/zeronat-{target}");
+    let url = format!("{RELEASE_BASE}/{BINARY_ASSET_PREFIX}-{target}");
 
     r.step("downloading latest binary".into());
     download_binary(r, &url, target)?;
@@ -642,43 +1183,101 @@ fn upgrade_docker(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<(), String
         let base: Vec<String> = dc[1..]
             .iter()
             .cloned()
-            .chain(["-f".into(), COMPOSE_FILE.into()])
+            .chain([
+                "--env-file".into(),
+                ENV_FILE.into(),
+                "-f".into(),
+                COMPOSE_FILE.into(),
+            ])
             .collect();
         r.step("pulling latest image".into());
         compose(r, &dc[0], &base, "pull")?;
         r.step("recreating container".into());
         compose(r, &dc[0], &base, "up")?;
     } else {
+        let snapshot = container_snapshot(r)?;
         r.step("pulling latest image".into());
         let out = r.run(true, "docker", &["pull", IMAGE])?;
         if !ok(&out) {
             return Err(format!("docker pull: {}", errtext(&out)));
         }
         r.step("recreating container".into());
-        recreate_container(r)?;
+        recreate_container(r, snapshot)?;
     }
     Ok(())
 }
 
-/// Recreate a plain `docker run` container on the freshly pulled image, carrying
-/// over the run config read back from the old container. The secret rides via the
-/// installer env file, which a docker-run install always wrote.
-fn recreate_container(r: &mut dyn Runner) -> Result<(), String> {
-    let cmd = inspect_lines(r, "{{range .Config.Cmd}}{{println .}}{{end}}");
-    let caps = inspect_lines(r, "{{range .HostConfig.CapAdd}}{{println .}}{{end}}");
-    let devices = inspect_lines(
+/// Configuration captured from a plain `docker run` container for recreation.
+struct ContainerSnapshot {
+    cmd: Vec<String>,
+    env: Vec<String>,
+    caps: Vec<String>,
+    devices: Vec<String>,
+    binds: Vec<String>,
+    network: String,
+    restart: String,
+}
+
+fn container_snapshot(r: &mut dyn Runner) -> Result<ContainerSnapshot, String> {
+    if !std::path::Path::new(ENV_FILE).exists() {
+        return Err(format!(
+            "cannot recreate the container without {ENV_FILE}; restore its enrollment values before upgrading"
+        ));
+    }
+    let cmd = inspect_lines_required(r, "{{range .Config.Cmd}}{{println .}}{{end}}")?;
+    if cmd.is_empty() {
+        return Err("cannot determine the zeronat command for the docker deployment".into());
+    }
+    let env = inspect_container_env(r)?;
+    let caps = inspect_lines_required(r, "{{range .HostConfig.CapAdd}}{{println .}}{{end}}")?;
+    let devices = inspect_lines_required(
         r,
-        "{{range .HostConfig.Devices}}{{println .PathOnHost}}{{end}}",
-    );
-    let binds = inspect_lines(r, "{{range .HostConfig.Binds}}{{println .}}{{end}}");
-    let network = inspect_lines(r, "{{.HostConfig.NetworkMode}}")
+        "{{range .HostConfig.Devices}}{{printf \"%s:%s:%s\\n\" .PathOnHost .PathInContainer .CgroupPermissions}}{{end}}",
+    )?;
+    let binds = inspect_lines_required(r, "{{range .HostConfig.Binds}}{{println .}}{{end}}")?;
+    let network = inspect_lines_required(r, "{{.HostConfig.NetworkMode}}")?
         .into_iter()
         .next()
-        .unwrap_or_else(|| "host".into());
-    let restart = inspect_lines(r, "{{.HostConfig.RestartPolicy.Name}}")
+        .unwrap_or_default();
+    let restart_name = inspect_lines_required(r, "{{.HostConfig.RestartPolicy.Name}}")?
         .into_iter()
         .next()
-        .unwrap_or_else(|| "unless-stopped".into());
+        .unwrap_or_default();
+    let restart_retries =
+        inspect_lines_required(r, "{{.HostConfig.RestartPolicy.MaximumRetryCount}}")?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "0".into());
+    let restart = docker_restart_policy(restart_name, restart_retries)?;
+    Ok(ContainerSnapshot {
+        cmd,
+        env,
+        caps,
+        devices,
+        binds,
+        network,
+        restart,
+    })
+}
+
+fn recreate_container(r: &mut dyn Runner, snapshot: ContainerSnapshot) -> Result<(), String> {
+    let ContainerSnapshot {
+        cmd,
+        env,
+        caps,
+        devices,
+        binds,
+        network,
+        restart,
+    } = snapshot;
+
+    let image_env = inspect_image_env(r)?;
+    validate_image_env(&env, &image_env)?;
+    let env_file = protected_env_file(&env)?;
+    let env_path = env_file
+        .path()
+        .to_str()
+        .ok_or("the private environment snapshot path is not valid UTF-8")?;
 
     let out = r.run(true, "docker", &["rm", "-f", "zeronat"])?;
     if !ok(&out) {
@@ -706,10 +1305,8 @@ fn recreate_container(r: &mut dyn Runner) -> Result<(), String> {
         args.push("-v".into());
         args.push(b.clone());
     }
-    if std::path::Path::new(ENV_FILE).exists() {
-        args.push("--env-file".into());
-        args.push(ENV_FILE.into());
-    }
+    args.push("--env-file".into());
+    args.push(env_path.into());
     args.push(IMAGE.into());
     args.extend(cmd);
 
@@ -721,19 +1318,54 @@ fn recreate_container(r: &mut dyn Runner) -> Result<(), String> {
     Ok(())
 }
 
-fn inspect_lines(r: &mut dyn Runner, fmt: &str) -> Vec<String> {
-    r.run(true, "docker", &["inspect", "-f", fmt, "zeronat"])
-        .ok()
-        .filter(ok)
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+fn inspect_lines_required(r: &mut dyn Runner, fmt: &str) -> Result<Vec<String>, String> {
+    let out = r.run(true, "docker", &["inspect", "-f", fmt, "zeronat"])?;
+    if !ok(&out) {
+        return Err(format!(
+            "inspecting the docker deployment: {}",
+            errtext(&out)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn inspect_container_env(r: &mut dyn Runner) -> Result<Vec<String>, String> {
+    let out = r.run(
+        true,
+        "docker",
+        &["inspect", "-f", "{{json .Config.Env}}", "zeronat"],
+    )?;
+    if !ok(&out) {
+        return Err(format!(
+            "inspecting the docker deployment: {}",
+            errtext(&out)
+        ));
+    }
+    serde_json::from_slice::<Option<Vec<String>>>(&out.stdout)
+        .map(Option::unwrap_or_default)
+        .map_err(|error| format!("reading the docker environment snapshot: {error}"))
+}
+
+fn inspect_image_env(r: &mut dyn Runner) -> Result<Vec<String>, String> {
+    let out = r.run(
+        true,
+        "docker",
+        &["image", "inspect", "-f", "{{json .Config.Env}}", IMAGE],
+    )?;
+    if !ok(&out) {
+        return Err(format!(
+            "inspecting the pulled docker image: {}",
+            errtext(&out)
+        ));
+    }
+    serde_json::from_slice::<Option<Vec<String>>>(&out.stdout)
+        .map(Option::unwrap_or_default)
+        .map_err(|error| format!("reading the pulled image environment: {error}"))
 }
 
 fn upgrade_outcome(offer: &UpgradeOffer) -> Outcome {
@@ -814,13 +1446,15 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started
         if dc.is_empty() {
             return Err("docker compose not available".into());
         }
-        // compose auto-loads .env from the project directory (the compose file's
-        // own dir), so -f is the only flag needed and the command works from any
-        // cwd; --env-file and --project-directory would be redundant.
         let base: Vec<String> = dc[1..]
             .iter()
             .cloned()
-            .chain(["-f".into(), COMPOSE_FILE.into()])
+            .chain([
+                "--env-file".into(),
+                ENV_FILE.into(),
+                "-f".into(),
+                COMPOSE_FILE.into(),
+            ])
             .collect();
 
         r.step("pulling image".into());
@@ -844,7 +1478,7 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started
                     cmd: format!("cd {ETC_DIR} && {dcj} ps"),
                 },
             ],
-            note: Some(format!("change ports or the secret by editing {ENV_FILE}")),
+            note: Some(format!("change deployment settings in {ENV_FILE}")),
         })
     } else {
         r.step("pulling image".into());
@@ -897,13 +1531,14 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started
                     cmd: "docker ps".into(),
                 },
             ],
-            note: Some(format!("change ports or the secret by editing {ENV_FILE}")),
+            note: Some(format!("change deployment settings in {ENV_FILE}")),
         })
     }
 }
 
 fn compose(r: &mut dyn Runner, prog: &str, base: &[String], verb: &str) -> Result<(), String> {
-    let mut args: Vec<String> = base.to_vec();
+    let mut args = vec![format!("ZERONAT_IMAGE={IMAGE}"), prog.to_string()];
+    args.extend_from_slice(base);
     if verb == "up" {
         args.push("up".into());
         args.push("-d".into());
@@ -911,7 +1546,7 @@ fn compose(r: &mut dyn Runner, prog: &str, base: &[String], verb: &str) -> Resul
         args.push(verb.into());
     }
     let aref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let out = r.run(true, prog, &aref)?;
+    let out = r.run(true, "env", &aref)?;
     if ok(&out) {
         Ok(())
     } else {
@@ -922,7 +1557,7 @@ fn compose(r: &mut dyn Runner, prog: &str, base: &[String], verb: &str) -> Resul
 fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started, String> {
     let target = sys::arch_target()?;
     r.info(format!("target {target}"));
-    let url = format!("{RELEASE_BASE}/zeronat-{target}");
+    let url = format!("{RELEASE_BASE}/{BINARY_ASSET_PREFIX}-{target}");
 
     r.step("downloading zeronat binary".into());
     download_binary(r, &url, target)?;
@@ -977,7 +1612,7 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Starte
             },
         ],
         note: Some(format!(
-            "change ports or the secret by editing {ENV_FILE} and {UNIT}"
+            "change deployment settings in {ENV_FILE} and {UNIT}"
         )),
     })
 }
@@ -985,9 +1620,12 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Starte
 #[cfg(test)]
 mod tests {
     use super::{
-        check_forwards, console_cmd, env_file, install_systemd, peer_steps, subcmd, Runner,
+        check_forwards, compose, console_cmd, deployment_role, env_file, install_systemd,
+        parse_compose_command, peer_steps, subcmd, upgrade, validate_client_config_layout,
+        validate_container_env, Runner, COMPOSE_FILE, IMAGE,
     };
-    use crate::ui::{Config, Kind, Method, Mode};
+    use crate::args::Host;
+    use crate::ui::{Config, Kind, Method, Mode, UpgradeOffer};
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
     use std::path::PathBuf;
@@ -1120,6 +1758,198 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_refuses_legacy_shared_credentials_before_commands() {
+        let offer = UpgradeOffer {
+            latest: "0.25.1".into(),
+            systemd: Some("0.24.0".into()),
+            docker: None,
+            compose: false,
+        };
+        let host = Host {
+            have_docker: false,
+            have_compose: false,
+            existing_secret: Some(TEST_SECRET.into()),
+            existing_client_secret: Some(TEST_SECRET.to_ascii_uppercase()),
+            existing_admin_secret: Some(TEST_ADMIN_SECRET.into()),
+            ssh_port: 22,
+        };
+        let mut runner = FakeRunner { cmds: Vec::new() };
+
+        let error = match upgrade(&offer, &host, &mut runner) {
+            Ok(_) => panic!("legacy credentials must block the upgrade"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("legacy shared credentials"), "{error}");
+        assert!(error.contains("rerun the installer"), "{error}");
+        assert!(runner.cmds.is_empty());
+    }
+
+    #[test]
+    fn legacy_client_config_layouts_block_upgrade() {
+        let secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let missing =
+            format!("[[servers]]\nname = \"home\"\naddr = \"dht\"\nsecret = \"{secret}\"\n");
+        let error = validate_client_config_layout("client.toml", &missing).unwrap_err();
+        assert!(error.contains("without a credential"), "{error}");
+
+        let shared = format!(
+            "[[servers]]\nname = \"home\"\naddr = \"dht\"\nsecret = \"{secret}\"\ncredential = \"{}\"\n",
+            secret.to_ascii_uppercase()
+        );
+        let error = validate_client_config_layout("client.toml", &shared).unwrap_err();
+        assert!(error.contains("shared credentials"), "{error}");
+    }
+
+    #[test]
+    fn current_client_config_layout_reaches_upgrade() {
+        let current = "[[servers]]\nname = \"home\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\ncredential = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\n";
+        assert!(validate_client_config_layout("client.toml", current).unwrap());
+    }
+
+    #[test]
+    fn peer_config_requires_a_peer_key_and_identity_before_upgrade() {
+        let server = "[[servers]]\nname = \"home\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\ncredential = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\n";
+        let peer_identity = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let peer_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let missing = format!("{server}\n[tun]\nexit_via = \"{peer_identity}\"\n");
+        let error = validate_client_config_layout("client.toml", &missing).unwrap_err();
+        assert!(error.contains("without [client] peer_secret"), "{error}");
+
+        let legacy = format!(
+            "[client]\npeer_secret = \"{peer_secret}\"\n\n{server}\n[tun]\nexit_via = \"office\"\n"
+        );
+        let error = validate_client_config_layout("client.toml", &legacy).unwrap_err();
+        assert!(error.contains("invalid tun exit_via"), "{error}");
+
+        let current = format!(
+            "[client]\npeer_secret = \"{peer_secret}\"\n\n{server}\n[tun]\nexit_via = \"{peer_identity}\"\n"
+        );
+        assert!(validate_client_config_layout("client.toml", &current).unwrap());
+
+        let relay_known = format!(
+            "[client]\npeer_secret = \"{}\"\n\n{server}[peer]\nexit = true\n",
+            "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF"
+        );
+        let error = validate_client_config_layout("client.toml", &relay_known).unwrap_err();
+        assert!(
+            error.contains("peer_secret known by a configured server"),
+            "{error}"
+        );
+
+        let credential_known = format!(
+            "[client]\npeer_secret = \"{}\"\n\n{server}[peer]\nexit = true\n",
+            "FFEEDDCCBBAA99887766554433221100FFEEDDCCBBAA99887766554433221100"
+        );
+        let error = validate_client_config_layout("client.toml", &credential_known).unwrap_err();
+        assert!(
+            error.contains("peer_secret known by a configured server"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn container_environment_requires_recreation_values() {
+        let current = [
+            "ZERONAT_SECRET=current".into(),
+            "MODE=client".into(),
+            "PATH=/usr/local/bin:/usr/bin".into(),
+        ];
+
+        validate_container_env(&current, "ZERONAT_SECRET=current\nMODE=client\n").unwrap();
+
+        let error = validate_container_env(
+            &current,
+            "ZERONAT_SECRET=replacement\nMODE=client\nEXTRA=value\n",
+        )
+        .unwrap_err();
+        assert!(error.contains("ZERONAT_SECRET"), "{error}");
+        assert!(error.contains("EXTRA"), "{error}");
+        assert!(!error.contains("PATH"), "{error}");
+        assert!(!error.contains("current"), "{error}");
+        assert!(!error.contains("replacement"), "{error}");
+    }
+
+    #[test]
+    fn docker_restart_policy_keeps_failure_retry_limit() {
+        assert_eq!(
+            super::docker_restart_policy("on-failure".into(), "7".into()).unwrap(),
+            "on-failure:7"
+        );
+        assert_eq!(
+            super::docker_restart_policy("always".into(), "0".into()).unwrap(),
+            "always"
+        );
+    }
+
+    #[test]
+    fn environment_snapshot_refuses_unrepresentable_entries_and_new_image_keys() {
+        assert!(super::validate_env_file_entry(
+            "ZERONAT_ARGS=client --config /etc/zeronat/client.toml"
+        )
+        .is_ok());
+        assert!(super::validate_env_file_entry("#SECRET=value").is_err());
+        assert!(super::validate_env_file_entry("SECRET= trailing ").is_err());
+        assert!(
+            super::validate_env_file_entry(&format!("LONG={}", "x".repeat(64 * 1024))).is_err()
+        );
+
+        let current = ["PATH=/old".into(), "SECRET=current".into()];
+        super::validate_image_env(&current, &["PATH=/new".into()]).unwrap();
+        let error = super::validate_image_env(&current, &["NEW=value".into()]).unwrap_err();
+        assert!(error.contains("NEW"), "{error}");
+        assert!(!error.contains("value"), "{error}");
+    }
+
+    #[test]
+    fn client_role_is_not_bypassed_by_a_server_argument_value() {
+        let command = [
+            "client".to_string(),
+            "--config".to_string(),
+            "server".to_string(),
+        ];
+
+        assert_eq!(deployment_role(&command), Some("client"));
+    }
+
+    #[test]
+    fn client_config_layout_accepts_comments_outside_strings() {
+        let current = "[[servers]] # home\nname = \"home#lab\" # label\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\" # identity\ncredential = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\" # credential\n";
+
+        assert!(validate_client_config_layout("client.toml", current).unwrap());
+    }
+
+    #[test]
+    fn compose_pins_the_protocol_v6_image() {
+        let mut runner = FakeRunner { cmds: Vec::new() };
+        let base = vec![
+            "compose".to_string(),
+            "-f".to_string(),
+            COMPOSE_FILE.to_string(),
+        ];
+
+        compose(&mut runner, "docker", &base, "pull").unwrap();
+
+        assert_eq!(
+            runner.cmds,
+            [format!(
+                "env ZERONAT_IMAGE={IMAGE} docker compose -f {COMPOSE_FILE} pull"
+            )]
+        );
+    }
+
+    #[test]
+    fn rendered_compose_command_selects_the_zeronat_service() {
+        let rendered = br#"{"services":{"other":{"command":["server"]},"zeronat":{"command":["client","--config","/etc/zeronat/client.toml"]}}}"#;
+
+        assert_eq!(
+            parse_compose_command(rendered).unwrap(),
+            ["client", "--config", "/etc/zeronat/client.toml"]
+        );
+    }
+
+    #[test]
     fn systemd_install_restarts_after_writing_config() {
         let mut r = FakeRunner { cmds: Vec::new() };
         let mut c = cfg();
@@ -1128,6 +1958,10 @@ mod tests {
 
         let reload = r.cmds.iter().position(|c| c == "systemctl daemon-reload");
         let restart = r.cmds.iter().position(|c| c == "systemctl restart zeronat");
+        assert!(r
+            .cmds
+            .iter()
+            .any(|command| command.contains("/zeronat-v6-")));
         assert!(r.cmds.contains(&"systemctl enable zeronat".to_string()));
         assert!(restart.unwrap() > reload.unwrap());
     }
@@ -1162,16 +1996,21 @@ mod tests {
     fn generated_env_authorizes_the_installed_client() {
         let mut c = cfg();
         c.mode = Mode::Server;
-        let server = env_file(&c, "server --control 2222");
+        let credential = zeronat_secret::client_credential(TEST_SECRET).unwrap();
+        let public = zeronat_secret::server_public(TEST_SECRET).unwrap();
+        let server = env_file(&c, "server --control 2222").unwrap();
         assert!(server.contains(&format!("ZERONAT_SECRET={TEST_SECRET}\n")));
         assert!(server.contains("ZERONAT_CLIENT_ID=client\n"));
-        assert!(server.contains(&format!("ZERONAT_CLIENT_SECRET={TEST_SECRET}\n")));
+        assert!(server.contains(&format!("ZERONAT_CLIENT_SECRET={credential}\n")));
         assert!(server.contains(&format!("ZERONAT_ADMIN_SECRET={TEST_ADMIN_SECRET}\n")));
 
         c.mode = Mode::Client;
-        let client = env_file(&c, "client --server 127.0.0.1:2222");
-        assert!(client.contains(&format!("ZERONAT_SECRET={TEST_SECRET}\n")));
-        assert!(client.contains(&format!("ZERONAT_CLIENT_SECRET={TEST_SECRET}\n")));
+        c.secret = credential.clone();
+        c.server_public = public.clone();
+        let client = env_file(&c, "client --server 127.0.0.1:2222").unwrap();
+        assert!(client.contains(&format!("ZERONAT_SECRET={public}\n")));
+        assert!(client.contains(&format!("ZERONAT_CLIENT_SECRET={credential}\n")));
+        assert!(!client.contains(&format!("ZERONAT_SECRET={TEST_SECRET}\n")));
         assert!(!client.contains("ZERONAT_CLIENT_ID="));
         assert!(!client.contains("ZERONAT_ADMIN_SECRET="));
     }
@@ -1209,23 +2048,13 @@ mod tests {
     }
 
     #[test]
-    fn client_peer_uses_the_server_port() {
+    fn enrolled_client_does_not_generate_a_server_command() {
         let mut c = cfg();
         c.mode = Mode::Client;
         c.server_addr = "vps.example:9000".into();
         c.ports = "443/tcp".into();
         let (_, cmd) = peer_steps(&c);
-        assert!(cmd.contains("--server --control 9000"), "{cmd}");
-    }
-
-    #[test]
-    fn client_peer_defaults_the_port_when_omitted() {
-        let mut c = cfg();
-        c.mode = Mode::Client;
-        c.server_addr = "vps.example".into();
-        c.ports = "443/tcp".into();
-        let (_, cmd) = peer_steps(&c);
-        assert!(cmd.contains("--control 2222"), "{cmd}");
+        assert!(cmd.is_empty());
     }
 
     #[test]
@@ -1364,5 +2193,20 @@ mod tests {
         let (_, cmd) = peer_steps(&c);
         assert!(cmd.contains("get.sh"), "{cmd}");
         assert!(cmd.ends_with(" -y"), "{cmd}");
+    }
+
+    #[test]
+    fn generated_client_enrollment_does_not_disclose_the_server_secret() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.use_dht = true;
+        c.secret = TEST_SECRET.into();
+        let (_, cmd) = peer_steps(&c);
+        let public = zeronat_secret::server_public(TEST_SECRET).unwrap();
+        let credential = zeronat_secret::client_credential(TEST_SECRET).unwrap();
+
+        assert!(!cmd.contains(TEST_SECRET), "{cmd}");
+        assert!(cmd.contains(&public), "{cmd}");
+        assert!(cmd.contains(&credential), "{cmd}");
     }
 }

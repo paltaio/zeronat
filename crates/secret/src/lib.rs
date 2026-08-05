@@ -1,5 +1,8 @@
 use std::fmt;
 
+use blake2::{Blake2s256, Digest};
+use ed25519_dalek::SigningKey;
+
 pub const BYTE_LEN: usize = 32;
 pub const HEX_LEN: usize = BYTE_LEN * 2;
 
@@ -36,7 +39,28 @@ pub fn generate() -> Result<String, getrandom::Error> {
     Ok(encode(bytes))
 }
 
-fn encode(bytes: [u8; BYTE_LEN]) -> String {
+pub fn server_signing_seed(secret: &str) -> Result<[u8; BYTE_LEN], FormatError> {
+    derive(b"zeronat-server-signing-v1", secret)
+}
+
+pub fn server_public(secret: &str) -> Result<String, FormatError> {
+    let signing = SigningKey::from_bytes(&server_signing_seed(secret)?);
+    Ok(encode(signing.verifying_key().to_bytes()))
+}
+
+pub fn client_credential(secret: &str) -> Result<String, FormatError> {
+    derive(b"zeronat-client-credential-v1", secret).map(encode)
+}
+
+fn derive(domain: &[u8], secret: &str) -> Result<[u8; BYTE_LEN], FormatError> {
+    let secret = decode(secret)?;
+    let mut hash = Blake2s256::new();
+    hash.update(domain);
+    hash.update(secret);
+    Ok(hash.finalize().into())
+}
+
+pub fn encode(bytes: [u8; BYTE_LEN]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(HEX_LEN);
     for byte in bytes {
@@ -84,5 +108,17 @@ mod tests {
         let secret = generate().unwrap();
         assert_eq!(secret.len(), HEX_LEN);
         assert!(secret.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn server_public_and_client_credential_are_separate_derivations() {
+        let secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let public = server_public(secret).unwrap();
+        let credential = client_credential(secret).unwrap();
+        assert_ne!(public, secret);
+        assert_ne!(credential, secret);
+        assert_ne!(public, credential);
+        decode(&public).unwrap();
+        decode(&credential).unwrap();
     }
 }

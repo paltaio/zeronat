@@ -22,8 +22,8 @@ use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 #[cfg(target_os = "linux")]
 use crate::netfilter;
 use crate::noise::{
-    server_handshake_remote, server_handshake_stateless_claim, AuthIdentity, ClientCredentials,
-    Noise, NoiseReader, NoiseWriter, StatelessNoise,
+    server_handshake_remote, server_handshake_stateless_claim_remote, AuthIdentity,
+    ClientCredentials, Noise, NoiseReader, NoiseWriter, StatelessNoise,
 };
 #[cfg(target_os = "linux")]
 use crate::proto::BridgeEntry;
@@ -174,6 +174,7 @@ struct ClientHandle {
     /// it has not announced. The server sends peer tags only to a client whose
     /// entry holds `Some`, so an old client never sees an undecodable frame.
     peer_provides: Option<u8>,
+    peer_identity: Option<[u8; 32]>,
     bridge_capability: Option<Capability>,
     cancel: watch::Sender<bool>,
 }
@@ -217,6 +218,8 @@ struct Pair {
     provider_id: String,
     /// The pair's capability: the consumer's validated `want` bit.
     want: u8,
+    /// Public transcript challenge sent to both parties.
+    challenge: [u8; 32],
     consumer: PartyProbe,
     provider: PartyProbe,
     /// Set once the `PeerInfo` frames go out, so a completing probe and the
@@ -354,6 +357,7 @@ struct RelayLegClaim {
 
 struct ProbeClaim {
     pair_id: u64,
+    client_id: String,
     capability: Capability,
 }
 
@@ -378,7 +382,6 @@ struct PendingStream {
 }
 
 pub(crate) struct Server {
-    psk: [u8; 32],
     client_credentials: ClientCredentials,
     admin_psk: Option<[u8; 32]>,
     server_id: String,
@@ -389,6 +392,8 @@ pub(crate) struct Server {
     /// Every client id that has ever registered on this server, kept across
     /// disconnects so `PeerConnect` can tell an offline peer from an unknown one.
     known_clients: Mutex<HashSet<String>>,
+    /// Peer identities seen in a completed announcement, retained for offline status.
+    known_peer_ids: Mutex<HashSet<String>>,
     /// Accepted rendezvous pairs by `pair_id`.
     pairs: Mutex<HashMap<u64, Pair>>,
     /// Outstanding probe ids to their owning `pair_id`, letting the udp
@@ -577,23 +582,30 @@ impl Server {
         if !owned {
             return None;
         }
-        // A party never pairs with itself. The punch elects its roles by
-        // comparing the two client ids, so equal ids leave both ends
-        // responders: neither can send handshake message one, the pair burns
-        // its deadline, and an exclusive provider's one slot is held by a
-        // pair that carries nothing.
-        if provider_id == consumer_id {
-            return Some((0, PeerStatus::UnknownPeer));
-        }
-        let Some(handle) = clients.get(provider_id) else {
+        let provider = crate::secret::decode(provider_id)
+            .ok()
+            .and_then(|identity| {
+                clients
+                    .iter()
+                    .find(|(_, handle)| handle.peer_identity == Some(identity))
+            });
+        #[cfg(test)]
+        let provider = provider.or_else(|| clients.get_key_value(provider_id));
+        let Some((provider_client_id, handle)) = provider else {
             drop(clients);
-            // An id that has registered before but holds no live session is
-            // offline; one this server has never seen is unknown.
+            if self.known_peer_ids.lock().unwrap().contains(provider_id) {
+                return Some((0, PeerStatus::PeerOffline));
+            }
+            #[cfg(test)]
             if self.known_clients.lock().unwrap().contains(provider_id) {
                 return Some((0, PeerStatus::PeerOffline));
             }
             return Some((0, PeerStatus::UnknownPeer));
         };
+        let provider_client_id = provider_client_id.clone();
+        if provider_client_id == consumer_id {
+            return Some((0, PeerStatus::UnknownPeer));
+        }
         if handle.tx.is_closed() {
             return Some((0, PeerStatus::PeerOffline));
         }
@@ -613,7 +625,9 @@ impl Server {
         // both relay legs.
         for (id, pair) in pairs
             .extract_if(|_, p| {
-                p.consumer_id == consumer_id && p.provider_id == provider_id && p.want == want
+                p.consumer_id == consumer_id
+                    && p.provider_id == provider_client_id
+                    && p.want == want
             })
             .collect::<Vec<_>>()
         {
@@ -625,24 +639,29 @@ impl Server {
         if want == PROVIDES_EXIT
             && pairs
                 .values()
-                .any(|p| p.provider_id == provider_id && p.want == want)
+                .any(|p| p.provider_id == provider_client_id && p.want == want)
         {
             return Some((0, PeerStatus::PeerBusy));
         }
         let pair_id = self.next_id();
+        let Ok(challenge) = Self::capability() else {
+            crate::elog!("peer pair allocation failed: random source unavailable");
+            return None;
+        };
         pairs.insert(
             pair_id,
             Pair {
                 consumer_id: consumer_id.to_string(),
-                provider_id: provider_id.to_string(),
+                provider_id: provider_client_id.clone(),
                 want,
+                challenge,
                 consumer: PartyProbe::default(),
                 provider: PartyProbe::default(),
                 info_sent: false,
                 relay: None,
             },
         );
-        crate::elog!("peer pair {pair_id}: {consumer_id} -> {provider_id}");
+        crate::elog!("peer pair {pair_id}: {consumer_id} -> {provider_client_id}");
         Some((pair_id, PeerStatus::Accepted))
     }
 
@@ -704,15 +723,31 @@ impl Server {
             let consumer_id = pair.consumer_id.clone();
             let provider_id = pair.provider_id.clone();
             let want = pair.want;
+            let challenge = pair.challenge;
             let mut probes = self.probes.lock().unwrap();
-            for (id, peer_id, party) in [
-                (&consumer_id, &provider_id, &mut pair.consumer),
-                (&provider_id, &consumer_id, &mut pair.provider),
+            for (id, party, peer_identity) in [
+                (
+                    &consumer_id,
+                    &mut pair.consumer,
+                    clients
+                        .get(&provider_id)
+                        .and_then(|handle| handle.peer_identity),
+                ),
+                (
+                    &provider_id,
+                    &mut pair.provider,
+                    clients
+                        .get(&consumer_id)
+                        .and_then(|handle| handle.peer_identity),
+                ),
             ] {
                 // An entry gone or swapped mid-teardown is left unsettled: the
                 // pending invalidation clears this pair, and a probe must not
                 // ride a session that never announced.
                 let Some(h) = clients.get(id).filter(|h| h.peer_provides.is_some()) else {
+                    continue;
+                };
+                let Some(peer_identity) = peer_identity else {
                     continue;
                 };
                 let probe_id = self.next_id();
@@ -732,6 +767,7 @@ impl Server {
                             probe_id,
                             ProbeClaim {
                                 pair_id,
+                                client_id: id.clone(),
                                 capability,
                             },
                         );
@@ -742,9 +778,10 @@ impl Server {
                     h.tx.clone(),
                     Msg::PeerProbe {
                         pair_id,
-                        peer_id: peer_id.clone(),
+                        peer_id: crate::secret::encode(peer_identity),
                         probe_id,
                         probe_capability,
+                        auth: crate::proto::PairAuth { challenge },
                         provides: want,
                     }
                     .encode(),
@@ -802,11 +839,11 @@ impl Server {
         .then_some(pair_id)
     }
 
-    fn take_probe(&self, probe_id: u64, capability: &Capability) -> Option<u64> {
+    fn take_probe(&self, probe_id: u64, client_id: &str, capability: &Capability) -> Option<u64> {
         let mut probes = self.probes.lock().unwrap();
         let authorized = probes
             .get(&probe_id)
-            .is_some_and(|claim| capability == &claim.capability);
+            .is_some_and(|claim| client_id == claim.client_id && capability == &claim.capability);
         authorized
             .then(|| probes.remove(&probe_id))
             .flatten()
@@ -1174,6 +1211,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
     let secret = crate::secret::normalize(&secret)?;
     let mut authorized_clients = ClientCredentials::new();
     let mut authorized_ids = HashSet::new();
+    let mut dht_credentials = Vec::new();
     for credential in client_credentials {
         if credential.client_id.is_empty() {
             return Err("client id must not be empty".into());
@@ -1181,8 +1219,12 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         if !authorized_ids.insert(credential.client_id.clone()) {
             return Err(format!("duplicate client id `{}`", credential.client_id).into());
         }
-        let secret = crate::secret::normalize(&credential.secret)?;
-        let psk = crate::noise::derive_psk(&secret);
+        let credential_secret = crate::secret::normalize(&credential.secret)?;
+        if credential_secret == secret {
+            return Err("client credential must differ from the server secret".into());
+        }
+        dht_credentials.push(credential_secret.clone());
+        let psk = crate::noise::derive_psk(&credential_secret);
         let selector = crate::noise::client_selector(&psk);
         if authorized_clients
             .insert(selector, (credential.client_id.clone(), psk))
@@ -1270,12 +1312,14 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
     if let Some(ann) = dht {
         #[cfg(feature = "dht")]
         {
-            let secret = secret.clone();
             let ip = ann.ip;
             let port = ann.port.unwrap_or(control_port);
-            crate::spawn(async move {
-                crate::dht::announce_loop(&secret, ip, port).await;
-            });
+            for credential in dht_credentials {
+                let secret = secret.clone();
+                crate::spawn(async move {
+                    crate::dht::announce_loop(&secret, &credential, ip, port).await;
+                });
+            }
         }
         #[cfg(not(feature = "dht"))]
         {
@@ -1285,7 +1329,6 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
     }
 
     let srv = Arc::new(Server {
-        psk: crate::noise::derive_psk(&secret),
         client_credentials: authorized_clients,
         admin_psk,
         server_id,
@@ -1294,6 +1337,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         udp_pending: Mutex::new(HashMap::new()),
         clients: Mutex::new(HashMap::new()),
         known_clients: Mutex::new(HashSet::new()),
+        known_peer_ids: Mutex::new(HashSet::new()),
         pairs: Mutex::new(HashMap::new()),
         probes: Mutex::new(HashMap::new()),
         relay_legs: Mutex::new(HashMap::new()),
@@ -1452,6 +1496,7 @@ pub(crate) async fn serve_stream(
                         fwd: Arc::new(HashMap::new()),
                         observed: peer,
                         peer_provides: None,
+                        peer_identity: None,
                         bridge_capability: Some(bridge_capability),
                         cancel,
                     },
@@ -1523,15 +1568,26 @@ pub(crate) async fn serve_stream(
                         // so an old client never sees an undecodable frame.
                         tx.try_send(Msg::FwdOptionsAck.encode()).ok();
                     }
-                    Ok(Msg::PeerAnnounce { provides }) => {
+                    Ok(Msg::PeerAnnounce { provides, identity }) => {
                         // Record peer support only while this session still owns
                         // its slot (same guard as FwdOptions); the recorded
                         // entry gates every later peer tag to this client.
                         let observed = {
                             let mut clients = srv.clients.lock().unwrap();
+                            let duplicate = clients.iter().any(|(id, handle)| {
+                                id != &client_id && handle.peer_identity == Some(identity)
+                            });
+                            if duplicate {
+                                continue;
+                            }
                             match clients.get_mut(&client_id) {
                                 Some(h) if h.tx.same_channel(&tx) => {
                                     h.peer_provides = Some(provides);
+                                    h.peer_identity = Some(identity);
+                                    srv.known_peer_ids
+                                        .lock()
+                                        .unwrap()
+                                        .insert(crate::secret::encode(identity));
                                     h.observed
                                 }
                                 _ => None,
@@ -2574,7 +2630,7 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
             }) => {
                 let srv = srv.clone();
                 let sess2 = sess.clone();
-                let psk = srv.psk;
+                let client_credentials = srv.client_credentials.clone();
                 crate::spawn(async move {
                     // Message 2's payload carries the datagram source address
                     // back to the initiator: a probe reads its public mapping
@@ -2582,22 +2638,28 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
                     let reply = crate::proto::encode_sockaddr(src);
                     let handshake = timeout(
                         HANDSHAKE_TIMEOUT,
-                        server_handshake_stateless_claim(stream, &psk, &reply),
+                        server_handshake_stateless_claim_remote(
+                            stream,
+                            &client_credentials,
+                            &reply,
+                        ),
                     )
                     .await;
                     drop(permit);
-                    if let Ok(Ok((id, capability, noise))) = handshake {
+                    if let Ok(Ok((client_id, id, capability, noise))) = handshake {
                         #[cfg(target_os = "linux")]
                         if conv == BRIDGE_CONV {
-                            accept_bridge(srv, sess2, conv, capability, noise, src).await;
+                            accept_bridge(srv, sess2, conv, &client_id, capability, noise, src)
+                                .await;
                             return;
                         }
-                        if let Some(pair_id) = srv.take_probe(id, &capability) {
+                        if let Some(pair_id) = srv.take_probe(id, &client_id, &capability) {
                             accept_probe(srv, sess2, conv, pair_id, id, noise, src).await;
                         } else if srv.relay_legs.lock().unwrap().contains_key(&id) {
-                            accept_relay_leg(&srv, &sess2, conv, id, capability, noise);
+                            accept_relay_leg(&srv, &sess2, conv, &client_id, id, capability, noise);
                         } else {
-                            accept_udp_forward(srv, sess2, conv, id, capability, noise).await;
+                            accept_udp_forward(srv, sess2, conv, &client_id, id, capability, noise)
+                                .await;
                         }
                     }
                 });
@@ -2623,6 +2685,7 @@ async fn accept_udp_forward(
     srv: Arc<Server>,
     sess: Arc<Session>,
     conv: u32,
+    client_id: &str,
     id: u64,
     capability: Capability,
     noise: StatelessNoise,
@@ -2635,7 +2698,7 @@ async fn accept_udp_forward(
         idle,
         mut cancel,
         ..
-    }) = take_udp_pending(&srv, id, &capability)
+    }) = take_udp_pending(&srv, client_id, id, &capability)
     else {
         return;
     };
@@ -2658,11 +2721,17 @@ async fn accept_udp_forward(
     }
 }
 
-fn take_udp_pending(srv: &Server, id: u64, capability: &Capability) -> Option<UdpPending> {
+fn take_udp_pending(
+    srv: &Server,
+    client_id: &str,
+    id: u64,
+    capability: &Capability,
+) -> Option<UdpPending> {
     let clients = srv.clients.lock().ok()?;
     let mut pending = srv.udp_pending.lock().ok()?;
     if pending.get(&id).is_some_and(|entry| {
-        &entry.capability == capability
+        entry.client_id == client_id
+            && &entry.capability == capability
             && clients
                 .get(&entry.client_id)
                 .is_some_and(|h| h.tx.same_channel(&entry.control_tx))
@@ -2680,6 +2749,7 @@ fn accept_relay_leg(
     srv: &Arc<Server>,
     sess: &Session,
     conv: u32,
+    client_id: &str,
     id: u64,
     capability: Capability,
     noise: StatelessNoise,
@@ -2687,7 +2757,7 @@ fn accept_relay_leg(
     // Claim the id before registering the tag: two handshakes completing for
     // one leg id would otherwise both register it, and the loser's guard would
     // erase the winner's entry on the way out.
-    let Some(pair_id) = srv.take_relay_leg(id, None, &capability) else {
+    let Some(pair_id) = srv.take_relay_leg(id, Some(client_id), &capability) else {
         return;
     };
     let noise = Arc::new(noise);
@@ -2742,6 +2812,7 @@ async fn accept_bridge(
     srv: Arc<Server>,
     sess: Arc<Session>,
     conv: u32,
+    authenticated_id: &str,
     capability: Capability,
     noise: StatelessNoise,
     src: SocketAddr,
@@ -2754,14 +2825,14 @@ async fn accept_bridge(
             crate::elog!("rejecting bridge conv: client registry lock poisoned");
             return;
         };
-        let Some((client_id, handle)) = clients
-            .iter_mut()
-            .find(|(_, handle)| handle.bridge_capability == Some(capability))
-        else {
+        let Some(handle) = clients.get_mut(authenticated_id) else {
             return;
         };
+        if handle.bridge_capability != Some(capability) {
+            return;
+        }
         handle.bridge_capability = None;
-        (client_id.clone(), handle.cancel.subscribe())
+        (authenticated_id.to_string(), handle.cancel.subscribe())
     };
     // One bridge port per session. A second concurrent bridge attach in the same
     // session is anomalous; refuse it so two ports never learn and ping-pong the
@@ -2991,15 +3062,14 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
     }
 
     fn test_server() -> Arc<Server> {
-        let client_psk = crate::noise::derive_psk("test-secret");
-        let client_credentials = [(
-            crate::noise::client_selector(&client_psk),
-            ("authorized".to_string(), client_psk),
-        )]
-        .into_iter()
-        .collect();
+        let client_credentials = ["authorized", "attacker", "prov", "c"]
+            .into_iter()
+            .map(|id| {
+                let psk = crate::noise::derive_psk(&format!("test-secret-{id}"));
+                (crate::noise::client_selector(&psk), (id.to_string(), psk))
+            })
+            .collect();
         Arc::new(Server {
-            psk: client_psk,
             client_credentials,
             admin_psk: Some(crate::noise::derive_psk("test-admin-secret")),
             server_id: "test".into(),
@@ -3008,6 +3078,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             udp_pending: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             known_clients: Mutex::new(HashSet::new()),
+            known_peer_ids: Mutex::new(HashSet::new()),
             pairs: Mutex::new(HashMap::new()),
             probes: Mutex::new(HashMap::new()),
             relay_legs: Mutex::new(HashMap::new()),
@@ -3029,14 +3100,15 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
 
     async fn dispatch_first(srv: Arc<Server>, identity: AuthIdentity, msg: Msg) -> Result<()> {
         let (client_io, server_io) = tokio::io::duplex(8192);
-        let psk = srv.psk;
+        let psk = crate::noise::derive_psk("test-secret");
         let client = crate::spawn(async move {
             let (_r, mut w) = crate::noise::client_handshake(client_io, &psk)
                 .await
                 .expect("client handshake");
             w.send(&msg.encode()).await.expect("send first message");
         });
-        let (r, w) = crate::noise::server_handshake(server_io, &srv.psk)
+        let psk = crate::noise::derive_psk("test-secret");
+        let (r, w) = crate::noise::server_handshake(server_io, &psk)
             .await
             .expect("server handshake");
         let result = serve_stream(srv, identity, r, w, ActiveTransport::Tcp, None).await;
@@ -3177,7 +3249,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
     async fn serve_stream_times_out_silent_role_frame() {
         let srv = test_server();
         let (client_io, server_io) = tokio::io::duplex(8192);
-        let psk = srv.psk;
+        let psk = crate::noise::derive_psk("test-secret");
 
         let client = crate::spawn(async move {
             let (_cr, _cw) = crate::noise::client_handshake(client_io, &psk)
@@ -3187,7 +3259,8 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             std::future::pending::<()>().await;
         });
 
-        let (r, w) = crate::noise::server_handshake(server_io, &srv.psk)
+        let psk = crate::noise::derive_psk("test-secret");
+        let (r, w) = crate::noise::server_handshake(server_io, &psk)
             .await
             .expect("server handshake");
         let res = serve_stream(
@@ -3212,7 +3285,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
     async fn serve_stream_times_out_silent_admin_request() {
         let srv = test_server();
         let (client_io, server_io) = tokio::io::duplex(8192);
-        let psk = srv.psk;
+        let psk = crate::noise::derive_psk("test-secret");
 
         let client = crate::spawn(async move {
             let (_cr, mut cw) = crate::noise::client_handshake(client_io, &psk)
@@ -3228,7 +3301,8 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             std::future::pending::<()>().await;
         });
 
-        let (r, w) = crate::noise::server_handshake(server_io, &srv.psk)
+        let psk = crate::noise::derive_psk("test-secret");
+        let (r, w) = crate::noise::server_handshake(server_io, &psk)
             .await
             .expect("server handshake");
         let res = serve_stream(srv, AuthIdentity::Admin, r, w, ActiveTransport::Tcp, None).await;
@@ -3269,12 +3343,17 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
                 fwd: Arc::new(HashMap::new()),
                 observed: None,
                 peer_provides,
+                peer_identity: Some(crate::peer::public_identity(&crate::noise::derive_psk(id))),
                 bridge_capability: None,
                 cancel,
             },
         );
         srv.known_clients.lock().unwrap().insert(id.into());
         (tx, rx)
+    }
+
+    fn test_peer_identity(id: &str) -> String {
+        crate::secret::encode(crate::peer::public_identity(&crate::noise::derive_psk(id)))
     }
 
     // Every PeerConnect failure names its reason: an id the server has never
@@ -3573,7 +3652,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
     async fn peer_announce_acked_with_recorded_address() {
         let srv = test_server();
         let (client_io, server_io) = tokio::io::duplex(8192);
-        let psk = srv.psk;
+        let psk = crate::noise::derive_psk("test-secret");
         let observed: SocketAddr = "203.0.113.7:4321".parse().unwrap();
 
         let srv2 = srv.clone();
@@ -3608,6 +3687,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         cw.send(
             &Msg::PeerAnnounce {
                 provides: PROVIDES_EXIT,
+                identity: [3; 32],
             }
             .encode(),
         )
@@ -3641,7 +3721,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
     async fn peer_connect_before_announce_is_dropped() {
         let srv = test_server();
         let (client_io, server_io) = tokio::io::duplex(8192);
-        let psk = srv.psk;
+        let psk = crate::noise::derive_psk("test-secret");
 
         let srv2 = srv.clone();
         let server = crate::spawn(async move {
@@ -3721,7 +3801,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
                 ..
             } => {
                 assert_eq!(got, pair_id);
-                assert_eq!(peer_id, peer);
+                assert_eq!(peer_id, test_peer_identity(peer));
                 assert_eq!(provides, PROVIDES_EXIT);
                 probe_id
             }
@@ -3845,7 +3925,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
                     ..
                 } => {
                     assert_eq!(got, pair_id);
-                    assert_eq!(peer_id, peer);
+                    assert_eq!(peer_id, test_peer_identity(peer));
                     assert_eq!(provides, PROVIDES_EXIT);
                     probe_id
                 }

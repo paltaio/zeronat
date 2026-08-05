@@ -58,8 +58,7 @@ impl Uplink {
     }
 }
 
-/// The client id of the peer serving the segment, distinct from this process's
-/// own client id.
+/// The public identity of the peer serving the segment.
 pub struct PeerId<'a>(pub &'a str);
 
 /// Pair with `peer`'s L2 segment and hand every session that comes up to the
@@ -71,6 +70,7 @@ pub fn peer(
     server: &str,
     secret: &str,
     credential: &str,
+    peer_secret: &str,
     id_prefix: &str,
     peer: PeerId<'_>,
 ) -> Uplink {
@@ -91,6 +91,7 @@ pub fn peer(
         pppoe: Vec::new(),
         autostart: None,
         id_prefix: Some(id_prefix.to_string()),
+        peer_secret: Some(peer_secret.to_string()),
         control: None,
         config: None,
         peers: vec![PeerSlotSpec::Consumer {
@@ -117,17 +118,15 @@ pub fn peer(
 /// How to reach the zeronat server, so the driver can redial after a drop.
 pub struct Dialer {
     target: Target,
-    secret: String,
     credential: String,
     client_id: String,
     backoff: Duration,
 }
 
 impl Dialer {
-    pub fn new(target: Target, secret: String, credential: String, client_id: String) -> Self {
+    pub fn new(target: Target, credential: String, client_id: String) -> Self {
         Dialer {
             target,
-            secret,
             credential,
             client_id,
             backoff: BACKOFF_START,
@@ -155,7 +154,7 @@ impl Dialer {
     /// One resolve-and-dial attempt.
     async fn attempt(&self) -> Result<Bridge> {
         let addr = self.target.resolve().await?;
-        bridge::connect(addr, &self.secret, &self.credential, &self.client_id)
+        bridge::connect(addr, &self.credential, &self.client_id)
             .await
             .map_err(|e| {
                 // A cached DHT address that stopped answering is re-resolved on

@@ -22,6 +22,27 @@ use crate::config::LoadError;
 use crate::proto::{proto_name, Proto};
 use crate::Result;
 
+#[derive(Debug)]
+struct EnrollmentConfigError(String);
+
+impl std::fmt::Display for EnrollmentConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EnrollmentConfigError {}
+
+fn enrollment_err(line: usize, message: &str) -> crate::Error {
+    Box::new(EnrollmentConfigError(format!(
+        "config line {line}: {message}"
+    )))
+}
+
+pub(crate) fn is_enrollment_error(error: &crate::Error) -> bool {
+    error.downcast_ref::<EnrollmentConfigError>().is_some()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CfgServer {
     /// Unique profile name; the select-server key.
@@ -85,8 +106,8 @@ pub struct CfgTun {
     /// without a default route.
     pub exit_strict: bool,
     /// The peer whose internet connection this tunnel exits through, naming
-    /// its `client_id`. Set, the table feeds a peer consumer slot; unset, it
-    /// feeds the server slot.
+    /// its public peer identity. Set, the table feeds a peer consumer slot;
+    /// unset, it feeds the server slot.
     pub exit_via: Option<String>,
 }
 
@@ -107,6 +128,8 @@ pub struct CfgPeer {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClientConfig {
     pub id: Option<String>,
+    /// Client-owned static Noise private key for peer sessions.
+    pub peer_secret: Option<ServerSecret>,
     /// Which `[[servers]]` entry to dial at boot; the first entry when unset.
     pub active: Option<String>,
     /// Admin socket path override.
@@ -133,13 +156,50 @@ impl ClientConfig {
     /// and device exclusivity. A violation here is a fatal boot error, kept
     /// out of `parse_client` so the file is never quarantined for it.
     pub fn validate(&self) -> Result<()> {
+        let peer_secret = self
+            .peer_secret
+            .as_ref()
+            .map(|secret| crate::secret::decode(&secret.0))
+            .transpose()
+            .map_err(|_| -> crate::Error {
+                "client peer_secret must be 64 hexadecimal characters".into()
+            })?;
+        let has_peer_slots = self.tun.as_ref().is_some_and(CfgTun::is_peer)
+            || self
+                .peer
+                .as_ref()
+                .is_some_and(|peer| peer.exit || peer.segment.is_some());
+        if has_peer_slots && self.peer_secret.is_none() {
+            return Err(
+                "[client] peer_secret is required when peer sessions are configured".into(),
+            );
+        }
+        if let Some(peer) = self.tun.as_ref().and_then(|tun| tun.exit_via.as_deref()) {
+            crate::secret::decode(peer).map_err(|_| -> crate::Error {
+                "tun exit_via must be a 64-hex peer identity".into()
+            })?;
+        }
         let mut names: HashSet<&str> = HashSet::new();
         for s in &self.servers {
-            crate::secret::decode(&s.secret.0)
+            let server_public = crate::secret::decode(&s.secret.0)
                 .map_err(|e| -> crate::Error { format!("server `{}` {e}", s.name).into() })?;
-            crate::secret::decode(&s.credential.0).map_err(|e| -> crate::Error {
-                format!("server `{}` client credential {e}", s.name).into()
-            })?;
+            let credential =
+                crate::secret::decode(&s.credential.0).map_err(|e| -> crate::Error {
+                    format!("server `{}` client credential {e}", s.name).into()
+                })?;
+            if server_public == credential {
+                return Err(Box::new(EnrollmentConfigError(format!(
+                    "server `{}` identity and client credential must differ; rotate the client credential and re-enroll this profile",
+                    s.name
+                ))));
+            }
+            if peer_secret.is_some_and(|peer| peer == server_public || peer == credential) {
+                return Err(format!(
+                    "client peer_secret must differ from the identity and client credential for server `{}`",
+                    s.name
+                )
+                .into());
+            }
             if !names.insert(&s.name) {
                 return Err(format!("duplicate server name `{}`", s.name).into());
             }
@@ -166,8 +226,8 @@ impl ClientConfig {
         if self.pppoe.iter().filter(|p| p.autostart).count() > 1 {
             return Err("more than one [[pppoe]] entry sets autostart = true".into());
         }
-        // A pair addresses both its ends off the shared secret, so a consumer
-        // table has no address of its own to take.
+        // Peer endpoint addresses are assigned as a pair, so a consumer table
+        // has no independent address.
         if self
             .tun
             .as_ref()
@@ -326,6 +386,7 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
                 reject_dup(&mut client_keys, key, n)?;
                 match key {
                     "id" => cfg.id = Some(parse_string(value, n)?),
+                    "peer_secret" => cfg.peer_secret = Some(ServerSecret(parse_string(value, n)?)),
                     "active" => cfg.active = Some(parse_string(value, n)?),
                     "control" => cfg.control = Some(parse_string(value, n)?),
                     other => {
@@ -453,7 +514,15 @@ fn close_record(
                 .secret
                 .take()
                 .ok_or_else(|| err(n, "server missing `secret`"))?;
-            let credential = record.credential.take().unwrap_or_else(|| secret.clone());
+            let credential = record
+                .credential
+                .take()
+                .ok_or_else(|| {
+                    enrollment_err(
+                        n,
+                        "server missing `credential`; rotate the client credential and re-enroll this profile",
+                    )
+                })?;
             cfg.servers.push(CfgServer {
                 name,
                 addr,
@@ -604,10 +673,17 @@ fn transport_str(t: Transport) -> &'static str {
 pub fn serialize_client(cfg: &ClientConfig) -> String {
     let mut out = String::new();
 
-    if cfg.id.is_some() || cfg.active.is_some() || cfg.control.is_some() {
+    if cfg.id.is_some()
+        || cfg.peer_secret.is_some()
+        || cfg.active.is_some()
+        || cfg.control.is_some()
+    {
         out.push_str("[client]\n");
         if let Some(id) = &cfg.id {
             out.push_str(&format!("id = {}\n", quote(id)));
+        }
+        if let Some(secret) = &cfg.peer_secret {
+            out.push_str(&format!("peer_secret = {}\n", quote(&secret.0)));
         }
         if let Some(active) = &cfg.active {
             out.push_str(&format!("active = {}\n", quote(active)));
@@ -735,6 +811,7 @@ mod tests {
     fn sample() -> ClientConfig {
         ClientConfig {
             id: Some("rpi-2".into()),
+            peer_secret: None,
             active: Some("home".into()),
             control: Some("/run/zeronat/client.sock".into()),
             servers: vec![
@@ -742,14 +819,14 @@ mod tests {
                     name: "home".into(),
                     addr: "dht".into(),
                     secret: ServerSecret(TEST_SECRET.into()),
-                    credential: ServerSecret(TEST_SECRET.into()),
+                    credential: ServerSecret(OTHER_SECRET.into()),
                     transport: Transport::Auto,
                 },
                 CfgServer {
                     name: "oci".into(),
                     addr: "203.0.113.10:2222".into(),
                     secret: ServerSecret(OTHER_SECRET.into()),
-                    credential: ServerSecret(OTHER_SECRET.into()),
+                    credential: ServerSecret(TEST_SECRET.into()),
                     transport: Transport::Tcp,
                 },
             ],
@@ -797,20 +874,61 @@ mod tests {
     }
 
     // Assertion failures and logged errors debug-print whole configs, so a
-    // debug-printed config must not carry any server secret.
+    // debug-printed config must not carry credentials or private keys.
     #[test]
-    fn cfg_debug_redacts_the_server_secret() {
-        let s = format!("{:?}", sample());
+    fn cfg_debug_redacts_credentials_and_peer_secret() {
+        let peer_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut cfg = sample();
+        cfg.peer_secret = Some(ServerSecret(peer_secret.into()));
+
+        let s = format!("{cfg:?}");
         assert!(!s.contains(TEST_SECRET), "{s}");
         assert!(!s.contains(OTHER_SECRET), "{s}");
+        assert!(!s.contains(peer_secret), "{s}");
         assert!(s.contains("home"));
+    }
+
+    #[test]
+    fn legacy_server_profile_requires_re_enrollment() {
+        let missing =
+            format!("[[servers]]\nname = \"home\"\naddr = \"dht\"\nsecret = \"{TEST_SECRET}\"\n");
+        let error = parse_client(&missing).unwrap_err().to_string();
+        assert!(error.contains("missing `credential`"), "{error}");
+        assert!(error.contains("re-enroll"), "{error}");
+
+        let shared = format!(
+            "[[servers]]\nname = \"home\"\naddr = \"dht\"\nsecret = \"{TEST_SECRET}\"\ncredential = \"{}\"\n",
+            TEST_SECRET.to_ascii_uppercase()
+        );
+        let error = parse_client(&shared)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must differ"), "{error}");
+        assert!(error.contains("re-enroll"), "{error}");
+    }
+
+    #[test]
+    fn peer_secret_must_differ_from_relay_known_values() {
+        let mut cfg = sample();
+        cfg.servers.truncate(1);
+        cfg.peer_secret = Some(ServerSecret(TEST_SECRET.to_ascii_uppercase()));
+
+        let error = cfg.validate().unwrap_err().to_string();
+
+        assert!(error.contains("peer_secret must differ"), "{error}");
+
+        cfg.peer_secret = Some(ServerSecret(OTHER_SECRET.to_ascii_uppercase()));
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("peer_secret must differ"), "{error}");
     }
 
     #[test]
     fn runtime_secret_format_is_strict() {
         let config = |secret: &str| {
             format!(
-                "[[servers]]\nname = \"home\"\naddr = \"127.0.0.1:2222\"\nsecret = \"{secret}\"\n"
+                "[[servers]]\nname = \"home\"\naddr = \"127.0.0.1:2222\"\nsecret = \"{secret}\"\ncredential = \"{OTHER_SECRET}\"\n"
             )
         };
         for invalid in [
@@ -841,7 +959,7 @@ mod tests {
                 name: "home".into(),
                 addr: "dht".into(),
                 secret: ServerSecret(TEST_SECRET.into()),
-                credential: ServerSecret(TEST_SECRET.into()),
+                credential: ServerSecret(OTHER_SECRET.into()),
                 transport: Transport::Auto,
             }],
             tap: Some(CfgTap {
@@ -913,16 +1031,17 @@ mod tests {
     #[test]
     fn peer_slot_tables_roundtrip() {
         let cfg = parse_client(
-            "[[forwards]]\nproto = \"tcp\"\nport = 443\n\
+            "[client]\npeer_secret = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\n\
+             [[forwards]]\nproto = \"tcp\"\nport = 443\n\
              [[pppoe]]\nname = \"wan\"\nusername = \"u\"\n\
-             [tun]\ndev = \"zn0\"\nexit = true\nexit_via = \"office-b1c2\"\n\
+             [tun]\ndev = \"zn0\"\nexit = true\nexit_via = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
              [peer]\nexit = true\nexit_iface = \"wan0\"\nsegment = \"eth1\"\n",
         )
         .unwrap();
         cfg.validate().unwrap();
         let tun = cfg.tun.as_ref().unwrap();
         assert!(tun.is_peer());
-        assert_eq!(tun.exit_via.as_deref(), Some("office-b1c2"));
+        assert_eq!(tun.exit_via.as_deref(), Some(TEST_SECRET));
         let peer = cfg.peer.as_ref().unwrap();
         assert!(peer.exit);
         assert_eq!(peer.exit_iface.as_deref(), Some("wan0"));
@@ -944,7 +1063,7 @@ mod tests {
     #[test]
     fn entry_defaults() {
         let cfg = parse_client(
-            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
+            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\ncredential = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = 8080\n\
              [[pppoe]]\nname = \"wan\"\nusername = \"u\"\n",
         )
@@ -970,7 +1089,7 @@ mod tests {
     #[test]
     fn serialize_omits_defaults() {
         let cfg = parse_client(
-            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
+            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\ncredential = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = 8080\n\
              [[pppoe]]\nname = \"wan\"\nusername = \"u\"\n",
         )
@@ -1077,10 +1196,10 @@ mod tests {
     fn semantic_errors_parse_but_fail_validate() {
         let cases = [
             // active names no [[servers]] entry.
-            "[client]\nactive = \"gone\"\n[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n",
+            "[client]\nactive = \"gone\"\n[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\ncredential = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\n",
             // Duplicate server names.
-            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
-             [[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\n",
+            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\ncredential = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\n\
+             [[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\ncredential = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n",
             // Duplicate (proto, port) forwards.
             "[[forwards]]\nproto = \"tcp\"\nport = 443\n[[forwards]]\nproto = \"tcp\"\nport = 443\n",
             // More than one autostart.
@@ -1092,8 +1211,6 @@ mod tests {
             "[tap]\ndev = \"t0\"\n[tun]\n",
             "[tap]\ndev = \"t0\"\n[[forwards]]\nproto = \"tcp\"\nport = 443\n",
             "[tun]\n[[pppoe]]\nname = \"w\"\nusername = \"u\"\n",
-            // A peer pair derives both ends of its subnet from the secret.
-            "[tun]\naddress = \"10.9.0.2/24\"\nexit_via = \"office-b1c2\"\n",
         ];
         for case in cases {
             let cfg = parse_client(case).unwrap_or_else(|e| {
@@ -1104,6 +1221,19 @@ mod tests {
                 "expected validate Err for:\n{case}"
             );
         }
+
+        let address_with_peer = format!(
+            "[client]\npeer_secret = \"{OTHER_SECRET}\"\n\n[tun]\naddress = \"10.9.0.2/24\"\nexit_via = \"{TEST_SECRET}\"\n"
+        );
+        let error = parse_client(&address_with_peer)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("`address` cannot be combined with `exit_via`"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1148,7 +1278,7 @@ mod tests {
         let path = dir.join("client.toml");
         std::fs::write(
             &path,
-            "[[servers]]\nname = \"home\"\naddr = \"127.0.0.1:2222\"\nsecret = \"short\"\n",
+            "[[servers]]\nname = \"home\"\naddr = \"127.0.0.1:2222\"\nsecret = \"short\"\ncredential = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\n",
         )
         .unwrap();
 

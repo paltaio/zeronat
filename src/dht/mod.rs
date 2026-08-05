@@ -1,7 +1,5 @@
-//! Server discovery over the Mainline DHT. The server publishes its reachable
-//! address as a signed, encrypted BEP44 mutable item; the client looks it up.
-//! Both derive the signing key, salt, and sealing key from the shared secret, so
-//! there is no out-of-band key exchange.
+//! Server discovery over the Mainline DHT. The server publishes one signed,
+//! encrypted BEP44 mutable item per authorized client credential.
 
 mod bencode;
 mod bep44;
@@ -30,9 +28,9 @@ const COLD_START_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const CACHE_TTL: Duration = Duration::from_secs(6 * 3600);
 const ADDR_VERSION: u8 = 0x01;
 
-/// Secret-derived DHT identity shared by both peers.
+/// A client's lookup identity. It contains the server's verifying key and
+/// credential-scoped lookup and sealing keys, but no signing key.
 pub struct Identity {
-    signing: SigningKey,
     pubkey: [u8; 32],
     salt: Vec<u8>,
     addr_key: [u8; 32],
@@ -40,15 +38,13 @@ pub struct Identity {
 }
 
 impl Identity {
-    pub fn derive(secret: &str) -> Result<Self> {
-        let secret = crate::secret::normalize(secret)?;
-        let signing = SigningKey::from_bytes(&blake(b"zeronat-dht-ed25519-v1", &secret));
-        let pubkey = signing.verifying_key().to_bytes();
-        let salt = blake(b"zeronat-dht-salt-v1", &secret)[..20].to_vec();
-        let addr_key = blake(b"zeronat-dht-addr-key-v1", &secret);
+    pub fn derive(server_public: &str, credential: &str) -> Result<Self> {
+        let pubkey = crate::secret::decode(server_public)?;
+        let credential = crate::secret::decode(credential)?;
+        let salt = blake(b"zeronat-dht-salt-v2", &credential)[..20].to_vec();
+        let addr_key = blake(b"zeronat-dht-addr-key-v2", &credential);
         let target = bep44::target(&pubkey, Some(&salt));
         Ok(Identity {
-            signing,
             pubkey,
             salt,
             addr_key,
@@ -57,10 +53,26 @@ impl Identity {
     }
 }
 
-fn blake(domain: &[u8], secret: &str) -> [u8; 32] {
+struct Publisher {
+    identity: Identity,
+    signing: SigningKey,
+}
+
+impl Publisher {
+    fn derive(server_secret: &str, credential: &str) -> Result<Self> {
+        let signing = SigningKey::from_bytes(&crate::secret::server_signing_seed(server_secret)?);
+        let public = crate::secret::encode(signing.verifying_key().to_bytes());
+        Ok(Publisher {
+            identity: Identity::derive(&public, credential)?,
+            signing,
+        })
+    }
+}
+
+fn blake(domain: &[u8], secret: &[u8; 32]) -> [u8; 32] {
     let mut h = Blake2s256::new();
     h.update(domain);
-    h.update(secret.as_bytes());
+    h.update(secret);
     h.finalize().into()
 }
 
@@ -120,10 +132,11 @@ fn aead_nonce(n: u64) -> Nonce {
 /// the DHT reports seeing us from (BEP42). Returns the announced IP and the
 /// number of nodes that stored the record.
 async fn publish(
-    id: &Identity,
+    publisher: &Publisher,
     announce_ip: Option<Ipv4Addr>,
     port: u16,
 ) -> Result<(Ipv4Addr, usize)> {
+    let id = &publisher.identity;
     // Persist the seq before the put so a crash between persist and put still
     // leaves the next boot with a strictly higher seq, never a re-used one.
     let seq = next_seq(now_unix(), read_seq(id));
@@ -134,7 +147,7 @@ async fn publish(
         .or(lookup.external_ip)
         .ok_or("could not determine external IP from the DHT; pass --announce-ip")?;
     let v = seal_addr(&id.addr_key, ip, port, seq);
-    let sig = bep44::sign(&id.signing, Some(&id.salt), seq, &v);
+    let sig = bep44::sign(&publisher.signing, Some(&id.salt), seq, &v);
     let stored = node
         .put(&id.pubkey, Some(&id.salt), seq, &v, &sig, &lookup.storers)
         .await;
@@ -162,11 +175,16 @@ pub async fn resolve(id: &Identity) -> Result<SocketAddr> {
 
 /// Republish the server address forever, refreshing the IP each cycle so a
 /// changed WAN address propagates within one interval.
-pub async fn announce_loop(secret: &str, announce_ip: Option<Ipv4Addr>, port: u16) {
-    let id = match Identity::derive(secret) {
-        Ok(id) => id,
+pub async fn announce_loop(
+    server_secret: &str,
+    credential: &str,
+    announce_ip: Option<Ipv4Addr>,
+    port: u16,
+) {
+    let publisher = match Publisher::derive(server_secret, credential) {
+        Ok(publisher) => publisher,
         Err(e) => {
-            crate::elog!("dht: invalid secret: {e}");
+            crate::elog!("dht: invalid identity input: {e}");
             return;
         }
     };
@@ -177,7 +195,7 @@ pub async fn announce_loop(secret: &str, announce_ip: Option<Ipv4Addr>, port: u1
     let mut backoff = COLD_START_BACKOFF;
     let mut warm = false;
     loop {
-        let delay = match publish(&id, announce_ip, port).await {
+        let delay = match publish(&publisher, announce_ip, port).await {
             Ok((ip, stored)) => {
                 crate::elog!("dht: announced {ip}:{port} to {stored} nodes");
                 if stored > 0 {
@@ -306,37 +324,71 @@ mod tests {
 
     #[test]
     fn identity_is_deterministic() {
-        let a = Identity::derive(&"a".repeat(64)).unwrap();
-        let b = Identity::derive(&"a".repeat(64)).unwrap();
-        let c = Identity::derive(&"b".repeat(64)).unwrap();
+        let server = "a".repeat(64);
+        let public = crate::secret::server_public(&server).unwrap();
+        let a = Identity::derive(&public, &"b".repeat(64)).unwrap();
+        let b = Identity::derive(&public, &"b".repeat(64)).unwrap();
+        let c = Identity::derive(&public, &"c".repeat(64)).unwrap();
         assert_eq!(a.pubkey, b.pubkey);
         assert_eq!(a.target, b.target);
         assert_eq!(a.salt, b.salt);
-        assert_ne!(a.pubkey, c.pubkey);
+        assert_eq!(a.pubkey, c.pubkey);
         assert_ne!(a.target, c.target);
     }
 
     #[test]
     fn seal_open_roundtrip() {
-        let id = Identity::derive(&"a".repeat(64)).unwrap();
+        let server = "a".repeat(64);
+        let public = crate::secret::server_public(&server).unwrap();
+        let id = Identity::derive(&public, &"b".repeat(64)).unwrap();
         let ip = Ipv4Addr::new(203, 0, 113, 7);
         let v = seal_addr(&id.addr_key, ip, 2222, 1700000000);
         assert_eq!(open_addr(&id.addr_key, &v), Some((ip, 2222)));
     }
 
     #[test]
-    fn open_rejects_wrong_key() {
-        let a = Identity::derive(&"a".repeat(64)).unwrap();
-        let b = Identity::derive(&"b".repeat(64)).unwrap();
+    fn client_credential_cannot_open_another_clients_discovery_record() {
+        let server = "a".repeat(64);
+        let public = crate::secret::server_public(&server).unwrap();
+        let a = Identity::derive(&public, &"b".repeat(64)).unwrap();
+        let b = Identity::derive(&public, &"c".repeat(64)).unwrap();
         let v = seal_addr(&a.addr_key, Ipv4Addr::LOCALHOST, 1, 5);
+        assert_ne!(a.target, b.target);
         assert_eq!(open_addr(&b.addr_key, &v), None);
     }
 
     #[test]
+    fn discovery_credential_cannot_sign_as_server() {
+        let server_secret = "a".repeat(64);
+        let credential = "b".repeat(64);
+        let publisher = Publisher::derive(&server_secret, &credential).unwrap();
+        let compromised_seed = crate::noise::derive_psk(&credential);
+        let compromised_client = SigningKey::from_bytes(&compromised_seed);
+        let v = seal_addr(
+            &publisher.identity.addr_key,
+            Ipv4Addr::new(203, 0, 113, 99),
+            2222,
+            5,
+        );
+        let forged = bep44::sign(&compromised_client, Some(&publisher.identity.salt), 5, &v);
+        assert!(
+            !bep44::verify(
+                &publisher.identity.pubkey,
+                Some(&publisher.identity.salt),
+                5,
+                &v,
+                &forged,
+            ),
+            "a client discovery credential must not sign a server record"
+        );
+    }
+
+    #[test]
     fn identity_rejects_invalid_runtime_secrets() {
-        assert!(Identity::derive("short").is_err());
-        assert!(Identity::derive(&"g".repeat(64)).is_err());
-        assert!(Identity::derive(&"a".repeat(64)).is_ok());
+        let public = crate::secret::server_public(&"a".repeat(64)).unwrap();
+        assert!(Identity::derive("short", &"b".repeat(64)).is_err());
+        assert!(Identity::derive(&public, &"g".repeat(64)).is_err());
+        assert!(Identity::derive(&public, &"b".repeat(64)).is_ok());
     }
 
     #[test]

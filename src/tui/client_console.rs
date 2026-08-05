@@ -100,13 +100,13 @@ enum Overlay {
         idle: String,
         field: u8,
     },
-    /// The add-server form. The secret lives only here and renders masked;
-    /// no toast or error ever echoes it.
+    /// The add-server form. Both enrollment values render masked.
     AddServer {
         name: String,
         addr: String,
         transport: Transport,
-        secret: String,
+        server_public: String,
+        credential: String,
         field: u8,
     },
     /// The add-forward form. A blank target is sent as the empty sentinel the
@@ -301,7 +301,8 @@ impl App {
                     name: String::new(),
                     addr: String::new(),
                     transport: Transport::Auto,
-                    secret: String::new(),
+                    server_public: String::new(),
+                    credential: String::new(),
                     field: 0,
                 };
             }
@@ -511,12 +512,12 @@ impl App {
             Key::Esc => self.overlay = Overlay::None,
             Key::Tab | Key::Down => {
                 if let Overlay::AddServer { field, .. } = &mut self.overlay {
-                    *field = (*field + 1) % 4;
+                    *field = (*field + 1) % 5;
                 }
             }
             Key::Up => {
                 if let Overlay::AddServer { field, .. } = &mut self.overlay {
-                    *field = (*field + 3) % 4;
+                    *field = (*field + 4) % 5;
                 }
             }
             Key::Left => {
@@ -552,7 +553,8 @@ impl App {
                     field,
                     name,
                     addr,
-                    secret,
+                    server_public,
+                    credential,
                     ..
                 } = &mut self.overlay
                 {
@@ -564,7 +566,10 @@ impl App {
                             addr.pop();
                         }
                         3 => {
-                            secret.pop();
+                            server_public.pop();
+                        }
+                        4 => {
+                            credential.pop();
                         }
                         _ => {}
                     }
@@ -577,14 +582,16 @@ impl App {
                     field,
                     name,
                     addr,
-                    secret,
+                    server_public,
+                    credential,
                     ..
                 } = &mut self.overlay
                 {
                     match field {
                         0 => name.push(c),
                         1 => addr.push(c),
-                        3 => secret.push(c),
+                        3 => server_public.push(c),
+                        4 => credential.push(c),
                         _ => {}
                     }
                 }
@@ -596,29 +603,56 @@ impl App {
     }
 
     async fn submit_add_server(&mut self) -> Flow {
-        let (name, addr, transport, secret) = match &self.overlay {
+        let (name, addr, transport, server_public, credential) = match &self.overlay {
             Overlay::AddServer {
                 name,
                 addr,
                 transport,
-                secret,
+                server_public,
+                credential,
                 ..
-            } => (name.clone(), addr.clone(), *transport, secret.clone()),
+            } => (
+                name.clone(),
+                addr.clone(),
+                *transport,
+                server_public.clone(),
+                credential.clone(),
+            ),
             _ => return Flow::Continue,
         };
-        let secret = match crate::secret::normalize(&secret) {
-            Ok(secret) => secret,
-            Err(e) => {
-                self.set_toast(e.to_string(), true);
+        let server_public = match crate::secret::normalize(&server_public) {
+            Ok(server_public) => server_public,
+            Err(_) => {
+                self.set_toast(
+                    "server identity must be exactly 64 hexadecimal characters (32 bytes)".into(),
+                    true,
+                );
                 return Flow::Continue;
             }
         };
+        let credential = match crate::secret::normalize(&credential) {
+            Ok(credential) => credential,
+            Err(_) => {
+                self.set_toast(
+                    "client credential must be exactly 64 hexadecimal characters (32 bytes)".into(),
+                    true,
+                );
+                return Flow::Continue;
+            }
+        };
+        if server_public == credential {
+            self.set_toast(
+                "server identity and client credential must differ".into(),
+                true,
+            );
+            return Flow::Continue;
+        }
         self.overlay = Overlay::None;
-        // The ok toast names the profile only; the secret is never echoed.
         let req = ClientMsg::AddServer {
             name: name.clone(),
             addr,
-            secret: ServerSecret(secret),
+            server_public: ServerSecret(server_public),
+            credential: ServerSecret(credential),
             transport,
         };
         self.apply(req, format!("added {name}")).await;
@@ -1198,7 +1232,8 @@ impl App {
                 name,
                 addr,
                 transport,
-                secret,
+                server_public,
+                credential,
                 field,
             } => {
                 let mut p = vec![frame::divider(w)];
@@ -1209,14 +1244,25 @@ impl App {
                     w,
                     form_pick("transport", transport_label(*transport), *field == 2),
                 ));
-                // One * per typed character; the secret itself never renders.
                 p.push(frame::row(
                     w,
-                    form_text("secret", &"*".repeat(secret.chars().count()), *field == 3),
+                    form_text(
+                        "identity",
+                        &"*".repeat(server_public.chars().count()),
+                        *field == 3,
+                    ),
                 ));
                 p.push(frame::row(
                     w,
-                    muted_line("  addr is \"dht\" or host:port; the secret is sent, never shown"),
+                    form_text(
+                        "credential",
+                        &"*".repeat(credential.chars().count()),
+                        *field == 4,
+                    ),
+                ));
+                p.push(frame::row(
+                    w,
+                    muted_line("  addr is \"dht\" or host:port; enrollment values stay masked"),
                 ));
                 p.push(frame::divider(w));
                 p
@@ -1752,60 +1798,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_form_masks_the_secret() {
-        let fixture = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    async fn add_form_masks_enrollment_values() {
+        let server_public = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let credential = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
         let mut app = app_with(snap());
         app.on_key(Key::Char('a')).await;
         assert!(matches!(app.overlay, Overlay::AddServer { .. }));
         for _ in 0..3 {
             app.on_key(Key::Tab).await;
         }
-        for c in fixture.chars() {
+        for c in server_public.chars() {
+            app.on_key(Key::Char(c)).await;
+        }
+        app.on_key(Key::Tab).await;
+        for c in credential.chars() {
             app.on_key(Key::Char(c)).await;
         }
         let rows = plain_view(&app);
         assert!(
-            rows.iter().any(|r| r.contains(&"*".repeat(64))),
-            "expected one * per typed char:\n{}",
+            rows.iter().filter(|r| r.contains(&"*".repeat(64))).count() >= 2,
+            "expected both values to render masked:\n{}",
             rows.join("\n")
         );
         assert!(
-            !rows.iter().any(|r| r.contains(fixture)),
-            "the secret text must never render"
+            !rows
+                .iter()
+                .any(|r| r.contains(server_public) || r.contains(credential)),
+            "enrollment values must never render"
         );
-        // The toggles walk the transport picker without touching the secret.
+        app.on_key(Key::Up).await;
         app.on_key(Key::Up).await;
         app.on_key(Key::Right).await;
         match &app.overlay {
             Overlay::AddServer {
-                transport, secret, ..
+                transport,
+                server_public: entered_public,
+                credential: entered_credential,
+                ..
             } => {
                 assert_eq!(*transport, Transport::Udp);
-                assert_eq!(secret, fixture);
+                assert_eq!(entered_public, server_public);
+                assert_eq!(entered_credential, credential);
             }
             _ => panic!("expected the add-server form"),
         }
-        // Submit against a dead socket: the error toast and status row must
-        // not echo the secret either.
         app.socket = std::env::temp_dir().join("zeronat-console-test-none.sock");
         app.on_key(Key::Enter).await;
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.toast.is_some(), "the failed submit must toast");
         let rows = plain_view(&app);
         assert!(
-            !rows.iter().any(|r| r.contains(fixture)),
-            "the secret text must never render:\n{}",
+            !rows
+                .iter()
+                .any(|r| r.contains(server_public) || r.contains(credential)),
+            "enrollment values must never render:\n{}",
             rows.join("\n")
         );
     }
 
     #[tokio::test]
-    async fn add_form_rejects_invalid_secret_before_submit() {
+    async fn add_form_rejects_invalid_credential_before_submit() {
+        let server_public = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         let mut app = app_with(snap());
         app.on_key(Key::Char('a')).await;
         for _ in 0..3 {
             app.on_key(Key::Tab).await;
         }
+        for c in server_public.chars() {
+            app.on_key(Key::Char(c)).await;
+        }
+        app.on_key(Key::Tab).await;
         for c in "short".chars() {
             app.on_key(Key::Char(c)).await;
         }
@@ -1813,6 +1875,7 @@ mod tests {
         assert!(matches!(app.overlay, Overlay::AddServer { .. }));
         let (message, is_error, _) = app.toast.clone().expect("a refusal toast");
         assert!(is_error);
+        assert!(message.contains("client credential"), "{message}");
         assert!(message.contains("64 hexadecimal"), "{message}");
     }
 

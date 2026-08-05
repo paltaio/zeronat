@@ -28,7 +28,7 @@ impl DownloadFile {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => {
-                    return Err(format!("failed to create private download directory: {e}"));
+                    return Err(format!("failed to create private staging directory: {e}"));
                 }
             }
 
@@ -38,12 +38,12 @@ impl DownloadFile {
             }
             return result;
         }
-        Err("could not create a private download directory".into())
+        Err("could not create a private staging directory".into())
     }
 
     fn create_file(dir: PathBuf) -> Result<Self, String> {
         let dir_meta = std::fs::symlink_metadata(&dir)
-            .map_err(|e| format!("failed to inspect private download directory: {e}"))?;
+            .map_err(|e| format!("failed to inspect private staging directory: {e}"))?;
         validate_dir(&dir_meta)?;
 
         let path = dir.join("artifact");
@@ -54,10 +54,10 @@ impl DownloadFile {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
-            .map_err(|e| format!("failed to create private download file: {e}"))?;
+            .map_err(|e| format!("failed to create private staging file: {e}"))?;
         let file_meta = file
             .metadata()
-            .map_err(|e| format!("failed to inspect private download file: {e}"))?;
+            .map_err(|e| format!("failed to inspect private staging file: {e}"))?;
         validate_file(&file_meta, false)?;
 
         Ok(Self {
@@ -73,12 +73,16 @@ impl DownloadFile {
         &self.file
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn prepare_install(&mut self) -> Result<&File, String> {
         let dir_meta = std::fs::symlink_metadata(&self.dir)
-            .map_err(|e| format!("failed to inspect private download directory: {e}"))?;
+            .map_err(|e| format!("failed to inspect private staging directory: {e}"))?;
         validate_dir(&dir_meta)?;
         if (dir_meta.dev(), dir_meta.ino()) != self.dir_identity {
-            return Err("private download directory was replaced".into());
+            return Err("private staging directory was replaced".into());
         }
 
         let path_meta = std::fs::symlink_metadata(&self.path)
@@ -121,7 +125,7 @@ fn random_download_name() -> Result<String, String> {
 
 fn validate_dir(meta: &std::fs::Metadata) -> Result<(), String> {
     if !meta.file_type().is_dir() || meta.uid() != effective_uid() || meta.mode() & 0o777 != 0o700 {
-        return Err("private download directory owner or permissions changed".into());
+        return Err("private staging directory owner or permissions changed".into());
     }
     Ok(())
 }
@@ -132,7 +136,7 @@ fn validate_file(meta: &std::fs::Metadata, require_content: bool) -> Result<(), 
         || meta.mode() & 0o777 != 0o600
         || meta.nlink() != 1
     {
-        return Err("downloaded binary owner, type, permissions, or link count changed".into());
+        return Err("private staging file owner, type, permissions, or link count changed".into());
     }
     if require_content && meta.len() == 0 {
         return Err("downloaded binary is empty".into());

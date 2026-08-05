@@ -24,6 +24,10 @@ const SECRET_D: &str = "22223333444455556666777788889999aaaabbbbccccddddeeeeffff
 const SECRET_E: &str = "3333444455556666777788889999aaaabbbbccccddddeeeeffff000011112222";
 const SECRET_F: &str = "444455556666777788889999aaaabbbbccccddddeeeeffff0000111122223333";
 const SECRET_G: &str = "55556666777788889999aaaabbbbccccddddeeeeffff00001111222233334444";
+const SERVER_SECRET: &str = "6666777788889999aaaabbbbccccddddeeeeffff000011112222333344445555";
+const SERVER_SECRET_B: &str = "777788889999aaaabbbbccccddddeeeeffff0000111122223333444455556666";
+const SERVER_PUBLIC: &str = "6f5c335b0ed3ffbc3da61d3112f9e6b58185e38efa43ac60c10c52030443ed43";
+const SERVER_PUBLIC_B: &str = "3b28e244139ae14462c07c1727482c8fa89c86cf988ef31e893e5ea18b0fa288";
 const ADMIN_SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// Build a `ServerSettings` for a config-less (runtime-only) server: localhost
@@ -51,7 +55,7 @@ fn cli_settings(control: u16, tcp: Vec<u16>, udp: Vec<u16>) -> ServerSettings {
     ServerSettings {
         bind: Ipv4Addr::LOCALHOST,
         control_port: control,
-        secret: SECRET.into(),
+        secret: SERVER_SECRET.into(),
         admin_secret: Some(ADMIN_SECRET.into()),
         client_credentials: vec![
             ClientCredentialSpec {
@@ -281,7 +285,7 @@ async fn start_tagged_pair(
         };
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
-            SECRET.into(),
+            SERVER_PUBLIC.into(),
             credential.into(),
             tcp_map,
             udp_map,
@@ -336,7 +340,7 @@ fn start_tunnel(transport: zeronat::client::Transport) -> Tunnel {
     // Client dialing out, mapping public ports to the local echo services.
     tokio::spawn(zeronat::client::run(
         format!("127.0.0.1:{control}"),
-        SECRET.into(),
+        SERVER_PUBLIC.into(),
         SECRET.into(),
         vec![fwd(public_tcp, local_tcp)],
         vec![fwd(public_udp, local_udp)],
@@ -650,7 +654,7 @@ async fn udp_control_answers_on_the_dialed_address() {
     tokio::spawn(zeronat::server::run(settings));
     tokio::spawn(zeronat::client::run(
         format!("127.0.0.2:{control}"),
-        SECRET.into(),
+        SERVER_PUBLIC.into(),
         SECRET.into(),
         vec![fwd(public_tcp, local_tcp)],
         vec![],
@@ -688,7 +692,7 @@ async fn run_udp_forward_source_test(transport: zeronat::client::Transport) {
     tokio::spawn(zeronat::server::run(settings));
     tokio::spawn(zeronat::client::run(
         format!("127.0.0.1:{control}"),
-        SECRET.into(),
+        SERVER_PUBLIC.into(),
         SECRET.into(),
         vec![],
         vec![fwd(public_udp, local_udp)],
@@ -1640,7 +1644,7 @@ async fn reconnect_same_id_supersede() {
         // full id, so the second supersedes the first in the registry.
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
-            SECRET.into(),
+            SERVER_PUBLIC.into(),
             SECRET.into(),
             vec![fwd(public_tcp, local_tcp)],
             vec![],
@@ -1653,7 +1657,7 @@ async fn reconnect_same_id_supersede() {
         ));
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
-            SECRET.into(),
+            SERVER_PUBLIC.into(),
             SECRET.into(),
             vec![fwd(public_tcp, local_tcp)],
             vec![],
@@ -1721,7 +1725,7 @@ async fn config_autosave_persists_route() {
         // One client maps the public port to its echo, so it serves the route.
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
-            SECRET.into(),
+            SERVER_PUBLIC.into(),
             SECRET.into(),
             vec![fwd(public_tcp, local_tcp)],
             vec![],
@@ -1809,7 +1813,7 @@ async fn cli_listener_remove_refused() {
 
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
-            SECRET.into(),
+            SERVER_PUBLIC.into(),
             SECRET.into(),
             vec![fwd(public_tcp, local_tcp)],
             vec![],
@@ -1865,7 +1869,7 @@ async fn runtime_node_does_not_persist() {
 
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
-            SECRET.into(),
+            SERVER_PUBLIC.into(),
             SECRET.into(),
             vec![fwd(public_tcp, local_tcp)],
             vec![],
@@ -1978,7 +1982,7 @@ async fn run_proxy_header_test(transport: zeronat::client::Transport) {
     forward.proxy = true;
     tokio::spawn(zeronat::client::run(
         format!("127.0.0.1:{control}"),
-        SECRET.into(),
+        SERVER_PUBLIC.into(),
         SECRET.into(),
         vec![forward],
         vec![],
@@ -2183,7 +2187,7 @@ async fn proxy_forward_refuses_headerless_open() {
         forward.proxy = true;
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
-            SECRET.into(),
+            SERVER_PUBLIC.into(),
             SECRET.into(),
             vec![forward],
             vec![],
@@ -2227,12 +2231,16 @@ async fn proxy_forward_refuses_headerless_open() {
         .expect("headerless-open refusal did not complete within 30s");
 }
 
-fn server_target(name: &str, control: u16, secret: &str) -> zeronat::client::ServerTarget {
+fn server_target(name: &str, control: u16, credential: &str) -> zeronat::client::ServerTarget {
     zeronat::client::ServerTarget {
         name: name.into(),
         addr: format!("127.0.0.1:{control}"),
-        secret: secret.into(),
-        credential: SECRET.into(),
+        secret: if name == "b" {
+            SERVER_PUBLIC_B.into()
+        } else {
+            SERVER_PUBLIC.into()
+        },
+        credential: credential.into(),
         transport: zeronat::client::Transport::Tcp,
     }
 }
@@ -2255,6 +2263,7 @@ fn client_settings(
         pppoe: vec![],
         autostart: None,
         id_prefix: Some(id.into()),
+        peer_secret: None,
         control: sock.map(|p| zeronat::clientctl::ControlPath::Explicit(p.to_path_buf())),
         config: None,
         peers: vec![],
@@ -2334,7 +2343,7 @@ async fn server_switch_moves_session() {
             vec![],
         )));
         let mut settings_b = cli_settings(control_b, vec![public_b], vec![]);
-        settings_b.secret = SECRET_B.into();
+        settings_b.secret = SERVER_SECRET_B.into();
         tokio::spawn(zeronat::server::run(settings_b));
 
         // One client dialing A, carrying forwards for both servers' public
@@ -2357,7 +2366,9 @@ async fn server_switch_moves_session() {
         // out the 90s control timeout waiting to notice A is gone: the
         // established relay through A is cut and traffic round-trips through
         // B's public port under B's secret within the 15s bound.
-        active.switch(server_target("b", control_b, SECRET_B));
+        active
+            .switch(server_target("b", control_b, SECRET_B))
+            .unwrap();
         timeout(Duration::from_secs(15), async {
             wait_tcp_cut(&mut conn).await;
             wait_tcp_path(public_b).await;
@@ -2385,7 +2396,7 @@ async fn dropping_client_future_aborts_session() {
         )));
         let client = tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
-            SECRET.into(),
+            SERVER_PUBLIC.into(),
             SECRET.into(),
             vec![fwd(public_tcp, local_tcp)],
             vec![],
@@ -2427,7 +2438,7 @@ async fn client_admin_socket_serves_snapshot() {
         let sock = dir.join("client.sock");
         tokio::spawn(zeronat::client::run(
             format!("127.0.0.1:{control}"),
-            SECRET.into(),
+            SERVER_PUBLIC.into(),
             SECRET.into(),
             vec![fwd(public_tcp, local_tcp)],
             vec![],
@@ -2579,7 +2590,7 @@ async fn select_server_moves_session_and_persists() {
             vec![],
         )));
         let mut settings_b = cli_settings(control_b, vec![public_b], vec![]);
-        settings_b.secret = SECRET_B.into();
+        settings_b.secret = SERVER_SECRET_B.into();
         tokio::spawn(zeronat::server::run(settings_b));
 
         // A file-backed client: the config on disk is what mutations persist
@@ -2589,8 +2600,8 @@ async fn select_server_moves_session_and_persists() {
         let sock = dir.join("client.sock");
         let text = format!(
             "[client]\nactive = \"a\"\n\
-             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:{control_a}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
-             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:{control_b}\"\nsecret = \"{SECRET_B}\"\ntransport = \"tcp\"\n\
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:{control_a}\"\nsecret = \"{SERVER_PUBLIC}\"\ncredential = \"{SECRET}\"\ntransport = \"tcp\"\n\
+             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:{control_b}\"\nsecret = \"{SERVER_PUBLIC_B}\"\ncredential = \"{SECRET}\"\ntransport = \"tcp\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = {public_a}\ntarget = \"127.0.0.1:{local_echo}\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = {public_b}\ntarget = \"127.0.0.1:{local_echo}\"\n"
         );
@@ -2687,7 +2698,7 @@ async fn set_forward_options_redials_and_persists() {
         let path = dir.join("client.toml");
         let sock = dir.join("client.sock");
         let text = format!(
-            "[[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
+            "[[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SERVER_PUBLIC}\"\ncredential = \"{SECRET}\"\ntransport = \"tcp\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = {public_tcp}\ntarget = \"127.0.0.1:{local_tcp}\"\n\
              [[forwards]]\nproto = \"udp\"\nport = {public_udp}\ntarget = \"127.0.0.1:{local_udp}\"\n"
         );
@@ -2879,7 +2890,7 @@ async fn add_and_remove_forward_move_live_traffic() {
         let path = dir.join("client.toml");
         let sock = dir.join("client.sock");
         let text = format!(
-            "[[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
+            "[[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SERVER_PUBLIC}\"\ncredential = \"{SECRET}\"\ntransport = \"tcp\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = {public_a}\ntarget = \"127.0.0.1:{local_echo}\"\n\
              [[forwards]]\nproto = \"udp\"\nport = {public_udp}\ntarget = \"127.0.0.1:{local_udp}\"\n"
         );
@@ -3047,7 +3058,7 @@ async fn add_first_forward_promotes_an_idle_client() {
         let sock = dir.join("client.sock");
         let text = format!(
             "[client]\nactive = \"home\"\n\
-             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n"
+             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SERVER_PUBLIC}\"\ncredential = \"{SECRET}\"\ntransport = \"tcp\"\n"
         );
         std::fs::write(&path, &text).unwrap();
         let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
@@ -3115,8 +3126,8 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
         let path = dir.join("client.toml");
         let sock = dir.join("client.sock");
         let text = format!(
-            "[client]\nactive = \"home\"\n\
-             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n"
+            "[client]\nactive = \"home\"\npeer_secret = \"{ADMIN_SECRET}\"\n\
+             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SERVER_PUBLIC}\"\ncredential = \"{SECRET}\"\ntransport = \"tcp\"\n"
         );
         std::fs::write(&path, &text).unwrap();
         let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
@@ -3128,6 +3139,7 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
             "psl",
             Some(&sock),
         );
+        settings.peer_secret = Some(ADMIN_SECRET.into());
         settings.config = Some((path.clone(), cfg));
         tokio::spawn(zeronat::client::run_switchable(
             zeronat::client::ActiveTarget::new(server_target("home", control, SECRET)),
@@ -3151,7 +3163,7 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
 
         // A consumer names the peer it exits through, which the file records
         // as the `[tun]` table feeding that slot.
-        zeronat::client_admin::attach_peer(Some(&sock), "office-b1c2".into(), None, false, false)
+        zeronat::client_admin::attach_peer(Some(&sock), SECRET_B.into(), None, false, false)
             .await
             .expect("attach the exit consumer");
         let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
@@ -3161,18 +3173,18 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
         // A second consumer is refused, and the refusal reaches the caller as
         // an error naming the consumer this client already runs.
         let err =
-            zeronat::client_admin::attach_peer(Some(&sock), "depot-77a1".into(), None, true, false)
+            zeronat::client_admin::attach_peer(Some(&sock), SECRET_C.into(), None, true, false)
                 .await
                 .expect_err("a second consumer must be refused");
         assert!(
             err.to_string()
-                .contains("already has the exit consumer for `office-b1c2`"),
+                .contains(&format!("already has the exit consumer for `{SECRET_B}`")),
             "{err}"
         );
 
         // Detaching every slot takes the client back to the park, and the file
         // back to the servers it started with.
-        zeronat::client_admin::detach_peer(Some(&sock), "office-b1c2".into())
+        zeronat::client_admin::detach_peer(Some(&sock), SECRET_B.into())
             .await
             .expect("detach the consumer");
         zeronat::client_admin::detach_provider(Some(&sock), "exit")
@@ -3219,7 +3231,7 @@ async fn offline_add_forward_lands_after_connect() {
         let sock = dir.join("client.sock");
         let text = format!(
             "[client]\nactive = \"home\"\n\
-             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n"
+             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SERVER_PUBLIC}\"\ncredential = \"{SECRET}\"\ntransport = \"tcp\"\n"
         );
         std::fs::write(&path, &text).unwrap();
         let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
@@ -3381,7 +3393,7 @@ async fn connect_named_retargets_and_persists() {
             vec![],
         )));
         let mut settings_b = cli_settings(control_b, vec![public_b], vec![]);
-        settings_b.secret = SECRET_B.into();
+        settings_b.secret = SERVER_SECRET_B.into();
         tokio::spawn(zeronat::server::run(settings_b));
 
         let dir = temp_config_dir("connectnamed");
@@ -3389,8 +3401,8 @@ async fn connect_named_retargets_and_persists() {
         let sock = dir.join("client.sock");
         let text = format!(
             "[client]\nactive = \"a\"\n\
-             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:{control_a}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
-             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:{control_b}\"\nsecret = \"{SECRET_B}\"\ntransport = \"tcp\"\n\
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:{control_a}\"\nsecret = \"{SERVER_PUBLIC}\"\ncredential = \"{SECRET}\"\ntransport = \"tcp\"\n\
+             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:{control_b}\"\nsecret = \"{SERVER_PUBLIC_B}\"\ncredential = \"{SECRET}\"\ntransport = \"tcp\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = {public_a}\ntarget = \"127.0.0.1:{local_echo}\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = {public_b}\ntarget = \"127.0.0.1:{local_echo}\"\n"
         );
@@ -3498,7 +3510,7 @@ async fn add_server_then_select_moves_traffic() {
             vec![],
         )));
         let mut settings_b = cli_settings(control_b, vec![public_b], vec![]);
-        settings_b.secret = SECRET_B.into();
+        settings_b.secret = SERVER_SECRET_B.into();
         tokio::spawn(zeronat::server::run(settings_b));
 
         // The file (and the client) starts knowing only server a; b joins at
@@ -3508,7 +3520,7 @@ async fn add_server_then_select_moves_traffic() {
         let sock = dir.join("client.sock");
         let text = format!(
             "[client]\nactive = \"a\"\n\
-             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:{control_a}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:{control_a}\"\nsecret = \"{SERVER_PUBLIC}\"\ncredential = \"{SECRET}\"\ntransport = \"tcp\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = {public_a}\ntarget = \"127.0.0.1:{local_echo}\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = {public_b}\ntarget = \"127.0.0.1:{local_echo}\"\n"
         );
@@ -3531,26 +3543,29 @@ async fn add_server_then_select_moves_traffic() {
         let mut conn = wait_tcp_path(public_a).await;
 
         // Refusals change nothing, in memory or on disk: a duplicate name, an
-        // empty secret, and a malformed address.
+        // empty server identity, and a malformed address.
         let before = std::fs::read_to_string(&path).unwrap();
         let servers_before = client_snapshot(&sock).await.servers;
         let refused = [
             ClientMsg::AddServer {
                 name: "a".into(),
                 addr: format!("127.0.0.1:{control_b}"),
-                secret: ServerSecret("x".into()),
+                server_public: ServerSecret("x".into()),
+                credential: ServerSecret(SECRET.into()),
                 transport: zeronat::client::Transport::Tcp,
             },
             ClientMsg::AddServer {
                 name: "b".into(),
                 addr: format!("127.0.0.1:{control_b}"),
-                secret: ServerSecret(String::new()),
+                server_public: ServerSecret(String::new()),
+                credential: ServerSecret(SECRET.into()),
                 transport: zeronat::client::Transport::Tcp,
             },
             ClientMsg::AddServer {
                 name: "b".into(),
                 addr: "not-an-addr".into(),
-                secret: ServerSecret("x".into()),
+                server_public: ServerSecret(SERVER_PUBLIC_B.into()),
+                credential: ServerSecret(SECRET.into()),
                 transport: zeronat::client::Transport::Tcp,
             },
         ];
@@ -3569,7 +3584,8 @@ async fn add_server_then_select_moves_traffic() {
             ClientMsg::AddServer {
                 name: "b".into(),
                 addr: format!("127.0.0.1:{control_b}"),
-                secret: ServerSecret(SECRET_B.into()),
+                server_public: ServerSecret(SERVER_PUBLIC_B.into()),
+                credential: ServerSecret(SECRET.into()),
                 transport: zeronat::client::Transport::Tcp,
             },
         )
@@ -3582,7 +3598,8 @@ async fn add_server_then_select_moves_traffic() {
         let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
         on_disk.validate().unwrap();
         assert_eq!(on_disk.servers.len(), 2);
-        assert_eq!(on_disk.servers[1].secret.0, SECRET_B);
+        assert_eq!(on_disk.servers[1].secret.0, SERVER_PUBLIC_B);
+        assert_eq!(on_disk.servers[1].credential.0, SECRET);
 
         // The full operator flow: select the added server and live traffic
         // moves to it under its own secret.
@@ -3886,8 +3903,8 @@ async fn config_client_with_no_session_body_idles() {
         let sock = dir.join("client.sock");
         let text = format!(
             "[client]\nactive = \"a\"\n\
-             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{SECRET}\"\n\
-             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"{SECRET_B}\"\n"
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{SERVER_PUBLIC}\"\ncredential = \"{SECRET}\"\n\
+             [[servers]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nsecret = \"{SERVER_PUBLIC_B}\"\ncredential = \"{SECRET}\"\n"
         );
         std::fs::write(&path, &text).unwrap();
         let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
@@ -3982,6 +3999,18 @@ async fn idle_healthy_stream_outlives_reap_udp_transport() {
 /// Connect a hand-rolled peer-speaking control client: Noise handshake,
 /// `ClientHello`, `PeerAnnounce`, and the ack, asserting the ack echoes this
 /// socket's own address. Retries until the control listener is accepting.
+fn test_peer_static(client_id: &str) -> [u8; 32] {
+    zeronat::noise::derive_psk(&format!("test peer identity {client_id}"))
+}
+
+fn test_peer_id(client_id: &str) -> String {
+    if zeronat::secret::decode(client_id).is_ok() {
+        client_id.to_string()
+    } else {
+        zeronat::secret::encode(zeronat::peer::public_identity(&test_peer_static(client_id)))
+    }
+}
+
 async fn peer_control_connect(
     control: u16,
     client_id: &str,
@@ -4023,9 +4052,15 @@ async fn peer_control_connect(
     )
     .await
     .unwrap();
-    w.send(&Msg::PeerAnnounce { provides }.encode())
-        .await
-        .unwrap();
+    w.send(
+        &Msg::PeerAnnounce {
+            provides,
+            identity: zeronat::peer::public_identity(&test_peer_static(client_id)),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
     let frame = r.recv().await.unwrap();
     match Msg::decode(&frame).unwrap() {
         Msg::ClientHelloAck { client_id, .. } => assert_eq!(client_id, expected_id),
@@ -4047,9 +4082,10 @@ async fn peer_connect(
     peer_id: &str,
     want: u8,
 ) -> (u64, PeerStatus) {
+    let peer_identity = test_peer_id(peer_id);
     w.send(
         &Msg::PeerConnect {
-            peer_id: peer_id.into(),
+            peer_id: peer_identity.clone(),
             want,
         }
         .encode(),
@@ -4064,7 +4100,7 @@ async fn peer_connect(
             pair_id,
             status,
         } => {
-            assert_eq!(got, peer_id);
+            assert_eq!(got, peer_identity);
             assert_eq!(got_want, want);
             (pair_id, status)
         }
@@ -4204,9 +4240,15 @@ async fn peer_control_connect_udp(
     )
     .await
     .unwrap();
-    w.send(&Msg::PeerAnnounce { provides }.encode())
-        .await
-        .unwrap();
+    w.send(
+        &Msg::PeerAnnounce {
+            provides,
+            identity: zeronat::peer::public_identity(&test_peer_static(client_id)),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
     let frame = r.recv().await.unwrap();
     match Msg::decode(&frame).unwrap() {
         Msg::ClientHelloAck { client_id, .. } => assert_eq!(client_id, expected_id),
@@ -4227,7 +4269,7 @@ async fn recv_peer_probe(
     pair_id: u64,
     peer: &str,
     want: u8,
-) -> (u64, zeronat::proto::Capability) {
+) -> ((u64, zeronat::proto::Capability), zeronat::proto::PairAuth) {
     let frame = r.recv().await.unwrap();
     match Msg::decode(&frame).unwrap() {
         Msg::PeerProbe {
@@ -4235,12 +4277,13 @@ async fn recv_peer_probe(
             peer_id,
             probe_id,
             probe_capability,
+            auth,
             provides,
         } => {
             assert_eq!(got, pair_id);
-            assert_eq!(peer_id, peer);
+            assert_eq!(peer_id, test_peer_id(peer));
             assert_eq!(provides, want);
-            (probe_id, probe_capability)
+            ((probe_id, probe_capability), auth)
         }
         other => panic!("expected peer probe, got {other:?}"),
     }
@@ -4280,16 +4323,17 @@ async fn peer_probe_discovers_candidates_both_ways() {
         let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
         assert_eq!(status, PeerStatus::Accepted);
 
-        let c_probe = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
-        let p_probe = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
+        let (c_probe, _) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
+        let (p_probe, _) = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
         assert_ne!(c_probe, p_probe);
 
-        let psk = zeronat::noise::derive_psk(SECRET);
+        let c_psk = zeronat::noise::derive_psk(SECRET_C);
+        let p_psk = zeronat::noise::derive_psk(SECRET_B);
         let server = format!("127.0.0.1:{control}").parse().unwrap();
-        let mut c_sess = zeronat::client::probe_candidates(server, &psk, c_probe)
+        let mut c_sess = zeronat::client::probe_candidates(server, &c_psk, c_probe)
             .await
             .expect("consumer probe");
-        let mut p_sess = zeronat::client::probe_candidates(server, &psk, p_probe)
+        let mut p_sess = zeronat::client::probe_candidates(server, &p_psk, p_probe)
             .await
             .expect("provider probe");
         // The public candidate is the probe socket's mapping as the server
@@ -4330,15 +4374,16 @@ async fn peer_probe_socket_queues_peer_datagrams() {
 
         let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
         assert_eq!(status, PeerStatus::Accepted);
-        let c_probe = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
-        let p_probe = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
+        let (c_probe, _) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
+        let (p_probe, _) = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
 
-        let psk = zeronat::noise::derive_psk(SECRET);
+        let c_psk = zeronat::noise::derive_psk(SECRET_C);
+        let p_psk = zeronat::noise::derive_psk(SECRET_B);
         let server = format!("127.0.0.1:{control}").parse().unwrap();
-        let mut c_sess = zeronat::client::probe_candidates(server, &psk, c_probe)
+        let mut c_sess = zeronat::client::probe_candidates(server, &c_psk, c_probe)
             .await
             .expect("consumer probe");
-        let p_sess = zeronat::client::probe_candidates(server, &psk, p_probe)
+        let p_sess = zeronat::client::probe_candidates(server, &p_psk, p_probe)
             .await
             .expect("provider probe");
 
@@ -4375,10 +4420,10 @@ async fn peer_probe_deadline_marks_silent_party_relay_only() {
         let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
         assert_eq!(status, PeerStatus::Accepted);
 
-        let c_probe = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
-        let _p_probe = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
+        let (c_probe, _) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
+        let _ = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
 
-        let psk = zeronat::noise::derive_psk(SECRET);
+        let psk = zeronat::noise::derive_psk(SECRET_C);
         let server = format!("127.0.0.1:{control}").parse().unwrap();
         let c_sess = zeronat::client::probe_candidates(server, &psk, c_probe)
             .await
@@ -4433,10 +4478,12 @@ struct PunchParties {
     cw: zeronat::noise::NoiseWriter,
     c_sess: zeronat::client::ProbeSession,
     c_cands: Vec<std::net::SocketAddr>,
+    c_auth: zeronat::proto::PairAuth,
     pr: zeronat::noise::NoiseReader,
     pw: zeronat::noise::NoiseWriter,
     p_sess: zeronat::client::ProbeSession,
     p_cands: Vec<std::net::SocketAddr>,
+    p_auth: zeronat::proto::PairAuth,
     _pumps: (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
 }
 
@@ -4448,15 +4495,16 @@ async fn punch_parties(control: u16) -> PunchParties {
 
     let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
     assert_eq!(status, PeerStatus::Accepted);
-    let c_probe = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
-    let p_probe = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
+    let (c_probe, c_auth) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
+    let (p_probe, p_auth) = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
 
-    let psk = zeronat::noise::derive_psk(SECRET);
     let server = format!("127.0.0.1:{control}").parse().unwrap();
-    let c_sess = zeronat::client::probe_candidates(server, &psk, c_probe)
+    let c_psk = zeronat::noise::derive_psk(SECRET_C);
+    let p_psk = zeronat::noise::derive_psk(SECRET_B);
+    let c_sess = zeronat::client::probe_candidates(server, &c_psk, c_probe)
         .await
         .expect("consumer probe");
-    let p_sess = zeronat::client::probe_candidates(server, &psk, p_probe)
+    let p_sess = zeronat::client::probe_candidates(server, &p_psk, p_probe)
         .await
         .expect("provider probe");
     let c_cands = recv_peer_info(&mut cr, pair_id).await;
@@ -4468,10 +4516,12 @@ async fn punch_parties(control: u16) -> PunchParties {
         cw,
         c_sess,
         c_cands,
+        c_auth,
         pr,
         pw,
         p_sess,
         p_cands,
+        p_auth,
         _pumps: (c_pump, p_pump),
     }
 }
@@ -4557,11 +4607,13 @@ async fn assert_control_alive(
 /// control session.
 struct PunchedPair {
     pair_id: u64,
+    c_auth: zeronat::proto::PairAuth,
     c_link: zeronat::punch::PeerLink,
     c_ctl: tokio::sync::mpsc::Sender<Vec<u8>>,
     c_seen: tokio::sync::mpsc::Receiver<Vec<u8>>,
     cr: zeronat::noise::NoiseReader,
     p_link: zeronat::punch::PeerLink,
+    p_auth: zeronat::proto::PairAuth,
     p_ctl: tokio::sync::mpsc::Sender<Vec<u8>>,
     p_seen: tokio::sync::mpsc::Receiver<Vec<u8>>,
     pr: zeronat::noise::NoiseReader,
@@ -4578,6 +4630,8 @@ async fn punched_links(
     c_cands: Option<Vec<std::net::SocketAddr>>,
 ) -> PunchedPair {
     let pair_id = parties.pair_id;
+    let c_auth = parties.c_auth;
+    let p_auth = parties.p_auth;
     let c_cands = c_cands.unwrap_or(parties.c_cands);
     let (c_ctl, c_seen) = punch_control(parties.cw);
     let (p_ctl, p_seen) = punch_control(parties.pw);
@@ -4601,11 +4655,13 @@ async fn punched_links(
     };
     PunchedPair {
         pair_id,
+        c_auth,
         c_link,
         c_ctl,
         c_seen,
         cr: parties.cr,
         p_link,
+        p_auth,
         p_ctl,
         p_seen,
         pr: parties.pr,
@@ -4622,8 +4678,8 @@ async fn peer_punch_establishes_direct_session() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let parties = punch_parties(control).await;
+        let psk = parties.c_auth.challenge;
         let mut punched = punched_links(parties, &psk, None).await;
 
         expect_peer_path(&mut punched.c_seen, punched.pair_id, PathStatus::Direct).await;
@@ -4655,8 +4711,8 @@ async fn peer_punch_deadline_reports_relay() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let mut parties = punch_parties(control).await;
+        let psk = parties.c_auth.challenge;
 
         // A bound socket nothing ever answers on: every punch datagram is
         // accepted by the kernel and replied to by no one.
@@ -4743,6 +4799,12 @@ async fn peer_punch_deadline_reports_relay() {
 async fn probe_resends_local_candidate_until_peer_info() {
     let body = async {
         let psk = zeronat::noise::derive_psk(SECRET);
+        let credentials: zeronat::noise::ClientCredentials = [(
+            zeronat::noise::client_selector(&psk),
+            ("probe".to_string(), psk),
+        )]
+        .into_iter()
+        .collect();
         let socket = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let addr = socket.local_addr().unwrap();
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel::<std::net::SocketAddr>(16);
@@ -4786,12 +4848,17 @@ async fn probe_resends_local_candidate_until_peer_info() {
                     zeronat::kcp::route(&sess, &buf[..n])
                 {
                     let frames_tx = frames_tx.clone();
+                    let credentials = credentials.clone();
                     tokio::spawn(async move {
                         let reply = zeronat::proto::encode_sockaddr(src);
-                        let (_id, _capability, noise) =
-                            zeronat::noise::server_handshake_stateless_claim(stream, &psk, &reply)
-                                .await
-                                .unwrap();
+                        let (_, _id, _capability, noise) =
+                            zeronat::noise::server_handshake_stateless_claim_remote(
+                                stream,
+                                &credentials,
+                                &reply,
+                            )
+                            .await
+                            .unwrap();
                         let (inbound, _guard) = sess.register_dgram(conv);
                         let mut rx =
                             zeronat::dgram::DgramRx::new(inbound, std::sync::Arc::new(noise));
@@ -4894,8 +4961,8 @@ async fn peer_punch_binds_one_path_across_two_candidates() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let parties = punch_parties(control).await;
+        let psk = parties.c_auth.challenge;
 
         // Both candidates forward to the responder's probe socket. "fast-out"
         // delivers message one first but returns message two last, so each
@@ -4942,8 +5009,8 @@ async fn peer_punch_responder_needs_inbound_evidence() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let parties = punch_parties(control).await;
+        let psk = parties.c_auth.challenge;
         let target = parties.p_sess.public;
         let conv = (parties.pair_id as u32) | zeronat::kcp::SETUP_CONV_BIT;
 
@@ -4998,8 +5065,8 @@ async fn peer_punch_survives_a_lost_nomination() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let parties = punch_parties(control).await;
+        let psk = parties.c_auth.challenge;
 
         // The only candidate reaches the responder through a forwarder that
         // eats the first datagram-channel frame, which is the nomination.
@@ -5096,9 +5163,11 @@ struct RelayPair {
     cr: zeronat::noise::NoiseReader,
     cw: zeronat::noise::NoiseWriter,
     c_leg: RelayClaim,
+    c_auth: zeronat::proto::PairAuth,
     pr: zeronat::noise::NoiseReader,
     pw: zeronat::noise::NoiseWriter,
     p_leg: RelayClaim,
+    p_auth: zeronat::proto::PairAuth,
 }
 
 /// Pair a consumer "c" with a provider "prov" over the tcp control transport,
@@ -5111,8 +5180,8 @@ async fn relay_pair(control: u16) -> RelayPair {
     assert_eq!(status, PeerStatus::Accepted);
     // Both parties hear of the pair through a PeerProbe; on the tcp transport
     // neither probes, so the PeerInfo follows with no candidates.
-    recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
-    recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
+    let (_, c_auth) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
+    let (_, p_auth) = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
     assert_eq!(recv_peer_info(&mut cr, pair_id).await, Vec::new());
     assert_eq!(recv_peer_info(&mut pr, pair_id).await, Vec::new());
 
@@ -5126,9 +5195,11 @@ async fn relay_pair(control: u16) -> RelayPair {
         cr,
         cw,
         c_leg,
+        c_auth,
         pr,
         pw,
         p_leg,
+        p_auth,
     }
 }
 
@@ -5149,7 +5220,7 @@ async fn dgram_leg_via(
     claim: RelayClaim,
 ) -> (zeronat::client::RelayDgramLeg, tokio::task::JoinHandle<()>) {
     use zeronat::kcp::{route, session};
-    let psk = zeronat::noise::derive_psk(SECRET);
+    let psk = zeronat::noise::derive_psk(claim.credential);
     let socket = std::sync::Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
     socket.connect(server).await.unwrap();
     zeronat::admission::admit(&socket, server).await.unwrap();
@@ -5412,8 +5483,8 @@ async fn peer_relay_opens_while_the_peer_is_still_punching() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let mut parties = punch_parties(control).await;
+        let psk = parties.c_auth.challenge;
 
         // "prov" holds its probe socket open but never punches, so "c" keeps
         // handshaking into it for the whole deadline while the relay opens.
@@ -5498,17 +5569,45 @@ async fn assert_inner_echo(
     assert_eq!(back, payload);
 }
 
+fn pair_identities(
+    consumer_auth: zeronat::proto::PairAuth,
+    provider_auth: zeronat::proto::PairAuth,
+) -> (zeronat::peer::PairIdentity, zeronat::peer::PairIdentity) {
+    (
+        zeronat::peer::PairIdentity::new(
+            test_peer_static("c"),
+            consumer_auth,
+            zeronat::peer::PairContext {
+                local_id: test_peer_id("c"),
+                peer_id: test_peer_id("prov"),
+                provides: PROVIDES_EXIT,
+            },
+        ),
+        zeronat::peer::PairIdentity::new(
+            test_peer_static("prov"),
+            provider_auth,
+            zeronat::peer::PairContext {
+                local_id: test_peer_id("prov"),
+                peer_id: test_peer_id("c"),
+                provides: PROVIDES_EXIT,
+            },
+        ),
+    )
+}
+
 /// Bring up both ends of an inner session and echo a few frames through it,
 /// including one at the largest size a frame can carry.
 async fn assert_inner_session(
     consumer: zeronat::peer::PeerPath,
     provider: zeronat::peer::PeerPath,
     pair_id: u64,
+    consumer_auth: zeronat::proto::PairAuth,
+    provider_auth: zeronat::proto::PairAuth,
 ) {
-    let psk = zeronat::noise::derive_psk(SECRET);
+    let (consumer_identity, provider_identity) = pair_identities(consumer_auth, provider_auth);
     let ((mut consumer, answer), mut provider) = tokio::try_join!(
-        zeronat::peer::PeerSession::consumer(consumer, &psk, pair_id),
-        zeronat::peer::PeerSession::provider(provider, &psk, pair_id, &[]),
+        zeronat::peer::PeerSession::consumer(consumer, &consumer_identity, pair_id),
+        zeronat::peer::PeerSession::provider(provider, &provider_identity, pair_id, &[]),
     )
     .expect("the inner handshake must complete on both sides");
     assert!(answer.is_empty(), "an accepting provider answers empty");
@@ -5527,22 +5626,23 @@ async fn assert_inner_session(
     );
 }
 
-// The inner session over a punched path: the two clients handshake their own
-// NNpsk0 on top of the direct session and echo frames both ways, with nothing
-// but the pair's own keys between them.
+// The inner session over a punched path: Noise XX authenticates the clients'
+// static identities before both sides echo frames over fresh session keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_inner_session_echoes_over_a_punched_path() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let parties = punch_parties(control).await;
+        let psk = parties.c_auth.challenge;
         let punched = punched_links(parties, &psk, None).await;
 
         assert_inner_session(
             zeronat::peer::PeerPath::direct(punched.c_link),
             zeronat::peer::PeerPath::direct(punched.p_link),
             punched.pair_id,
+            punched.c_auth,
+            punched.p_auth,
         )
         .await;
     };
@@ -5567,6 +5667,8 @@ async fn peer_inner_session_echoes_over_two_dgram_relay_legs() {
             zeronat::peer::PeerPath::relay_dgram(c_leg),
             zeronat::peer::PeerPath::relay_dgram(p_leg),
             pair.pair_id,
+            pair.c_auth,
+            pair.p_auth,
         )
         .await;
     };
@@ -5592,6 +5694,8 @@ async fn peer_inner_session_echoes_over_a_stream_leg_and_a_dgram_leg() {
             zeronat::peer::PeerPath::relay_stream(c_leg),
             zeronat::peer::PeerPath::relay_dgram(p_leg),
             pair.pair_id,
+            pair.c_auth,
+            pair.p_auth,
         )
         .await;
     };
@@ -5624,6 +5728,8 @@ async fn peer_inner_handshake_survives_a_lossy_path() {
             zeronat::peer::PeerPath::relay_dgram(c_leg),
             zeronat::peer::PeerPath::relay_dgram(p_leg),
             pair.pair_id,
+            pair.c_auth,
+            pair.p_auth,
         )
         .await;
     };
@@ -5640,20 +5746,20 @@ async fn peer_inner_handshake_carries_the_providers_answer() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let pair = relay_pair(control).await;
+        let (consumer_identity, provider_identity) = pair_identities(pair.c_auth, pair.p_auth);
 
         let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
         let (p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
         let ((_consumer, answer), _provider) = tokio::try_join!(
             zeronat::peer::PeerSession::consumer(
                 zeronat::peer::PeerPath::relay_dgram(c_leg),
-                &psk,
+                &consumer_identity,
                 pair.pair_id,
             ),
             zeronat::peer::PeerSession::provider(
                 zeronat::peer::PeerPath::relay_dgram(p_leg),
-                &psk,
+                &provider_identity,
                 pair.pair_id,
                 b"peer_busy",
             ),
@@ -5699,6 +5805,8 @@ async fn peer_inner_handshake_ignores_frames_ahead_of_it() {
             zeronat::peer::PeerPath::relay_dgram(c_leg),
             zeronat::peer::PeerPath::relay_dgram(p_leg),
             pair.pair_id,
+            pair.c_auth,
+            pair.p_auth,
         )
         .await;
     };
@@ -5708,40 +5816,66 @@ async fn peer_inner_handshake_ignores_frames_ahead_of_it() {
         .expect("junk-ahead handshake flow did not complete within 60s");
 }
 
-/// Answer an inner handshake by hand on a raw relay leg, holding the keys the
-/// server never gets. Each frame leads with the byte naming what follows, so
-/// the responder feeds its duplex the handshake messages alone.
+/// Answer an inner handshake by hand on a raw relay leg. Each frame leads with
+/// the byte naming what follows, so the responder feeds its duplex the
+/// handshake messages alone.
 async fn raw_inner_responder(
     leg: &mut zeronat::client::RelayDgramLeg,
     pair_id: u64,
+    auth: zeronat::proto::PairAuth,
 ) -> zeronat::noise::StatelessNoise {
-    let psk = zeronat::noise::derive_psk(SECRET);
-    let (mine, theirs) = tokio::io::duplex(4096);
-    let (mut r, mut w) = tokio::io::split(mine);
-    let task =
-        tokio::spawn(
-            async move { zeronat::noise::server_handshake_stateless(theirs, &psk, &[]).await },
-        );
+    use snow::Builder;
 
+    let consumer_id = test_peer_id("c");
+    let provider_id = test_peer_id("prov");
+    let mut prologue = Vec::new();
+    prologue.extend_from_slice(b"zeronat-peer-noise-v1");
+    prologue.push(zeronat::identity::PROTO_VERSION);
+    prologue.extend_from_slice(&pair_id.to_be_bytes());
+    prologue.push(PROVIDES_EXIT);
+    prologue.extend_from_slice(consumer_id.as_bytes());
+    prologue.extend_from_slice(provider_id.as_bytes());
+    prologue.extend_from_slice(&auth.challenge);
+    let private = test_peer_static("prov");
+    let params = "Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+    let mut state = Builder::new(params)
+        .local_private_key(&private)
+        .prologue(&prologue)
+        .build_responder()
+        .unwrap();
     let msg1 = loop {
         let frame = recv_dgram_frame(&mut leg.rx).await;
         if let Some((&zeronat::peer::FRAME_HANDSHAKE, msg)) = frame.split_first() {
             break msg.to_vec();
         }
     };
-    w.write_all(&(msg1.len() as u16).to_be_bytes())
-        .await
-        .unwrap();
-    w.write_all(&msg1).await.unwrap();
-    let mut len = [0u8; 2];
-    r.read_exact(&mut len).await.unwrap();
-    let mut msg2 = vec![zeronat::peer::FRAME_HANDSHAKE; 1 + u16::from_be_bytes(len) as usize];
-    r.read_exact(&mut msg2[1..]).await.unwrap();
+    let mut payload = [0; 128];
+    assert_eq!(state.read_message(&msg1, &mut payload).unwrap(), 0);
+    let mut msg2 = vec![0; 4096];
+    let len = state.write_message(&[], &mut msg2[1..]).unwrap();
+    msg2.truncate(1 + len);
+    msg2[0] = zeronat::peer::FRAME_HANDSHAKE;
     leg.tx.send(&msg2).await.unwrap();
-
-    let (id, noise) = task.await.unwrap().expect("inner responder handshake");
-    assert_eq!(id, pair_id, "the initiator must name its own pair");
-    noise
+    let msg3 = loop {
+        let frame = recv_dgram_frame(&mut leg.rx).await;
+        if let Some((&zeronat::peer::FRAME_HANDSHAKE, msg)) = frame.split_first() {
+            break msg.to_vec();
+        }
+    };
+    let mut keys = [0; 64];
+    assert_eq!(state.read_message(&msg3, &mut keys).unwrap(), 64);
+    assert_eq!(
+        state.get_remote_static(),
+        Some(zeronat::secret::decode(&consumer_id).unwrap().as_slice())
+    );
+    let mut transport = state.into_transport_mode().unwrap();
+    let mut ack = vec![zeronat::peer::FRAME_HANDSHAKE; 129];
+    let len = transport
+        .write_message(b"zeronat-peer-ready-v1", &mut ack[1..])
+        .unwrap();
+    ack.truncate(1 + len);
+    leg.tx.send(&ack).await.unwrap();
+    zeronat::noise::StatelessNoise::from_peer_keys(&keys, false)
 }
 
 /// The next session frame on a raw leg, with the ciphertext it arrived as and
@@ -5761,26 +5895,25 @@ async fn next_inner_frame(
     }
 }
 
-// The relay moves inner ciphertext: what crosses a leg is sealed under keys
-// the pair made between themselves, so the plaintext is not on the wire the
-// server splices, and no frame the layer emits is empty.
+// The relay moves inner ciphertext, so the plaintext is not on the wire the
+// server splices and no frame the layer emits is empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_inner_frames_cross_the_relay_sealed() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let pair = relay_pair(control).await;
+        let (consumer_identity, _) = pair_identities(pair.c_auth, pair.p_auth);
 
         let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
         let (mut p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
         let (consumer, noise) = tokio::join!(
             zeronat::peer::PeerSession::consumer(
                 zeronat::peer::PeerPath::relay_dgram(c_leg),
-                &psk,
+                &consumer_identity,
                 pair.pair_id,
             ),
-            raw_inner_responder(&mut p_leg, pair.pair_id),
+            raw_inner_responder(&mut p_leg, pair.pair_id, pair.p_auth),
         );
         let (consumer, _answer) = consumer.expect("the inner handshake must complete");
 
@@ -5812,8 +5945,8 @@ async fn peer_inner_session_dies_on_missed_keepalives() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let pair = relay_pair(control).await;
+        let (consumer_identity, _) = pair_identities(pair.c_auth, pair.p_auth);
 
         let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
         let (mut p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
@@ -5824,10 +5957,10 @@ async fn peer_inner_session_dies_on_missed_keepalives() {
         let (consumer, _noise) = tokio::join!(
             zeronat::peer::PeerSession::consumer(
                 zeronat::peer::PeerPath::relay_dgram(c_leg),
-                &psk,
+                &consumer_identity,
                 pair.pair_id,
             ),
-            raw_inner_responder(&mut p_leg, pair.pair_id),
+            raw_inner_responder(&mut p_leg, pair.pair_id, pair.p_auth),
         );
         let (mut consumer, _answer) = consumer.expect("the inner handshake must complete");
 
@@ -5897,6 +6030,8 @@ async fn run_two_slot_test(transport: zeronat::client::Transport, punched: bool)
 
         let consumer_id = zeronat::identity::derive_client_id(Some("consumer"));
         let provider_id = zeronat::identity::derive_client_id(Some("provider"));
+        let consumer_peer_id = test_peer_id(&consumer_id);
+        let provider_peer_id = test_peer_id(&provider_id);
 
         // Two clients are connected, so the forward needs an explicit route.
         let mut settings = cli_settings(control, vec![public_tcp], vec![]);
@@ -5912,13 +6047,14 @@ async fn run_two_slot_test(transport: zeronat::client::Transport, punched: bool)
         let target = |credential: &str| zeronat::client::ServerTarget {
             name: "home".into(),
             addr: format!("127.0.0.1:{control}"),
-            secret: SECRET.into(),
+            secret: SERVER_PUBLIC.into(),
             credential: credential.into(),
             transport,
         };
 
         let (prov_tx, mut prov_rx) = tokio::sync::mpsc::channel(4);
         let mut provider = client_settings(vec![target(SECRET_F)], vec![], "provider", None);
+        provider.peer_secret = Some(zeronat::secret::encode(test_peer_static(&provider_id)));
         provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
             provides: PROVIDES_EXIT,
             adapter: None,
@@ -5936,8 +6072,9 @@ async fn run_two_slot_test(transport: zeronat::client::Transport, punched: bool)
             "consumer",
             None,
         );
+        consumer.peer_secret = Some(zeronat::secret::encode(test_peer_static(&consumer_id)));
         consumer.peers = vec![zeronat::client::PeerSlotSpec::Consumer {
-            peer_id: provider_id.clone(),
+            peer_id: provider_peer_id.clone(),
             want: PROVIDES_EXIT,
             adapter: None,
         }];
@@ -5954,8 +6091,8 @@ async fn run_two_slot_test(transport: zeronat::client::Transport, punched: bool)
 
         let mut consumer_slot = next_slot_session(&mut cons_rx).await;
         let mut provider_slot = next_slot_session(&mut prov_rx).await;
-        assert_eq!(consumer_slot.peer_id, provider_id);
-        assert_eq!(provider_slot.peer_id, consumer_id);
+        assert_eq!(consumer_slot.peer_id, provider_peer_id);
+        assert_eq!(provider_slot.peer_id, consumer_peer_id);
         assert_eq!(consumer_slot.want, PROVIDES_EXIT);
         assert_eq!(provider_slot.want, PROVIDES_EXIT);
 
@@ -6012,20 +6149,20 @@ async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
-
         let consumer_id = zeronat::identity::derive_client_id(Some("consumer"));
         let provider_id = zeronat::identity::derive_client_id(Some("provider"));
+        let provider_peer_id = test_peer_id(&provider_id);
         let target = |credential: &str| zeronat::client::ServerTarget {
             name: "home".into(),
             addr: format!("127.0.0.1:{control}"),
-            secret: SECRET.into(),
+            secret: SERVER_PUBLIC.into(),
             credential: credential.into(),
             transport: zeronat::client::Transport::Udp,
         };
 
         let (prov_tx, mut prov_rx) = tokio::sync::mpsc::channel(4);
         let mut provider = client_settings(vec![target(SECRET_F)], vec![], "provider", None);
+        provider.peer_secret = Some(zeronat::secret::encode(test_peer_static(&provider_id)));
         provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
             provides: PROVIDES_EXIT,
             adapter: None,
@@ -6038,8 +6175,9 @@ async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
 
         let (cons_tx, mut cons_rx) = tokio::sync::mpsc::channel(4);
         let mut consumer = client_settings(vec![target(SECRET_G)], vec![], "consumer", None);
+        consumer.peer_secret = Some(zeronat::secret::encode(test_peer_static(&consumer_id)));
         consumer.peers = vec![zeronat::client::PeerSlotSpec::Consumer {
-            peer_id: provider_id.clone(),
+            peer_id: provider_peer_id.clone(),
             want: PROVIDES_EXIT,
             adapter: None,
         }];
@@ -6068,23 +6206,32 @@ async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
         let (mut c2r, mut c2w) = peer_control_connect(control, "c2", 0).await;
         let pair_id = loop {
             let (pair_id, status) =
-                peer_connect(&mut c2r, &mut c2w, &provider_id, PROVIDES_EXIT).await;
+                peer_connect(&mut c2r, &mut c2w, &provider_peer_id, PROVIDES_EXIT).await;
             match status {
                 PeerStatus::Accepted => break pair_id,
                 PeerStatus::PeerBusy => sleep(Duration::from_millis(100)).await,
                 other => panic!("unexpected status {other:?}"),
             }
         };
-        recv_peer_probe(&mut c2r, pair_id, &provider_id, PROVIDES_EXIT).await;
+        let (_, auth) = recv_peer_probe(&mut c2r, pair_id, &provider_peer_id, PROVIDES_EXIT).await;
         // c2 arrived on tcp and never probes, so it reports the relay as soon
         // as the pair's info lands, whatever candidates the provider offered.
         recv_peer_info(&mut c2r, pair_id).await;
         report_path(&mut c2w, pair_id, PathStatus::Relay).await;
         let leg = recv_relay_open(&mut c2r, pair_id, "c2").await;
+        let identity = zeronat::peer::PairIdentity::new(
+            test_peer_static("c2"),
+            auth,
+            zeronat::peer::PairContext {
+                local_id: test_peer_id("c2"),
+                peer_id: provider_peer_id.clone(),
+                provides: PROVIDES_EXIT,
+            },
+        );
 
         let (_refused, answer) = zeronat::peer::PeerSession::consumer(
             zeronat::peer::PeerPath::relay_stream(stream_leg(control, leg).await),
-            &psk,
+            &identity,
             pair_id,
         )
         .await
@@ -6109,7 +6256,6 @@ async fn pair_answer(
     w: &mut zeronat::noise::NoiseWriter,
     provider: &str,
     want: u8,
-    psk: &[u8; 32],
 ) -> Vec<u8> {
     let pair_id = loop {
         let (pair_id, status) = peer_connect(r, w, provider, want).await;
@@ -6123,13 +6269,22 @@ async fn pair_answer(
             other => panic!("unexpected status {other:?}"),
         }
     };
-    recv_peer_probe(r, pair_id, provider, want).await;
+    let (_, auth) = recv_peer_probe(r, pair_id, provider, want).await;
     recv_peer_info(r, pair_id).await;
     report_path(w, pair_id, PathStatus::Relay).await;
     let leg = recv_relay_open(r, pair_id, "c").await;
+    let identity = zeronat::peer::PairIdentity::new(
+        test_peer_static("c"),
+        auth,
+        zeronat::peer::PairContext {
+            local_id: test_peer_id("c"),
+            peer_id: test_peer_id(provider),
+            provides: want,
+        },
+    );
     let (_session, answer) = zeronat::peer::PeerSession::consumer(
         zeronat::peer::PeerPath::relay_stream(stream_leg(control, leg).await),
-        psk,
+        &identity,
         pair_id,
     )
     .await
@@ -6147,17 +6302,17 @@ async fn peer_exit_provider_refuses_a_pair_it_cannot_serve() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let provider_id = zeronat::identity::derive_client_id(Some("provider"));
         let target = || zeronat::client::ServerTarget {
             name: "home".into(),
             addr: format!("127.0.0.1:{control}"),
-            secret: SECRET.into(),
+            secret: SERVER_PUBLIC.into(),
             credential: SECRET_F.into(),
             transport: zeronat::client::Transport::Tcp,
         };
 
         let mut provider = client_settings(vec![target()], vec![], "provider", None);
+        provider.peer_secret = Some(zeronat::secret::encode(test_peer_static(&provider_id)));
         provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
             provides: PROVIDES_EXIT,
             // The egress names the tun the pair itself rides, which is a
@@ -6178,8 +6333,7 @@ async fn peer_exit_provider_refuses_a_pair_it_cannot_serve() {
         let (mut cr, mut cw) = peer_control_connect(control, "c", 0).await;
         wait_clients(control, 2).await;
         for _ in 0..2 {
-            let answer =
-                pair_answer(control, &mut cr, &mut cw, &provider_id, PROVIDES_EXIT, &psk).await;
+            let answer = pair_answer(control, &mut cr, &mut cw, &provider_id, PROVIDES_EXIT).await;
             let reason = String::from_utf8_lossy(&answer).into_owned();
             assert!(
                 reason.contains("znx0"),
@@ -6203,17 +6357,17 @@ async fn peer_segment_provider_refuses_a_pair_it_cannot_serve() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let provider_id = zeronat::identity::derive_client_id(Some("provider"));
         let target = || zeronat::client::ServerTarget {
             name: "home".into(),
             addr: format!("127.0.0.1:{control}"),
-            secret: SECRET.into(),
+            secret: SERVER_PUBLIC.into(),
             credential: SECRET_F.into(),
             transport: zeronat::client::Transport::Tcp,
         };
 
         let mut provider = client_settings(vec![target()], vec![], "provider", None);
+        provider.peer_secret = Some(zeronat::secret::encode(test_peer_static(&provider_id)));
         provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
             provides: PROVIDES_SEGMENT,
             adapter: Some(zeronat::client::ProviderAdapter::Segment(
@@ -6232,15 +6386,8 @@ async fn peer_segment_provider_refuses_a_pair_it_cannot_serve() {
         let (mut cr, mut cw) = peer_control_connect(control, "c", 0).await;
         wait_clients(control, 2).await;
         for _ in 0..2 {
-            let answer = pair_answer(
-                control,
-                &mut cr,
-                &mut cw,
-                &provider_id,
-                PROVIDES_SEGMENT,
-                &psk,
-            )
-            .await;
+            let answer =
+                pair_answer(control, &mut cr, &mut cw, &provider_id, PROVIDES_SEGMENT).await;
             let reason = String::from_utf8_lossy(&answer).into_owned();
             assert!(
                 reason.contains("zeronat-no-such-bridge"),
@@ -6259,7 +6406,11 @@ async fn peer_segment_provider_refuses_a_pair_it_cannot_serve() {
 async fn recv_pair_probe(
     r: &mut zeronat::noise::NoiseReader,
     peer: &str,
-) -> (u64, (u64, zeronat::proto::Capability)) {
+) -> (
+    u64,
+    (u64, zeronat::proto::Capability),
+    zeronat::proto::PairAuth,
+) {
     let frame = timeout(Duration::from_secs(30), r.recv())
         .await
         .expect("no peer probe")
@@ -6270,11 +6421,12 @@ async fn recv_pair_probe(
             peer_id,
             probe_id,
             probe_capability,
+            auth,
             provides,
         } => {
-            assert_eq!(peer_id, peer);
+            assert_eq!(peer_id, test_peer_id(peer));
             assert_eq!(provides, PROVIDES_EXIT);
-            (pair_id, (probe_id, probe_capability))
+            (pair_id, (probe_id, probe_capability), auth)
         }
         other => panic!("expected peer probe, got {other:?}"),
     }
@@ -6291,9 +6443,10 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
 
-        let psk = zeronat::noise::derive_psk(SECRET);
+        let credential_psk = zeronat::noise::derive_psk(SECRET_B);
         let server: std::net::SocketAddr = format!("127.0.0.1:{control}").parse().unwrap();
         let consumer_id = zeronat::identity::derive_client_id(Some("consumer"));
+        let consumer_peer_id = test_peer_id(&consumer_id);
 
         // The counterpart is driven by hand so its punch outcome and its
         // report to the server can disagree.
@@ -6305,7 +6458,7 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
             vec![zeronat::client::ServerTarget {
                 name: "home".into(),
                 addr: format!("127.0.0.1:{control}"),
-                secret: SECRET.into(),
+                secret: SERVER_PUBLIC.into(),
                 credential: SECRET_G.into(),
                 transport: zeronat::client::Transport::Udp,
             }],
@@ -6313,8 +6466,9 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
             "consumer",
             None,
         );
+        consumer.peer_secret = Some(zeronat::secret::encode(test_peer_static(&consumer_id)));
         consumer.peers = vec![zeronat::client::PeerSlotSpec::Consumer {
-            peer_id: "prov".into(),
+            peer_id: test_peer_id("prov"),
             want: PROVIDES_EXIT,
             adapter: None,
         }];
@@ -6322,7 +6476,7 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
         let target = zeronat::client::ServerTarget {
             name: "home".into(),
             addr: format!("127.0.0.1:{control}"),
-            secret: SECRET.into(),
+            secret: SERVER_PUBLIC.into(),
             credential: SECRET_G.into(),
             transport: zeronat::client::Transport::Udp,
         };
@@ -6331,8 +6485,8 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
             consumer,
         ));
 
-        let (pair_id, probe_id) = recv_pair_probe(&mut pr, &consumer_id).await;
-        let probe = zeronat::client::probe_candidates(server, &psk, probe_id)
+        let (pair_id, probe_id, auth) = recv_pair_probe(&mut pr, &consumer_id).await;
+        let probe = zeronat::client::probe_candidates(server, &credential_psk, probe_id)
             .await
             .expect("counterpart probe");
         let candidates = recv_peer_info(&mut pr, pair_id).await;
@@ -6345,9 +6499,9 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
             probe,
             &candidates,
             pair_id,
-            "prov",
-            &consumer_id,
-            &psk,
+            &test_peer_id("prov"),
+            &consumer_peer_id,
+            &auth.challenge,
             &swallow,
         )
         .await;
@@ -6361,9 +6515,18 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
         report_path(&mut pw, pair_id, PathStatus::Relay).await;
         let leg_id = recv_relay_open(&mut pr, pair_id, "prov").await;
         let (leg, _leg_pump) = dgram_leg(control, leg_id).await;
+        let provider_identity = zeronat::peer::PairIdentity::new(
+            test_peer_static("prov"),
+            auth,
+            zeronat::peer::PairContext {
+                local_id: test_peer_id("prov"),
+                peer_id: consumer_peer_id,
+                provides: PROVIDES_EXIT,
+            },
+        );
         let mut provider = zeronat::peer::PeerSession::provider(
             zeronat::peer::PeerPath::relay_dgram(leg),
-            &psk,
+            &provider_identity,
             pair_id,
             &[],
         )

@@ -20,8 +20,8 @@ use crate::client::{
 };
 use crate::clientproto::{ClientPeerSlotEntry, LinkStatus, PeerSlotCell};
 use crate::kcp::Session;
-use crate::peer::{PeerPath, PeerSession};
-use crate::proto::{provides_name, Msg, PathStatus, PeerStatus, PROVIDES_EXIT};
+use crate::peer::{PairContext, PairIdentity, PeerPath, PeerSession};
+use crate::proto::{provides_name, Msg, PairAuth, PathStatus, PeerStatus, PROVIDES_EXIT};
 use crate::punch::{punch, PunchOutcome};
 use crate::Result;
 
@@ -62,8 +62,9 @@ pub struct ControlSession {
     pub tx: mpsc::Sender<Vec<u8>>,
     pub server: String,
     pub client_id: String,
-    pub psk: [u8; 32],
     pub credential_psk: [u8; 32],
+    pub peer_static: [u8; 32],
+    pub peer_id: String,
     /// The KCP session under a udp control channel. `None` on tcp, where the
     /// party never probes and opens its relay leg as a fresh connection.
     pub sess: Option<Arc<Session>>,
@@ -753,9 +754,19 @@ async fn pair_as_consumer(
     // The binding lives as long as the cycle: the relay open stays
     // authoritative until the inner handshake completes.
     let _pair = control.pair_guard(pair_id);
-    let settled = settle_path(pair_id, peer_id, &session.client_id, session, rx).await?;
+    let (settled, auth) = settle_path(pair_id, peer_id, &session.peer_id, session, rx).await?;
+    let identity = PairIdentity::new(
+        session.peer_static,
+        auth,
+        PairContext {
+            local_id: session.peer_id.clone(),
+            peer_id: peer_id.to_string(),
+            provides: want,
+        },
+    );
     let (peer, answer, path) =
-        handshake_under_relay_authority(settled, Side::Consumer, pair_id, session, rx).await?;
+        handshake_under_relay_authority(settled, Side::Consumer, pair_id, &identity, session, rx)
+            .await?;
     if !answer.is_empty() {
         return Err(format!(
             "the provider refused the pair: {}",
@@ -904,6 +915,7 @@ async fn provider_slot(
                 pair_id,
                 ref peer_id,
                 provides,
+                auth,
                 ..
             } => {
                 let Some((generation, session)) = control.live() else {
@@ -915,9 +927,9 @@ async fn provider_slot(
                         pair_id,
                         peer_id: peer_id.clone(),
                         provides,
+                        auth,
                         generation,
                     },
-                    session.client_id.clone(),
                     session,
                     pair_rx,
                     control.pair_guard(pair_id),
@@ -1244,16 +1256,15 @@ struct PairStart {
     pair_id: u64,
     peer_id: String,
     provides: u8,
+    auth: PairAuth,
     generation: u64,
 }
 
 /// Serve one pair on a provider slot: probe, take the path the punch or the
 /// relay authority hands it, answer the inner handshake, and hold the session
 /// until it dies.
-#[allow(clippy::too_many_arguments)]
 async fn provider_pair(
     start: PairStart,
-    client_id: String,
     session: ControlSession,
     mut rx: mpsc::Receiver<Msg>,
     _pair: RouteGuard,
@@ -1265,12 +1276,26 @@ async fn provider_pair(
         pair_id,
         peer_id,
         provides,
+        auth,
         generation,
     } = start;
     let exclusive = provides == PROVIDES_EXIT;
     let served: Result<Served> = {
         let cycle = async {
-            let settled = settle_path(pair_id, &peer_id, &client_id, &session, &mut rx).await?;
+            let (settled, received_auth) =
+                settle_path(pair_id, &peer_id, &session.peer_id, &session, &mut rx).await?;
+            if received_auth != auth {
+                return Err("pair authorization changed during setup".into());
+            }
+            let identity = PairIdentity::new(
+                session.peer_static,
+                auth,
+                PairContext {
+                    local_id: session.peer_id.clone(),
+                    peer_id: peer_id.clone(),
+                    provides,
+                },
+            );
             // An adapter that cannot come up refuses before it takes the slot,
             // so a provider stuck on its own config never reads as busy.
             let broken = owner
@@ -1295,6 +1320,7 @@ async fn provider_pair(
                 settled,
                 Side::Provider(&refuse),
                 pair_id,
+                &identity,
                 &session,
                 &mut rx,
             )
@@ -1385,8 +1411,9 @@ async fn settle_path(
     client_id: &str,
     session: &ControlSession,
     rx: &mut mpsc::Receiver<Msg>,
-) -> Result<SettledPath> {
+) -> Result<(SettledPath, PairAuth)> {
     let mut probe: Option<ProbeSession> = None;
+    let mut pair_auth: Option<PairAuth> = None;
     let candidates = loop {
         match next_frame(rx).await? {
             // A tcp control transport never probes: the frame is the pair
@@ -1396,23 +1423,30 @@ async fn settle_path(
                 pair_id: got,
                 probe_id,
                 probe_capability,
+                auth,
                 ..
             } if got == pair_id => {
+                pair_auth = Some(auth);
                 if let Some(server) = udp_server(session)? {
                     probe = Some(
-                        probe_candidates(server, &session.psk, (probe_id, probe_capability))
-                            .await?,
+                        probe_candidates(
+                            server,
+                            &session.credential_psk,
+                            (probe_id, probe_capability),
+                        )
+                        .await?,
                     );
                 }
             }
             Msg::PeerInfo {
                 pair_id: got,
                 candidates,
-            } if got == pair_id => break candidates,
+            } if got == pair_id && pair_auth.is_some() => break candidates,
             _ => continue,
         }
     };
 
+    let auth = pair_auth.ok_or("pair authorization is missing")?;
     let settled = match probe {
         Some(probe) => {
             let punching = punch(
@@ -1421,7 +1455,7 @@ async fn settle_path(
                 pair_id,
                 client_id,
                 peer_id,
-                &session.psk,
+                &auth.challenge,
                 &session.tx,
             );
             tokio::select! {
@@ -1446,13 +1480,14 @@ async fn settle_path(
     let (leg_id, capability) = match settled {
         Settled::Punched(PunchOutcome::Direct(link)) => {
             let peer = link.peer;
-            return Ok(SettledPath::Direct(PeerPath::direct(link), peer));
+            return Ok((SettledPath::Direct(PeerPath::direct(link), peer), auth));
         }
         Settled::Punched(PunchOutcome::Relay) => wait_relay_open(rx, pair_id).await?,
         Settled::Relay(claim) => claim,
     };
-    Ok(SettledPath::Relayed(
-        open_leg(session, leg_id, capability).await?,
+    Ok((
+        SettledPath::Relayed(open_leg(session, leg_id, capability).await?),
+        auth,
     ))
 }
 
@@ -1464,7 +1499,7 @@ async fn open_leg(
 ) -> Result<PeerPath> {
     match &session.sess {
         Some(sess) => Ok(PeerPath::relay_dgram(
-            relay_leg_dgram(sess, &session.psk, leg_id, capability).await?,
+            relay_leg_dgram(sess, &session.credential_psk, leg_id, capability).await?,
         )),
         None => Ok(PeerPath::relay_stream(
             relay_leg_stream(&session.server, &session.credential_psk, leg_id, capability).await?,
@@ -1482,18 +1517,19 @@ async fn handshake_under_relay_authority(
     settled: SettledPath,
     side: Side<'_>,
     pair_id: u64,
+    identity: &PairIdentity,
     session: &ControlSession,
     rx: &mut mpsc::Receiver<Msg>,
 ) -> Result<(PeerSession, Vec<u8>, PairPath)> {
     let (direct, peer) = match settled {
         SettledPath::Relayed(path) => {
-            let (peer_session, answer) = inner_handshake(side, path, &session.psk, pair_id).await?;
+            let (peer_session, answer) = inner_handshake(side, path, identity, pair_id).await?;
             return Ok((peer_session, answer, PairPath::Relayed));
         }
         SettledPath::Direct(path, peer) => (path, peer),
     };
     let raced = tokio::select! {
-        r = inner_handshake(side, direct, &session.psk, pair_id) => Raced::Handshake(r),
+        r = inner_handshake(side, direct, identity, pair_id) => Raced::Handshake(r),
         id = wait_relay_open(rx, pair_id) => Raced::Relay(id?),
     };
     match raced {
@@ -1504,7 +1540,7 @@ async fn handshake_under_relay_authority(
         // The direct path went down with the losing future above.
         Raced::Relay((leg_id, capability)) => {
             let leg = open_leg(session, leg_id, capability).await?;
-            let (peer_session, answer) = inner_handshake(side, leg, &session.psk, pair_id).await?;
+            let (peer_session, answer) = inner_handshake(side, leg, identity, pair_id).await?;
             Ok((peer_session, answer, PairPath::Relayed))
         }
     }
@@ -1515,13 +1551,13 @@ async fn handshake_under_relay_authority(
 async fn inner_handshake(
     side: Side<'_>,
     path: PeerPath,
-    psk: &[u8; 32],
+    identity: &PairIdentity,
     pair_id: u64,
 ) -> Result<(PeerSession, Vec<u8>)> {
     match side {
-        Side::Consumer => PeerSession::consumer(path, psk, pair_id).await,
+        Side::Consumer => PeerSession::consumer(path, identity, pair_id).await,
         Side::Provider(refuse) => Ok((
-            PeerSession::provider(path, psk, pair_id, refuse).await?,
+            PeerSession::provider(path, identity, pair_id, refuse).await?,
             Vec::new(),
         )),
     }
@@ -1657,8 +1693,9 @@ mod tests {
             tx,
             server: "127.0.0.1:1".into(),
             client_id: "c".into(),
-            psk: [7u8; 32],
             credential_psk: [8u8; 32],
+            peer_static: [7u8; 32],
+            peer_id: crate::secret::encode(crate::peer::public_identity(&[7u8; 32])),
             sess: None,
         }
     }

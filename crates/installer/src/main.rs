@@ -201,7 +201,9 @@ zeronat installer
   --ports \"443/tcp 80/tcp 51820/udp\"
   --all                     forward every port plus ICMP; keeps SSH on the server
   --control PORT            tunnel control port (default 2222)
-  --secret 64-HEX           32-byte hex secret (default: generated)
+  --secret 64-HEX           server signing secret (server only; default: generated)
+  --credential 64-HEX       server-issued client credential (client only)
+  --server-public 64-HEX    server public identity (client only)
   --admin-secret 64-HEX     server admin secret (default: generated)
   --server-addr HOST[:PORT] (client only) where the server is reachable
   --dht                     find the server over the DHT (dynamic IP, no fixed address)
@@ -248,16 +250,26 @@ fn real_main() -> i32 {
     // Dry-run previews use the stored credentials that installation would reuse.
     let existing = sys::existing_secret();
     let existing_admin = sys::existing_admin_secret();
+    let existing_client = sys::existing_client_secret();
     let host = Host {
         have_docker,
         have_compose,
         existing_secret: existing,
+        existing_client_secret: existing_client,
         existing_admin_secret: existing_admin,
         ssh_port: sys::ssh_port(),
     };
 
     if headless {
         return run_headless(&parsed, &host, dry);
+    }
+
+    let installed = sys::installed();
+    if !dry && (installed.systemd.is_some() || installed.docker.is_some()) {
+        if let Err(e) = install::preflight_upgrade(&installed, &host) {
+            eprintln!("error: {e}");
+            return 1;
+        }
     }
 
     let mut cfg = match args::build(&parsed, &host, headless) {
@@ -294,7 +306,7 @@ fn real_main() -> i32 {
     let upgrade = if dry {
         None
     } else {
-        upgrade_offer(&sys::installed(), sys::latest_version().as_deref())
+        upgrade_offer(&installed, sys::latest_version().as_deref())
     };
 
     let mut renderer = Renderer::new();
@@ -333,7 +345,7 @@ fn real_main() -> i32 {
             spin: 0,
         };
         let result = match (do_upgrade, &offer) {
-            (true, Some(o)) => install::upgrade(o, &mut runner),
+            (true, Some(o)) => install::upgrade(o, &host, &mut runner),
             _ => args::finalize_credentials(&mut cfg, &parsed, &host)
                 .and_then(|()| install::execute(&cfg, dry, &mut runner)),
         };
