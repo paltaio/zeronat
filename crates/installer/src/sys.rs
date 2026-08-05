@@ -3,6 +3,7 @@
 //! here touches the terminal, so it is safe to call while the TUI is on screen.
 
 use std::process::{Command, Output};
+use zeronat_install_support::SelectedRelease;
 
 pub fn is_root() -> bool {
     // SAFETY: geteuid has no failure mode and does not dereference memory.
@@ -246,8 +247,7 @@ fn systemd_version() -> Option<String> {
     }
 }
 
-/// "unknown" when the binary predates `--version` or cannot run, which
-/// `version_newer` treats as upgradable.
+/// "unknown" when the binary predates `--version` or cannot run.
 fn binary_version(path: &str) -> String {
     Command::new(path)
         .arg("--version")
@@ -295,7 +295,16 @@ pub fn latest_version() -> Option<String> {
         false,
         "curl",
         &[
-            "-fsSL",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--max-redirs",
+            "5",
             "-I",
             "-o",
             "/dev/null",
@@ -316,13 +325,9 @@ pub fn latest_version() -> Option<String> {
 /// Version out of a `releases/tag/vX.Y.Z` redirect target; None for the
 /// unresolved `releases/latest` URL.
 pub fn version_from_url(url: &str) -> Option<String> {
-    let tag = url.trim().trim_end_matches('/').rsplit('/').next()?;
-    let ver = tag.strip_prefix('v').unwrap_or(tag);
-    if ver.chars().next()?.is_ascii_digit() {
-        Some(ver.to_string())
-    } else {
-        None
-    }
+    SelectedRelease::from_latest_url(url)
+        .ok()
+        .map(|release| release.version().to_string())
 }
 
 fn version_token(s: &str) -> String {
@@ -330,22 +335,9 @@ fn version_token(s: &str) -> String {
 }
 
 pub fn version_newer(latest: &str, current: &str) -> bool {
-    let Some(l) = parse_semver(latest) else {
-        return false;
-    };
-    match parse_semver(current) {
-        Some(c) => l > c,
-        None => true,
-    }
-}
-
-fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
-    let core = s.split(['-', '+']).next().unwrap_or(s);
-    let mut it = core.split('.');
-    let major = it.next()?.parse().ok()?;
-    let minor = it.next()?.parse().ok()?;
-    let patch = it.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor, patch))
+    SelectedRelease::from_version(latest)
+        .and_then(|release| release.is_newer_than(current))
+        .unwrap_or(false)
 }
 
 pub fn arch_target() -> Result<&'static str, String> {
@@ -409,7 +401,9 @@ mod tests {
         assert!(version_newer("0.14.0", "0.13.0"));
         assert!(!version_newer("0.14.0", "0.14.0"));
         assert!(!version_newer("0.13.0", "0.14.0"));
-        assert!(version_newer("0.14.0", "unknown"));
+        assert!(!version_newer("0.14.0", "unknown"));
         assert!(!version_newer("unknown", "0.14.0"));
+        assert!(!version_newer("0.14.0", "0.13"));
+        assert!(!version_newer("0.14.0", "0.13.0-rc1"));
     }
 }

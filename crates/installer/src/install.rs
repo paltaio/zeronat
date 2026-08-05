@@ -5,7 +5,26 @@
 use std::fs::File;
 use std::io::Write as _;
 use std::process::Output;
-use zeronat_install_support::DownloadFile;
+use zeronat_install_support::{
+    curl_fetch_command, download_verified_asset_with_keys, DownloadFile, SelectedRelease,
+    TrustedKey,
+};
+
+#[cfg(not(test))]
+use zeronat_install_support::TRUSTED_RELEASE_KEYS;
+#[cfg(test)]
+const TEST_RELEASE_KEYS: &[TrustedKey] = &[TrustedKey {
+    id: "3cafdfbef1bd2ed8",
+    public_key: include_str!("../../install-support/tests/fixtures/minisign.pub"),
+}];
+#[cfg(test)]
+const TEST_RELEASE_MANIFEST: &[u8] =
+    include_bytes!("../../install-support/tests/fixtures/v0.25.1.manifest");
+#[cfg(test)]
+const TEST_RELEASE_SIGNATURE: &[u8] =
+    include_bytes!("../../install-support/tests/fixtures/v0.25.1.manifest.minisig");
+#[cfg(test)]
+const TEST_RELEASE_BINARY: &[u8] = b"downloaded binary";
 
 use crate::args::Host;
 use crate::bridge;
@@ -19,7 +38,6 @@ const BRIDGE_TIMEOUT: u32 = 30;
 const INSTALL_URL: &str = "https://paltaio.github.io/zeronat/get.sh";
 // Internal fetches (compose templates) hit the repo directly to stay current.
 const RAW_BASE: &str = "https://raw.githubusercontent.com/paltaio/zeronat/main";
-const RELEASE_BASE: &str = "https://github.com/paltaio/zeronat/releases/latest/download";
 const IMAGE: &str = "ghcr.io/paltaio/zeronat:protocol-v6";
 const BINARY_ASSET_PREFIX: &str = "zeronat-v6";
 const ETC_DIR: &str = "/etc/zeronat";
@@ -90,12 +108,23 @@ pub trait Runner {
     fn confirm(&mut self, prompt: &str, secs: u32) -> bool;
 }
 
-fn download_binary(r: &mut dyn Runner, url: &str, target: &str) -> Result<(), String> {
-    let mut download = DownloadFile::create()?;
-    let out = r.run_with_stdout(false, "curl", &["-fsSL", url], download.output())?;
-    if !ok(&out) {
-        return Err(format!("download failed (no release asset for {target}?)"));
-    }
+fn download_binary(
+    r: &mut dyn Runner,
+    release: &SelectedRelease,
+    target: &str,
+) -> Result<(), String> {
+    let asset_name = format!("{BINARY_ASSET_PREFIX}-{target}");
+    let mut download = download_verified_asset_with_keys(
+        release,
+        &asset_name,
+        release_keys(),
+        |url, max_bytes, output| {
+            let (program, args) = curl_fetch_command(url, max_bytes);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = r.run_with_stdout(false, program, &args, output)?;
+            Ok(ok(&out))
+        },
+    )?;
     let input = download.prepare_install()?;
     let out = r.run_with_stdin(
         true,
@@ -107,6 +136,28 @@ fn download_binary(r: &mut dyn Runner, url: &str, target: &str) -> Result<(), St
         return Err(format!("install binary: {}", errtext(&out)));
     }
     Ok(())
+}
+
+#[cfg(not(test))]
+fn release_keys() -> &'static [TrustedKey] {
+    TRUSTED_RELEASE_KEYS
+}
+
+#[cfg(test)]
+fn release_keys() -> &'static [TrustedKey] {
+    TEST_RELEASE_KEYS
+}
+
+#[cfg(not(test))]
+fn release_for_install() -> Result<SelectedRelease, String> {
+    let latest = sys::latest_version()
+        .ok_or_else(|| "could not determine the latest signed release".to_string())?;
+    SelectedRelease::from_version(&latest)
+}
+
+#[cfg(test)]
+fn release_for_install() -> Result<SelectedRelease, String> {
+    SelectedRelease::from_version("0.25.1")
 }
 
 /// Write `content` to `dest` with `mode` as root: stage a temp file and let the
@@ -600,7 +651,7 @@ pub fn upgrade(offer: &UpgradeOffer, host: &Host, r: &mut dyn Runner) -> Result<
     validate_upgrade_credentials(host)?;
     validate_upgrade_deployments(offer, host)?;
     if offer.systemd.is_some() {
-        upgrade_systemd(r)?;
+        upgrade_systemd(offer, r)?;
     }
     if offer.docker.is_some() {
         upgrade_docker(offer, r)?;
@@ -610,6 +661,8 @@ pub fn upgrade(offer: &UpgradeOffer, host: &Host, r: &mut dyn Runner) -> Result<
 
 pub fn preflight_upgrade(installed: &sys::Installed, host: &Host) -> Result<(), String> {
     validate_upgrade_credentials(host)?;
+    validate_installed_version("systemd", installed.systemd.as_deref())?;
+    validate_installed_version("docker", installed.docker.as_deref())?;
     let offer = UpgradeOffer {
         latest: String::new(),
         systemd: installed.systemd.clone(),
@@ -617,6 +670,18 @@ pub fn preflight_upgrade(installed: &sys::Installed, host: &Host) -> Result<(), 
         compose: installed.compose,
     };
     validate_upgrade_deployments(&offer, host)
+}
+
+fn validate_installed_version(deployment: &str, version: Option<&str>) -> Result<(), String> {
+    let Some(version) = version else {
+        return Ok(());
+    };
+    SelectedRelease::from_version(version).map_err(|_| {
+        format!(
+            "cannot verify the installed {deployment} version '{version}'; reinstall it from a signed release before upgrading"
+        )
+    })?;
+    Ok(())
 }
 
 fn validate_upgrade_credentials(host: &Host) -> Result<(), String> {
@@ -1154,13 +1219,13 @@ fn config_bool(line: &str, key: &str) -> Result<Option<bool>, String> {
     }
 }
 
-fn upgrade_systemd(r: &mut dyn Runner) -> Result<(), String> {
+fn upgrade_systemd(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<(), String> {
     let target = sys::arch_target()?;
     r.info(format!("target {target}"));
-    let url = format!("{RELEASE_BASE}/{BINARY_ASSET_PREFIX}-{target}");
+    let release = SelectedRelease::from_version(&offer.latest)?;
 
     r.step("downloading latest binary".into());
-    download_binary(r, &url, target)?;
+    download_binary(r, &release, target)?;
 
     r.step("restarting service".into());
     let out = r.run(true, "systemctl", &["restart", "zeronat"])?;
@@ -1553,10 +1618,10 @@ fn compose(r: &mut dyn Runner, prog: &str, base: &[String], verb: &str) -> Resul
 fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started, String> {
     let target = sys::arch_target()?;
     r.info(format!("target {target}"));
-    let url = format!("{RELEASE_BASE}/{BINARY_ASSET_PREFIX}-{target}");
+    let release = release_for_install()?;
 
     r.step("downloading zeronat binary".into());
-    download_binary(r, &url, target)?;
+    download_binary(r, &release, target)?;
 
     r.step("writing systemd unit".into());
     let mode = match cfg.mode {
@@ -1618,7 +1683,8 @@ mod tests {
     use super::{
         check_forwards, compose, console_cmd, deployment_role, env_file, execute, install_systemd,
         parse_compose_command, peer_steps, subcmd, upgrade, validate_client_config_layout,
-        validate_container_env, Runner, COMPOSE_FILE, IMAGE,
+        validate_container_env, validate_installed_version, Runner, COMPOSE_FILE, IMAGE,
+        TEST_RELEASE_BINARY, TEST_RELEASE_MANIFEST, TEST_RELEASE_SIGNATURE,
     };
     use crate::args::Host;
     use crate::ui::{Config, Kind, Method, Mode, UpgradeOffer};
@@ -1675,11 +1741,19 @@ mod tests {
             args: &[&str],
             output: &std::fs::File,
         ) -> Result<Output, String> {
-            output
-                .try_clone()
-                .unwrap()
-                .write_all(b"downloaded binary")
-                .unwrap();
+            let url = args
+                .iter()
+                .find(|arg| arg.starts_with("https://"))
+                .copied()
+                .unwrap_or_default();
+            let bytes = if url.ends_with(".manifest") {
+                TEST_RELEASE_MANIFEST
+            } else if url.ends_with(".minisig") {
+                TEST_RELEASE_SIGNATURE
+            } else {
+                TEST_RELEASE_BINARY
+            };
+            output.try_clone().unwrap().write_all(bytes).unwrap();
             self.run(false, program, args)
         }
         fn confirm(&mut self, _: &str, _: u32) -> bool {
@@ -1751,6 +1825,15 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!remained, "failed download directory should be removed");
+    }
+
+    #[test]
+    fn upgrade_rejects_an_unknown_installed_version() {
+        let error = validate_installed_version("systemd", Some("unknown")).unwrap_err();
+        assert!(
+            error.contains("reinstall it from a signed release"),
+            "{error}"
+        );
     }
 
     #[test]

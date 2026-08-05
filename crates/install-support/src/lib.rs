@@ -5,6 +5,13 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+mod release;
+
+pub use release::{
+    curl_fetch_command, download_verified_asset_with_keys, SelectedRelease, TrustedKey,
+    TRUSTED_RELEASE_KEYS,
+};
+
 pub struct DownloadFile {
     dir: PathBuf,
     path: PathBuf,
@@ -78,6 +85,56 @@ impl DownloadFile {
     }
 
     pub fn prepare_install(&mut self) -> Result<&File, String> {
+        self.validate_identity(true)?;
+        self.rewind()?;
+        Ok(&self.file)
+    }
+
+    pub(crate) fn read_limited(&mut self, limit: u64, label: &str) -> Result<Vec<u8>, String> {
+        self.validate_identity(true)?;
+        self.rewind()?;
+        let mut bytes = Vec::new();
+        self.file
+            .by_ref()
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("failed to read {label}: {e}"))?;
+        if bytes.len() as u64 > limit {
+            return Err(format!("{label} exceeds {limit} bytes"));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn verify_sha256(
+        &mut self,
+        expected_len: u64,
+        expected_digest: &[u8; 32],
+    ) -> Result<(), String> {
+        use sha2::{Digest as _, Sha256};
+
+        self.validate_identity(true)?;
+        let actual_len = self
+            .file
+            .metadata()
+            .map_err(|e| format!("failed to inspect downloaded binary: {e}"))?
+            .len();
+        if actual_len != expected_len {
+            return Err(format!(
+                "downloaded binary length mismatch: expected {expected_len}, got {actual_len}"
+            ));
+        }
+        self.rewind()?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut self.file, &mut hasher)
+            .map_err(|e| format!("failed to hash downloaded binary: {e}"))?;
+        let actual = hasher.finalize();
+        if actual.as_slice() != expected_digest {
+            return Err("downloaded binary digest mismatch".into());
+        }
+        self.rewind()
+    }
+
+    fn validate_identity(&self, require_content: bool) -> Result<(), String> {
         let dir_meta = std::fs::symlink_metadata(&self.dir)
             .map_err(|e| format!("failed to inspect private staging directory: {e}"))?;
         validate_dir(&dir_meta)?;
@@ -91,17 +148,21 @@ impl DownloadFile {
             .file
             .metadata()
             .map_err(|e| format!("failed to inspect downloaded binary: {e}"))?;
-        validate_file(&path_meta, true)?;
-        validate_file(&file_meta, true)?;
+        validate_file(&path_meta, require_content)?;
+        validate_file(&file_meta, require_content)?;
         if (path_meta.dev(), path_meta.ino()) != self.file_identity
             || (file_meta.dev(), file_meta.ino()) != self.file_identity
         {
             return Err("downloaded binary was replaced".into());
         }
+        Ok(())
+    }
+
+    fn rewind(&mut self) -> Result<(), String> {
         self.file
             .seek(SeekFrom::Start(0))
-            .map_err(|e| format!("failed to read downloaded binary: {e}"))?;
-        Ok(&self.file)
+            .map(|_| ())
+            .map_err(|e| format!("failed to read downloaded binary: {e}"))
     }
 }
 

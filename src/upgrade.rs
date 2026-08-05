@@ -9,7 +9,27 @@ use std::fs::File;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use zeronat_install_support::DownloadFile;
+use zeronat_install_support::{
+    curl_fetch_command, download_verified_asset_with_keys, DownloadFile, SelectedRelease,
+    TrustedKey,
+};
+
+#[cfg(not(test))]
+use zeronat_install_support::TRUSTED_RELEASE_KEYS;
+
+#[cfg(test)]
+const TEST_RELEASE_KEYS: &[TrustedKey] = &[TrustedKey {
+    id: "3cafdfbef1bd2ed8",
+    public_key: include_str!("../crates/install-support/tests/fixtures/minisign.pub"),
+}];
+#[cfg(test)]
+const TEST_RELEASE_MANIFEST: &[u8] =
+    include_bytes!("../crates/install-support/tests/fixtures/v0.25.1.manifest");
+#[cfg(test)]
+const TEST_RELEASE_SIGNATURE: &[u8] =
+    include_bytes!("../crates/install-support/tests/fixtures/v0.25.1.manifest.minisig");
+#[cfg(test)]
+const TEST_RELEASE_BINARY: &[u8] = b"downloaded binary";
 
 const ENV_FILE: &str = "/etc/zeronat/.env";
 const COMPOSE_FILE: &str = "/etc/zeronat/compose.yml";
@@ -18,7 +38,6 @@ const UNIT_FILE: &str = "/etc/systemd/system/zeronat.service";
 const CONTAINER: &str = "zeronat";
 const IMAGE: &str = "ghcr.io/paltaio/zeronat:protocol-v6";
 const BINARY_ASSET_PREFIX: &str = "zeronat-v6";
-const RELEASE_BASE: &str = "https://github.com/paltaio/zeronat/releases/latest/download";
 const LATEST_URL: &str = "https://github.com/paltaio/zeronat/releases/latest";
 
 trait UpgradeRunner {
@@ -83,21 +102,32 @@ pub fn run(check_only: bool) -> Result<()> {
         .into());
     }
 
+    if let Some(version) = &systemd {
+        validate_installed_version("systemd", version)?;
+    }
+    if let Some(deployment) = &docker {
+        validate_installed_version("docker", &deployment.version)?;
+    }
+
     if !check_only {
         validate_installed_credentials(systemd.is_some(), docker.as_ref())?;
     }
 
-    let latest = latest_version()?;
+    let latest = latest_release()?;
+    let latest_version = latest.version();
     let systemd_newer = systemd
         .as_ref()
-        .is_some_and(|current| version_newer(&latest, current));
+        .is_some_and(|current| version_newer(latest_version, current));
     let docker_newer = docker
         .as_ref()
-        .is_some_and(|deployment| version_newer(&latest, &deployment.version));
+        .is_some_and(|deployment| version_newer(latest_version, &deployment.version));
     let mut applied = false;
 
     if let Some(current) = &systemd {
-        println!("systemd: {}", status_line(current, &latest, systemd_newer));
+        println!(
+            "systemd: {}",
+            status_line(current, latest_version, systemd_newer)
+        );
         if systemd_newer && !check_only {
             upgrade_systemd(&latest)?;
             applied = true;
@@ -107,7 +137,7 @@ pub fn run(check_only: bool) -> Result<()> {
     if let Some(dep) = &docker {
         println!(
             "docker:  {}",
-            status_line(&dep.version, &latest, docker_newer)
+            status_line(&dep.version, latest_version, docker_newer)
         );
         if docker_newer && !check_only {
             upgrade_docker(dep)?;
@@ -117,9 +147,9 @@ pub fn run(check_only: bool) -> Result<()> {
 
     if !check_only {
         if applied {
-            println!("upgrade complete (latest {latest})");
+            println!("upgrade complete (latest {latest_version})");
         } else {
-            println!("already up to date (latest {latest})");
+            println!("already up to date (latest {latest_version})");
         }
     }
     Ok(())
@@ -583,29 +613,30 @@ fn docker_mode() -> Option<DockerMode> {
 
 // ---- apply ---------------------------------------------------------------
 
-fn upgrade_systemd(latest: &str) -> Result<()> {
-    upgrade_systemd_with(latest, &mut CommandRunner)
+fn upgrade_systemd(release: &SelectedRelease) -> Result<()> {
+    upgrade_systemd_with(release, &mut CommandRunner)
 }
 
-fn upgrade_systemd_with(latest: &str, runner: &mut dyn UpgradeRunner) -> Result<()> {
+fn upgrade_systemd_with(release: &SelectedRelease, runner: &mut dyn UpgradeRunner) -> Result<()> {
     if !have("curl") {
         return Err("curl is required to download the new binary".into());
     }
     let target = arch_target()?;
-    println!("systemd: downloading {BINARY_ASSET_PREFIX}-{target} ({latest})");
-    let url = format!("{RELEASE_BASE}/{BINARY_ASSET_PREFIX}-{target}");
-    let mut download = DownloadFile::create()?;
-    let dl = runner
-        .run_with_stdout(
-            false,
-            "curl",
-            &["-fsSL", &url, "--max-time", "180"],
-            download.output(),
-        )
-        .map_err(|e| format!("running curl: {e}"))?;
-    if !dl.status.success() {
-        return Err(format!("download failed (no release asset for {target}?)").into());
-    }
+    let asset_name = format!("{BINARY_ASSET_PREFIX}-{target}");
+    println!("systemd: downloading {asset_name} ({})", release.version());
+    let mut download = download_verified_asset_with_keys(
+        release,
+        &asset_name,
+        release_keys(),
+        |url, max_bytes, output| {
+            let (program, args) = curl_fetch_command(url, max_bytes);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let result = runner
+                .run_with_stdout(false, program, &args, output)
+                .map_err(|e| format!("running curl: {e}"))?;
+            Ok(result.status.success())
+        },
+    )?;
     let input = download.prepare_install()?;
     let inst = runner
         .run_with_stdin(
@@ -852,7 +883,7 @@ fn compose_command(
 
 // ---- version helpers -----------------------------------------------------
 
-fn latest_version() -> Result<String> {
+fn latest_release() -> Result<SelectedRelease> {
     if !have("curl") {
         return Err("curl is required to check for the latest release".into());
     }
@@ -860,7 +891,16 @@ fn latest_version() -> Result<String> {
         false,
         "curl",
         &[
-            "-fsSL",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--max-redirs",
+            "5",
             "-I",
             "-o",
             "/dev/null",
@@ -876,21 +916,8 @@ fn latest_version() -> Result<String> {
         return Err("could not reach the release server to check the latest version".into());
     }
     let url = String::from_utf8_lossy(&out.stdout);
-    version_from_url(&url)
-        .ok_or_else(|| format!("could not parse the latest release from '{}'", url.trim()).into())
-}
-
-/// Pull the version out of a GitHub `releases/latest` redirect target, e.g.
-/// `.../releases/tag/v0.14.0` -> `0.14.0`. None for the unresolved
-/// `.../releases/latest` URL (no tag yet).
-fn version_from_url(url: &str) -> Option<String> {
-    let tag = url.trim().trim_end_matches('/').rsplit('/').next()?;
-    let ver = tag.strip_prefix('v').unwrap_or(tag);
-    if ver.chars().next()?.is_ascii_digit() {
-        Some(ver.to_string())
-    } else {
-        None
-    }
+    SelectedRelease::from_latest_url(&url)
+        .map_err(|error| format!("could not parse the latest release: {error}").into())
 }
 
 /// Last whitespace token of a `--version` line, e.g. `zeronat 0.14.0` -> `0.14.0`.
@@ -899,24 +926,29 @@ fn version_token(s: &str) -> String {
 }
 
 fn version_newer(latest: &str, current: &str) -> bool {
-    let Some(l) = parse_semver(latest) else {
-        return false;
-    };
-    match parse_semver(current) {
-        Some(c) => l > c,
-        // An unparseable installed version (e.g. a pre-`--version` binary) is
-        // treated as upgradable; an unparseable latest is the safe no-op above.
-        None => true,
-    }
+    SelectedRelease::from_version(latest)
+        .and_then(|release| release.is_newer_than(current))
+        .unwrap_or(false)
 }
 
-fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
-    let core = s.split(['-', '+']).next().unwrap_or(s);
-    let mut it = core.split('.');
-    let major = it.next()?.parse().ok()?;
-    let minor = it.next()?.parse().ok()?;
-    let patch = it.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor, patch))
+fn validate_installed_version(deployment: &str, version: &str) -> Result<()> {
+    if SelectedRelease::from_version(version).is_err() {
+        return Err(format!(
+            "cannot verify the installed {deployment} version '{version}'; reinstall it from a signed release before upgrading"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn release_keys() -> &'static [TrustedKey] {
+    TRUSTED_RELEASE_KEYS
+}
+
+#[cfg(test)]
+fn release_keys() -> &'static [TrustedKey] {
+    TEST_RELEASE_KEYS
 }
 
 fn arch_target() -> Result<&'static str> {
@@ -1068,7 +1100,19 @@ mod tests {
             args: &[&str],
             output: &File,
         ) -> std::io::Result<Output> {
-            output.try_clone()?.write_all(b"downloaded binary")?;
+            let url = args
+                .iter()
+                .find(|arg| arg.starts_with("https://"))
+                .copied()
+                .unwrap_or_default();
+            let bytes = if url.ends_with(".manifest") {
+                TEST_RELEASE_MANIFEST
+            } else if url.ends_with(".minisig") {
+                TEST_RELEASE_SIGNATURE
+            } else {
+                TEST_RELEASE_BINARY
+            };
+            output.try_clone()?.write_all(bytes)?;
             self.run(false, program, args)
         }
     }
@@ -1090,13 +1134,16 @@ mod tests {
             installed: Vec::new(),
         };
 
-        upgrade_systemd_with("0.25.1", &mut runner).unwrap();
+        let release = SelectedRelease::from_version("0.25.1").unwrap();
+        upgrade_systemd_with(&release, &mut runner).unwrap();
 
         assert_eq!(runner.installed, b"downloaded binary");
         assert!(runner
             .commands
             .iter()
-            .any(|command| command.starts_with("curl -fsSL ")
+            .any(|command| command.starts_with("sh -c ")
+                && command.contains("ulimit -f")
+                && command.contains(" curl --fail ")
                 && command.contains("/zeronat-v6-")
                 && !command.contains(" -o ")));
         assert!(runner
@@ -1268,23 +1315,6 @@ mod tests {
     }
 
     #[test]
-    fn version_from_url_extracts_tag() {
-        assert_eq!(
-            version_from_url("https://github.com/paltaio/zeronat/releases/tag/v0.14.0").as_deref(),
-            Some("0.14.0")
-        );
-        assert_eq!(
-            version_from_url("https://github.com/x/y/releases/tag/v1.2.3\n").as_deref(),
-            Some("1.2.3")
-        );
-        // The unresolved latest URL has no tag.
-        assert_eq!(
-            version_from_url("https://github.com/x/y/releases/latest"),
-            None
-        );
-    }
-
-    #[test]
     fn version_token_takes_last() {
         assert_eq!(version_token("zeronat 0.14.0"), "0.14.0");
         assert_eq!(version_token("zeronat 0.14.0\n"), "0.14.0");
@@ -1298,8 +1328,13 @@ mod tests {
         assert!(version_newer("1.0.0", "0.99.99"));
         assert!(!version_newer("0.14.0", "0.14.0"));
         assert!(!version_newer("0.13.0", "0.14.0"));
-        // Unknown installed version -> upgradable; unknown latest -> no-op.
-        assert!(version_newer("0.14.0", "unknown"));
+        assert!(!version_newer("0.14.0", "unknown"));
         assert!(!version_newer("unknown", "0.14.0"));
+        assert!(!version_newer("0.14.0", "0.13"));
+        assert!(!version_newer("0.14.0", "0.13.0-rc1"));
+        assert!(validate_installed_version("systemd", "unknown")
+            .unwrap_err()
+            .to_string()
+            .contains("reinstall it from a signed release"));
     }
 }

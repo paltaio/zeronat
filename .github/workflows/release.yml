@@ -112,6 +112,51 @@ jobs:
           path: out/zeronat
           if-no-files-found: error
 
+  installers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - arm-unknown-linux-musleabihf
+          - mips-unknown-linux-gnu
+          - mipsel-unknown-linux-gnu
+          - mips64-unknown-linux-gnuabi64
+          - mips64el-unknown-linux-gnuabi64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build installer
+        env:
+          RUSTFLAGS: '-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort -Cforce-unwind-tables=no'
+        run: |
+          cross build --release --locked \
+            -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
+            --target ${{ matrix.target }} -p zeronat-installer
+
+      - name: Stage installer
+        run: install -D "target/${{ matrix.target }}/release/zeronat-installer" "out/zeronat-installer-${{ matrix.target }}"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: installer-${{ matrix.target }}
+          path: out/zeronat-installer-${{ matrix.target }}
+          if-no-files-found: error
+
   windows:
     # Temporarily disabled. Re-enable: drop `if: false` and add `windows` back to release.needs.
     if: false
@@ -159,14 +204,28 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [binaries, freebsd]
+    needs: [binaries, freebsd, installers]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    environment: release-signing
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: bin-*
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: installer-*
+
       - name: Collect per-target binaries
         run: |
           mkdir -p out
@@ -178,9 +237,102 @@ jobs:
               install -m 0755 "$d/zeronat" "out/zeronat-v6-${name}"
             fi
           done
-      - uses: softprops/action-gh-release@v3
-        with:
-          files: out/zeronat-*
+          for d in artifacts/installer-*; do
+            install -m 0755 "$d"/zeronat-installer-* out/
+          done
+
+      - name: Validate release identity and inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF#refs/tags/}
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          version=${tag#v}
+          package_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "zeronat") | .version')
+          test "$version" = "$package_version"
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          test "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists" >&2
+            exit 1
+          fi
+          test "$(find out -maxdepth 1 -type f -name 'zeronat-v6-*' | wc -l)" -eq 14
+          test "$(find out -maxdepth 1 -type f -name 'zeronat-installer-*' | wc -l)" -eq 8
+
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      - name: Sign release manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          tag=${GITHUB_REF#refs/tags/}
+          key_id=85ba020a1bd957f1
+          manifest="out/zeronat-release-v1-$tag.manifest"
+          signature="$manifest.$key_id.minisig"
+          key=$(mktemp)
+          derived=$(mktemp)
+          trap 'rm -f "$key" "$derived"' EXIT
+          derived_id=$(python3 - <<'PY'
+          import base64
+          from pathlib import Path
+
+          payload = base64.b64decode(Path("release/minisign.pub").read_text().splitlines()[1], validate=True)
+          if len(payload) != 42:
+              raise SystemExit("invalid Minisign public key")
+          print(f"{int.from_bytes(payload[2:10], 'little'):016x}")
+          PY
+          )
+          test "$derived_id" = "$key_id"
+          printf '%s' "$MINISIGN_SECRET_KEY" > "$key"
+          minisign -R -s "$key" -p "$derived"
+          test "$(sed -n '2p' "$derived")" = "$(sed -n '2p' release/minisign.pub)"
+          {
+            printf 'zeronat-release-v1 %s\n' "$tag"
+            for asset in out/zeronat-v6-* out/zeronat-installer-*; do
+              printf '%s %s %s\n' \
+                "$(sha256sum "$asset" | awk '{print $1}')" \
+                "$(stat -c '%s' "$asset")" \
+                "$(basename "$asset")"
+            done | LC_ALL=C sort -k3,3
+          } > "$manifest"
+          minisign -S -s "$key" -m "$manifest" -x "$signature" -t "zeronat $tag release manifest"
+          minisign -V -H -q -p release/minisign.pub -m "$manifest" -x "$signature"
+          rm -f "$key" "$derived"
+          trap - EXIT
+
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF#refs/tags/}
+          manifest="out/zeronat-release-v1-$tag.manifest"
+          signature="$manifest.85ba020a1bd957f1.minisig"
+          release_assets=(out/zeronat-v6-* out/zeronat-installer-* "$manifest" "$signature")
+          test "${#release_assets[@]}" -eq 24
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          test "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA"
+          gh release create "$tag" --draft --verify-tag --title "$tag" "${release_assets[@]}"
+
+          verify_dir=$(mktemp -d)
+          trap 'rm -rf "$verify_dir"' EXIT
+          gh release download "$tag" --dir "$verify_dir"
+          test "${#release_assets[@]}" -eq "$(find "$verify_dir" -maxdepth 1 -type f | wc -l)"
+          for local_asset in "${release_assets[@]}"; do
+            remote_asset="$verify_dir/$(basename "$local_asset")"
+            test -f "$remote_asset"
+            test "$(stat -c '%s' "$local_asset")" = "$(stat -c '%s' "$remote_asset")"
+            test "$(sha256sum "$local_asset" | awk '{print $1}')" = "$(sha256sum "$remote_asset" | awk '{print $1}')"
+          done
+
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          test "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA"
+          gh release edit "$tag" --draft=false
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.immutable')" = true
 
   docker:
     needs: binaries
