@@ -161,12 +161,26 @@ pub fn pub_ip() -> String {
 
 /// A secret already on disk, so a re-run does not rotate it and break clients.
 pub fn existing_secret() -> Option<String> {
+    existing_env_value("ZERONAT_SECRET")
+}
+
+/// An administrative secret already on disk, kept across installer re-runs.
+pub fn existing_admin_secret() -> Option<String> {
+    existing_env_value("ZERONAT_ADMIN_SECRET")
+}
+
+fn existing_env_value(key: &str) -> Option<String> {
     let out = run(true, "cat", &["/etc/zeronat/.env"]).ok()?;
     if !out.status.success() {
         return None;
     }
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some(v) = line.strip_prefix("ZERONAT_SECRET=") {
+    env_value(&String::from_utf8_lossy(&out.stdout), key)
+}
+
+fn env_value(body: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    for line in body.lines() {
+        if let Some(v) = line.strip_prefix(&prefix) {
             if !v.is_empty() {
                 return Some(v.to_string());
             }
@@ -373,6 +387,17 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert!(a.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn env_file_keeps_client_and_admin_secrets_separate() {
+        let body = "ZERONAT_SECRET=client\nZERONAT_ADMIN_SECRET=admin\n";
+        assert_eq!(env_value(body, "ZERONAT_SECRET").as_deref(), Some("client"));
+        assert_eq!(
+            env_value(body, "ZERONAT_ADMIN_SECRET").as_deref(),
+            Some("admin")
+        );
+        assert_eq!(env_value(body, "MISSING"), None);
     }
 
     #[test]

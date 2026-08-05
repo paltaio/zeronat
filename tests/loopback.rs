@@ -19,6 +19,7 @@ use zeronat::server::{ListenerSpec, ServerSettings};
 
 const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 const SECRET_B: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+const ADMIN_SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// Build a `ServerSettings` for a config-less (runtime-only) server: localhost
 /// bind, removable runtime-sourced listeners, no routes, no config file. The
@@ -46,6 +47,7 @@ fn cli_settings(control: u16, tcp: Vec<u16>, udp: Vec<u16>) -> ServerSettings {
         bind: Ipv4Addr::LOCALHOST,
         control_port: control,
         secret: SECRET.into(),
+        admin_secret: Some(ADMIN_SECRET.into()),
         server_id: "0".into(),
         tap: None,
         tun: None,
@@ -55,6 +57,7 @@ fn cli_settings(control: u16, tcp: Vec<u16>, udp: Vec<u16>) -> ServerSettings {
         config_path: None,
         file_id: None,
         file_control: None,
+        file_admin_secret: None,
         file_exit: None,
         file_exit_iface: None,
     }
@@ -104,6 +107,47 @@ fn free_port() -> u16 {
             return port;
         }
     }
+}
+
+#[test]
+fn server_cli_rejects_malformed_admin_credentials() {
+    let exe = env!("CARGO_BIN_EXE_zeronat");
+    let run = |args: &[&str], admin_env: Option<&str>| {
+        let mut command = std::process::Command::new(exe);
+        command.args(args).env_remove("ZERONAT_ADMIN_SECRET");
+        if let Some(value) = admin_env {
+            command.env("ZERONAT_ADMIN_SECRET", value);
+        }
+        command.output().unwrap()
+    };
+
+    let output = run(
+        &["server", "--secret", SECRET, "--admin-secret", "short"],
+        None,
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("64 hexadecimal"));
+
+    let output = run(&["server", "--secret", SECRET], Some("short"));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("64 hexadecimal"));
+
+    let dir = temp_config_dir("admin-secret-cli");
+    let path = dir.join("server.toml");
+    std::fs::write(&path, "[server]\nadmin_secret = \"short\"\n").unwrap();
+    let output = run(
+        &[
+            "server",
+            "--secret",
+            SECRET,
+            "--config",
+            path.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("64 hexadecimal"));
+    std::fs::remove_dir_all(dir).ok();
 }
 
 /// Echoes back every chunk it receives on a local TCP port.
@@ -270,15 +314,78 @@ fn start_tunnel(transport: zeronat::client::Transport) -> Tunnel {
 /// Connect to the control port and run the admin Noise handshake, retrying until
 /// the control listener is accepting. Returns the handshaked reader/writer.
 async fn admin_connect(control: u16) -> (zeronat::noise::NoiseReader, zeronat::noise::NoiseWriter) {
-    let psk = zeronat::noise::derive_psk(SECRET);
+    let psk = zeronat::noise::derive_psk(ADMIN_SECRET);
+    remote_connect(control, &psk, zeronat::noise::AuthRole::Admin).await
+}
+
+async fn remote_connect(
+    control: u16,
+    psk: &[u8; 32],
+    role: zeronat::noise::AuthRole,
+) -> (zeronat::noise::NoiseReader, zeronat::noise::NoiseWriter) {
     loop {
         if let Ok(sock) = TcpStream::connect(("127.0.0.1", control)).await {
             sock.set_nodelay(true).ok();
-            if let Ok(pair) = zeronat::noise::client_handshake(sock, &psk).await {
+            if let Ok(pair) = zeronat::noise::client_handshake_remote(sock, psk, role).await {
                 return pair;
             }
         }
         sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Open one handshaked KCP control stream and keep its UDP receive pump alive.
+async fn udp_control_connect(
+    control: u16,
+    psk: &[u8; 32],
+    role: zeronat::noise::AuthRole,
+) -> (
+    zeronat::noise::NoiseReader,
+    zeronat::noise::NoiseWriter,
+    tokio::task::JoinHandle<()>,
+) {
+    loop {
+        let (stream, pump) = udp_control_stream(control).await;
+        match timeout(
+            Duration::from_secs(2),
+            zeronat::noise::client_handshake_remote(stream, psk, role),
+        )
+        .await
+        {
+            Ok(Ok((r, w))) => return (r, w, pump),
+            _ => {
+                pump.abort();
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+async fn udp_control_stream(
+    control: u16,
+) -> (zeronat::kcp::KcpStream, tokio::task::JoinHandle<()>) {
+    use zeronat::kcp::{route, session, CLASS_KCP};
+
+    let server: std::net::SocketAddr = format!("127.0.0.1:{control}").parse().unwrap();
+    loop {
+        let socket = std::sync::Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        socket.connect(server).await.unwrap();
+        if zeronat::admission::admit(&socket, server).await.is_err() {
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        let sess = session(socket.clone(), server, 1);
+        let pump = {
+            let sess = sess.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65535];
+                while let Ok(n) = socket.recv(&mut buf).await {
+                    route(&sess, &buf[..n]);
+                }
+            })
+        };
+        let (_conv, stream) = sess.open_conv(CLASS_KCP);
+        return (stream, pump);
     }
 }
 
@@ -601,6 +708,203 @@ async fn admin_snapshot_over_tcp() {
     timeout(Duration::from_secs(20), body)
         .await
         .expect("admin snapshot did not complete within 20s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_credential_cannot_read_admin_over_tcp_or_udp() {
+    let control = free_port();
+    tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+    let psk = zeronat::noise::derive_psk(SECRET);
+
+    let (mut tcp_r, mut tcp_w) =
+        remote_connect(control, &psk, zeronat::noise::AuthRole::Client).await;
+    tcp_w
+        .send(
+            &Msg::AdminHello {
+                version: zeronat::identity::PROTO_VERSION,
+                mode: 0,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !matches!(
+            timeout(Duration::from_secs(2), tcp_r.recv()).await,
+            Ok(Ok(frame)) if matches!(Msg::decode(&frame), Ok(Msg::Snapshot(_)))
+        ),
+        "the client credential read an admin snapshot over tcp"
+    );
+
+    let (mut udp_r, mut udp_w, _pump) =
+        udp_control_connect(control, &psk, zeronat::noise::AuthRole::Client).await;
+    udp_w
+        .send(
+            &Msg::AdminHello {
+                version: zeronat::identity::PROTO_VERSION,
+                mode: 0,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !matches!(
+            timeout(Duration::from_secs(2), udp_r.recv()).await,
+            Ok(Ok(frame)) if matches!(Msg::decode(&frame), Ok(Msg::Snapshot(_)))
+        ),
+        "the client credential read an admin snapshot over udp"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_credential_cannot_register_clients_over_tcp_or_udp() {
+    let control = free_port();
+    tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+    let admin_psk = zeronat::noise::derive_psk(ADMIN_SECRET);
+
+    let (mut tcp_r, mut tcp_w) = admin_connect(control).await;
+    tcp_w
+        .send(
+            &Msg::ClientHello {
+                version: zeronat::identity::PROTO_VERSION,
+                client_id: "tcp-admin-impostor".into(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    tcp_w.send(&Msg::Ping.encode()).await.ok();
+    assert!(
+        !matches!(
+            timeout(Duration::from_secs(2), tcp_r.recv()).await,
+            Ok(Ok(frame)) if matches!(Msg::decode(&frame), Ok(Msg::Pong))
+        ),
+        "the admin credential registered a client over tcp"
+    );
+
+    let (mut udp_r, mut udp_w, _pump) =
+        udp_control_connect(control, &admin_psk, zeronat::noise::AuthRole::Admin).await;
+    udp_w
+        .send(
+            &Msg::ClientHello {
+                version: zeronat::identity::PROTO_VERSION,
+                client_id: "udp-admin-impostor".into(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    udp_w.send(&Msg::Ping.encode()).await.ok();
+    assert!(
+        !matches!(
+            timeout(Duration::from_secs(2), udp_r.recv()).await,
+            Ok(Ok(frame)) if matches!(Msg::decode(&frame), Ok(Msg::Pong))
+        ),
+        "the admin credential registered a client over udp"
+    );
+
+    let snap = fetch_snapshot(control).await;
+    assert!(snap.clients.iter().all(|client| {
+        client.client_id != "tcp-admin-impostor" && client.client_id != "udp-admin-impostor"
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_snapshot_over_udp_uses_the_admin_credential() {
+    let control = free_port();
+    tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
+    let admin_psk = zeronat::noise::derive_psk(ADMIN_SECRET);
+    let (mut r, mut w, _pump) =
+        udp_control_connect(control, &admin_psk, zeronat::noise::AuthRole::Admin).await;
+    w.send(
+        &Msg::AdminHello {
+            version: zeronat::identity::PROTO_VERSION,
+            mode: 0,
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let frame = timeout(Duration::from_secs(2), r.recv())
+        .await
+        .expect("admin snapshot timed out")
+        .unwrap();
+    assert!(matches!(Msg::decode(&frame), Ok(Msg::Snapshot(_))));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_admin_credential_disables_admin_without_disabling_clients() {
+    let control = free_port();
+    let mut settings = cli_settings(control, vec![], vec![]);
+    settings.admin_secret = None;
+    tokio::spawn(zeronat::server::run(settings));
+    let client_psk = zeronat::noise::derive_psk(SECRET);
+
+    let (mut tcp_r, mut tcp_w) =
+        remote_connect(control, &client_psk, zeronat::noise::AuthRole::Client).await;
+    tcp_w
+        .send(
+            &Msg::ClientHello {
+                version: zeronat::identity::PROTO_VERSION,
+                client_id: "tcp-client".into(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    tcp_w.send(&Msg::Ping.encode()).await.unwrap();
+    let frame = timeout(Duration::from_secs(2), tcp_r.recv())
+        .await
+        .expect("tcp client received no pong")
+        .unwrap();
+    assert!(matches!(Msg::decode(&frame), Ok(Msg::Pong)));
+
+    let (mut udp_r, mut udp_w, _pump) =
+        udp_control_connect(control, &client_psk, zeronat::noise::AuthRole::Client).await;
+    udp_w
+        .send(
+            &Msg::ClientHello {
+                version: zeronat::identity::PROTO_VERSION,
+                client_id: "udp-client".into(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    udp_w.send(&Msg::Ping.encode()).await.unwrap();
+    let frame = timeout(Duration::from_secs(2), udp_r.recv())
+        .await
+        .expect("udp client received no pong")
+        .unwrap();
+    assert!(matches!(Msg::decode(&frame), Ok(Msg::Pong)));
+
+    let admin_psk = zeronat::noise::derive_psk(ADMIN_SECRET);
+    let sock = TcpStream::connect(("127.0.0.1", control)).await.unwrap();
+    let admin = timeout(
+        Duration::from_secs(2),
+        zeronat::noise::client_handshake_remote(sock, &admin_psk, zeronat::noise::AuthRole::Admin),
+    )
+    .await;
+    assert!(
+        !matches!(admin, Ok(Ok(_))),
+        "an unconfigured tcp admin credential authenticated"
+    );
+
+    let (stream, _pump) = udp_control_stream(control).await;
+    let admin = timeout(
+        Duration::from_secs(2),
+        zeronat::noise::client_handshake_remote(
+            stream,
+            &admin_psk,
+            zeronat::noise::AuthRole::Admin,
+        ),
+    )
+    .await;
+    assert!(
+        !matches!(admin, Ok(Ok(_))),
+        "an unconfigured udp admin credential authenticated"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1478,9 +1782,11 @@ async fn proxy_forward_refuses_headerless_open() {
                 // The first connection is the control channel.
                 let (sock, _) = l.accept().await.unwrap();
                 tokio::spawn(async move {
-                    let (mut r, mut w) = zeronat::noise::server_handshake(sock, &psk)
-                        .await
-                        .expect("control handshake");
+                    let (role, (mut r, mut w)) =
+                        zeronat::noise::server_handshake_remote(sock, &psk, None)
+                            .await
+                            .expect("control handshake");
+                    assert_eq!(role, zeronat::noise::AuthRole::Client);
                     let first = r.recv().await.expect("client hello");
                     if !matches!(Msg::decode(&first), Ok(Msg::ClientHello { .. })) {
                         return; // drops open_sent_tx
@@ -3322,7 +3628,13 @@ async fn peer_control_connect(
         if let Ok(sock) = TcpStream::connect(("127.0.0.1", control)).await {
             sock.set_nodelay(true).ok();
             let local = sock.local_addr().unwrap();
-            if let Ok((r, w)) = zeronat::noise::client_handshake(sock, &psk).await {
+            if let Ok((r, w)) = zeronat::noise::client_handshake_remote(
+                sock,
+                &psk,
+                zeronat::noise::AuthRole::Client,
+            )
+            .await
+            {
                 break (r, w, local);
             }
         }
@@ -3483,7 +3795,7 @@ async fn peer_control_connect_udp(
         let (_conv, stream) = sess.open_conv(CLASS_KCP);
         match timeout(
             Duration::from_secs(2),
-            zeronat::noise::client_handshake(stream, &psk),
+            zeronat::noise::client_handshake_remote(stream, &psk, zeronat::noise::AuthRole::Client),
         )
         .await
         {
@@ -5663,7 +5975,11 @@ async fn handshake_within(
                 sock.set_nodelay(true).ok();
                 if let Ok(Ok(pair)) = timeout(
                     Duration::from_secs(2),
-                    zeronat::noise::client_handshake(sock, psk),
+                    zeronat::noise::client_handshake_remote(
+                        sock,
+                        psk,
+                        zeronat::noise::AuthRole::Client,
+                    ),
                 )
                 .await
                 {
@@ -5933,7 +6249,9 @@ async fn prior_role_frames_are_rejected_by_current_server() {
         vec![],
     )));
 
-    let (mut r, mut w) = admin_connect(control).await;
+    let client_psk = zeronat::noise::derive_psk(SECRET);
+    let (mut r, mut w) =
+        remote_connect(control, &client_psk, zeronat::noise::AuthRole::Client).await;
     let prior_version = zeronat::identity::PROTO_VERSION - 1;
     w.send(
         &Msg::ClientHello {
@@ -5952,7 +6270,8 @@ async fn prior_role_frames_are_rejected_by_current_server() {
     let snap = fetch_snapshot(control).await;
     assert!(snap.clients.iter().all(|c| c.client_id != "prior-client"));
 
-    let (mut control_r, mut control_w) = admin_connect(control).await;
+    let (mut control_r, mut control_w) =
+        remote_connect(control, &client_psk, zeronat::noise::AuthRole::Client).await;
     control_w
         .send(
             &Msg::ClientHello {
@@ -5986,7 +6305,8 @@ async fn prior_role_frames_are_rejected_by_current_server() {
         other => panic!("expected open, got {other:?}"),
     };
 
-    let (mut data_r, mut data_w) = admin_connect(control).await;
+    let (mut data_r, mut data_w) =
+        remote_connect(control, &client_psk, zeronat::noise::AuthRole::Client).await;
     data_w
         .send(
             &Msg::Data {
@@ -6006,7 +6326,8 @@ async fn prior_role_frames_are_rejected_by_current_server() {
         "prior-version data role did not fail closed"
     );
 
-    let (mut legacy_r, mut legacy_w) = admin_connect(control).await;
+    let (mut legacy_r, mut legacy_w) =
+        remote_connect(control, &client_psk, zeronat::noise::AuthRole::Client).await;
     let mut legacy_data = vec![3];
     legacy_data.extend_from_slice(&id.to_be_bytes());
     legacy_w.send(&legacy_data).await.unwrap();

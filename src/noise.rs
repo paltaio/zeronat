@@ -15,8 +15,37 @@ const HASHLEN: usize = 32;
 const DHLEN: usize = 32;
 const TAGLEN: usize = 16;
 const REPLAY_WINDOW_LEN: u64 = 128;
+const REMOTE_PREFACE_MAGIC: [u8; 2] = *b"ZN";
+const REMOTE_PREFACE_LEN: usize = 4;
 // Stateless peers authenticate the protocol version as part of the Noise transcript.
 const STATELESS_PROLOGUE: [u8; 1] = [crate::identity::PROTO_VERSION];
+
+/// Credential selected before a remote control-port Noise handshake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AuthRole {
+    Client = 1,
+    Admin = 2,
+}
+
+impl AuthRole {
+    fn from_byte(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::Client),
+            2 => Ok(Self::Admin),
+            _ => Err("unsupported remote authentication role".into()),
+        }
+    }
+
+    fn preface(self) -> [u8; REMOTE_PREFACE_LEN] {
+        [
+            REMOTE_PREFACE_MAGIC[0],
+            REMOTE_PREFACE_MAGIC[1],
+            crate::identity::PROTO_VERSION,
+            self as u8,
+        ]
+    }
+}
 
 pub type Noise = (NoiseReader, NoiseWriter);
 
@@ -300,6 +329,50 @@ where
     let mut stream: BoxStream = Box::new(stream);
     let (keys, _payload) = run_responder(&mut stream, psk, &[], &[]).await?;
     Ok(finish(stream, keys))
+}
+
+/// Run a remote control-port initiator handshake under one credential role.
+pub async fn client_handshake_remote<S>(
+    mut stream: S,
+    psk: &[u8; 32],
+    role: AuthRole,
+) -> Result<Noise>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let preface = role.preface();
+    stream.write_all(&preface).await?;
+    stream.flush().await?;
+    let mut stream: BoxStream = Box::new(stream);
+    let (keys, _payload2) = run_initiator(&mut stream, psk, &preface, &[]).await?;
+    Ok(finish(stream, keys))
+}
+
+/// Read the role preface and complete the handshake with that role's configured key.
+pub async fn server_handshake_remote<S>(
+    mut stream: S,
+    client_psk: &[u8; 32],
+    admin_psk: Option<&[u8; 32]>,
+) -> Result<(AuthRole, Noise)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut preface = [0u8; REMOTE_PREFACE_LEN];
+    stream.read_exact(&mut preface).await?;
+    if preface[..2] != REMOTE_PREFACE_MAGIC {
+        return Err("unsupported remote handshake preface".into());
+    }
+    if preface[2] != crate::identity::PROTO_VERSION {
+        return Err("unsupported protocol version".into());
+    }
+    let role = AuthRole::from_byte(preface[3])?;
+    let psk = match role {
+        AuthRole::Client => client_psk,
+        AuthRole::Admin => admin_psk.ok_or("remote administration is disabled")?,
+    };
+    let mut stream: BoxStream = Box::new(stream);
+    let (keys, _payload) = run_responder(&mut stream, psk, &preface, &[]).await?;
+    Ok((role, finish(stream, keys)))
 }
 
 fn finish(stream: BoxStream, keys: Keys) -> Noise {
@@ -714,6 +787,83 @@ mod tests {
                                                            // server -> client
         sw.send(b"pong").await.unwrap();
         assert_eq!(cr.recv().await.unwrap(), b"pong");
+    }
+
+    #[tokio::test]
+    async fn remote_handshake_selects_independent_credentials() {
+        let client_psk = derive_psk("remote client fixture");
+        let admin_psk = derive_psk("remote admin fixture");
+
+        for (role, psk) in [(AuthRole::Client, client_psk), (AuthRole::Admin, admin_psk)] {
+            let (initiator, responder) = tokio::io::duplex(8192);
+            let client = client_handshake_remote(initiator, &psk, role);
+            let server = server_handshake_remote(responder, &client_psk, Some(&admin_psk));
+            let (client, server) = tokio::join!(client, server);
+            assert!(client.is_ok());
+            assert_eq!(server.unwrap().0, role);
+        }
+
+        for (role, wrong_psk) in [(AuthRole::Client, admin_psk), (AuthRole::Admin, client_psk)] {
+            let (initiator, responder) = tokio::io::duplex(8192);
+            let client = client_handshake_remote(initiator, &wrong_psk, role);
+            let server = server_handshake_remote(responder, &client_psk, Some(&admin_psk));
+            let (client, server) = tokio::join!(client, server);
+            assert!(client.is_err());
+            assert!(server.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_admin_handshake_fails_when_unconfigured() {
+        let client_psk = derive_psk("remote client fixture");
+        let admin_psk = derive_psk("remote admin fixture");
+        let (initiator, responder) = tokio::io::duplex(8192);
+        let client = client_handshake_remote(initiator, &admin_psk, AuthRole::Admin);
+        let server = server_handshake_remote(responder, &client_psk, None);
+        let (client, server) = tokio::join!(client, server);
+        assert!(client.is_err());
+        assert!(server.is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_mixed_protocol_versions_fail_closed() {
+        let psk = derive_psk("remote version fixture");
+        let (legacy, current) = tokio::io::duplex(8192);
+        let legacy_client = client_handshake(legacy, &psk);
+        let current_server = server_handshake_remote(current, &psk, None);
+        let (legacy_result, current_result) = tokio::join!(legacy_client, current_server);
+        assert!(legacy_result.is_err());
+        assert!(current_result.is_err());
+
+        let (current, legacy) = tokio::io::duplex(8192);
+        let current_client = client_handshake_remote(current, &psk, AuthRole::Client);
+        let legacy_server = async {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                server_handshake(legacy, &psk),
+            )
+            .await
+        };
+        let (current_result, legacy_result) = tokio::join!(current_client, legacy_server);
+        assert!(current_result.is_err());
+        assert!(legacy_result.is_err());
+
+        let (mut prior, current) = tokio::io::duplex(8192);
+        let prior_client = async {
+            let preface = [
+                REMOTE_PREFACE_MAGIC[0],
+                REMOTE_PREFACE_MAGIC[1],
+                crate::identity::PROTO_VERSION - 1,
+                AuthRole::Client as u8,
+            ];
+            prior.write_all(&preface).await?;
+            let mut stream: BoxStream = Box::new(prior);
+            run_initiator(&mut stream, &psk, &preface, &[]).await
+        };
+        let current_server = server_handshake_remote(current, &psk, None);
+        let (prior_result, current_result) = tokio::join!(prior_client, current_server);
+        assert!(prior_result.is_err());
+        assert!(current_result.is_err());
     }
 
     // The responder's message-2 payload reaches the initiator intact, and the

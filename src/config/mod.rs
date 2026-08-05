@@ -37,6 +37,7 @@ pub struct CfgRoute {
 pub struct ServerConfig {
     pub id: Option<String>,
     pub control: Option<String>,
+    pub admin_secret: Option<String>,
     /// Exit mode: masquerade the tunnel client's outbound traffic.
     pub exit: Option<bool>,
     /// Egress interface for exit mode; unset auto-detects the default route.
@@ -130,6 +131,7 @@ pub fn parse(text: &str) -> Result<ServerConfig> {
                 match key {
                     "id" => cfg.id = Some(parse_string(value, n)?),
                     "control" => cfg.control = Some(parse_string(value, n)?),
+                    "admin_secret" => cfg.admin_secret = Some(parse_string(value, n)?),
                     "exit" => cfg.exit = Some(parse_bool(value, n)?),
                     "exit_iface" => cfg.exit_iface = Some(parse_string(value, n)?),
                     other => {
@@ -265,13 +267,21 @@ fn parse_ip(value: &str, n: usize) -> Result<Ipv4Addr> {
 pub fn serialize(cfg: &ServerConfig) -> String {
     let mut out = String::new();
 
-    if cfg.id.is_some() || cfg.control.is_some() || cfg.exit.is_some() || cfg.exit_iface.is_some() {
+    if cfg.id.is_some()
+        || cfg.control.is_some()
+        || cfg.admin_secret.is_some()
+        || cfg.exit.is_some()
+        || cfg.exit_iface.is_some()
+    {
         out.push_str("[server]\n");
         if let Some(id) = &cfg.id {
             out.push_str(&format!("id = {}\n", quote(id)));
         }
         if let Some(control) = &cfg.control {
             out.push_str(&format!("control = {}\n", quote(control)));
+        }
+        if let Some(admin_secret) = &cfg.admin_secret {
+            out.push_str(&format!("admin_secret = {}\n", quote(admin_secret)));
         }
         if let Some(exit) = cfg.exit {
             out.push_str(&format!("exit = {exit}\n"));
@@ -344,6 +354,7 @@ mod tests {
         ServerConfig {
             id: Some("oci".into()),
             control: Some("0.0.0.0:2222".into()),
+            admin_secret: Some("admin-secret".into()),
             exit: Some(true),
             exit_iface: Some("eth0".into()),
             listeners: vec![
@@ -402,6 +413,7 @@ mod tests {
         let cfg = ServerConfig {
             id: None,
             control: None,
+            admin_secret: None,
             exit: None,
             exit_iface: None,
             listeners: vec![

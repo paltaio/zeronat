@@ -87,6 +87,7 @@ pub struct Config {
     pub announce_port: String,
     pub server_addr: String,
     pub secret: String,
+    pub admin_secret: String,
     pub secret_mode: SecretMode,
     pub have_docker: bool,
     pub have_compose: bool,
@@ -121,6 +122,7 @@ impl Config {
             announce_port: String::new(),
             server_addr: String::new(),
             secret: String::new(),
+            admin_secret: String::new(),
             secret_mode: if existing_secret.is_some() {
                 SecretMode::Reuse
             } else {

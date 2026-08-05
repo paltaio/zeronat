@@ -202,6 +202,7 @@ zeronat installer
   --all                     forward every port plus ICMP; keeps SSH on the server
   --control PORT            tunnel control port (default 2222)
   --secret 64-HEX           32-byte hex secret (default: generated)
+  --admin-secret 64-HEX     server admin secret (default: generated)
   --server-addr HOST[:PORT] (client only) where the server is reachable
   --dht                     find the server over the DHT (dynamic IP, no fixed address)
   --announce-ip IP          (server, with --dht) public IPv4 to announce
@@ -244,13 +245,14 @@ fn real_main() -> i32 {
     }
     let have_docker = sys::have("docker");
     let have_compose = have_docker && sys::have_compose();
-    // Read the on-disk secret even in dry-run so the preview shows the secret a
-    // real run would reuse, not a freshly generated one.
+    // Dry-run previews use the stored credentials that installation would reuse.
     let existing = sys::existing_secret();
+    let existing_admin = sys::existing_admin_secret();
     let host = Host {
         have_docker,
         have_compose,
         existing_secret: existing,
+        existing_admin_secret: existing_admin,
         ssh_port: sys::ssh_port(),
     };
 
@@ -320,7 +322,7 @@ fn real_main() -> i32 {
     }
 
     // Execute, animating a progress screen as each step runs.
-    let cfg = app.cfg.clone();
+    let mut cfg = app.cfg.clone();
     let do_upgrade = app.do_upgrade;
     let offer = app.upgrade_offer().cloned();
     let (result, log) = {
@@ -332,7 +334,8 @@ fn real_main() -> i32 {
         };
         let result = match (do_upgrade, &offer) {
             (true, Some(o)) => install::upgrade(o, &mut runner),
-            _ => install::execute(&cfg, dry, &mut runner),
+            _ => args::finalize_credentials(&mut cfg, &parsed, &host)
+                .and_then(|()| install::execute(&cfg, dry, &mut runner)),
         };
         (result, runner.log)
     };

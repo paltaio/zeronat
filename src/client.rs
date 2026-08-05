@@ -29,7 +29,7 @@ use crate::kcp::{
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 use crate::noise::{
-    client_handshake, client_handshake_stateless, client_handshake_stateless_reply,
+    client_handshake_remote, client_handshake_stateless, client_handshake_stateless_reply, AuthRole,
 };
 use crate::peerslot;
 use crate::peerslot::PeerControl;
@@ -1795,7 +1795,7 @@ pub async fn relay_leg_stream(
     let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
         let sock = TcpStream::connect(server).await?;
         sock.set_nodelay(true).ok();
-        client_handshake(sock, psk).await
+        client_handshake_remote(sock, psk, AuthRole::Client).await
     })
     .await
     .map_err(|_| -> crate::Error { "relay leg connect+handshake timed out".into() })??;
@@ -2179,9 +2179,12 @@ async fn udp_session(
     // session's lifetime so control death aborts it too.
     let (sess, pump, cancel) = udp_connect(&client).await?;
     let (_conv, stream) = sess.open_conv(CLASS_KCP);
-    let noise = tokio_timeout(UDP_HANDSHAKE_TIMEOUT, client_handshake(stream, &client.psk))
-        .await
-        .map_err(|_| -> crate::Error { "udp handshake timed out".into() })??;
+    let noise = tokio_timeout(
+        UDP_HANDSHAKE_TIMEOUT,
+        client_handshake_remote(stream, &client.psk, AuthRole::Client),
+    )
+    .await
+    .map_err(|_| -> crate::Error { "udp handshake timed out".into() })??;
     Ok((sess, pump, cancel, noise))
 }
 
@@ -2272,7 +2275,7 @@ async fn connect_and_handshake(
             .map_err(|e| -> crate::Error { format!("connecting to {addr}: {e}").into() })?;
         sock.set_nodelay(true).ok();
         let peer = sock.peer_addr().ok();
-        let noise = client_handshake(sock, psk).await?;
+        let noise = client_handshake_remote(sock, psk, AuthRole::Client).await?;
         Ok((noise, peer))
     })
     .await
@@ -2568,7 +2571,7 @@ async fn handle_open(
             let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
                 let sock = TcpStream::connect(&client.server).await?;
                 sock.set_nodelay(true).ok();
-                client_handshake(sock, &client.psk).await
+                client_handshake_remote(sock, &client.psk, AuthRole::Client).await
             })
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
@@ -2588,7 +2591,7 @@ async fn handle_open(
             let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
                 let sock = TcpStream::connect(&client.server).await?;
                 sock.set_nodelay(true).ok();
-                client_handshake(sock, &client.psk).await
+                client_handshake_remote(sock, &client.psk, AuthRole::Client).await
             })
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
@@ -2612,7 +2615,7 @@ async fn handle_open(
             let (_conv, stream) = sess.open_conv(CLASS_KCP);
             let (nr, mut nw) = tokio_timeout(
                 OPEN_HANDSHAKE_TIMEOUT,
-                client_handshake(stream, &client.psk),
+                client_handshake_remote(stream, &client.psk, AuthRole::Client),
             )
             .await
             .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;

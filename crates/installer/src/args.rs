@@ -16,6 +16,7 @@ pub struct Parsed {
     pub method: Option<String>,
     pub deploy: Option<String>,
     pub secret: Option<String>,
+    pub admin_secret: Option<String>,
     pub control: Option<String>,
     pub ports: Option<String>,
     pub server_addr: Option<String>,
@@ -37,6 +38,7 @@ pub struct Host {
     pub have_docker: bool,
     pub have_compose: bool,
     pub existing_secret: Option<String>,
+    pub existing_admin_secret: Option<String>,
     pub ssh_port: u16,
 }
 
@@ -58,6 +60,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             "--method" => p.method = Some(take(&mut i, a)?),
             "--deploy" => p.deploy = Some(take(&mut i, a)?),
             "--secret" => p.secret = Some(take(&mut i, a)?),
+            "--admin-secret" => p.admin_secret = Some(take(&mut i, a)?),
             "--control" => p.control = Some(take(&mut i, a)?),
             "--ports" => p.ports = Some(take(&mut i, a)?),
             "--server-addr" | "--addr" => p.server_addr = Some(take(&mut i, a)?),
@@ -255,9 +258,38 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
     } else {
         sys::gen_secret()?
     };
-    cfg.secret = zeronat_secret::normalize(&secret).map_err(|e| e.to_string())?;
+    cfg.secret = secret;
+    finalize_credentials(&mut cfg, p, host)?;
 
     Ok(cfg)
+}
+
+/// Normalize the client secret, then clear the admin secret for clients or
+/// resolve it for servers.
+pub fn finalize_credentials(cfg: &mut Config, p: &Parsed, host: &Host) -> Result<(), String> {
+    cfg.secret = zeronat_secret::normalize(&cfg.secret).map_err(|e| format!("client {e}"))?;
+    if cfg.mode != Mode::Server {
+        cfg.admin_secret.clear();
+        return Ok(());
+    }
+
+    let admin_secret = if cfg.admin_secret.is_empty() {
+        if let Some(s) = &p.admin_secret {
+            s.clone()
+        } else if let Some(s) = &host.existing_admin_secret {
+            s.clone()
+        } else {
+            sys::gen_secret()?
+        }
+    } else {
+        cfg.admin_secret.clone()
+    };
+    cfg.admin_secret =
+        zeronat_secret::normalize(&admin_secret).map_err(|e| format!("admin {e}"))?;
+    if cfg.admin_secret == cfg.secret {
+        return Err("admin secret must differ from the client secret".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -266,6 +298,7 @@ mod tests {
 
     const FLAG_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
     const DISK_SECRET: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+    const ADMIN_SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -276,6 +309,7 @@ mod tests {
             have_docker: false,
             have_compose: false,
             existing_secret: None,
+            existing_admin_secret: None,
             ssh_port: 22,
         }
     }
@@ -288,6 +322,8 @@ mod tests {
             "systemd",
             "--secret",
             "abc",
+            "--admin-secret",
+            ADMIN_SECRET,
             "--control",
             "3333",
             "--ports",
@@ -310,6 +346,7 @@ mod tests {
         assert_eq!(p.mode, Some(Mode::Client));
         assert_eq!(p.method.as_deref(), Some("systemd"));
         assert_eq!(p.secret.as_deref(), Some("abc"));
+        assert_eq!(p.admin_secret.as_deref(), Some(ADMIN_SECRET));
         assert_eq!(p.control.as_deref(), Some("3333"));
         assert_eq!(p.ports.as_deref(), Some("443/tcp 80/tcp"));
         assert_eq!(p.server_addr.as_deref(), Some("host:9000"));
@@ -457,6 +494,108 @@ mod tests {
         let p = parse(&s(&["-y", "--server", "--ports", "80/tcp"])).unwrap();
         let gen = build(&p, &host(), p.headless).unwrap().secret;
         assert_eq!(gen.len(), 64);
+    }
+
+    #[test]
+    fn server_admin_secret_is_independent_and_optional_for_clients() {
+        let p = parse(&s(&[
+            "-y",
+            "--server",
+            "--ports",
+            "80/tcp",
+            "--secret",
+            FLAG_SECRET,
+            "--admin-secret",
+            ADMIN_SECRET,
+        ]))
+        .unwrap();
+        let cfg = build(&p, &host(), p.headless).unwrap();
+        assert_eq!(cfg.admin_secret, ADMIN_SECRET);
+
+        let mut h = host();
+        h.existing_admin_secret = Some(DISK_SECRET.into());
+        let p = parse(&s(&[
+            "-y",
+            "--server",
+            "--ports",
+            "80/tcp",
+            "--secret",
+            FLAG_SECRET,
+        ]))
+        .unwrap();
+        assert_eq!(build(&p, &h, p.headless).unwrap().admin_secret, DISK_SECRET);
+
+        let p = parse(&s(&[
+            "-y",
+            "--client",
+            "--ports",
+            "80/tcp",
+            "--server-addr",
+            "127.0.0.1:2222",
+            "--secret",
+            FLAG_SECRET,
+        ]))
+        .unwrap();
+        assert!(build(&p, &h, p.headless).unwrap().admin_secret.is_empty());
+    }
+
+    #[test]
+    fn server_rejects_invalid_or_shared_admin_secret() {
+        for admin in ["short", FLAG_SECRET] {
+            let p = parse(&s(&[
+                "-y",
+                "--server",
+                "--ports",
+                "80/tcp",
+                "--secret",
+                FLAG_SECRET,
+                "--admin-secret",
+                admin,
+            ]))
+            .unwrap();
+            assert!(build(&p, &host(), p.headless).is_err());
+        }
+    }
+
+    #[test]
+    fn client_to_server_wizard_change_resolves_admin_secret() {
+        let p = parse(&s(&[
+            "--client",
+            "--secret",
+            FLAG_SECRET,
+            "--admin-secret",
+            ADMIN_SECRET,
+        ]))
+        .unwrap();
+        let h = host();
+        let mut cfg = build(&p, &h, false).unwrap();
+        assert!(cfg.admin_secret.is_empty());
+
+        cfg.mode = Mode::Server;
+        finalize_credentials(&mut cfg, &p, &h).unwrap();
+
+        assert_eq!(cfg.admin_secret, ADMIN_SECRET);
+    }
+
+    #[test]
+    fn wizard_secret_change_rejects_matching_admin_secret() {
+        let p = parse(&s(&[
+            "--server",
+            "--secret",
+            FLAG_SECRET,
+            "--admin-secret",
+            ADMIN_SECRET,
+        ]))
+        .unwrap();
+        let h = host();
+        let mut cfg = build(&p, &h, false).unwrap();
+
+        cfg.secret = ADMIN_SECRET.into();
+
+        assert_eq!(
+            finalize_credentials(&mut cfg, &p, &h).unwrap_err(),
+            "admin secret must differ from the client secret"
+        );
     }
 
     #[test]

@@ -22,7 +22,8 @@ use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 #[cfg(target_os = "linux")]
 use crate::netfilter;
 use crate::noise::{
-    server_handshake, server_handshake_stateless, Noise, NoiseReader, NoiseWriter, StatelessNoise,
+    server_handshake_remote, server_handshake_stateless, AuthRole, Noise, NoiseReader, NoiseWriter,
+    StatelessNoise,
 };
 #[cfg(target_os = "linux")]
 use crate::proto::BridgeEntry;
@@ -349,6 +350,7 @@ type UdpPending = (
 
 pub(crate) struct Server {
     psk: [u8; 32],
+    admin_psk: Option<[u8; 32]>,
     server_id: String,
     next_id: Mutex<u64>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Noise>>>,
@@ -376,6 +378,7 @@ pub(crate) struct Server {
     config_path: Option<PathBuf>,
     file_id: Option<String>,
     file_control: Option<String>,
+    file_admin_secret: Option<String>,
     file_exit: Option<bool>,
     file_exit_iface: Option<String>,
     /// Serializes config writes so two concurrent admin sessions never interleave
@@ -940,6 +943,7 @@ pub struct ServerSettings {
     pub bind: Ipv4Addr,
     pub control_port: u16,
     pub secret: String,
+    pub admin_secret: Option<String>,
     pub server_id: String,
     pub tap: Option<TapConfig>,
     pub tun: Option<ServerTun>,
@@ -949,6 +953,7 @@ pub struct ServerSettings {
     pub config_path: Option<PathBuf>,
     pub file_id: Option<String>,
     pub file_control: Option<String>,
+    pub file_admin_secret: Option<String>,
     pub file_exit: Option<bool>,
     pub file_exit_iface: Option<String>,
 }
@@ -990,6 +995,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         bind,
         control_port,
         secret,
+        admin_secret,
         server_id,
         tap,
         tun,
@@ -999,10 +1005,17 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         config_path,
         file_id,
         file_control,
+        file_admin_secret,
         file_exit,
         file_exit_iface,
     } = settings;
     let secret = crate::secret::normalize(&secret)?;
+    let admin_secret = admin_secret
+        .map(|value| crate::secret::normalize(&value))
+        .transpose()?;
+    if admin_secret.as_deref() == Some(secret.as_str()) {
+        return Err("admin secret must differ from the client secret".into());
+    }
 
     // The TUN NAT guard tears the rules down when this future is dropped: on the
     // SIGTERM/SIGINT cancel in main, or on an early-return error (the accept loop
@@ -1085,6 +1098,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
 
     let srv = Arc::new(Server {
         psk: crate::noise::derive_psk(&secret),
+        admin_psk: admin_secret.as_deref().map(crate::noise::derive_psk),
         server_id,
         next_id: Mutex::new(1),
         pending: Mutex::new(HashMap::new()),
@@ -1113,6 +1127,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         config_path,
         file_id,
         file_control,
+        file_admin_secret,
         file_exit,
         file_exit_iface,
         save_lock: tokio::sync::Mutex::new(()),
@@ -1184,20 +1199,26 @@ async fn handle_incoming(
     permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     sock.set_nodelay(true).ok();
-    let (r, w) = {
+    let (role, (r, w)) = {
         let _permit = permit;
-        match timeout(HANDSHAKE_TIMEOUT, server_handshake(sock, &srv.psk)).await {
+        match timeout(
+            HANDSHAKE_TIMEOUT,
+            server_handshake_remote(sock, &srv.psk, srv.admin_psk.as_ref()),
+        )
+        .await
+        {
             Ok(res) => res?,
             Err(_) => return Err("handshake timed out".into()),
         }
     };
-    serve_stream(srv, r, w, ActiveTransport::Tcp, Some(peer)).await
+    serve_stream(srv, role, r, w, ActiveTransport::Tcp, Some(peer)).await
 }
 
-/// Dispatch a freshly handshaked stream (control, admin, or data),
-/// transport-agnostic. The first message decides the role.
+/// Dispatch a freshly authenticated client or admin stream over either transport.
+/// The first message must match the authenticated role.
 pub(crate) async fn serve_stream(
     srv: Arc<Server>,
+    auth_role: AuthRole,
     mut r: crate::noise::NoiseReader,
     w: crate::noise::NoiseWriter,
     transport: ActiveTransport,
@@ -1211,8 +1232,8 @@ pub(crate) async fn serve_stream(
         Ok(res) => res?,
         Err(_) => return Err("timed out waiting for role frame".into()),
     };
-    match Msg::decode(&first)? {
-        Msg::ClientHello { version, client_id } => {
+    match (auth_role, Msg::decode(&first)?) {
+        (AuthRole::Client, Msg::ClientHello { version, client_id }) => {
             if version != crate::identity::PROTO_VERSION {
                 return Err("unsupported protocol version".into());
             }
@@ -1367,7 +1388,7 @@ pub(crate) async fn serve_stream(
             writer.abort();
             Ok(())
         }
-        Msg::AdminHello { version, mode } => {
+        (AuthRole::Admin, Msg::AdminHello { version, mode }) => {
             if version != crate::identity::PROTO_VERSION {
                 return Err("unsupported protocol version".into());
             }
@@ -1396,7 +1417,7 @@ pub(crate) async fn serve_stream(
                 other => Err(format!("unsupported admin mode {other}").into()),
             }
         }
-        Msg::Data { version, id, name } => {
+        (AuthRole::Client, Msg::Data { version, id, name }) => {
             if version != crate::identity::PROTO_VERSION {
                 return Err("unsupported protocol version".into());
             }
@@ -1434,7 +1455,9 @@ pub(crate) async fn serve_stream(
             }
             Ok(())
         }
-        other => Err(format!("unexpected first message: {other:?}").into()),
+        (role, other) => {
+            Err(format!("message {other:?} is not valid for {role:?} authentication").into())
+        }
     }
 }
 
@@ -1626,6 +1649,7 @@ impl Server {
         let cfg = config::ServerConfig {
             id: self.file_id.clone(),
             control: self.file_control.clone(),
+            admin_secret: self.file_admin_secret.clone(),
             exit: self.file_exit,
             exit_iface: self.file_exit_iface.clone(),
             listeners,
@@ -2218,13 +2242,18 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
                 ..
             }) => {
                 let srv = srv.clone();
-                let psk = srv.psk;
+                let client_psk = srv.psk;
+                let admin_psk = srv.admin_psk;
                 crate::spawn(async move {
-                    let handshake =
-                        timeout(HANDSHAKE_TIMEOUT, server_handshake(stream, &psk)).await;
+                    let handshake = timeout(
+                        HANDSHAKE_TIMEOUT,
+                        server_handshake_remote(stream, &client_psk, admin_psk.as_ref()),
+                    )
+                    .await;
                     drop(permit);
-                    if let Ok(Ok((r, w))) = handshake {
-                        let _ = serve_stream(srv, r, w, ActiveTransport::Udp, Some(src)).await;
+                    if let Ok(Ok((role, (r, w)))) = handshake {
+                        let _ =
+                            serve_stream(srv, role, r, w, ActiveTransport::Udp, Some(src)).await;
                     }
                 });
             }
@@ -2603,6 +2632,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
     fn test_server() -> Arc<Server> {
         Arc::new(Server {
             psk: crate::noise::derive_psk("test-secret"),
+            admin_psk: Some(crate::noise::derive_psk("test-admin-secret")),
             server_id: "test".into(),
             next_id: Mutex::new(1),
             pending: Mutex::new(HashMap::new()),
@@ -2618,12 +2648,71 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             config_path: None,
             file_id: None,
             file_control: None,
+            file_admin_secret: None,
             file_exit: None,
             file_exit_iface: None,
             save_lock: tokio::sync::Mutex::new(()),
             #[cfg(target_os = "linux")]
             switch: None,
         })
+    }
+
+    async fn dispatch_first(srv: Arc<Server>, role: AuthRole, msg: Msg) -> Result<()> {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let psk = srv.psk;
+        let client = crate::spawn(async move {
+            let (_r, mut w) = crate::noise::client_handshake(client_io, &psk)
+                .await
+                .expect("client handshake");
+            w.send(&msg.encode()).await.expect("send first message");
+        });
+        let (r, w) = crate::noise::server_handshake(server_io, &srv.psk)
+            .await
+            .expect("server handshake");
+        let result = serve_stream(srv, role, r, w, ActiveTransport::Tcp, None).await;
+        client.await.expect("client task");
+        result
+    }
+
+    #[tokio::test]
+    async fn authenticated_role_restricts_first_message() {
+        let srv = test_server();
+        assert!(dispatch_first(
+            srv.clone(),
+            AuthRole::Admin,
+            Msg::ClientHello {
+                version: crate::identity::PROTO_VERSION,
+                client_id: "impostor".into(),
+            },
+        )
+        .await
+        .is_err());
+        assert!(srv.clients.lock().unwrap().is_empty());
+
+        for id in [1, u64::MAX] {
+            assert!(dispatch_first(
+                srv.clone(),
+                AuthRole::Admin,
+                Msg::Data {
+                    version: crate::identity::PROTO_VERSION,
+                    id,
+                    name: None,
+                },
+            )
+            .await
+            .is_err());
+        }
+
+        assert!(dispatch_first(
+            srv,
+            AuthRole::Client,
+            Msg::AdminHello {
+                version: crate::identity::PROTO_VERSION,
+                mode: 0,
+            },
+        )
+        .await
+        .is_err());
     }
 
     // A peer that finishes the handshake then never sends its role frame must not
@@ -2649,7 +2738,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let (r, w) = crate::noise::server_handshake(server_io, &srv.psk)
             .await
             .expect("server handshake");
-        let res = serve_stream(srv, r, w, ActiveTransport::Tcp, None).await;
+        let res = serve_stream(srv, AuthRole::Client, r, w, ActiveTransport::Tcp, None).await;
         assert!(
             res.is_err(),
             "silent role frame must time out and release the task"
@@ -2682,7 +2771,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let (r, w) = crate::noise::server_handshake(server_io, &srv.psk)
             .await
             .expect("server handshake");
-        let res = serve_stream(srv, r, w, ActiveTransport::Tcp, None).await;
+        let res = serve_stream(srv, AuthRole::Admin, r, w, ActiveTransport::Tcp, None).await;
         assert!(
             res.is_err(),
             "silent admin request must time out and release the task"
@@ -3028,7 +3117,15 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             let (r, w) = crate::noise::server_handshake(server_io, &psk)
                 .await
                 .expect("server handshake");
-            let _ = serve_stream(srv2, r, w, ActiveTransport::Tcp, Some(observed)).await;
+            let _ = serve_stream(
+                srv2,
+                AuthRole::Client,
+                r,
+                w,
+                ActiveTransport::Tcp,
+                Some(observed),
+            )
+            .await;
         });
 
         let (mut cr, mut cw) = crate::noise::client_handshake(client_io, &psk)
@@ -3087,7 +3184,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
                 .await
                 .expect("server handshake");
             let peer = Some("192.0.2.1:1".parse().unwrap());
-            let _ = serve_stream(srv2, r, w, ActiveTransport::Tcp, peer).await;
+            let _ = serve_stream(srv2, AuthRole::Client, r, w, ActiveTransport::Tcp, peer).await;
         });
 
         let (mut cr, mut cw) = crate::noise::client_handshake(client_io, &psk)

@@ -223,21 +223,21 @@ fn mode_str(cfg: &Config) -> &'static str {
     }
 }
 
-/// Command to open the interactive admin console for this node. The console
-/// connects to a server's control port: local on a server box, the dialed server
-/// for a fixed-address client. A DHT client has no fixed control address to point
-/// at, so there is no one-line console command (run it on the server instead).
+/// Command to open the server's interactive admin console locally. Client
+/// installations do not receive the server's administrative credential.
 fn console_cmd(cfg: &Config) -> Option<String> {
     let target = match cfg.mode {
         Mode::Server => format!("127.0.0.1:{}", cfg.control),
-        Mode::Client if cfg.use_dht => return None,
-        Mode::Client => client_addr(cfg),
+        Mode::Client => return None,
     };
     Some(match cfg.method {
-        // The image is FROM scratch with the binary at /zeronat (not on PATH), and
-        // the container already holds ZERONAT_SECRET from its env file.
+        // The image is FROM scratch with the binary at /zeronat, and the
+        // container receives ZERONAT_ADMIN_SECRET from its env file.
         Method::Docker => format!("docker exec -it zeronat /zeronat admin --server {target}"),
-        Method::Systemd => format!("zeronat admin --server {target} --secret {}", cfg.secret),
+        Method::Systemd => format!(
+            "zeronat admin --server {target} --secret {}",
+            cfg.admin_secret
+        ),
     })
 }
 
@@ -316,6 +316,19 @@ fn check_forwards(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+fn env_file(cfg: &Config, sub: &str) -> String {
+    let admin = if cfg.mode == Mode::Server {
+        format!("ZERONAT_ADMIN_SECRET={}\n", cfg.admin_secret)
+    } else {
+        String::new()
+    };
+    if cfg.method == Method::Docker && cfg.deploy == Deploy::Compose {
+        format!("ZERONAT_SECRET={}\n{admin}ZERONAT_ARGS={sub}\n", cfg.secret)
+    } else {
+        format!("ZERONAT_SECRET={}\n{admin}", cfg.secret)
+    }
+}
+
 pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, String> {
     check_forwards(cfg)?;
     let sub = subcmd(cfg);
@@ -338,11 +351,7 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
     }
 
     r.step("writing env file".into());
-    let env = if cfg.method == Method::Docker && cfg.deploy == Deploy::Compose {
-        format!("ZERONAT_SECRET={}\nZERONAT_ARGS={}\n", cfg.secret, sub)
-    } else {
-        format!("ZERONAT_SECRET={}\n", cfg.secret)
-    };
+    let env = env_file(cfg, &sub);
     place(r, env.as_bytes(), "0600", ENV_FILE)?;
 
     // Build the host bridge before starting zeronat, so the TAP has a bridge to
@@ -972,7 +981,9 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Starte
 
 #[cfg(test)]
 mod tests {
-    use super::{check_forwards, console_cmd, install_systemd, peer_steps, subcmd, Runner};
+    use super::{
+        check_forwards, console_cmd, env_file, install_systemd, peer_steps, subcmd, Runner,
+    };
     use crate::ui::{Config, Kind, Method, Mode};
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
@@ -980,9 +991,14 @@ mod tests {
     use std::process::Output;
 
     const TEST_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const TEST_ADMIN_SECRET: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn cfg() -> Config {
-        Config::new(false, false, None)
+        let mut cfg = Config::new(false, false, None);
+        cfg.secret = TEST_SECRET.into();
+        cfg.admin_secret = TEST_ADMIN_SECRET.into();
+        cfg
     }
 
     /// Records every command instead of running it; all commands succeed.
@@ -1124,23 +1140,33 @@ mod tests {
             "docker exec -it zeronat /zeronat admin --server 127.0.0.1:2222"
         );
         c.method = Method::Systemd;
-        c.secret = TEST_SECRET.into();
         assert_eq!(
             console_cmd(&c).unwrap(),
-            format!("zeronat admin --server 127.0.0.1:2222 --secret {TEST_SECRET}")
+            format!("zeronat admin --server 127.0.0.1:2222 --secret {TEST_ADMIN_SECRET}")
         );
     }
 
     #[test]
-    fn console_client_targets_the_server() {
+    fn client_install_does_not_receive_an_admin_command() {
         let mut c = cfg();
         c.mode = Mode::Client;
         c.server_addr = "vps.example:9000".into();
         c.method = Method::Docker;
-        assert_eq!(
-            console_cmd(&c).unwrap(),
-            "docker exec -it zeronat /zeronat admin --server vps.example:9000"
-        );
+        assert!(console_cmd(&c).is_none());
+    }
+
+    #[test]
+    fn server_env_contains_the_admin_secret_but_client_env_does_not() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        let server = env_file(&c, "server --control 2222");
+        assert!(server.contains(&format!("ZERONAT_SECRET={TEST_SECRET}\n")));
+        assert!(server.contains(&format!("ZERONAT_ADMIN_SECRET={TEST_ADMIN_SECRET}\n")));
+
+        c.mode = Mode::Client;
+        let client = env_file(&c, "client --server 127.0.0.1:2222");
+        assert!(client.contains(&format!("ZERONAT_SECRET={TEST_SECRET}\n")));
+        assert!(!client.contains("ZERONAT_ADMIN_SECRET="));
     }
 
     #[test]

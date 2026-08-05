@@ -70,7 +70,7 @@ mod pty {
 
     /// The fleet console process: `run` against one server's control port.
     fn server_child(addr: String) {
-        if let Err(e) = child_runtime().block_on(zeronat::tui::run(addr, SECRET.into())) {
+        if let Err(e) = child_runtime().block_on(zeronat::tui::run(addr, OTHER_SECRET.into())) {
             eprintln!("fleet console failed: {e}");
             std::process::exit(1);
         }
@@ -314,6 +314,7 @@ mod pty {
             bind: std::net::Ipv4Addr::LOCALHOST,
             control_port: control,
             secret: SECRET.into(),
+            admin_secret: Some(OTHER_SECRET.into()),
             server_id: "0".into(),
             tap: None,
             tun: None,
@@ -350,6 +351,7 @@ mod pty {
             config_path: None,
             file_id: None,
             file_control: None,
+            file_admin_secret: None,
             file_exit: None,
             file_exit_iface: None,
         }

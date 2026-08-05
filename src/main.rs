@@ -32,6 +32,8 @@ server options:
   --bind <ADDR>       Address to bind on (default: 0.0.0.0)
   --control <PORT>    Control port (default: 2222)
   --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET)
+  --admin-secret <64-HEX>  Independent remote admin secret (or env
+                      ZERONAT_ADMIN_SECRET; remote admin is disabled when unset)
   --id <ID>           Server identity label (default: 0)
   --config <PATH>     Load listeners/routes/identity from a config file
   --tcp <PORT>        Public TCP port to expose (repeatable)
@@ -125,8 +127,8 @@ admin options:
                       status and exits when piped or redirected
   show                Print the server's current topology and exit
   --server <ADDR>     Server control address host:port
-  --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET, or the ZERONAT_SECRET
-                      in /etc/zeronat/.env)
+  --secret <64-HEX>   32-byte admin secret (or env ZERONAT_ADMIN_SECRET, or the
+                      ZERONAT_ADMIN_SECRET in /etc/zeronat/.env)
 
 upgrade options:
   --check             Report whether a newer release exists, without applying it
@@ -141,6 +143,7 @@ enum Cmd {
         bind: Option<Ipv4Addr>,
         control: Option<u16>,
         secret: String,
+        admin_secret: Option<String>,
         server_id: Option<String>,
         tcp: Vec<u16>,
         udp: Vec<u16>,
@@ -616,6 +619,7 @@ fn parse_args() -> Result<Cmd> {
         let mut bind: Option<Ipv4Addr> = None;
         let mut control: Option<u16> = None;
         let mut secret: Option<String> = None;
+        let mut admin_secret: Option<String> = None;
         let mut server_id: Option<String> = None;
         let mut tcp: Vec<u16> = Vec::new();
         let mut udp: Vec<u16> = Vec::new();
@@ -674,6 +678,9 @@ fn parse_args() -> Result<Cmd> {
                 "--secret" => {
                     secret = Some(iter.next().ok_or("--secret requires a value")?);
                 }
+                "--admin-secret" => {
+                    admin_secret = Some(iter.next().ok_or("--admin-secret requires a value")?);
+                }
                 "--id" => {
                     server_id = Some(iter.next().ok_or("--id requires a value")?);
                 }
@@ -731,6 +738,7 @@ fn parse_args() -> Result<Cmd> {
                 .or_else(|| std::env::var("ZERONAT_SECRET").ok())
                 .ok_or("--secret or ZERONAT_SECRET is required")?,
         )?;
+        let admin_secret = admin_secret.or_else(|| std::env::var("ZERONAT_ADMIN_SECRET").ok());
 
         if tun && bridge.is_some() {
             return Err("--bridge applies to --tap only, not --tun".into());
@@ -741,6 +749,7 @@ fn parse_args() -> Result<Cmd> {
             bind,
             control,
             secret,
+            admin_secret,
             server_id,
             tcp,
             udp,
@@ -959,9 +968,9 @@ fn parse_args() -> Result<Cmd> {
         let server = server.ok_or("--server is required")?;
         let secret = runtime_secret(
             secret
-            .or_else(|| std::env::var("ZERONAT_SECRET").ok())
-            .or_else(zeronat::admin::secret_from_env_file)
-            .ok_or("no secret: pass --secret, set ZERONAT_SECRET, or run where /etc/zeronat/.env has one")?,
+            .or_else(|| std::env::var("ZERONAT_ADMIN_SECRET").ok())
+            .or_else(zeronat::admin::admin_secret_from_env_file)
+            .ok_or("no admin secret: pass --secret, set ZERONAT_ADMIN_SECRET, or add it to /etc/zeronat/.env")?,
         )?;
 
         let interactive = command.is_none() && interactive_default();
@@ -1037,6 +1046,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             bind,
             control,
             secret,
+            admin_secret,
             server_id,
             tcp,
             udp,
@@ -1082,7 +1092,8 @@ async fn run(cmd: Cmd) -> Result<()> {
 
             // A valid file's identity/control win over the CLI; a present CLI flag
             // that the file overrides is logged so the override is visible.
-            let (cli_id, cli_bind, cli_control) = (server_id, bind, control);
+            let (cli_id, cli_bind, cli_control, cli_admin_secret) =
+                (server_id, bind, control, admin_secret);
             if let (Some(f), Some(c)) = (&file.id, &cli_id) {
                 if f != c {
                     zeronat::elog!("config [server].id '{f}' overrides --server-id '{c}'");
@@ -1115,6 +1126,16 @@ async fn run(cmd: Cmd) -> Result<()> {
             }
             let bind_ip = file_ip.or(cli_bind).unwrap_or(Ipv4Addr::UNSPECIFIED);
             let control_port = file_port.or(cli_control).unwrap_or(2222);
+
+            if file.admin_secret.is_some() && cli_admin_secret.is_some() {
+                zeronat::elog!("config [server].admin_secret overrides --admin-secret");
+            }
+            let admin_secret = file
+                .admin_secret
+                .clone()
+                .or(cli_admin_secret)
+                .map(runtime_secret)
+                .transpose()?;
 
             let (cli_exit, cli_exit_iface) = (exit, exit_iface);
             if file.exit == Some(false) && cli_exit {
@@ -1264,20 +1285,29 @@ async fn run(cmd: Cmd) -> Result<()> {
             // On a self-heal the file lost its [server] table; record the resolved
             // identity so the rewritten file matches the running server and an
             // operator can later drop the CLI flags without a silent change.
-            let (file_id, file_control, file_exit, file_exit_iface) = if self_healed {
-                (
-                    Some(server_id.clone()),
-                    Some(format!("{bind_ip}:{control_port}")),
-                    exit.then_some(true),
-                    exit_iface,
-                )
-            } else {
-                (file.id, file.control, file.exit, file.exit_iface)
-            };
+            let (file_id, file_control, file_admin_secret, file_exit, file_exit_iface) =
+                if self_healed {
+                    (
+                        Some(server_id.clone()),
+                        Some(format!("{bind_ip}:{control_port}")),
+                        admin_secret.clone(),
+                        exit.then_some(true),
+                        exit_iface,
+                    )
+                } else {
+                    (
+                        file.id,
+                        file.control,
+                        file.admin_secret,
+                        file.exit,
+                        file.exit_iface,
+                    )
+                };
             server::run(server::ServerSettings {
                 bind: bind_ip,
                 control_port,
                 secret,
+                admin_secret,
                 server_id,
                 tap,
                 tun,
@@ -1287,6 +1317,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 config_path: config,
                 file_id,
                 file_control,
+                file_admin_secret,
                 file_exit,
                 file_exit_iface,
             })
