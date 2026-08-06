@@ -3,7 +3,6 @@ name: release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions: {}
 
@@ -164,8 +163,36 @@ jobs:
           path: out/zeronat-installer-${{ matrix.target }}
           if-no-files-found: error
 
+  release-preflight:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate release identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "paltaio/zeronat"
+          tag=${GITHUB_REF#refs/tags/}
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          version=${tag#v}
+          package_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "zeronat") | .version')
+          test "$version" = "$package_version"
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          test "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists" >&2
+            exit 1
+          fi
+
   release:
-    needs: [binaries, freebsd, installers]
+    needs: [binaries, freebsd, installers, docker]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -189,6 +216,11 @@ jobs:
           path: artifacts
           pattern: installer-*
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: image-reference
+          path: out
+
       - name: Collect per-target binaries
         run: |
           mkdir -p out
@@ -199,6 +231,7 @@ jobs:
           for d in artifacts/installer-*; do
             install -m 0755 "$d"/zeronat-installer-* out/
           done
+          install -m 0644 compose.yml compose.bridge.yml out/
 
       - name: Validate release identity and inventory
         env:
@@ -218,6 +251,8 @@ jobs:
           fi
           test "$(find out -maxdepth 1 -type f -name 'zeronat-v6-*' | wc -l)" -eq 14
           test "$(find out -maxdepth 1 -type f -name 'zeronat-installer-*' | wc -l)" -eq 8
+          grep -Eq '^ghcr\.io/paltaio/zeronat@sha256:[0-9a-f]{64}$' out/zeronat-image-v6.txt
+          test "$(wc -l < out/zeronat-image-v6.txt)" -eq 1
 
       - name: Install Minisign
         run: sudo apt-get update && sudo apt-get install -y minisign
@@ -251,7 +286,7 @@ jobs:
           test "$(sed -n '2p' "$derived")" = "$(sed -n '2p' release/minisign.pub)"
           {
             printf 'zeronat-release-v1 %s\n' "$tag"
-            for asset in out/zeronat-v6-* out/zeronat-installer-*; do
+            for asset in out/compose.yml out/compose.bridge.yml out/zeronat-image-v6.txt out/zeronat-v6-* out/zeronat-installer-*; do
               printf '%s %s %s\n' \
                 "$(sha256sum "$asset" | awk '{print $1}')" \
                 "$(stat -c '%s' "$asset")" \
@@ -271,8 +306,8 @@ jobs:
           tag=${GITHUB_REF#refs/tags/}
           manifest="out/zeronat-release-v1-$tag.manifest"
           signature="$manifest.85ba020a1bd957f1.minisig"
-          release_assets=(out/zeronat-v6-* out/zeronat-installer-* "$manifest" "$signature")
-          test "${#release_assets[@]}" -eq 24
+          release_assets=(out/compose.yml out/compose.bridge.yml out/zeronat-image-v6.txt out/zeronat-v6-* out/zeronat-installer-* "$manifest" "$signature")
+          test "${#release_assets[@]}" -eq 27
           git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
           test "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA"
           gh release create "$tag" --draft --verify-tag --title "$tag" "${release_assets[@]}"
@@ -294,13 +329,35 @@ jobs:
           test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.immutable')" = true
 
   docker:
-    needs: binaries
+    needs: [binaries, release-preflight]
     permissions:
       contents: read
       packages: write
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    environment: release-signing
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Revalidate protected release identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "paltaio/zeronat"
+          tag=${GITHUB_REF#refs/tags/}
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          version=${tag#v}
+          package_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "zeronat") | .version')
+          test "$version" = "$package_version"
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          test "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists" >&2
+            exit 1
+          fi
 
       # Docker platform -> static musl target.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -336,16 +393,29 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=protocol-v6,enable=${{ startsWith(github.ref, 'refs/tags/') }}
-            type=ref,event=branch
-            type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=protocol-v6
 
       - name: Build and push
+        id: image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Record release image digest
+        run: |
+          set -euo pipefail
+          digest='${{ steps.image.outputs.digest }}'
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'ghcr.io/paltaio/zeronat@%s\n' "$digest" > zeronat-image-v6.txt
+
+      - name: Upload release image reference
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: image-reference
+          path: zeronat-image-v6.txt
+          if-no-files-found: error

@@ -10,8 +10,9 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use zeronat_install_support::{
-    curl_fetch_command, download_verified_asset_with_keys, DownloadFile, SelectedRelease,
-    TrustedKey,
+    curl_fetch_command, download_verified_asset_with_keys, parse_image_reference,
+    replace_image_reference_in_env, DownloadFile, SelectedRelease, TrustedKey, COMPOSE_ASSET,
+    COMPOSE_BRIDGE_ASSET, IMAGE_REFERENCE_ASSET,
 };
 
 #[cfg(not(test))]
@@ -19,7 +20,7 @@ use zeronat_install_support::TRUSTED_RELEASE_KEYS;
 
 #[cfg(test)]
 const TEST_RELEASE_KEYS: &[TrustedKey] = &[TrustedKey {
-    id: "3cafdfbef1bd2ed8",
+    id: "3cbde1bed2d17057",
     public_key: include_str!("../crates/install-support/tests/fixtures/minisign.pub"),
 }];
 #[cfg(test)]
@@ -29,7 +30,17 @@ const TEST_RELEASE_MANIFEST: &[u8] =
 const TEST_RELEASE_SIGNATURE: &[u8] =
     include_bytes!("../crates/install-support/tests/fixtures/v0.25.1.manifest.minisig");
 #[cfg(test)]
-const TEST_RELEASE_BINARY: &[u8] = b"downloaded binary";
+const TEST_RELEASE_BINARY: &[u8] =
+    include_bytes!("../crates/install-support/tests/fixtures/zeronat-v6-x86_64-unknown-linux-musl");
+#[cfg(test)]
+const TEST_RELEASE_IMAGE: &[u8] =
+    include_bytes!("../crates/install-support/tests/fixtures/zeronat-image-v6.txt");
+#[cfg(test)]
+const TEST_RELEASE_COMPOSE: &[u8] =
+    include_bytes!("../crates/install-support/tests/fixtures/compose.yml");
+#[cfg(test)]
+const TEST_RELEASE_COMPOSE_BRIDGE: &[u8] =
+    include_bytes!("../crates/install-support/tests/fixtures/compose.bridge.yml");
 
 const ENV_FILE: &str = "/etc/zeronat/.env";
 const COMPOSE_FILE: &str = "/etc/zeronat/compose.yml";
@@ -42,13 +53,9 @@ const ROOT_USER: &str = "0:0";
 const BINARY_ASSET_PREFIX: &str = "zeronat-v6";
 const LATEST_URL: &str = "https://github.com/paltaio/zeronat/releases/latest";
 
-fn image_for_release(release: &SelectedRelease) -> String {
-    format!("{IMAGE_REPOSITORY}:{}", release.version())
-}
-
 fn image_for_version(version: &str) -> Result<String> {
     SelectedRelease::from_version(version)
-        .map(|release| image_for_release(&release))
+        .map(|release| format!("{IMAGE_REPOSITORY}:{}", release.version()))
         .map_err(Into::into)
 }
 
@@ -199,7 +206,8 @@ fn validate_installed_credentials(
             .into());
         }
         let command = if deployment.compose {
-            rendered_compose_command(deployment.mode, &image_for_version(&deployment.version)?)?
+            rendered_compose_deployment(deployment.mode, &image_for_version(&deployment.version)?)?
+                .command
         } else {
             direct_docker_command(deployment.mode)?
         };
@@ -363,7 +371,7 @@ fn direct_docker_command(mode: DockerMode) -> Result<Vec<String>> {
     Ok(command)
 }
 
-fn rendered_compose_command(mode: DockerMode, image: &str) -> Result<Vec<String>> {
+fn rendered_compose_deployment(mode: DockerMode, image: &str) -> Result<RenderedCompose> {
     let mut command = if dk(mode, &["compose", "version"])
         .map(|out| out.status.success())
         .unwrap_or(false)
@@ -408,16 +416,23 @@ fn rendered_compose_command(mode: DockerMode, image: &str) -> Result<Vec<String>
     if !out.status.success() {
         return Err(format!("rendering {COMPOSE_FILE} before upgrade: {}", errtext(&out)).into());
     }
-    parse_compose_command(&out.stdout)
+    parse_compose_deployment(&out.stdout)
 }
 
-fn parse_compose_command(body: &[u8]) -> Result<Vec<String>> {
+struct RenderedCompose {
+    command: Vec<String>,
+    privileged: bool,
+}
+
+fn parse_compose_deployment(body: &[u8]) -> Result<RenderedCompose> {
     let config: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| format!("reading rendered compose configuration: {e}"))?;
-    let command = config
+    let service = config
         .get("services")
         .and_then(|services| services.get(CONTAINER))
-        .and_then(|service| service.get("command"))
+        .ok_or_else(|| format!("cannot determine the zeronat service in {COMPOSE_FILE}"))?;
+    let command = service
+        .get("command")
         .ok_or_else(|| format!("cannot determine the zeronat command in {COMPOSE_FILE}"))?;
     let command = match command {
         serde_json::Value::Array(parts) => parts
@@ -436,7 +451,43 @@ fn parse_compose_command(body: &[u8]) -> Result<Vec<String>> {
     if command.is_empty() {
         return Err(format!("cannot determine the zeronat command in {COMPOSE_FILE}").into());
     }
-    Ok(command)
+    let privileged = service
+        .get("privileged")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || service
+            .get("cap_add")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some("NET_ADMIN")))
+        || service
+            .get("devices")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|devices| devices.iter().any(compose_device_maps_tun));
+    Ok(RenderedCompose {
+        command,
+        privileged,
+    })
+}
+
+fn compose_device_maps_tun(device: &serde_json::Value) -> bool {
+    match device {
+        serde_json::Value::String(mapping) => mapping
+            .split(':')
+            .take(2)
+            .any(|path| path == "/dev/net/tun"),
+        serde_json::Value::Object(mapping) => ["source", "target"].iter().any(|key| {
+            mapping.get(*key).and_then(serde_json::Value::as_str) == Some("/dev/net/tun")
+        }),
+        _ => false,
+    }
+}
+
+fn compose_asset(privileged: bool) -> &'static str {
+    if privileged {
+        COMPOSE_BRIDGE_ASSET
+    } else {
+        COMPOSE_ASSET
+    }
 }
 
 fn validate_credential_env(body: &str) -> Result<()> {
@@ -631,16 +682,14 @@ fn upgrade_systemd(release: &SelectedRelease) -> Result<()> {
     upgrade_systemd_with(release, &mut CommandRunner)
 }
 
-fn upgrade_systemd_with(release: &SelectedRelease, runner: &mut dyn UpgradeRunner) -> Result<()> {
-    if !have("curl") {
-        return Err("curl is required to download the new binary".into());
-    }
-    let target = arch_target()?;
-    let asset_name = format!("{BINARY_ASSET_PREFIX}-{target}");
-    println!("systemd: downloading {asset_name} ({})", release.version());
-    let mut download = download_verified_asset_with_keys(
+fn download_asset_with(
+    release: &SelectedRelease,
+    asset_name: &str,
+    runner: &mut dyn UpgradeRunner,
+) -> Result<DownloadFile> {
+    download_verified_asset_with_keys(
         release,
-        &asset_name,
+        asset_name,
         release_keys(),
         |url, max_bytes, output| {
             let (program, args) = curl_fetch_command(url, max_bytes);
@@ -650,19 +699,50 @@ fn upgrade_systemd_with(release: &SelectedRelease, runner: &mut dyn UpgradeRunne
                 .map_err(|e| format!("running curl: {e}"))?;
             Ok(result.status.success())
         },
-    )?;
+    )
+    .map_err(Into::into)
+}
+
+fn download_image_reference_with(
+    release: &SelectedRelease,
+    runner: &mut dyn UpgradeRunner,
+) -> Result<String> {
+    let mut download = download_asset_with(release, IMAGE_REFERENCE_ASSET, runner)?;
+    let bytes = download.read_limited(256, "release image reference")?;
+    parse_image_reference(&bytes).map_err(Into::into)
+}
+
+fn install_download_with(
+    download: &mut DownloadFile,
+    mode: &str,
+    destination: &str,
+    runner: &mut dyn UpgradeRunner,
+) -> Result<()> {
     let input = download.prepare_install()?;
-    let inst = runner
+    let installed = runner
         .run_with_stdin(
             true,
             "install",
-            &["-m", "0755", "/dev/stdin", BIN_PATH],
+            &["-m", mode, "/dev/stdin", destination],
             input,
         )
         .map_err(|e| format!("running install: {e}"))?;
-    if !inst.status.success() {
-        return Err(format!("installing {BIN_PATH}: {}", errtext(&inst)).into());
+    if installed.status.success() {
+        Ok(())
+    } else {
+        Err(format!("installing {destination}: {}", errtext(&installed)).into())
     }
+}
+
+fn upgrade_systemd_with(release: &SelectedRelease, runner: &mut dyn UpgradeRunner) -> Result<()> {
+    if !have("curl") {
+        return Err("curl is required to download the new binary".into());
+    }
+    let target = arch_target()?;
+    let asset_name = format!("{BINARY_ASSET_PREFIX}-{target}");
+    println!("systemd: downloading {asset_name} ({})", release.version());
+    let mut download = download_asset_with(release, &asset_name, runner)?;
+    install_download_with(&mut download, "0755", BIN_PATH, runner)?;
     println!("systemd: restarting service");
     let res = runner
         .run(true, "systemctl", &["restart", "zeronat"])
@@ -674,8 +754,24 @@ fn upgrade_systemd_with(release: &SelectedRelease, runner: &mut dyn UpgradeRunne
 }
 
 fn upgrade_docker(dep: &DockerDeployment, release: &SelectedRelease) -> Result<()> {
-    let image = image_for_release(release);
+    let mut runner = CommandRunner;
+    let image = download_image_reference_with(release, &mut runner)?;
     if dep.compose {
+        let current_image = image_for_version(&dep.version)?;
+        let deployment = rendered_compose_deployment(dep.mode, &current_image)?;
+        let asset = compose_asset(deployment.privileged);
+        let mut compose_file = download_asset_with(release, asset, &mut runner)?;
+        install_download_with(&mut compose_file, "0644", COMPOSE_FILE, &mut runner)?;
+        let current_env = std::fs::read(ENV_FILE)
+            .map_err(|e| format!("reading {ENV_FILE} before upgrade: {e}"))?;
+        let updated_env = replace_image_reference_in_env(&current_env, &image)?;
+        let mut env_file = DownloadFile::create()?;
+        env_file
+            .output()
+            .try_clone()
+            .and_then(|mut file| file.write_all(&updated_env))
+            .map_err(|e| format!("staging {ENV_FILE}: {e}"))?;
+        install_download_with(&mut env_file, "0600", ENV_FILE, &mut runner)?;
         println!("docker:  pulling image via compose");
         compose(
             dep.mode,
@@ -1154,6 +1250,12 @@ mod tests {
                 TEST_RELEASE_MANIFEST
             } else if url.ends_with(".minisig") {
                 TEST_RELEASE_SIGNATURE
+            } else if url.ends_with("zeronat-image-v6.txt") {
+                TEST_RELEASE_IMAGE
+            } else if url.ends_with("compose.bridge.yml") {
+                TEST_RELEASE_COMPOSE_BRIDGE
+            } else if url.ends_with("compose.yml") {
+                TEST_RELEASE_COMPOSE
             } else {
                 TEST_RELEASE_BINARY
             };
@@ -1182,7 +1284,7 @@ mod tests {
         let release = SelectedRelease::from_version("0.25.1").unwrap();
         upgrade_systemd_with(&release, &mut runner).unwrap();
 
-        assert_eq!(runner.installed, b"downloaded binary");
+        assert_eq!(runner.installed, TEST_RELEASE_BINARY);
         assert!(runner
             .commands
             .iter()
@@ -1350,13 +1452,33 @@ mod tests {
     }
 
     #[test]
-    fn rendered_compose_command_selects_the_zeronat_service() {
+    fn rendered_compose_selects_the_zeronat_service() {
         let rendered = br#"{"services":{"other":{"command":["server"]},"zeronat":{"command":["client","--config","/etc/zeronat/client.toml"]}}}"#;
 
         assert_eq!(
-            parse_compose_command(rendered).unwrap(),
+            parse_compose_deployment(rendered).unwrap().command,
             ["client", "--config", "/etc/zeronat/client.toml"]
         );
+    }
+
+    #[test]
+    fn rendered_compose_preserves_privileges_for_config_driven_device_mode() {
+        let rendered = br#"{"services":{"zeronat":{"command":["client","--config","/etc/zeronat/client.toml"],"user":"0:0","cap_add":["NET_ADMIN"],"devices":[{"source":"/dev/net/tun","target":"/dev/net/tun","permissions":"rwm"}]}}}"#;
+        let secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let credential = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
+        for device in ["[tap]\ndev = \"zn0\"\n", "[tun]\n"] {
+            let config = format!(
+                "[[servers]]\nname = \"home\"\naddr = \"dht\"\nsecret = \"{secret}\"\ncredential = \"{credential}\"\n{device}"
+            );
+            assert!(validate_client_config("client.toml", &config).unwrap());
+            let deployment = parse_compose_deployment(rendered).unwrap();
+            assert_eq!(compose_asset(deployment.privileged), COMPOSE_BRIDGE_ASSET);
+        }
+
+        let plain = br#"{"services":{"zeronat":{"command":["client","--config","/etc/zeronat/client.toml"],"user":"65532:65532","cap_drop":["ALL"]}}}"#;
+        let deployment = parse_compose_deployment(plain).unwrap();
+        assert_eq!(compose_asset(deployment.privileged), COMPOSE_ASSET);
     }
 
     #[test]
@@ -1384,11 +1506,18 @@ mod tests {
     }
 
     #[test]
-    fn release_image_uses_the_exact_version_tag() {
+    fn image_reference_comes_from_the_signed_release_manifest() {
         let release = SelectedRelease::from_version("0.25.1").unwrap();
+        let mut runner = FakeUpgradeRunner {
+            commands: Vec::new(),
+            installed: Vec::new(),
+        };
+
+        let image = download_image_reference_with(&release, &mut runner).unwrap();
+
         assert_eq!(
-            image_for_release(&release),
-            "ghcr.io/paltaio/zeronat:0.25.1"
+            image,
+            std::str::from_utf8(TEST_RELEASE_IMAGE).unwrap().trim()
         );
     }
 }

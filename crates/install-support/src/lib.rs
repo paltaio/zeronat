@@ -8,9 +8,34 @@ use std::path::{Path, PathBuf};
 mod release;
 
 pub use release::{
-    curl_fetch_command, download_verified_asset_with_keys, SelectedRelease, TrustedKey,
-    TRUSTED_RELEASE_KEYS,
+    curl_fetch_command, download_verified_asset_with_keys, parse_image_reference, SelectedRelease,
+    TrustedKey, COMPOSE_ASSET, COMPOSE_BRIDGE_ASSET, IMAGE_REFERENCE_ASSET, TRUSTED_RELEASE_KEYS,
 };
+
+pub fn replace_image_reference_in_env(body: &[u8], image: &str) -> Result<Vec<u8>, String> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| "deployment environment file is not valid UTF-8".to_string())?;
+    let mut output = Vec::with_capacity(body.len().max(image.len() + 16));
+    let mut matches = 0;
+
+    for entry in text.split_inclusive('\n') {
+        let (line, newline) = entry
+            .strip_suffix('\n')
+            .map_or((entry, ""), |line| (line, "\n"));
+        if line.starts_with("ZERONAT_IMAGE=") {
+            matches += 1;
+            output.extend_from_slice(format!("ZERONAT_IMAGE={image}{newline}").as_bytes());
+        } else {
+            output.extend_from_slice(entry.as_bytes());
+        }
+    }
+
+    match matches {
+        1 => Ok(output),
+        0 => Err("deployment environment file has no ZERONAT_IMAGE entry".into()),
+        _ => Err("deployment environment file has duplicate ZERONAT_IMAGE entries".into()),
+    }
+}
 
 pub struct DownloadFile {
     dir: PathBuf,
@@ -90,7 +115,7 @@ impl DownloadFile {
         Ok(&self.file)
     }
 
-    pub(crate) fn read_limited(&mut self, limit: u64, label: &str) -> Result<Vec<u8>, String> {
+    pub fn read_limited(&mut self, limit: u64, label: &str) -> Result<Vec<u8>, String> {
         self.validate_identity(true)?;
         self.rewind()?;
         let mut bytes = Vec::new();
@@ -212,7 +237,7 @@ fn effective_uid() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::DownloadFile;
+    use super::{replace_image_reference_in_env, DownloadFile};
     use std::io::Write as _;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -258,6 +283,24 @@ mod tests {
         assert!(download.prepare_install().is_err());
         drop(download);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn image_reference_update_preserves_the_rest_of_the_environment() {
+        let old = b"# deployment\nZERONAT_IMAGE=ghcr.io/paltaio/zeronat@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nZERONAT_SECRET=do-not-change\nZERONAT_ARGS=client --config /etc/zeronat/client.toml\n";
+        let image = "ghcr.io/paltaio/zeronat@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let updated = replace_image_reference_in_env(old, image).unwrap();
+
+        assert_eq!(
+            updated,
+            format!("# deployment\nZERONAT_IMAGE={image}\nZERONAT_SECRET=do-not-change\nZERONAT_ARGS=client --config /etc/zeronat/client.toml\n").as_bytes()
+        );
+        assert!(replace_image_reference_in_env(b"ZERONAT_SECRET=value\n", image).is_err());
+        assert!(
+            replace_image_reference_in_env(b"ZERONAT_IMAGE=one\nZERONAT_IMAGE=two\n", image)
+                .is_err()
+        );
     }
 
     fn test_dir(tag: &str) -> PathBuf {

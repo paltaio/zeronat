@@ -8,6 +8,11 @@ const MANIFEST_LIMIT: u64 = 65_536;
 const SIGNATURE_LIMIT: u64 = 4_096;
 const ARTIFACT_LIMIT: u64 = 268_435_456;
 const MANIFEST_PREFIX: &str = "zeronat-release-v1";
+const IMAGE_REFERENCE_PREFIX: &str = "ghcr.io/paltaio/zeronat@sha256:";
+
+pub const IMAGE_REFERENCE_ASSET: &str = "zeronat-image-v6.txt";
+pub const COMPOSE_ASSET: &str = "compose.yml";
+pub const COMPOSE_BRIDGE_ASSET: &str = "compose.bridge.yml";
 
 #[derive(Clone, Copy)]
 pub struct TrustedKey {
@@ -161,6 +166,28 @@ where
     }
     artifact.verify_sha256(entry.length, &entry.digest)?;
     Ok(artifact)
+}
+
+pub fn parse_image_reference(bytes: &[u8]) -> Result<String, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "release image reference is not valid UTF-8".to_string())?;
+    let reference = text
+        .strip_suffix('\n')
+        .ok_or_else(|| "release image reference must end with one newline".to_string())?;
+    if reference.contains('\n') || reference.contains('\r') {
+        return Err("release image reference must contain one line".into());
+    }
+    let digest = reference
+        .strip_prefix(IMAGE_REFERENCE_PREFIX)
+        .ok_or_else(|| "release image reference has an unexpected repository".to_string())?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("release image reference has an invalid SHA-256 digest".into());
+    }
+    Ok(reference.to_string())
 }
 
 fn verify_signature(
@@ -329,13 +356,14 @@ mod tests {
     use std::io::{Read as _, Write as _};
 
     const TEST_KEY: TrustedKey = TrustedKey {
-        id: "3cafdfbef1bd2ed8",
+        id: "3cbde1bed2d17057",
         public_key: include_str!("../tests/fixtures/minisign.pub"),
     };
     const TEST_MANIFEST: &[u8] = include_bytes!("../tests/fixtures/v0.25.1.manifest");
     const TEST_SIGNATURE: &[u8] = include_bytes!("../tests/fixtures/v0.25.1.manifest.minisig");
     const TEST_ASSET: &str = "zeronat-v6-x86_64-unknown-linux-musl";
-    const TEST_BINARY: &[u8] = b"downloaded binary";
+    const TEST_BINARY: &[u8] =
+        include_bytes!("../tests/fixtures/zeronat-v6-x86_64-unknown-linux-musl");
 
     #[test]
     fn selected_release_requires_canonical_stable_versions() {
@@ -361,6 +389,30 @@ mod tests {
             "https://github.com/other/repo/releases/tag/v1.2.3"
         )
         .is_err());
+    }
+
+    #[test]
+    fn image_reference_requires_the_repository_and_an_oci_digest() {
+        let digest = "01".repeat(32);
+        let expected = format!("{IMAGE_REFERENCE_PREFIX}{digest}");
+        assert_eq!(
+            parse_image_reference(format!("{expected}\n").as_bytes()).unwrap(),
+            expected
+        );
+
+        for invalid in [
+            format!("ghcr.io/other/zeronat@sha256:{digest}\n"),
+            format!("ghcr.io/paltaio/zeronat:{digest}\n"),
+            format!("{IMAGE_REFERENCE_PREFIX}{}\n", "0".repeat(63)),
+            format!("{IMAGE_REFERENCE_PREFIX}{}\n", "A".repeat(64)),
+            format!("{IMAGE_REFERENCE_PREFIX}{digest}"),
+            format!("{IMAGE_REFERENCE_PREFIX}{digest}\nextra\n"),
+        ] {
+            assert!(
+                parse_image_reference(invalid.as_bytes()).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
@@ -416,6 +468,34 @@ mod tests {
             .read_to_end(&mut installed)
             .unwrap();
         assert_eq!(installed, TEST_BINARY);
+    }
+
+    #[test]
+    fn verified_download_accepts_signed_runtime_metadata() {
+        let release = SelectedRelease::from_version("0.25.1").unwrap();
+        for (name, bytes) in [
+            (
+                COMPOSE_ASSET,
+                include_bytes!("../tests/fixtures/compose.yml").as_slice(),
+            ),
+            (
+                COMPOSE_BRIDGE_ASSET,
+                include_bytes!("../tests/fixtures/compose.bridge.yml").as_slice(),
+            ),
+            (
+                IMAGE_REFERENCE_ASSET,
+                include_bytes!("../tests/fixtures/zeronat-image-v6.txt").as_slice(),
+            ),
+        ] {
+            let mut download = download_verified_asset_with_keys(
+                &release,
+                name,
+                &[TEST_KEY],
+                fixture_fetch_named(TEST_MANIFEST, TEST_SIGNATURE, name, bytes),
+            )
+            .unwrap();
+            assert_eq!(download.read_limited(256, name).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -548,12 +628,21 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         signature: &'a [u8],
         artifact: &'a [u8],
     ) -> impl FnMut(&str, u64, &File) -> Result<bool, String> + 'a {
+        fixture_fetch_named(manifest, signature, TEST_ASSET, artifact)
+    }
+
+    fn fixture_fetch_named<'a>(
+        manifest: &'a [u8],
+        signature: &'a [u8],
+        asset_name: &'a str,
+        artifact: &'a [u8],
+    ) -> impl FnMut(&str, u64, &File) -> Result<bool, String> + 'a {
         move |url, _, output| {
             let bytes = if url.ends_with(".manifest") {
                 manifest
             } else if url.ends_with(".minisig") {
                 signature
-            } else if url.ends_with(TEST_ASSET) {
+            } else if url.ends_with(asset_name) {
                 artifact
             } else {
                 return Ok(false);

@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::Result;
+use tokio::io::unix::AsyncFd;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
@@ -61,6 +62,8 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(90);
 /// and drops the socket when none is free, so stalled TCP peers hold at most
 /// this many pre-authentication sockets and tasks.
 const MAX_INFLIGHT_HANDSHAKES: usize = 256;
+/// Shared ceiling for public TCP bridges and per-source UDP forwarding work.
+const MAX_INFLIGHT_FORWARD_OPENS: usize = 256;
 /// Pause after a transient accept/recv error so a persistent failure (e.g. EMFILE
 /// under fd pressure) does not spin the listener loop at 100% CPU.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
@@ -372,6 +375,7 @@ struct UdpPending {
     dgram_rx: mpsc::Receiver<Vec<u8>>,
     idle: Duration,
     cancel: watch::Receiver<bool>,
+    _permit: OwnedSemaphorePermit,
 }
 
 struct PendingStream {
@@ -407,6 +411,7 @@ pub(crate) struct Server {
     routes: Mutex<HashMap<RouteKey, Route>>,
     listeners: Mutex<HashMap<RouteKey, ListenerHandle>>,
     handshakes: Arc<Semaphore>,
+    forward_slots: Arc<Semaphore>,
     /// Config file backing this server, or `None` for a runtime-only node that
     /// never writes. The `file_*` fields preserve the loaded `[server]` table
     /// verbatim so an auto-save never bakes CLI-sourced settings into the file.
@@ -481,6 +486,7 @@ impl Server {
     /// `try_send` runs outside every lock.
     fn open(
         &self,
+        _permit: &OwnedSemaphorePermit,
         bind_ip: Ipv4Addr,
         proto: Proto,
         port: u16,
@@ -1357,6 +1363,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         ),
         listeners: Mutex::new(HashMap::new()),
         handshakes: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
+        forward_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_FORWARD_OPENS)),
         config_path,
         file_id,
         file_control,
@@ -2226,19 +2233,53 @@ async fn tcp_listener(
     cancel: Arc<Notify>,
     bridges: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 ) {
+    let l = match l.into_std().and_then(AsyncFd::new) {
+        Ok(listener) => listener,
+        Err(e) => {
+            crate::elog!("tcp listener {bind_ip}:{port} setup error: {e}");
+            return;
+        }
+    };
     loop {
-        let (public, peer) = tokio::select! {
+        let mut readiness = tokio::select! {
             _ = cancel.notified() => break,
-            r = l.accept() => match r {
-                Ok(v) => v,
-                // Keep the forwarded port alive across transient accept errors so
-                // fd pressure does not silently and permanently kill this listener.
+            readiness = l.readable() => match readiness {
+                Ok(readiness) => readiness,
                 Err(e) => {
-                    crate::elog!("tcp listener {bind_ip}:{port} accept error: {e}");
+                    crate::elog!("tcp listener {bind_ip}:{port} readiness error: {e}");
                     tokio::time::sleep(ACCEPT_BACKOFF).await;
                     continue;
                 }
             },
+        };
+        let permit = tokio::select! {
+            _ = cancel.notified() => break,
+            permit = srv.forward_slots.clone().acquire_owned() => permit,
+        };
+        let Ok(permit) = permit else {
+            break;
+        };
+        let (public, peer) = match readiness.try_io(|listener| listener.get_ref().accept()) {
+            Ok(Ok(value)) => value,
+            Err(_) => continue,
+            // Keep the forwarded port alive across transient accept errors so
+            // fd pressure does not silently and permanently kill this listener.
+            Ok(Err(e)) => {
+                crate::elog!("tcp listener {bind_ip}:{port} accept error: {e}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+        };
+        if let Err(e) = public.set_nonblocking(true) {
+            crate::elog!("tcp listener {bind_ip}:{port} socket setup error: {e}");
+            continue;
+        }
+        let public = match TcpStream::from_std(public) {
+            Ok(public) => public,
+            Err(e) => {
+                crate::elog!("tcp listener {bind_ip}:{port} socket error: {e}");
+                continue;
+            }
         };
         let srv = srv.clone();
         let handle = crate::spawn(async move {
@@ -2249,7 +2290,7 @@ async fn tcp_listener(
                 .local_addr()
                 .unwrap_or_else(|_| SocketAddr::from((bind_ip, port)));
             let Some((id, rx, idle, mut session_cancel)) =
-                srv.open(bind_ip, Proto::Tcp, port, Some((peer, local)))
+                srv.open(&permit, bind_ip, Proto::Tcp, port, Some((peer, local)))
             else {
                 return;
             };
@@ -2354,6 +2395,9 @@ async fn udp_listener(
         let Some(handle) = srv.route_to((bind_ip, Proto::Udp, port)) else {
             continue;
         };
+        let Ok(permit) = srv.forward_slots.clone().try_acquire_owned() else {
+            continue;
+        };
 
         // A custom per-forward idle widens the entry's TTL so the sweep cannot
         // evict a source whose bridge is deliberately allowed to idle longer.
@@ -2369,7 +2413,7 @@ async fn udp_listener(
         match handle.transport {
             ActiveTransport::Tcp => {
                 let Some((id, rx, idle, mut session_cancel)) =
-                    srv.open(bind_ip, Proto::Udp, port, None)
+                    srv.open(&permit, bind_ip, Proto::Udp, port, None)
                 else {
                     sessions.remove(&src);
                     continue;
@@ -2377,6 +2421,7 @@ async fn udp_listener(
                 let socket = socket.clone();
                 let srv = srv.clone();
                 crate::spawn(async move {
+                    let _permit = permit;
                     tokio::select! {
                         result = timeout(OPEN_TIMEOUT, rx) => match result {
                             Ok(Ok((nr, nw))) => {
@@ -2427,6 +2472,7 @@ async fn udp_listener(
                         dgram_rx: drx,
                         idle,
                         cancel,
+                        _permit: permit,
                     },
                 );
                 drop(pending);
@@ -2697,6 +2743,7 @@ async fn accept_udp_forward(
         dgram_rx,
         idle,
         mut cancel,
+        _permit,
         ..
     }) = take_udp_pending(&srv, client_id, id, &capability)
     else {
@@ -3085,6 +3132,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             routes: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashMap::new()),
             handshakes: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
+            forward_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_FORWARD_OPENS)),
             config_path: None,
             file_id: None,
             file_control: None,
@@ -3350,6 +3398,171 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         );
         srv.known_clients.lock().unwrap().insert(id.into());
         (tx, rx)
+    }
+
+    #[tokio::test]
+    async fn public_tcp_connections_retain_the_forward_cap() {
+        let srv = test_server();
+        let (_tx, mut control_rx) = register_peer_client(&srv, "client", None);
+        let drain = crate::spawn(async move { while control_rx.recv().await.is_some() {} });
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cancel = Arc::new(Notify::new());
+        let bridges = Arc::new(Mutex::new(Vec::new()));
+        let task = crate::spawn(tcp_listener(
+            srv.clone(),
+            listener,
+            Ipv4Addr::LOCALHOST,
+            port,
+            cancel.clone(),
+            bridges.clone(),
+        ));
+        let mut connections = Vec::new();
+
+        timeout(Duration::from_secs(5), async {
+            for _ in 0..MAX_INFLIGHT_FORWARD_OPENS {
+                connections.push(
+                    TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                        .await
+                        .unwrap(),
+                );
+            }
+            while srv.pending.lock().unwrap().len() < MAX_INFLIGHT_FORWARD_OPENS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("TCP listener did not reach the forward cap");
+
+        let last_id = *srv.pending.lock().unwrap().keys().max().unwrap();
+        assert!(srv.forward_slots.clone().try_acquire_owned().is_err());
+        let extra = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            srv.pending.lock().unwrap().len(),
+            MAX_INFLIGHT_FORWARD_OPENS
+        );
+        assert_eq!(*srv.pending.lock().unwrap().keys().max().unwrap(), last_id);
+
+        bridges.lock().unwrap()[0].abort();
+        timeout(Duration::from_secs(5), async {
+            while !srv.pending.lock().unwrap().keys().any(|id| *id > last_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued TCP connection was not accepted after a slot was released");
+
+        drop(extra);
+        drop(connections);
+        cancel.notify_one();
+        task.await.unwrap();
+        for bridge in bridges.lock().unwrap().drain(..) {
+            bridge.abort();
+        }
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn idle_tcp_listener_does_not_reserve_forward_capacity() {
+        let srv = test_server();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cancel = Arc::new(Notify::new());
+        let task = crate::spawn(tcp_listener(
+            srv.clone(),
+            listener,
+            Ipv4Addr::LOCALHOST,
+            port,
+            cancel.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            srv.forward_slots.available_permits(),
+            MAX_INFLIGHT_FORWARD_OPENS
+        );
+        cancel.notify_one();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_udp_sources_have_a_hard_cap() {
+        let srv = test_server();
+        let (_tx, mut control_rx) =
+            register_peer_client_with(&srv, "client", None, ActiveTransport::Udp);
+        let drain = crate::spawn(async move { while control_rx.recv().await.is_some() {} });
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        crate::pktinfo::record_local_addr(&socket).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let cancel = Arc::new(Notify::new());
+        let flush = Arc::new(Notify::new());
+        let listener = crate::spawn(udp_listener(
+            srv.clone(),
+            socket,
+            Ipv4Addr::LOCALHOST,
+            addr.port(),
+            cancel.clone(),
+            flush,
+        ));
+        let mut sources = Vec::new();
+
+        for _ in 0..MAX_INFLIGHT_FORWARD_OPENS + 64 {
+            let source = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            source.send_to(b"x", addr).await.unwrap();
+            sources.push(source);
+            tokio::task::yield_now().await;
+        }
+        timeout(Duration::from_secs(5), async {
+            while srv.udp_pending.lock().unwrap().len() < MAX_INFLIGHT_FORWARD_OPENS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("UDP source tracking never reached the cap");
+
+        let (pending_id, admitted_src) = {
+            let mut pending = srv.udp_pending.lock().unwrap();
+            let (id, entry) = pending.iter_mut().next().unwrap();
+            assert_eq!(entry.dgram_rx.try_recv().unwrap(), b"x");
+            (*id, entry.public_src)
+        };
+        let admitted = sources
+            .iter()
+            .find(|source| source.local_addr().unwrap() == admitted_src)
+            .unwrap();
+        admitted.send_to(b"barrier", addr).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let received = srv
+                    .udp_pending
+                    .lock()
+                    .unwrap()
+                    .get_mut(&pending_id)
+                    .and_then(|entry| entry.dgram_rx.try_recv().ok());
+                if received.as_deref() == Some(b"barrier") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("UDP listener did not process the post-capacity barrier");
+
+        let retained = srv.udp_pending.lock().unwrap().len();
+        cancel.notify_one();
+        listener.abort();
+        drain.abort();
+        assert_eq!(retained, MAX_INFLIGHT_FORWARD_OPENS);
+        assert!(srv.forward_slots.clone().try_acquire_owned().is_err());
     }
 
     fn test_peer_identity(id: &str) -> String {

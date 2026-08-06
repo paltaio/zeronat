@@ -152,10 +152,10 @@
       <p>The installer configures Docker or systemd, generates the 32-byte server identity, client
       credential, and admin secret from the operating system random source, then prints a client enrollment command. The launcher resolves an exact release,
       verifies its Minisign manifest, and checks the installer length and SHA-256 digest before execution.</p>
-<pre><code>VERSION=X.Y.Z
-docker pull "ghcr.io/paltaio/zeronat:${VERSION}"</code></pre>
-      <p>Replace <code>X.Y.Z</code> with an exact published release version. Compose also requires
-      <code>ZERONAT_IMAGE</code> to contain an exact version tag or digest.</p>
+<pre><code>IMAGE="ghcr.io/paltaio/zeronat@sha256:&lt;64-hex-image-digest&gt;"
+docker pull "$IMAGE"</code></pre>
+      <p>Use the image digest published with the release. Compose requires
+      <code>ZERONAT_IMAGE</code> to contain the digest reference.</p>
     </section>
 
     <section id="start">
@@ -178,7 +178,7 @@ curl -fsSL https://paltaio.github.io/zeronat/get.sh | \
 SERVER_PUBLIC="&lt;64-hex-server-public-identity&gt;"
 CLIENT_CREDENTIAL="&lt;64-hex-client-credential&gt;"
 ADMIN_SECRET="&lt;64-hex-admin-secret&gt;"
-VERSION="X.Y.Z"
+IMAGE="ghcr.io/paltaio/zeronat@sha256:&lt;64-hex-image-digest&gt;"
 IMAGE_SHA="&lt;published-commit-sha&gt;"</code></pre>
       <p>Open the control port (2222, UDP and TCP) on the server firewall. UDP carries the preferred
       KCP transport and stateless datagrams; TCP is the fallback. Both listeners apply bounded admission
@@ -315,7 +315,7 @@ entryPoints:
 <pre class="v-docker"><code>docker run -d --name zeronat --restart unless-stopped --network host \
   --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
   -v /etc/zeronat/data:/etc/zeronat/data --env-file /etc/zeronat/.env \
-  "ghcr.io/paltaio/zeronat:${VERSION}" server --config /etc/zeronat/data/server.toml</code></pre>
+  "$IMAGE" server --config /etc/zeronat/data/server.toml</code></pre>
 <pre><code><span class="c"># server.toml</span>
 [server]
 id = "zn01"
@@ -481,14 +481,14 @@ zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --user 0:0 --cap-drop ALL --cap-add NET_ADMIN --security-opt no-new-privileges \
   --device /dev/net/tun -e ZERONAT_SECRET="$SERVER_SECRET" -e ZERONAT_CLIENT_ID=client \
-  -e ZERONAT_CLIENT_SECRET="$CLIENT_CREDENTIAL" "ghcr.io/paltaio/zeronat:${VERSION}" \
+  -e ZERONAT_CLIENT_SECRET="$CLIENT_CREDENTIAL" "$IMAGE" \
   server --control 2222 --tun --except 22
 
 <span class="c"># Client (behind CG-NAT): local services receive on the same port:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --user 0:0 --cap-drop ALL --cap-add NET_ADMIN --security-opt no-new-privileges \
   --device /dev/net/tun -e ZERONAT_SECRET="$SERVER_PUBLIC" \
-  -e ZERONAT_CLIENT_SECRET="$CLIENT_CREDENTIAL" "ghcr.io/paltaio/zeronat:${VERSION}" \
+  -e ZERONAT_CLIENT_SECRET="$CLIENT_CREDENTIAL" "$IMAGE" \
   client --server &lt;public-ip&gt;:2222 --tun</code></pre>
       <p>Forwarded traffic includes the server's own SSH; keep it reachable with
       <code>--except &lt;ssh-port&gt;</code> (repeatable). The client needs no NAT: local services receive
@@ -524,14 +524,14 @@ zeronat client --server &lt;public-ip&gt;:2222 --tun --exit --exit-strict</code>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --user 0:0 --cap-drop ALL --cap-add NET_ADMIN --security-opt no-new-privileges \
   --device /dev/net/tun -e ZERONAT_SECRET="$SERVER_SECRET" -e ZERONAT_CLIENT_ID=client \
-  -e ZERONAT_CLIENT_SECRET="$CLIENT_CREDENTIAL" "ghcr.io/paltaio/zeronat:${VERSION}" \
+  -e ZERONAT_CLIENT_SECRET="$CLIENT_CREDENTIAL" "$IMAGE" \
   server --control 2222 --tun --except 22 --exit --exit-iface eth0
 
 <span class="c"># Client: send this host's IPv4 traffic through the server:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --user 0:0 --cap-drop ALL --cap-add NET_ADMIN --security-opt no-new-privileges \
   --device /dev/net/tun -e ZERONAT_SECRET="$SERVER_PUBLIC" \
-  -e ZERONAT_CLIENT_SECRET="$CLIENT_CREDENTIAL" "ghcr.io/paltaio/zeronat:${VERSION}" \
+  -e ZERONAT_CLIENT_SECRET="$CLIENT_CREDENTIAL" "$IMAGE" \
   client --server &lt;public-ip&gt;:2222 --tun --exit --exit-strict</code></pre>
       <p><code>--exit</code> requires <code>--tun</code> on both ends; <code>--exit-iface</code> and
       <code>--exit-strict</code> require <code>--exit</code>. In the config file,
@@ -557,14 +557,14 @@ pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --user 0:0 --cap-drop ALL --cap-add NET_ADMIN --security-opt no-new-privileges \
   --device /dev/net/tun -e ZERONAT_SECRET="$SERVER_SECRET" -e ZERONAT_CLIENT_ID=client \
-  -e ZERONAT_CLIENT_SECRET="$CLIENT_CREDENTIAL" "ghcr.io/paltaio/zeronat:${VERSION}" \
+  -e ZERONAT_CLIENT_SECRET="$CLIENT_CREDENTIAL" "$IMAGE" \
   server --control 2222 --tap zn0 --bridge br0
 
 <span class="c"># Behind CG-NAT; zn0 lands in the host netns, run pppd on the host:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --user 0:0 --cap-drop ALL --cap-add NET_ADMIN --security-opt no-new-privileges \
   --device /dev/net/tun -e ZERONAT_SECRET="$SERVER_PUBLIC" \
-  -e ZERONAT_CLIENT_SECRET="$CLIENT_CREDENTIAL" "ghcr.io/paltaio/zeronat:${VERSION}" \
+  -e ZERONAT_CLIENT_SECRET="$CLIENT_CREDENTIAL" "$IMAGE" \
   client --server &lt;public-ip&gt;:2222 --tap zn0
 pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
       <p><code>--bridge &lt;name&gt;</code> enslaves the TAP to an existing bridge; <code>--tap-mtu &lt;n&gt;</code>
