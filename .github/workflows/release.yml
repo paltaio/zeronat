@@ -268,7 +268,7 @@ jobs:
           manifest="out/zeronat-release-v1-$tag.manifest"
           signature="$manifest.$key_id.minisig"
           key=$(mktemp)
-          derived=$(mktemp)
+          derived="$key.pub"
           trap 'rm -f "$key" "$derived"' EXIT
           derived_id=$(python3 - <<'PY'
           import base64
