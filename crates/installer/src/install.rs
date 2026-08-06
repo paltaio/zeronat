@@ -38,7 +38,9 @@ const BRIDGE_TIMEOUT: u32 = 30;
 const INSTALL_URL: &str = "https://paltaio.github.io/zeronat/get.sh";
 // Internal fetches (compose templates) hit the repo directly to stay current.
 const RAW_BASE: &str = "https://raw.githubusercontent.com/paltaio/zeronat/main";
-const IMAGE: &str = "ghcr.io/paltaio/zeronat:protocol-v6";
+const IMAGE_REPOSITORY: &str = "ghcr.io/paltaio/zeronat";
+const CONTAINER_USER: &str = "65532:65532";
+const ROOT_USER: &str = "0:0";
 const BINARY_ASSET_PREFIX: &str = "zeronat-v6";
 const ETC_DIR: &str = "/etc/zeronat";
 const ENV_FILE: &str = "/etc/zeronat/.env";
@@ -80,6 +82,11 @@ struct Started {
     ran: String,
     cmds: Vec<Cmd>,
     note: Option<String>,
+}
+
+enum InstallTarget {
+    Docker(String),
+    Systemd,
 }
 
 /// Drives the install. Every external command goes through `run` so the UI can
@@ -158,6 +165,14 @@ fn release_for_install() -> Result<SelectedRelease, String> {
 #[cfg(test)]
 fn release_for_install() -> Result<SelectedRelease, String> {
     SelectedRelease::from_version("0.25.1")
+}
+
+fn image_for_release(release: &SelectedRelease) -> String {
+    format!("{IMAGE_REPOSITORY}:{}", release.version())
+}
+
+fn image_for_version(version: &str) -> Result<String, String> {
+    SelectedRelease::from_version(version).map(|release| image_for_release(&release))
 }
 
 /// Write `content` to `dest` with `mode` as root: stage a temp file and let the
@@ -346,7 +361,7 @@ fn check_forwards(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn env_file(cfg: &Config, sub: &str) -> Result<String, String> {
+fn env_file(cfg: &Config, sub: &str, target: &InstallTarget) -> Result<String, String> {
     let (runtime_secret, client_credential) = match cfg.mode {
         Mode::Server => (
             cfg.secret.clone(),
@@ -363,13 +378,14 @@ fn env_file(cfg: &Config, sub: &str) -> Result<String, String> {
     } else {
         format!("ZERONAT_CLIENT_SECRET={client_credential}\n")
     };
-    if cfg.method == Method::Docker && cfg.deploy == Deploy::Compose {
-        Ok(format!(
-            "ZERONAT_SECRET={runtime_secret}\n{role}ZERONAT_ARGS={sub}\n"
-        ))
-    } else {
-        Ok(format!("ZERONAT_SECRET={runtime_secret}\n{role}"))
+    if cfg.deploy == Deploy::Compose {
+        if let InstallTarget::Docker(image) = target {
+            return Ok(format!(
+                "ZERONAT_IMAGE={image}\nZERONAT_SECRET={runtime_secret}\n{role}ZERONAT_ARGS={sub}\n"
+            ));
+        }
     }
+    Ok(format!("ZERONAT_SECRET={runtime_secret}\n{role}"))
 }
 
 pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, String> {
@@ -379,6 +395,11 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
         return dry_run(cfg, &sub, r);
     }
 
+    let target = match cfg.method {
+        Method::Docker => InstallTarget::Docker(image_for_release(&release_for_install()?)),
+        Method::Systemd => InstallTarget::Systemd,
+    };
+
     r.step(format!("preparing {ETC_DIR}"));
     let out = r.run(true, "mkdir", &["-p", ETC_DIR])?;
     if !ok(&out) {
@@ -387,23 +408,31 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
     // Port-forwarding servers persist routes into DATA_DIR; the dir must exist so
     // the mount source is present and the server's atomic rewrite has a temp dir.
     if cfg.mode == Mode::Server && cfg.kind == Kind::Ports {
-        let out = r.run(true, "mkdir", &["-p", DATA_DIR])?;
+        let out = if cfg.method == Method::Docker {
+            r.run(
+                true,
+                "install",
+                &["-d", "-m", "0700", "-o", "65532", "-g", "65532", DATA_DIR],
+            )?
+        } else {
+            r.run(true, "mkdir", &["-p", DATA_DIR])?
+        };
         if !ok(&out) {
-            return Err(format!("mkdir {DATA_DIR}: {}", errtext(&out)));
+            return Err(format!("prepare {DATA_DIR}: {}", errtext(&out)));
         }
     }
 
     r.step("writing env file".into());
-    let env = env_file(cfg, &sub)?;
+    let env = env_file(cfg, &sub, &target)?;
     place(r, env.as_bytes(), "0600", ENV_FILE)?;
 
     // Build the host bridge before starting zeronat, so the TAP has a bridge to
     // join. A no-op unless this is a server in bridge mode asked to create one.
     setup_bridge(cfg, r)?;
 
-    let started = match cfg.method {
-        Method::Docker => install_docker(cfg, &sub, r)?,
-        Method::Systemd => install_systemd(cfg, &sub, r)?,
+    let started = match &target {
+        InstallTarget::Docker(image) => install_docker(cfg, &sub, image, r)?,
+        InstallTarget::Systemd => install_systemd(cfg, &sub, r)?,
     };
 
     let mut cmds = vec![Cmd {
@@ -722,7 +751,11 @@ fn validate_upgrade_deployments(offer: &UpgradeOffer, host: &Host) -> Result<(),
             ));
         }
         let command = if offer.compose {
-            rendered_compose_command()?
+            let version = offer
+                .docker
+                .as_deref()
+                .ok_or("cannot determine the installed docker version")?;
+            rendered_compose_command(&image_for_version(version)?)?
         } else {
             direct_docker_command()?
         };
@@ -906,12 +939,12 @@ fn direct_docker_command() -> Result<Vec<String>, String> {
     Ok(command)
 }
 
-fn rendered_compose_command() -> Result<Vec<String>, String> {
+fn rendered_compose_command(image: &str) -> Result<Vec<String>, String> {
     let compose = sys::compose_argv();
     if compose.is_empty() {
         return Err("docker compose not available".into());
     }
-    let mut args = vec![format!("ZERONAT_IMAGE={IMAGE}")];
+    let mut args = vec![format!("ZERONAT_IMAGE={image}")];
     args.extend(compose);
     args.extend([
         "--env-file".into(),
@@ -1236,6 +1269,7 @@ fn upgrade_systemd(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<(), Strin
 }
 
 fn upgrade_docker(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<(), String> {
+    let image = image_for_version(&offer.latest)?;
     if offer.compose {
         let dc = sys::compose_argv();
         if dc.is_empty() {
@@ -1252,18 +1286,18 @@ fn upgrade_docker(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<(), String
             ])
             .collect();
         r.step("pulling latest image".into());
-        compose(r, &dc[0], &base, "pull")?;
+        compose(r, &image, &dc[0], &base, "pull")?;
         r.step("recreating container".into());
-        compose(r, &dc[0], &base, "up")?;
+        compose(r, &image, &dc[0], &base, "up")?;
     } else {
         let snapshot = container_snapshot(r)?;
         r.step("pulling latest image".into());
-        let out = r.run(true, "docker", &["pull", IMAGE])?;
+        let out = r.run(true, "docker", &["pull", &image])?;
         if !ok(&out) {
             return Err(format!("docker pull: {}", errtext(&out)));
         }
         r.step("recreating container".into());
-        recreate_container(r, snapshot)?;
+        recreate_container(r, snapshot, &image)?;
     }
     Ok(())
 }
@@ -1277,6 +1311,7 @@ struct ContainerSnapshot {
     binds: Vec<String>,
     network: String,
     restart: String,
+    user: String,
 }
 
 fn container_snapshot(r: &mut dyn Runner) -> Result<ContainerSnapshot, String> {
@@ -1310,6 +1345,10 @@ fn container_snapshot(r: &mut dyn Runner) -> Result<ContainerSnapshot, String> {
             .next()
             .unwrap_or_else(|| "0".into());
     let restart = docker_restart_policy(restart_name, restart_retries)?;
+    let user = inspect_lines_required(r, "{{.Config.User}}")?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
     Ok(ContainerSnapshot {
         cmd,
         env,
@@ -1318,10 +1357,15 @@ fn container_snapshot(r: &mut dyn Runner) -> Result<ContainerSnapshot, String> {
         binds,
         network,
         restart,
+        user,
     })
 }
 
-fn recreate_container(r: &mut dyn Runner, snapshot: ContainerSnapshot) -> Result<(), String> {
+fn recreate_container(
+    r: &mut dyn Runner,
+    snapshot: ContainerSnapshot,
+    image: &str,
+) -> Result<(), String> {
     let ContainerSnapshot {
         cmd,
         env,
@@ -1330,9 +1374,10 @@ fn recreate_container(r: &mut dyn Runner, snapshot: ContainerSnapshot) -> Result
         binds,
         network,
         restart,
+        user,
     } = snapshot;
 
-    let image_env = inspect_image_env(r)?;
+    let image_env = inspect_image_env(r, image)?;
     validate_image_env(&env, &image_env)?;
     let env_file = protected_env_file(&env)?;
     let env_path = env_file
@@ -1354,6 +1399,26 @@ fn recreate_container(r: &mut dyn Runner, snapshot: ContainerSnapshot) -> Result
         args.push("--network".into());
         args.push(network);
     }
+    args.extend([
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+        "--user".into(),
+        if user.is_empty() {
+            if caps.iter().any(|cap| cap == "NET_ADMIN")
+                || devices
+                    .iter()
+                    .any(|device| device.starts_with("/dev/net/tun:"))
+            {
+                ROOT_USER.into()
+            } else {
+                CONTAINER_USER.into()
+            }
+        } else {
+            user
+        },
+    ]);
     for c in &caps {
         args.push("--cap-add".into());
         args.push(c.clone());
@@ -1368,7 +1433,7 @@ fn recreate_container(r: &mut dyn Runner, snapshot: ContainerSnapshot) -> Result
     }
     args.push("--env-file".into());
     args.push(env_path.into());
-    args.push(IMAGE.into());
+    args.push(image.into());
     args.extend(cmd);
 
     let aref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -1412,11 +1477,11 @@ fn inspect_container_env(r: &mut dyn Runner) -> Result<Vec<String>, String> {
         .map_err(|error| format!("reading the docker environment snapshot: {error}"))
 }
 
-fn inspect_image_env(r: &mut dyn Runner) -> Result<Vec<String>, String> {
+fn inspect_image_env(r: &mut dyn Runner, image: &str) -> Result<Vec<String>, String> {
     let out = r.run(
         true,
         "docker",
-        &["image", "inspect", "-f", "{{json .Config.Env}}", IMAGE],
+        &["image", "inspect", "-f", "{{json .Config.Env}}", image],
     )?;
     if !ok(&out) {
         return Err(format!(
@@ -1485,7 +1550,12 @@ fn upgrade_outcome(offer: &UpgradeOffer) -> Outcome {
     }
 }
 
-fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started, String> {
+fn install_docker(
+    cfg: &Config,
+    sub: &str,
+    image: &str,
+    r: &mut dyn Runner,
+) -> Result<Started, String> {
     let _ = r.run(true, "docker", &["rm", "-f", "zeronat"]);
 
     if cfg.deploy == Deploy::Compose {
@@ -1519,9 +1589,9 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started
             .collect();
 
         r.step("pulling image".into());
-        compose(r, &dc[0], &base, "pull")?;
+        compose(r, image, &dc[0], &base, "pull")?;
         r.step("starting via compose".into());
-        compose(r, &dc[0], &base, "up")?;
+        compose(r, image, &dc[0], &base, "up")?;
 
         let view: Vec<&str> = std::iter::once(dc[0].as_str())
             .chain(base.iter().map(|s| s.as_str()))
@@ -1543,7 +1613,7 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started
         })
     } else {
         r.step("pulling image".into());
-        let out = r.run(true, "docker", &["pull", IMAGE])?;
+        let out = r.run(true, "docker", &["pull", image])?;
         if !ok(&out) {
             return Err(format!("docker pull: {}", errtext(&out)));
         }
@@ -1556,6 +1626,16 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started
             "unless-stopped".into(),
             "--network".into(),
             "host".into(),
+            "--cap-drop".into(),
+            "ALL".into(),
+            "--security-opt".into(),
+            "no-new-privileges".into(),
+            "--user".into(),
+            if cfg.kind == Kind::Ports {
+                CONTAINER_USER.into()
+            } else {
+                ROOT_USER.into()
+            },
         ];
         if cfg.kind != Kind::Ports {
             args.extend([
@@ -1572,7 +1652,7 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started
         if cfg.kind == Kind::Ports {
             args.extend(["-v".into(), format!("{DATA_DIR}:{DATA_DIR}")]);
         }
-        args.extend(["--env-file".into(), ENV_FILE.into(), IMAGE.into()]);
+        args.extend(["--env-file".into(), ENV_FILE.into(), image.into()]);
         args.extend(sub.split_whitespace().map(|s| s.to_string()));
         let aref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         r.step("starting container".into());
@@ -1597,8 +1677,14 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started
     }
 }
 
-fn compose(r: &mut dyn Runner, prog: &str, base: &[String], verb: &str) -> Result<(), String> {
-    let mut args = vec![format!("ZERONAT_IMAGE={IMAGE}"), prog.to_string()];
+fn compose(
+    r: &mut dyn Runner,
+    image: &str,
+    prog: &str,
+    base: &[String],
+    verb: &str,
+) -> Result<(), String> {
+    let mut args = vec![format!("ZERONAT_IMAGE={image}"), prog.to_string()];
     args.extend_from_slice(base);
     if verb == "up" {
         args.push("up".into());
@@ -1681,13 +1767,14 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Starte
 #[cfg(test)]
 mod tests {
     use super::{
-        check_forwards, compose, console_cmd, deployment_role, env_file, execute, install_systemd,
-        parse_compose_command, peer_steps, subcmd, upgrade, validate_client_config_layout,
-        validate_container_env, validate_installed_version, Runner, COMPOSE_FILE, IMAGE,
-        TEST_RELEASE_BINARY, TEST_RELEASE_MANIFEST, TEST_RELEASE_SIGNATURE,
+        check_forwards, compose, console_cmd, deployment_role, env_file, execute,
+        image_for_release, install_docker, install_systemd, parse_compose_command, peer_steps,
+        subcmd, upgrade, validate_client_config_layout, validate_container_env,
+        validate_installed_version, InstallTarget, Runner, COMPOSE_FILE, TEST_RELEASE_BINARY,
+        TEST_RELEASE_MANIFEST, TEST_RELEASE_SIGNATURE,
     };
     use crate::args::Host;
-    use crate::ui::{Config, Kind, Method, Mode, UpgradeOffer};
+    use crate::ui::{Config, Deploy, Kind, Method, Mode, UpgradeOffer};
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
     use std::path::PathBuf;
@@ -1696,6 +1783,7 @@ mod tests {
     const TEST_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
     const TEST_ADMIN_SECRET: &str =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_IMAGE: &str = "ghcr.io/paltaio/zeronat:0.25.1";
 
     fn cfg() -> Config {
         let mut cfg = Config::new(false, false, None);
@@ -2000,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_pins_the_protocol_v6_image() {
+    fn compose_pins_the_selected_release_image() {
         let mut runner = FakeRunner { cmds: Vec::new() };
         let base = vec![
             "compose".to_string(),
@@ -2008,14 +2096,77 @@ mod tests {
             COMPOSE_FILE.to_string(),
         ];
 
-        compose(&mut runner, "docker", &base, "pull").unwrap();
+        compose(&mut runner, TEST_IMAGE, "docker", &base, "pull").unwrap();
 
         assert_eq!(
             runner.cmds,
             [format!(
-                "env ZERONAT_IMAGE={IMAGE} docker compose -f {COMPOSE_FILE} pull"
+                "env ZERONAT_IMAGE={TEST_IMAGE} docker compose -f {COMPOSE_FILE} pull"
             )]
         );
+    }
+
+    #[test]
+    fn release_image_uses_the_exact_version_tag() {
+        let release = zeronat_install_support::SelectedRelease::from_version("0.25.1").unwrap();
+        assert_eq!(image_for_release(&release), TEST_IMAGE);
+    }
+
+    #[test]
+    fn compose_environment_persists_the_image() {
+        let mut c = cfg();
+        c.method = Method::Docker;
+        c.deploy = Deploy::Compose;
+        let target = InstallTarget::Docker(TEST_IMAGE.into());
+
+        assert!(env_file(&c, "server --control 2222", &target)
+            .unwrap()
+            .starts_with(&format!("ZERONAT_IMAGE={TEST_IMAGE}\n")));
+    }
+
+    #[test]
+    fn plain_docker_run_uses_nonroot_without_capabilities() {
+        let mut c = cfg();
+        c.method = Method::Docker;
+        c.deploy = Deploy::Run;
+        c.kind = Kind::Ports;
+        let mut runner = FakeRunner { cmds: Vec::new() };
+
+        install_docker(&c, "server --control 2222", TEST_IMAGE, &mut runner).unwrap();
+
+        let run = runner
+            .cmds
+            .iter()
+            .find(|command| command.starts_with("docker run "))
+            .unwrap();
+        assert!(run.contains("--cap-drop ALL"), "{run}");
+        assert!(run.contains("--security-opt no-new-privileges"), "{run}");
+        assert!(run.contains("--user 65532:65532"), "{run}");
+        assert!(!run.contains("NET_ADMIN"), "{run}");
+        assert!(!run.contains("/dev/net/tun"), "{run}");
+        assert!(run.contains(TEST_IMAGE), "{run}");
+    }
+
+    #[test]
+    fn tunnel_docker_run_adds_only_net_admin_and_tun() {
+        let mut c = cfg();
+        c.method = Method::Docker;
+        c.deploy = Deploy::Run;
+        c.kind = Kind::All;
+        let mut runner = FakeRunner { cmds: Vec::new() };
+
+        install_docker(&c, "server --control 2222 --tun", TEST_IMAGE, &mut runner).unwrap();
+
+        let run = runner
+            .cmds
+            .iter()
+            .find(|command| command.starts_with("docker run "))
+            .unwrap();
+        assert!(run.contains("--cap-drop ALL"), "{run}");
+        assert!(run.contains("--security-opt no-new-privileges"), "{run}");
+        assert!(run.contains("--user 0:0"), "{run}");
+        assert!(run.contains("--cap-add NET_ADMIN"), "{run}");
+        assert!(run.contains("--device /dev/net/tun"), "{run}");
     }
 
     #[test]
@@ -2077,7 +2228,7 @@ mod tests {
         c.mode = Mode::Server;
         let credential = zeronat_secret::client_credential(TEST_SECRET).unwrap();
         let public = zeronat_secret::server_public(TEST_SECRET).unwrap();
-        let server = env_file(&c, "server --control 2222").unwrap();
+        let server = env_file(&c, "server --control 2222", &InstallTarget::Systemd).unwrap();
         assert!(server.contains(&format!("ZERONAT_SECRET={TEST_SECRET}\n")));
         assert!(server.contains("ZERONAT_CLIENT_ID=client\n"));
         assert!(server.contains(&format!("ZERONAT_CLIENT_SECRET={credential}\n")));
@@ -2086,7 +2237,12 @@ mod tests {
         c.mode = Mode::Client;
         c.secret = credential.clone();
         c.server_public = public.clone();
-        let client = env_file(&c, "client --server 127.0.0.1:2222").unwrap();
+        let client = env_file(
+            &c,
+            "client --server 127.0.0.1:2222",
+            &InstallTarget::Systemd,
+        )
+        .unwrap();
         assert!(client.contains(&format!("ZERONAT_SECRET={public}\n")));
         assert!(client.contains(&format!("ZERONAT_CLIENT_SECRET={credential}\n")));
         assert!(!client.contains(&format!("ZERONAT_SECRET={TEST_SECRET}\n")));

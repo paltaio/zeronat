@@ -7,4 +7,5 @@ RUN cargo build --release -p znpppoe
 
 FROM scratch
 COPY --from=build /src/target/release/znpppoe /znpppoe
+USER 65532:65532
 ENTRYPOINT ["/znpppoe"]

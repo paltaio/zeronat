@@ -36,9 +36,21 @@ const COMPOSE_FILE: &str = "/etc/zeronat/compose.yml";
 const BIN_PATH: &str = "/usr/local/bin/zeronat";
 const UNIT_FILE: &str = "/etc/systemd/system/zeronat.service";
 const CONTAINER: &str = "zeronat";
-const IMAGE: &str = "ghcr.io/paltaio/zeronat:protocol-v6";
+const IMAGE_REPOSITORY: &str = "ghcr.io/paltaio/zeronat";
+const CONTAINER_USER: &str = "65532:65532";
+const ROOT_USER: &str = "0:0";
 const BINARY_ASSET_PREFIX: &str = "zeronat-v6";
 const LATEST_URL: &str = "https://github.com/paltaio/zeronat/releases/latest";
+
+fn image_for_release(release: &SelectedRelease) -> String {
+    format!("{IMAGE_REPOSITORY}:{}", release.version())
+}
+
+fn image_for_version(version: &str) -> Result<String> {
+    SelectedRelease::from_version(version)
+        .map(|release| image_for_release(&release))
+        .map_err(Into::into)
+}
 
 trait UpgradeRunner {
     fn run(&mut self, privileged: bool, program: &str, args: &[&str]) -> std::io::Result<Output>;
@@ -140,7 +152,7 @@ pub fn run(check_only: bool) -> Result<()> {
             status_line(&dep.version, latest_version, docker_newer)
         );
         if docker_newer && !check_only {
-            upgrade_docker(dep)?;
+            upgrade_docker(dep, &latest)?;
             applied = true;
         }
     }
@@ -187,7 +199,7 @@ fn validate_installed_credentials(
             .into());
         }
         let command = if deployment.compose {
-            rendered_compose_command(deployment.mode)?
+            rendered_compose_command(deployment.mode, &image_for_version(&deployment.version)?)?
         } else {
             direct_docker_command(deployment.mode)?
         };
@@ -351,13 +363,14 @@ fn direct_docker_command(mode: DockerMode) -> Result<Vec<String>> {
     Ok(command)
 }
 
-fn rendered_compose_command(mode: DockerMode) -> Result<Vec<String>> {
+fn rendered_compose_command(mode: DockerMode, image: &str) -> Result<Vec<String>> {
     let mut command = if dk(mode, &["compose", "version"])
         .map(|out| out.status.success())
         .unwrap_or(false)
     {
         compose_command(
             mode,
+            image,
             "docker",
             Some("compose"),
             &[
@@ -373,6 +386,7 @@ fn rendered_compose_command(mode: DockerMode) -> Result<Vec<String>> {
     } else if have("docker-compose") {
         compose_command(
             mode,
+            image,
             "docker-compose",
             None,
             &[
@@ -659,27 +673,30 @@ fn upgrade_systemd_with(release: &SelectedRelease, runner: &mut dyn UpgradeRunne
     Ok(())
 }
 
-fn upgrade_docker(dep: &DockerDeployment) -> Result<()> {
+fn upgrade_docker(dep: &DockerDeployment, release: &SelectedRelease) -> Result<()> {
+    let image = image_for_release(release);
     if dep.compose {
         println!("docker:  pulling image via compose");
         compose(
             dep.mode,
+            &image,
             &["--env-file", ENV_FILE, "-f", COMPOSE_FILE, "pull"],
         )?;
         println!("docker:  recreating container");
         compose(
             dep.mode,
+            &image,
             &["--env-file", ENV_FILE, "-f", COMPOSE_FILE, "up", "-d"],
         )?;
     } else {
         let snapshot = run_snapshot(dep.mode)?;
-        println!("docker:  pulling {IMAGE}");
-        let pull = dk(dep.mode, &["pull", IMAGE]).map_err(|e| format!("running docker: {e}"))?;
+        println!("docker:  pulling {image}");
+        let pull = dk(dep.mode, &["pull", &image]).map_err(|e| format!("running docker: {e}"))?;
         if !pull.status.success() {
             return Err(format!("docker pull: {}", errtext(&pull)).into());
         }
         println!("docker:  recreating container");
-        recreate_run(dep.mode, snapshot)?;
+        recreate_run(dep.mode, snapshot, &image)?;
     }
     Ok(())
 }
@@ -693,6 +710,7 @@ struct RunSnapshot {
     binds: Vec<String>,
     network: String,
     restart: String,
+    user: String,
 }
 
 fn run_snapshot(mode: DockerMode) -> Result<RunSnapshot> {
@@ -728,6 +746,10 @@ fn run_snapshot(mode: DockerMode) -> Result<RunSnapshot> {
             .next()
             .unwrap_or_else(|| "0".into());
     let restart = docker_restart_policy(restart_name, restart_retries)?;
+    let user = inspect_lines_required(mode, "{{.Config.User}}")?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
     Ok(RunSnapshot {
         cmd,
         env,
@@ -736,10 +758,11 @@ fn run_snapshot(mode: DockerMode) -> Result<RunSnapshot> {
         binds,
         network,
         restart,
+        user,
     })
 }
 
-fn recreate_run(mode: DockerMode, snapshot: RunSnapshot) -> Result<()> {
+fn recreate_run(mode: DockerMode, snapshot: RunSnapshot, image: &str) -> Result<()> {
     let RunSnapshot {
         cmd,
         env,
@@ -748,9 +771,10 @@ fn recreate_run(mode: DockerMode, snapshot: RunSnapshot) -> Result<()> {
         binds,
         network,
         restart,
+        user,
     } = snapshot;
 
-    let image_env = inspect_image_env(mode)?;
+    let image_env = inspect_image_env(mode, image)?;
     validate_image_env(&env, &image_env)?;
     let env_file = protected_env_file(&env)?;
     let env_path = env_file
@@ -772,6 +796,26 @@ fn recreate_run(mode: DockerMode, snapshot: RunSnapshot) -> Result<()> {
         args.push("--network".into());
         args.push(network);
     }
+    args.extend([
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+        "--user".into(),
+        if user.is_empty() {
+            if caps.iter().any(|cap| cap == "NET_ADMIN")
+                || devices
+                    .iter()
+                    .any(|device| device.starts_with("/dev/net/tun:"))
+            {
+                ROOT_USER.into()
+            } else {
+                CONTAINER_USER.into()
+            }
+        } else {
+            user
+        },
+    ]);
     for c in &caps {
         args.push("--cap-add".into());
         args.push(c.clone());
@@ -786,7 +830,7 @@ fn recreate_run(mode: DockerMode, snapshot: RunSnapshot) -> Result<()> {
     }
     args.push("--env-file".into());
     args.push(env_path.into());
-    args.push(IMAGE.into());
+    args.push(image.into());
     args.extend(cmd);
 
     let aref: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -822,10 +866,10 @@ fn inspect_container_env(mode: DockerMode) -> Result<Vec<String>> {
         .map_err(|error| format!("reading the docker environment snapshot: {error}").into())
 }
 
-fn inspect_image_env(mode: DockerMode) -> Result<Vec<String>> {
+fn inspect_image_env(mode: DockerMode, image: &str) -> Result<Vec<String>> {
     let out = dk(
         mode,
-        &["image", "inspect", "-f", "{{json .Config.Env}}", IMAGE],
+        &["image", "inspect", "-f", "{{json .Config.Env}}", image],
     )
     .map_err(|error| format!("inspecting the pulled docker image: {error}"))?;
     if !out.status.success() {
@@ -836,14 +880,14 @@ fn inspect_image_env(mode: DockerMode) -> Result<Vec<String>> {
         .map_err(|error| format!("reading the pulled image environment: {error}").into())
 }
 
-fn compose(mode: DockerMode, args: &[&str]) -> Result<()> {
+fn compose(mode: DockerMode, image: &str, args: &[&str]) -> Result<()> {
     let out = if dk(mode, &["compose", "version"])
         .map(|o| o.status.success())
         .unwrap_or(false)
     {
-        compose_command(mode, "docker", Some("compose"), args).output()
+        compose_command(mode, image, "docker", Some("compose"), args).output()
     } else if have("docker-compose") {
-        compose_command(mode, "docker-compose", None, args).output()
+        compose_command(mode, image, "docker-compose", None, args).output()
     } else {
         return Err("a compose file exists but docker compose is not available".into());
     };
@@ -857,6 +901,7 @@ fn compose(mode: DockerMode, args: &[&str]) -> Result<()> {
 
 fn compose_command(
     mode: DockerMode,
+    image: &str,
     program: &str,
     subcommand: Option<&str>,
     args: &[&str],
@@ -864,7 +909,7 @@ fn compose_command(
     match mode {
         DockerMode::Direct => {
             let mut command = Command::new(program);
-            command.env("ZERONAT_IMAGE", IMAGE);
+            command.env("ZERONAT_IMAGE", image);
             command.args(subcommand).args(args);
             command
         }
@@ -872,7 +917,7 @@ fn compose_command(
             let mut command = Command::new("sudo");
             command
                 .arg("env")
-                .arg(format!("ZERONAT_IMAGE={IMAGE}"))
+                .arg(format!("ZERONAT_IMAGE={image}"))
                 .arg(program)
                 .args(subcommand)
                 .args(args);
@@ -1336,5 +1381,14 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("reinstall it from a signed release"));
+    }
+
+    #[test]
+    fn release_image_uses_the_exact_version_tag() {
+        let release = SelectedRelease::from_version("0.25.1").unwrap();
+        assert_eq!(
+            image_for_release(&release),
+            "ghcr.io/paltaio/zeronat:0.25.1"
+        );
     }
 }

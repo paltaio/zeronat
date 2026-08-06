@@ -1,12 +1,17 @@
 services:
   zeronat:
-    image: ${ZERONAT_IMAGE:-ghcr.io/paltaio/zeronat:protocol-v6}
+    image: ${ZERONAT_IMAGE:?set ZERONAT_IMAGE to an immutable version tag or digest}
     container_name: zeronat
     network_mode: host
     restart: unless-stopped
+    user: "0:0"
+    cap_drop:
+      - ALL
     env_file: .env
     cap_add:
       - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
     devices:
       - /dev/net/tun
     command: ${ZERONAT_ARGS}

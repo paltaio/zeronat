@@ -84,5 +84,8 @@ jobs:
           for digest in *; do
             sources+=("${IMAGE}@sha256:${digest}")
           done
-          docker buildx imagetools create -t "${IMAGE}:latest" "${sources[@]}"
-      - run: docker buildx imagetools inspect "${IMAGE}:latest"
+          docker buildx imagetools create \
+            -t "${IMAGE}:sha-${GITHUB_SHA}" \
+            -t "${IMAGE}:latest" \
+            "${sources[@]}"
+      - run: docker buildx imagetools inspect "${IMAGE}:sha-${GITHUB_SHA}"
