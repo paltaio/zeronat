@@ -1,3 +1,0 @@
-services:
-  zeronat:
-    image: ${ZERONAT_IMAGE}

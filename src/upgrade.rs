@@ -10,9 +10,9 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use zeronat_install_support::{
-    curl_fetch_command, download_verified_asset_with_keys, parse_image_reference,
-    replace_image_reference_in_env, DownloadFile, SelectedRelease, TrustedKey, COMPOSE_ASSET,
-    COMPOSE_BRIDGE_ASSET, IMAGE_REFERENCE_ASSET,
+    curl_fetch_command, download_release_image_with_keys, download_verified_asset_with_keys,
+    extract_package_member, replace_image_reference_in_env, DownloadFile, SelectedRelease,
+    TrustedKey, PACKAGE_BINARY,
 };
 
 #[cfg(not(test))]
@@ -20,7 +20,7 @@ use zeronat_install_support::TRUSTED_RELEASE_KEYS;
 
 #[cfg(test)]
 const TEST_RELEASE_KEYS: &[TrustedKey] = &[TrustedKey {
-    id: "3cbde1bed2d17057",
+    id: "4271ab4a2334630e",
     public_key: include_str!("../crates/install-support/tests/fixtures/minisign.pub"),
 }];
 #[cfg(test)]
@@ -30,17 +30,14 @@ const TEST_RELEASE_MANIFEST: &[u8] =
 const TEST_RELEASE_SIGNATURE: &[u8] =
     include_bytes!("../crates/install-support/tests/fixtures/v0.25.1.manifest.minisig");
 #[cfg(test)]
+const TEST_RELEASE_PACKAGE: &[u8] = include_bytes!(
+    "../crates/install-support/tests/fixtures/zeronat-v0.25.1-x86_64-unknown-linux-musl.tar"
+);
+#[cfg(test)]
 const TEST_RELEASE_BINARY: &[u8] =
-    include_bytes!("../crates/install-support/tests/fixtures/zeronat-v6-x86_64-unknown-linux-musl");
+    include_bytes!("../crates/install-support/tests/fixtures/zeronat");
 #[cfg(test)]
-const TEST_RELEASE_IMAGE: &[u8] =
-    include_bytes!("../crates/install-support/tests/fixtures/zeronat-image-v6.txt");
-#[cfg(test)]
-const TEST_RELEASE_COMPOSE: &[u8] =
-    include_bytes!("../crates/install-support/tests/fixtures/compose.yml");
-#[cfg(test)]
-const TEST_RELEASE_COMPOSE_BRIDGE: &[u8] =
-    include_bytes!("../crates/install-support/tests/fixtures/compose.bridge.yml");
+const TEST_RELEASE_IMAGE: &str = "ghcr.io/paltaio/zeronat@sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 const ENV_FILE: &str = "/etc/zeronat/.env";
 const COMPOSE_FILE: &str = "/etc/zeronat/compose.yml";
@@ -50,8 +47,9 @@ const CONTAINER: &str = "zeronat";
 const IMAGE_REPOSITORY: &str = "ghcr.io/paltaio/zeronat";
 const CONTAINER_USER: &str = "65532:65532";
 const ROOT_USER: &str = "0:0";
-const BINARY_ASSET_PREFIX: &str = "zeronat-v6";
 const LATEST_URL: &str = "https://github.com/paltaio/zeronat/releases/latest";
+const COMPOSE: &[u8] = include_bytes!("../compose.yml");
+const COMPOSE_BRIDGE: &[u8] = include_bytes!("../compose.bridge.yml");
 
 fn image_for_version(version: &str) -> Result<String> {
     SelectedRelease::from_version(version)
@@ -482,11 +480,11 @@ fn compose_device_maps_tun(device: &serde_json::Value) -> bool {
     }
 }
 
-fn compose_asset(privileged: bool) -> &'static str {
+fn compose_content(privileged: bool) -> &'static [u8] {
     if privileged {
-        COMPOSE_BRIDGE_ASSET
+        COMPOSE_BRIDGE
     } else {
-        COMPOSE_ASSET
+        COMPOSE
     }
 }
 
@@ -707,9 +705,15 @@ fn download_image_reference_with(
     release: &SelectedRelease,
     runner: &mut dyn UpgradeRunner,
 ) -> Result<String> {
-    let mut download = download_asset_with(release, IMAGE_REFERENCE_ASSET, runner)?;
-    let bytes = download.read_limited(256, "release image reference")?;
-    parse_image_reference(&bytes).map_err(Into::into)
+    download_release_image_with_keys(release, release_keys(), |url, max_bytes, output| {
+        let (program, args) = curl_fetch_command(url, max_bytes);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = runner
+            .run_with_stdout(false, program, &args, output)
+            .map_err(|e| format!("running curl: {e}"))?;
+        Ok(result.status.success())
+    })
+    .map_err(Into::into)
 }
 
 fn install_download_with(
@@ -734,15 +738,31 @@ fn install_download_with(
     }
 }
 
+fn install_bytes_with(
+    bytes: &[u8],
+    mode: &str,
+    destination: &str,
+    runner: &mut dyn UpgradeRunner,
+) -> Result<()> {
+    let mut download = DownloadFile::create()?;
+    download
+        .output()
+        .try_clone()
+        .and_then(|mut file| file.write_all(bytes))
+        .map_err(|e| format!("staging {destination}: {e}"))?;
+    install_download_with(&mut download, mode, destination, runner)
+}
+
 fn upgrade_systemd_with(release: &SelectedRelease, runner: &mut dyn UpgradeRunner) -> Result<()> {
     if !have("curl") {
         return Err("curl is required to download the new binary".into());
     }
     let target = arch_target()?;
-    let asset_name = format!("{BINARY_ASSET_PREFIX}-{target}");
+    let asset_name = release.package_name(target)?;
     println!("systemd: downloading {asset_name} ({})", release.version());
-    let mut download = download_asset_with(release, &asset_name, runner)?;
-    install_download_with(&mut download, "0755", BIN_PATH, runner)?;
+    let mut package = download_asset_with(release, &asset_name, runner)?;
+    let mut binary = extract_package_member(&mut package, PACKAGE_BINARY)?;
+    install_download_with(&mut binary, "0755", BIN_PATH, runner)?;
     println!("systemd: restarting service");
     let res = runner
         .run(true, "systemctl", &["restart", "zeronat"])
@@ -759,19 +779,16 @@ fn upgrade_docker(dep: &DockerDeployment, release: &SelectedRelease) -> Result<(
     if dep.compose {
         let current_image = image_for_version(&dep.version)?;
         let deployment = rendered_compose_deployment(dep.mode, &current_image)?;
-        let asset = compose_asset(deployment.privileged);
-        let mut compose_file = download_asset_with(release, asset, &mut runner)?;
-        install_download_with(&mut compose_file, "0644", COMPOSE_FILE, &mut runner)?;
+        install_bytes_with(
+            compose_content(deployment.privileged),
+            "0644",
+            COMPOSE_FILE,
+            &mut runner,
+        )?;
         let current_env = std::fs::read(ENV_FILE)
             .map_err(|e| format!("reading {ENV_FILE} before upgrade: {e}"))?;
         let updated_env = replace_image_reference_in_env(&current_env, &image)?;
-        let mut env_file = DownloadFile::create()?;
-        env_file
-            .output()
-            .try_clone()
-            .and_then(|mut file| file.write_all(&updated_env))
-            .map_err(|e| format!("staging {ENV_FILE}: {e}"))?;
-        install_download_with(&mut env_file, "0600", ENV_FILE, &mut runner)?;
+        install_bytes_with(&updated_env, "0600", ENV_FILE, &mut runner)?;
         println!("docker:  pulling image via compose");
         compose(
             dep.mode,
@@ -1246,18 +1263,12 @@ mod tests {
                 .find(|arg| arg.starts_with("https://"))
                 .copied()
                 .unwrap_or_default();
-            let bytes = if url.ends_with(".manifest") {
+            let bytes = if url.ends_with("release.manifest") {
                 TEST_RELEASE_MANIFEST
             } else if url.ends_with(".minisig") {
                 TEST_RELEASE_SIGNATURE
-            } else if url.ends_with("zeronat-image-v6.txt") {
-                TEST_RELEASE_IMAGE
-            } else if url.ends_with("compose.bridge.yml") {
-                TEST_RELEASE_COMPOSE_BRIDGE
-            } else if url.ends_with("compose.yml") {
-                TEST_RELEASE_COMPOSE
             } else {
-                TEST_RELEASE_BINARY
+                TEST_RELEASE_PACKAGE
             };
             output.try_clone()?.write_all(bytes)?;
             self.run(false, program, args)
@@ -1291,7 +1302,7 @@ mod tests {
             .any(|command| command.starts_with("sh -c ")
                 && command.contains("ulimit -f")
                 && command.contains(" curl --fail ")
-                && command.contains("/zeronat-v6-")
+                && command.contains("/zeronat-v0.25.1-linux-amd64.tar")
                 && !command.contains(" -o ")));
         assert!(runner
             .commands
@@ -1473,12 +1484,12 @@ mod tests {
             );
             assert!(validate_client_config("client.toml", &config).unwrap());
             let deployment = parse_compose_deployment(rendered).unwrap();
-            assert_eq!(compose_asset(deployment.privileged), COMPOSE_BRIDGE_ASSET);
+            assert_eq!(compose_content(deployment.privileged), COMPOSE_BRIDGE);
         }
 
         let plain = br#"{"services":{"zeronat":{"command":["client","--config","/etc/zeronat/client.toml"],"user":"65532:65532","cap_drop":["ALL"]}}}"#;
         let deployment = parse_compose_deployment(plain).unwrap();
-        assert_eq!(compose_asset(deployment.privileged), COMPOSE_ASSET);
+        assert_eq!(compose_content(deployment.privileged), COMPOSE);
     }
 
     #[test]
@@ -1515,9 +1526,6 @@ mod tests {
 
         let image = download_image_reference_with(&release, &mut runner).unwrap();
 
-        assert_eq!(
-            image,
-            std::str::from_utf8(TEST_RELEASE_IMAGE).unwrap().trim()
-        );
+        assert_eq!(image, TEST_RELEASE_IMAGE);
     }
 }

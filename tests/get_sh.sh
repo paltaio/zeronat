@@ -19,32 +19,29 @@ wrong_secret="$tmp/wrong.key"
 wrong_public="$tmp/wrong.pub"
 minisign -G -W -s "$wrong_secret" -p "$wrong_public" >/dev/null 2>&1
 public_base64=$(sed -n '2p' "$public")
-key_id=$(python3 - "$public" <<'PY'
-import base64
-import sys
-from pathlib import Path
-
-payload = base64.b64decode(Path(sys.argv[1]).read_text().splitlines()[1], validate=True)
-print(f"{int.from_bytes(payload[2:10], 'little'):016x}")
-PY
-)
 
 tag=v0.25.1
-target=x86_64-unknown-linux-musl
-asset="zeronat-installer-$target"
-manifest="zeronat-release-v1-$tag.manifest"
-signature="$manifest.$key_id.minisig"
+platform=linux-amd64
+asset="zeronat-$tag-$platform.tar"
+manifest=release.manifest
+signature=release.manifest.minisig
 marker="$tmp/ran"
 
-cat > "$fixtures/$asset" <<'SH'
+cat > "$fixtures/zeronat-installer" <<'SH'
 #!/bin/sh
 printf '%s\n' "$*" > "$TEST_MARKER"
 SH
-chmod +x "$fixtures/$asset"
+chmod +x "$fixtures/zeronat-installer"
+cp "$fixtures/zeronat-installer" "$fixtures/zeronat"
+tar --format=ustar --owner=0 --group=0 --numeric-owner --mtime='@0' \
+  -cf "$fixtures/$asset" -C "$fixtures" zeronat zeronat-installer
 digest=$(sha256sum "$fixtures/$asset" | awk '{print $1}')
 length=$(wc -c < "$fixtures/$asset" | tr -d ' ')
-printf 'zeronat-release-v1 %s\n%s %s %s\n' \
-  "$tag" "$digest" "$length" "$asset" > "$fixtures/$manifest"
+printf 'zeronat-release-v2 %s\n%s\n%s\n%s %s %s\n' \
+  "$tag" \
+  'zeronat-image ghcr.io/paltaio/zeronat@sha256:0000000000000000000000000000000000000000000000000000000000000000' \
+  'znpppoe-image ghcr.io/paltaio/znpppoe@sha256:1111111111111111111111111111111111111111111111111111111111111111' \
+  "$digest" "$length" "$asset" > "$fixtures/$manifest"
 sign_manifest() {
   signing_key=$1
   rm -f "$fixtures/$signature"
@@ -55,7 +52,6 @@ sign_manifest "$secret"
 
 sed \
   -e "s|^PUBLIC_KEY=.*|PUBLIC_KEY=\"$public_base64\"|" \
-  -e "s|^KEY_ID=.*|KEY_ID=\"$key_id\"|" \
   "$repo/get.sh" > "$tmp/get.sh"
 
 cat > "$shim/uname" <<'SH'
@@ -137,13 +133,14 @@ run_get hello
 [ "$(cat "$marker")" = hello ]
 
 rm -f "$marker"
+cp "$fixtures/$asset" "$fixtures/$asset.saved"
 printf 'changed\n' >> "$fixtures/$asset"
 if run_get changed >/dev/null 2>&1; then
-  echo "changed installer was accepted" >&2
+  echo "changed package was accepted" >&2
   exit 1
 fi
 [ ! -e "$marker" ]
-sed -i '$d' "$fixtures/$asset"
+mv "$fixtures/$asset.saved" "$fixtures/$asset"
 
 mv "$fixtures/$signature" "$fixtures/$signature.saved"
 if run_get missing >/dev/null 2>&1; then
@@ -163,8 +160,11 @@ fi
 mv "$fixtures/$signature.saved" "$fixtures/$signature"
 
 cp "$fixtures/$manifest" "$fixtures/$manifest.saved"
-printf 'zeronat-release-v1 %s\r\n%s %s %s\r\n' \
-  "$tag" "$digest" "$length" "$asset" > "$fixtures/$manifest"
+printf 'zeronat-release-v2 %s\r\n%s\r\n%s\r\n%s %s %s\r\n' \
+  "$tag" \
+  'zeronat-image ghcr.io/paltaio/zeronat@sha256:0000000000000000000000000000000000000000000000000000000000000000' \
+  'znpppoe-image ghcr.io/paltaio/znpppoe@sha256:1111111111111111111111111111111111111111111111111111111111111111' \
+  "$digest" "$length" "$asset" > "$fixtures/$manifest"
 sign_manifest "$secret"
 if run_get malformed >/dev/null 2>&1; then
   echo "malformed manifest was accepted" >&2
@@ -188,11 +188,6 @@ if run_get oversized >/dev/null 2>&1; then
 fi
 mv "$fixtures/$manifest.saved" "$fixtures/$manifest"
 
-substituted_tag=v0.25.2
-substituted_manifest="zeronat-release-v1-$substituted_tag.manifest"
-substituted_signature="$substituted_manifest.$key_id.minisig"
-cp "$fixtures/$manifest" "$fixtures/$substituted_manifest"
-cp "$fixtures/$signature" "$fixtures/$substituted_signature"
 if TEST_TAG_URL=https://github.com/paltaio/zeronat/releases/tag/v0.25.2 \
   run_get substituted >/dev/null 2>&1; then
   echo "release substitution was accepted" >&2

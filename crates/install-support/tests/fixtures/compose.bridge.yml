@@ -1,5 +1,0 @@
-services:
-  zeronat:
-    image: ${ZERONAT_IMAGE}
-    devices:
-      - /dev/net/tun

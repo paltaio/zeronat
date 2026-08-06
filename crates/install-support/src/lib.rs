@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 mod release;
 
 pub use release::{
-    curl_fetch_command, download_verified_asset_with_keys, parse_image_reference, SelectedRelease,
-    TrustedKey, COMPOSE_ASSET, COMPOSE_BRIDGE_ASSET, IMAGE_REFERENCE_ASSET, TRUSTED_RELEASE_KEYS,
+    curl_fetch_command, download_release_image_with_keys, download_verified_asset_with_keys,
+    extract_package_member, SelectedRelease, TrustedKey, PACKAGE_BINARY, PACKAGE_INSTALLER,
+    TRUSTED_RELEASE_KEYS,
 };
 
 pub fn replace_image_reference_in_env(body: &[u8], image: &str) -> Result<Vec<u8>, String> {

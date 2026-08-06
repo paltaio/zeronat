@@ -192,7 +192,7 @@ jobs:
           fi
 
   release:
-    needs: [binaries, freebsd, installers, docker]
+    needs: [binaries, freebsd, installers, docker, znpppoe-docker]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -218,20 +218,54 @@ jobs:
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: image-reference
-          path: out
+          name: zeronat-image-reference
+          path: image-references
 
-      - name: Collect per-target binaries
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: znpppoe-image-reference
+          path: image-references
+
+      - name: Build per-target packages
         run: |
+          set -euo pipefail
           mkdir -p out
+          tag=${GITHUB_REF#refs/tags/}
+          source_date_epoch=$(git show -s --format=%ct "$GITHUB_SHA")
           for d in artifacts/bin-*; do
-            name="${d#artifacts/bin-}"
-            install -m 0755 "$d/zeronat" "out/zeronat-v6-${name}"
+            target="${d#artifacts/bin-}"
+            case "$target" in
+              x86_64-unknown-linux-gnu) platform=linux-amd64-gnu ;;
+              x86_64-unknown-linux-musl) platform=linux-amd64 ;;
+              aarch64-unknown-linux-gnu) platform=linux-arm64-gnu ;;
+              aarch64-unknown-linux-musl) platform=linux-arm64 ;;
+              arm-unknown-linux-gnueabihf) platform=linux-armv6-gnu ;;
+              arm-unknown-linux-musleabihf) platform=linux-armv6 ;;
+              armv7-unknown-linux-gnueabihf) platform=linux-armv7-gnu ;;
+              armv7-unknown-linux-musleabihf) platform=linux-armv7 ;;
+              mips-unknown-linux-gnu) platform=linux-mips ;;
+              mipsel-unknown-linux-gnu) platform=linux-mipsel ;;
+              mips64-unknown-linux-gnuabi64) platform=linux-mips64 ;;
+              mips64el-unknown-linux-gnuabi64) platform=linux-mips64el ;;
+              x86_64-unknown-freebsd) platform=freebsd-amd64 ;;
+              aarch64-unknown-freebsd) platform=freebsd-arm64 ;;
+              *) echo "unsupported release target $target" >&2; exit 1 ;;
+            esac
+            package_dir=$(mktemp -d)
+            install -m 0755 "$d/zeronat" "$package_dir/zeronat"
+            installer="artifacts/installer-$target/zeronat-installer-$target"
+            if test -f "$installer"; then
+              install -m 0755 "$installer" "$package_dir/zeronat-installer"
+            fi
+            members=(zeronat)
+            if test -f "$package_dir/zeronat-installer"; then
+              members+=(zeronat-installer)
+            fi
+            tar --format=ustar --owner=0 --group=0 --numeric-owner \
+              --mtime="@$source_date_epoch" -cf "out/zeronat-$tag-$platform.tar" \
+              -C "$package_dir" "${members[@]}"
+            rm -rf "$package_dir"
           done
-          for d in artifacts/installer-*; do
-            install -m 0755 "$d"/zeronat-installer-* out/
-          done
-          install -m 0644 compose.yml compose.bridge.yml out/
 
       - name: Validate release identity and inventory
         env:
@@ -249,10 +283,26 @@ jobs:
             echo "release $tag already exists" >&2
             exit 1
           fi
-          test "$(find out -maxdepth 1 -type f -name 'zeronat-v6-*' | wc -l)" -eq 14
-          test "$(find out -maxdepth 1 -type f -name 'zeronat-installer-*' | wc -l)" -eq 8
-          grep -Eq '^ghcr\.io/paltaio/zeronat@sha256:[0-9a-f]{64}$' out/zeronat-image-v6.txt
-          test "$(wc -l < out/zeronat-image-v6.txt)" -eq 1
+          test "$(find out -maxdepth 1 -type f -name "zeronat-$tag-*.tar" | wc -l)" -eq 14
+          installer_packages=0
+          expected_with_installer=$(printf 'zeronat\nzeronat-installer')
+          for package in out/zeronat-*.tar; do
+            members=$(tar -tf "$package")
+            if test "$members" = zeronat; then
+              continue
+            fi
+            if test "$members" = "$expected_with_installer"; then
+              installer_packages=$((installer_packages + 1))
+              continue
+            fi
+            echo "unexpected package contents in $package" >&2
+            exit 1
+          done
+          test "$installer_packages" -eq 8
+          grep -Eq '^ghcr\.io/paltaio/zeronat@sha256:[0-9a-f]{64}$' image-references/zeronat-image.txt
+          grep -Eq '^ghcr\.io/paltaio/znpppoe@sha256:[0-9a-f]{64}$' image-references/znpppoe-image.txt
+          test "$(wc -l < image-references/zeronat-image.txt)" -eq 1
+          test "$(wc -l < image-references/znpppoe-image.txt)" -eq 1
 
       - name: Install Minisign
         run: sudo apt-get update && sudo apt-get install -y minisign
@@ -265,8 +315,8 @@ jobs:
           umask 077
           tag=${GITHUB_REF#refs/tags/}
           key_id=85ba020a1bd957f1
-          manifest="out/zeronat-release-v1-$tag.manifest"
-          signature="$manifest.$key_id.minisig"
+          manifest="out/release.manifest"
+          signature="out/release.manifest.minisig"
           key=$(mktemp)
           derived="$key.pub"
           trap 'rm -f "$key" "$derived"' EXIT
@@ -285,8 +335,10 @@ jobs:
           minisign -R -s "$key" -p "$derived"
           test "$(sed -n '2p' "$derived")" = "$(sed -n '2p' release/minisign.pub)"
           {
-            printf 'zeronat-release-v1 %s\n' "$tag"
-            for asset in out/compose.yml out/compose.bridge.yml out/zeronat-image-v6.txt out/zeronat-v6-* out/zeronat-installer-*; do
+            printf 'zeronat-release-v2 %s\n' "$tag"
+            printf 'zeronat-image %s\n' "$(cat image-references/zeronat-image.txt)"
+            printf 'znpppoe-image %s\n' "$(cat image-references/znpppoe-image.txt)"
+            for asset in out/zeronat-*.tar; do
               printf '%s %s %s\n' \
                 "$(sha256sum "$asset" | awk '{print $1}')" \
                 "$(stat -c '%s' "$asset")" \
@@ -304,10 +356,10 @@ jobs:
         run: |
           set -euo pipefail
           tag=${GITHUB_REF#refs/tags/}
-          manifest="out/zeronat-release-v1-$tag.manifest"
-          signature="$manifest.85ba020a1bd957f1.minisig"
-          release_assets=(out/compose.yml out/compose.bridge.yml out/zeronat-image-v6.txt out/zeronat-v6-* out/zeronat-installer-* "$manifest" "$signature")
-          test "${#release_assets[@]}" -eq 27
+          manifest="out/release.manifest"
+          signature="out/release.manifest.minisig"
+          release_assets=(out/zeronat-*.tar "$manifest" "$signature")
+          test "${#release_assets[@]}" -eq 16
           git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
           test "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA"
           gh release create "$tag" --draft --verify-tag --title "$tag" "${release_assets[@]}"
@@ -335,7 +387,6 @@ jobs:
       packages: write
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    environment: release-signing
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -411,11 +462,117 @@ jobs:
           set -euo pipefail
           digest='${{ steps.image.outputs.digest }}'
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          printf 'ghcr.io/paltaio/zeronat@%s\n' "$digest" > zeronat-image-v6.txt
+          printf 'ghcr.io/paltaio/zeronat@%s\n' "$digest" > zeronat-image.txt
 
       - name: Upload release image reference
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: image-reference
-          path: zeronat-image-v6.txt
+          name: zeronat-image-reference
+          path: zeronat-image.txt
+          if-no-files-found: error
+
+  znpppoe-images:
+    needs: release-preflight
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: crates/znpppoe/Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/paltaio/znpppoe,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=znpppoe-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=znpppoe-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-znpppoe-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  znpppoe-docker:
+    needs: znpppoe-images
+    permissions:
+      packages: write
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests
+          pattern: release-znpppoe-digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish image manifest
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          minor=${version%.*}
+          sources=()
+          for digest in /tmp/digests/*; do
+            sources+=("ghcr.io/paltaio/znpppoe@sha256:${digest##*/}")
+          done
+          test "${#sources[@]}" -eq 2
+          docker buildx imagetools create \
+            -t "ghcr.io/paltaio/znpppoe:$version" \
+            -t "ghcr.io/paltaio/znpppoe:$minor" \
+            -t "ghcr.io/paltaio/znpppoe:latest" \
+            "${sources[@]}"
+          digest=
+          for attempt in {1..10}; do
+            if digest=$(docker buildx imagetools inspect "ghcr.io/paltaio/znpppoe:$version" | awk '$1 == "Digest:" { print $2 }') \
+              && [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              break
+            fi
+            if (( attempt == 10 )); then
+              exit 1
+            fi
+            sleep 3
+          done
+          printf 'ghcr.io/paltaio/znpppoe@%s\n' "$digest" > znpppoe-image.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: znpppoe-image-reference
+          path: znpppoe-image.txt
           if-no-files-found: error

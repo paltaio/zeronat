@@ -1,6 +1,6 @@
 #!/bin/sh
 # zeronat installer launcher. Detects this machine's architecture, downloads the
-# matching prebuilt installer, and runs it.
+# matching release package, and runs its installer.
 #
 #   curl -fsSL https://paltaio.github.io/zeronat/get.sh | sh
 #
@@ -11,7 +11,6 @@ DOCS="https://paltaio.github.io/zeronat/"
 LATEST_URL="https://github.com/paltaio/zeronat/releases/latest"
 RELEASE_ORIGIN="https://github.com/paltaio/zeronat"
 PUBLIC_KEY="RWTxV9kbCgK6hQn0rm2f5SIgbZvFEavw6Qf+b3BgCZldh/Er1tMhlAhK"
-KEY_ID="85ba020a1bd957f1"
 
 unsupported() {
   echo "$1" >&2
@@ -22,18 +21,18 @@ unsupported() {
 [ "$(uname -s)" = Linux ] || unsupported "zeronat installs only on Linux."
 
 case "$(uname -m)" in
-  x86_64|amd64)   T=x86_64-unknown-linux-musl ;;
-  aarch64|arm64)  T=aarch64-unknown-linux-musl ;;
-  armv7l)         T=armv7-unknown-linux-musleabihf ;;
-  armv6l)         T=arm-unknown-linux-musleabihf ;;
-  mips)           T=mips-unknown-linux-gnu ;;
-  mipsel)         T=mipsel-unknown-linux-gnu ;;
-  mips64)         T=mips64-unknown-linux-gnuabi64 ;;
-  mips64el)       T=mips64el-unknown-linux-gnuabi64 ;;
+  x86_64|amd64)   PLATFORM=linux-amd64 ;;
+  aarch64|arm64)  PLATFORM=linux-arm64 ;;
+  armv7l)         PLATFORM=linux-armv7 ;;
+  armv6l)         PLATFORM=linux-armv6 ;;
+  mips)           PLATFORM=linux-mips ;;
+  mipsel)         PLATFORM=linux-mipsel ;;
+  mips64)         PLATFORM=linux-mips64 ;;
+  mips64el)       PLATFORM=linux-mips64el ;;
   *) unsupported "no prebuilt installer for $(uname -m)." ;;
 esac
 
-for tool in curl grep awk minisign sha256sum mktemp tail wc tr chmod; do
+for tool in curl grep awk minisign sha256sum mktemp tail wc tr chmod tar; do
   command -v "$tool" >/dev/null 2>&1 || unsupported "$tool is required."
 done
 
@@ -51,17 +50,18 @@ printf '%s\n' "$TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-
 [ "$TAG_URL" = "$RELEASE_ORIGIN/releases/tag/$TAG" ] \
   || unsupported "the latest release redirect is invalid."
 
-MANIFEST_NAME="zeronat-release-v1-$TAG.manifest"
-SIGNATURE_NAME="$MANIFEST_NAME.$KEY_ID.minisig"
-ASSET_NAME="zeronat-installer-$T"
+MANIFEST_NAME="release.manifest"
+SIGNATURE_NAME="release.manifest.minisig"
+ASSET_NAME="zeronat-$TAG-$PLATFORM.tar"
 DOWNLOAD_BASE="$RELEASE_ORIGIN/releases/download/$TAG"
 
 TMP_DIR=$(mktemp -d)
 MANIFEST="$TMP_DIR/$MANIFEST_NAME"
 SIGNATURE="$TMP_DIR/$SIGNATURE_NAME"
-INSTALLER="$TMP_DIR/$ASSET_NAME"
+PACKAGE="$TMP_DIR/$ASSET_NAME"
+INSTALLER="$TMP_DIR/zeronat-installer"
 cleanup() {
-  rm -f "$MANIFEST" "$SIGNATURE" "$INSTALLER"
+  rm -f "$MANIFEST" "$SIGNATURE" "$PACKAGE" "$INSTALLER"
   rmdir "$TMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -93,15 +93,29 @@ tail -c 1 "$MANIFEST" | grep -qx '' \
 
 ENTRY=$(awk -v tag="$TAG" -v asset="$ASSET_NAME" '
   NR == 1 {
-    if ($0 != "zeronat-release-v1 " tag) exit 10
+    if ($0 != "zeronat-release-v2 " tag) exit 10
+    next
+  }
+  NR == 2 {
+    prefix = "ghcr.io/paltaio/zeronat@sha256:"
+    if (NF != 2 || $1 != "zeronat-image" || index($2, prefix) != 1) exit 11
+    digest = substr($2, length(prefix) + 1)
+    if (length(digest) != 64 || digest !~ /^[0-9a-f]+$/) exit 12
+    next
+  }
+  NR == 3 {
+    prefix = "ghcr.io/paltaio/znpppoe@sha256:"
+    if (NF != 2 || $1 != "znpppoe-image" || index($2, prefix) != 1) exit 13
+    digest = substr($2, length(prefix) + 1)
+    if (length(digest) != 64 || digest !~ /^[0-9a-f]+$/) exit 14
     next
   }
   {
-    if (NF != 3) exit 11
-    if (length($1) != 64 || $1 !~ /^[0-9a-f]+$/) exit 12
-    if ($2 !~ /^(0|[1-9][0-9]*)$/ || $2 == 0 || $2 > 268435456) exit 13
-    if ($3 !~ /^[A-Za-z0-9._-]+$/) exit 14
-    if (previous != "" && previous >= $3) exit 15
+    if (NF != 3) exit 15
+    if (length($1) != 64 || $1 !~ /^[0-9a-f]+$/) exit 16
+    if ($2 !~ /^(0|[1-9][0-9]*)$/ || $2 == 0 || $2 > 268435456) exit 17
+    if ($3 !~ /^[A-Za-z0-9._-]+$/) exit 18
+    if (previous != "" && previous >= $3) exit 19
     previous = $3
     if ($3 == asset) {
       count++
@@ -110,19 +124,27 @@ ENTRY=$(awk -v tag="$TAG" -v asset="$ASSET_NAME" '
     }
   }
   END {
-    if (count != 1) exit 16
+    if (count != 1) exit 20
     print digest " " size
   }
 ' "$MANIFEST") || unsupported "the release manifest is malformed."
 
 DIGEST=${ENTRY%% *}
 LENGTH=${ENTRY#* }
-fetch "$DOWNLOAD_BASE/$ASSET_NAME" "$LENGTH" "$INSTALLER" \
-  || unsupported "could not download the installer for $T."
-[ "$(wc -c < "$INSTALLER" | tr -d ' ')" = "$LENGTH" ] \
-  || unsupported "the installer length does not match the signed manifest."
-[ "$(sha256sum "$INSTALLER" | awk '{print $1}')" = "$DIGEST" ] \
-  || unsupported "the installer digest does not match the signed manifest."
+fetch "$DOWNLOAD_BASE/$ASSET_NAME" "$LENGTH" "$PACKAGE" \
+  || unsupported "could not download the package for $PLATFORM."
+[ "$(wc -c < "$PACKAGE" | tr -d ' ')" = "$LENGTH" ] \
+  || unsupported "the package length does not match the signed manifest."
+[ "$(sha256sum "$PACKAGE" | awk '{print $1}')" = "$DIGEST" ] \
+  || unsupported "the package digest does not match the signed manifest."
+
+MEMBERS=$(tar -tf "$PACKAGE") || unsupported "the release package is malformed."
+EXPECTED_MEMBERS=$(printf '%s\n%s\n' zeronat zeronat-installer)
+[ "$MEMBERS" = "$EXPECTED_MEMBERS" ] \
+  || unsupported "the release package has unexpected contents."
+tar -xOf "$PACKAGE" zeronat-installer > "$INSTALLER" \
+  || unsupported "the release package has no installer."
+[ -s "$INSTALLER" ] || unsupported "the release package has an empty installer."
 chmod +x "$INSTALLER"
 
 # The installer drives /dev/tty itself, so it works even though stdin is this pipe.

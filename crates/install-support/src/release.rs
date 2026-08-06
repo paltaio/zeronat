@@ -7,12 +7,14 @@ const RELEASE_ORIGIN: &str = "https://github.com/paltaio/zeronat";
 const MANIFEST_LIMIT: u64 = 65_536;
 const SIGNATURE_LIMIT: u64 = 4_096;
 const ARTIFACT_LIMIT: u64 = 268_435_456;
-const MANIFEST_PREFIX: &str = "zeronat-release-v1";
-const IMAGE_REFERENCE_PREFIX: &str = "ghcr.io/paltaio/zeronat@sha256:";
+const MANIFEST_PREFIX: &str = "zeronat-release-v2";
+const MANIFEST_NAME: &str = "release.manifest";
+const SIGNATURE_NAME: &str = "release.manifest.minisig";
+const ZERONAT_IMAGE_PREFIX: &str = "ghcr.io/paltaio/zeronat@sha256:";
+const ZNPPPOE_IMAGE_PREFIX: &str = "ghcr.io/paltaio/znpppoe@sha256:";
 
-pub const IMAGE_REFERENCE_ASSET: &str = "zeronat-image-v6.txt";
-pub const COMPOSE_ASSET: &str = "compose.yml";
-pub const COMPOSE_BRIDGE_ASSET: &str = "compose.bridge.yml";
+pub const PACKAGE_BINARY: &str = "zeronat";
+pub const PACKAGE_INSTALLER: &str = "zeronat-installer";
 
 #[derive(Clone, Copy)]
 pub struct TrustedKey {
@@ -71,16 +73,29 @@ impl SelectedRelease {
         Ok(parse_version(&self.version)? > parse_version(current)?)
     }
 
+    pub fn package_name(&self, target: &str) -> Result<String, String> {
+        let platform = match target {
+            "x86_64-unknown-linux-gnu" => "linux-amd64-gnu",
+            "x86_64-unknown-linux-musl" => "linux-amd64",
+            "aarch64-unknown-linux-gnu" => "linux-arm64-gnu",
+            "aarch64-unknown-linux-musl" => "linux-arm64",
+            "arm-unknown-linux-gnueabihf" => "linux-armv6-gnu",
+            "arm-unknown-linux-musleabihf" => "linux-armv6",
+            "armv7-unknown-linux-gnueabihf" => "linux-armv7-gnu",
+            "armv7-unknown-linux-musleabihf" => "linux-armv7",
+            "mips-unknown-linux-gnu" => "linux-mips",
+            "mipsel-unknown-linux-gnu" => "linux-mipsel",
+            "mips64-unknown-linux-gnuabi64" => "linux-mips64",
+            "mips64el-unknown-linux-gnuabi64" => "linux-mips64el",
+            "x86_64-unknown-freebsd" => "freebsd-amd64",
+            "aarch64-unknown-freebsd" => "freebsd-arm64",
+            _ => return Err(format!("unsupported release target {target}")),
+        };
+        Ok(format!("zeronat-{}-{platform}.tar", self.tag))
+    }
+
     fn download_url(&self, name: &str) -> String {
         format!("{RELEASE_ORIGIN}/releases/download/{}/{name}", self.tag)
-    }
-
-    fn manifest_name(&self) -> String {
-        format!("{MANIFEST_PREFIX}-{}.manifest", self.tag)
-    }
-
-    fn signature_name(&self, key_id: &str) -> String {
-        format!("{}.{}.minisig", self.manifest_name(), key_id)
     }
 }
 
@@ -121,41 +136,10 @@ where
     F: FnMut(&str, u64, &File) -> Result<bool, String>,
 {
     validate_asset_name(asset_name)?;
-    validate_trusted_keys(trusted_keys)?;
-
-    let manifest_name = release.manifest_name();
-    let mut manifest_file = DownloadFile::create()?;
-    if !fetch(
-        &release.download_url(&manifest_name),
-        MANIFEST_LIMIT,
-        manifest_file.output(),
-    )? {
-        return Err("release manifest is missing".into());
-    }
-    let manifest = manifest_file.read_limited(MANIFEST_LIMIT, "release manifest")?;
-
-    let mut verified = false;
-    for trusted in trusted_keys {
-        let mut signature_file = DownloadFile::create()?;
-        let signature_name = release.signature_name(trusted.id);
-        if !fetch(
-            &release.download_url(&signature_name),
-            SIGNATURE_LIMIT,
-            signature_file.output(),
-        )? {
-            continue;
-        }
-        let signature = signature_file.read_limited(SIGNATURE_LIMIT, "release signature")?;
-        if verify_signature(&manifest, &signature, trusted).is_ok() {
-            verified = true;
-            break;
-        }
-    }
-    if !verified {
-        return Err("release manifest has no valid trusted signature".into());
-    }
-
-    let entry = parse_manifest(&manifest, release.tag(), asset_name)?;
+    let manifest = fetch_verified_manifest(release, trusted_keys, &mut fetch)?;
+    let entry = parse_manifest(&manifest, release.tag(), Some(asset_name))?
+        .selected
+        .ok_or_else(|| format!("release manifest does not list {asset_name}"))?;
     let mut artifact = DownloadFile::create()?;
     if !fetch(
         &release.download_url(asset_name),
@@ -168,17 +152,108 @@ where
     Ok(artifact)
 }
 
-pub fn parse_image_reference(bytes: &[u8]) -> Result<String, String> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| "release image reference is not valid UTF-8".to_string())?;
-    let reference = text
-        .strip_suffix('\n')
-        .ok_or_else(|| "release image reference must end with one newline".to_string())?;
-    if reference.contains('\n') || reference.contains('\r') {
-        return Err("release image reference must contain one line".into());
+pub fn download_release_image_with_keys<F>(
+    release: &SelectedRelease,
+    trusted_keys: &[TrustedKey],
+    mut fetch: F,
+) -> Result<String, String>
+where
+    F: FnMut(&str, u64, &File) -> Result<bool, String>,
+{
+    let manifest = fetch_verified_manifest(release, trusted_keys, &mut fetch)?;
+    Ok(parse_manifest(&manifest, release.tag(), None)?.zeronat_image)
+}
+
+pub fn extract_package_member(
+    package: &mut DownloadFile,
+    member: &str,
+) -> Result<DownloadFile, String> {
+    if !matches!(member, PACKAGE_BINARY | PACKAGE_INSTALLER) {
+        return Err("release package member is unsupported".into());
     }
+
+    let input = package
+        .prepare_install()?
+        .try_clone()
+        .map_err(|e| format!("failed to read release package: {e}"))?;
+    let mut archive = tar::Archive::new(input);
+    let mut output = DownloadFile::create()?;
+    let mut seen = HashSet::new();
+    let mut found = false;
+
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("failed to read release package: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("failed to read release package: {e}"))?;
+        let path = entry.path_bytes();
+        let name = std::str::from_utf8(path.as_ref())
+            .map_err(|_| "release package contains an invalid member name".to_string())?;
+        if !matches!(name, PACKAGE_BINARY | PACKAGE_INSTALLER)
+            || !entry.header().entry_type().is_file()
+        {
+            return Err("release package contains an unsupported member".into());
+        }
+        if !seen.insert(name.to_string()) {
+            return Err("release package contains a duplicate member".into());
+        }
+        if name == member {
+            let mut destination = output
+                .output()
+                .try_clone()
+                .map_err(|e| format!("failed to extract release package: {e}"))?;
+            std::io::copy(&mut entry, &mut destination)
+                .map_err(|e| format!("failed to extract release package: {e}"))?;
+            found = true;
+        }
+    }
+    if !found {
+        return Err(format!("release package does not contain {member}"));
+    }
+    output.prepare_install()?;
+    Ok(output)
+}
+
+fn fetch_verified_manifest<F>(
+    release: &SelectedRelease,
+    trusted_keys: &[TrustedKey],
+    fetch: &mut F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(&str, u64, &File) -> Result<bool, String>,
+{
+    validate_trusted_keys(trusted_keys)?;
+    let mut manifest_file = DownloadFile::create()?;
+    if !fetch(
+        &release.download_url(MANIFEST_NAME),
+        MANIFEST_LIMIT,
+        manifest_file.output(),
+    )? {
+        return Err("release manifest is missing".into());
+    }
+    let manifest = manifest_file.read_limited(MANIFEST_LIMIT, "release manifest")?;
+
+    let mut signature_file = DownloadFile::create()?;
+    if !fetch(
+        &release.download_url(SIGNATURE_NAME),
+        SIGNATURE_LIMIT,
+        signature_file.output(),
+    )? {
+        return Err("release signature is missing".into());
+    }
+    let signature = signature_file.read_limited(SIGNATURE_LIMIT, "release signature")?;
+    if !trusted_keys
+        .iter()
+        .any(|trusted| verify_signature(&manifest, &signature, trusted).is_ok())
+    {
+        return Err("release manifest has no valid trusted signature".into());
+    }
+    Ok(manifest)
+}
+
+fn parse_image_reference(reference: &str, prefix: &str) -> Result<String, String> {
     let digest = reference
-        .strip_prefix(IMAGE_REFERENCE_PREFIX)
+        .strip_prefix(prefix)
         .ok_or_else(|| "release image reference has an unexpected repository".to_string())?;
     if digest.len() != 64
         || !digest
@@ -187,7 +262,7 @@ pub fn parse_image_reference(bytes: &[u8]) -> Result<String, String> {
     {
         return Err("release image reference has an invalid SHA-256 digest".into());
     }
-    Ok(reference.to_string())
+    Ok(reference.into())
 }
 
 fn verify_signature(
@@ -211,11 +286,16 @@ struct ManifestEntry {
     length: u64,
 }
 
+struct ParsedManifest {
+    zeronat_image: String,
+    selected: Option<ManifestEntry>,
+}
+
 fn parse_manifest(
     bytes: &[u8],
     expected_tag: &str,
-    expected_asset: &str,
-) -> Result<ManifestEntry, String> {
+    expected_asset: Option<&str>,
+) -> Result<ParsedManifest, String> {
     if bytes.is_empty() || bytes.last() != Some(&b'\n') || bytes.contains(&b'\r') {
         return Err("release manifest must end with one newline".into());
     }
@@ -227,8 +307,13 @@ fn parse_manifest(
         return Err("release manifest tag mismatch".into());
     }
 
+    let zeronat_image =
+        parse_manifest_image_line(lines.next(), "zeronat-image", ZERONAT_IMAGE_PREFIX)?;
+    parse_manifest_image_line(lines.next(), "znpppoe-image", ZNPPPOE_IMAGE_PREFIX)?;
+
     let mut previous_name: Option<&str> = None;
     let mut selected = None;
+    let mut asset_count = 0usize;
     for line in lines {
         let mut fields = line.split(' ');
         let digest = fields.next().unwrap_or_default();
@@ -245,14 +330,33 @@ fn parse_manifest(
 
         let length = parse_length(length)?;
         let digest = parse_digest(digest)?;
-        if name == expected_asset {
-            if selected.is_some() {
-                return Err("release manifest contains a duplicate asset".into());
-            }
+        asset_count += 1;
+        if Some(name) == expected_asset {
             selected = Some(ManifestEntry { digest, length });
         }
     }
-    selected.ok_or_else(|| format!("release manifest does not list {expected_asset}"))
+    if asset_count == 0 {
+        return Err("release manifest contains no assets".into());
+    }
+    Ok(ParsedManifest {
+        zeronat_image,
+        selected,
+    })
+}
+
+fn parse_manifest_image_line(
+    line: Option<&str>,
+    expected_name: &str,
+    prefix: &str,
+) -> Result<String, String> {
+    let line = line.ok_or_else(|| "release manifest is missing image metadata".to_string())?;
+    let (name, reference) = line
+        .split_once(' ')
+        .ok_or_else(|| "release manifest contains malformed image metadata".to_string())?;
+    if name != expected_name || reference.contains(' ') {
+        return Err("release manifest contains malformed image metadata".into());
+    }
+    parse_image_reference(reference, prefix)
 }
 
 fn parse_version(version: &str) -> Result<(u64, u64, u64), String> {
@@ -356,14 +460,16 @@ mod tests {
     use std::io::{Read as _, Write as _};
 
     const TEST_KEY: TrustedKey = TrustedKey {
-        id: "3cbde1bed2d17057",
+        id: "4271ab4a2334630e",
         public_key: include_str!("../tests/fixtures/minisign.pub"),
     };
     const TEST_MANIFEST: &[u8] = include_bytes!("../tests/fixtures/v0.25.1.manifest");
     const TEST_SIGNATURE: &[u8] = include_bytes!("../tests/fixtures/v0.25.1.manifest.minisig");
-    const TEST_ASSET: &str = "zeronat-v6-x86_64-unknown-linux-musl";
-    const TEST_BINARY: &[u8] =
-        include_bytes!("../tests/fixtures/zeronat-v6-x86_64-unknown-linux-musl");
+    const TEST_ASSET: &str = "zeronat-v0.25.1-linux-amd64.tar";
+    const TEST_PACKAGE: &[u8] =
+        include_bytes!("../tests/fixtures/zeronat-v0.25.1-x86_64-unknown-linux-musl.tar");
+    const TEST_BINARY: &[u8] = include_bytes!("../tests/fixtures/zeronat");
+    const TEST_INSTALLER: &[u8] = include_bytes!("../tests/fixtures/zeronat-installer");
 
     #[test]
     fn selected_release_requires_canonical_stable_versions() {
@@ -392,24 +498,42 @@ mod tests {
     }
 
     #[test]
+    fn package_names_use_public_platform_names() {
+        let release = SelectedRelease::from_version("0.25.1").unwrap();
+
+        assert_eq!(
+            release.package_name("x86_64-unknown-linux-musl").unwrap(),
+            "zeronat-v0.25.1-linux-amd64.tar"
+        );
+        assert_eq!(
+            release.package_name("aarch64-unknown-linux-gnu").unwrap(),
+            "zeronat-v0.25.1-linux-arm64-gnu.tar"
+        );
+        assert_eq!(
+            release.package_name("x86_64-unknown-freebsd").unwrap(),
+            "zeronat-v0.25.1-freebsd-amd64.tar"
+        );
+        assert!(release.package_name("x86_64-apple-darwin").is_err());
+    }
+
+    #[test]
     fn image_reference_requires_the_repository_and_an_oci_digest() {
         let digest = "01".repeat(32);
-        let expected = format!("{IMAGE_REFERENCE_PREFIX}{digest}");
+        let expected = format!("{ZERONAT_IMAGE_PREFIX}{digest}");
         assert_eq!(
-            parse_image_reference(format!("{expected}\n").as_bytes()).unwrap(),
+            parse_image_reference(&expected, ZERONAT_IMAGE_PREFIX).unwrap(),
             expected
         );
 
         for invalid in [
-            format!("ghcr.io/other/zeronat@sha256:{digest}\n"),
-            format!("ghcr.io/paltaio/zeronat:{digest}\n"),
-            format!("{IMAGE_REFERENCE_PREFIX}{}\n", "0".repeat(63)),
-            format!("{IMAGE_REFERENCE_PREFIX}{}\n", "A".repeat(64)),
-            format!("{IMAGE_REFERENCE_PREFIX}{digest}"),
-            format!("{IMAGE_REFERENCE_PREFIX}{digest}\nextra\n"),
+            format!("ghcr.io/other/zeronat@sha256:{digest}"),
+            format!("ghcr.io/paltaio/zeronat:{digest}"),
+            format!("{ZERONAT_IMAGE_PREFIX}{}", "0".repeat(63)),
+            format!("{ZERONAT_IMAGE_PREFIX}{}", "A".repeat(64)),
+            format!("{ZERONAT_IMAGE_PREFIX}{digest}\n"),
         ] {
             assert!(
-                parse_image_reference(invalid.as_bytes()).is_err(),
+                parse_image_reference(&invalid, ZERONAT_IMAGE_PREFIX).is_err(),
                 "{invalid}"
             );
         }
@@ -431,24 +555,39 @@ mod tests {
     #[test]
     fn manifest_parser_rejects_substitution_and_malformed_entries() {
         let digest = "00".repeat(32);
-        let valid =
-            format!("{MANIFEST_PREFIX} v1.2.3\n{digest} 17 zeronat-v6-x86_64-unknown-linux-musl\n");
+        let valid = format!(
+            "{MANIFEST_PREFIX} v1.2.3\n\
+             zeronat-image {ZERONAT_IMAGE_PREFIX}{digest}\n\
+             znpppoe-image {ZNPPPOE_IMAGE_PREFIX}{digest}\n\
+             {digest} 17 zeronat-v1.2.3-linux-amd64.tar\n"
+        );
         assert!(parse_manifest(
             valid.as_bytes(),
             "v1.2.3",
-            "zeronat-v6-x86_64-unknown-linux-musl"
+            Some("zeronat-v1.2.3-linux-amd64.tar")
         )
         .is_ok());
         assert!(parse_manifest(
             valid.as_bytes(),
             "v1.2.4",
-            "zeronat-v6-x86_64-unknown-linux-musl"
+            Some("zeronat-v1.2.3-linux-amd64.tar")
         )
         .is_err());
-        assert!(parse_manifest(valid.as_bytes(), "v1.2.3", "zeronat-v6-other").is_err());
+        assert!(
+            parse_manifest(valid.as_bytes(), "v1.2.3", Some("zeronat-v1.2.3-other.tar"))
+                .unwrap()
+                .selected
+                .is_none()
+        );
 
-        let duplicate = format!("{MANIFEST_PREFIX} v1.2.3\n{digest} 17 asset\n{digest} 17 asset\n");
-        assert!(parse_manifest(duplicate.as_bytes(), "v1.2.3", "asset").is_err());
+        let duplicate = format!(
+            "{MANIFEST_PREFIX} v1.2.3\n\
+             zeronat-image {ZERONAT_IMAGE_PREFIX}{digest}\n\
+             znpppoe-image {ZNPPPOE_IMAGE_PREFIX}{digest}\n\
+             {digest} 17 asset\n\
+             {digest} 17 asset\n"
+        );
+        assert!(parse_manifest(duplicate.as_bytes(), "v1.2.3", Some("asset")).is_err());
     }
 
     #[test]
@@ -458,44 +597,59 @@ mod tests {
             &release,
             TEST_ASSET,
             &[TEST_KEY],
-            fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_BINARY),
+            fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_PACKAGE),
         )
         .unwrap();
-        let mut installed = Vec::new();
+        let mut package = Vec::new();
         download
+            .prepare_install()
+            .unwrap()
+            .read_to_end(&mut package)
+            .unwrap();
+        assert_eq!(package, TEST_PACKAGE);
+    }
+
+    #[test]
+    fn verified_manifest_exposes_the_image_reference() {
+        let release = SelectedRelease::from_version("0.25.1").unwrap();
+        let image = download_release_image_with_keys(
+            &release,
+            &[TEST_KEY],
+            fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_PACKAGE),
+        )
+        .unwrap();
+
+        assert_eq!(image, format!("{ZERONAT_IMAGE_PREFIX}{}", "0".repeat(64)));
+    }
+
+    #[test]
+    fn package_extraction_returns_each_selected_binary() {
+        let release = SelectedRelease::from_version("0.25.1").unwrap();
+        let mut package = download_verified_asset_with_keys(
+            &release,
+            TEST_ASSET,
+            &[TEST_KEY],
+            fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_PACKAGE),
+        )
+        .unwrap();
+
+        let mut binary = extract_package_member(&mut package, PACKAGE_BINARY).unwrap();
+        let mut installed = Vec::new();
+        binary
             .prepare_install()
             .unwrap()
             .read_to_end(&mut installed)
             .unwrap();
         assert_eq!(installed, TEST_BINARY);
-    }
 
-    #[test]
-    fn verified_download_accepts_signed_runtime_metadata() {
-        let release = SelectedRelease::from_version("0.25.1").unwrap();
-        for (name, bytes) in [
-            (
-                COMPOSE_ASSET,
-                include_bytes!("../tests/fixtures/compose.yml").as_slice(),
-            ),
-            (
-                COMPOSE_BRIDGE_ASSET,
-                include_bytes!("../tests/fixtures/compose.bridge.yml").as_slice(),
-            ),
-            (
-                IMAGE_REFERENCE_ASSET,
-                include_bytes!("../tests/fixtures/zeronat-image-v6.txt").as_slice(),
-            ),
-        ] {
-            let mut download = download_verified_asset_with_keys(
-                &release,
-                name,
-                &[TEST_KEY],
-                fixture_fetch_named(TEST_MANIFEST, TEST_SIGNATURE, name, bytes),
-            )
+        let mut installer = extract_package_member(&mut package, PACKAGE_INSTALLER).unwrap();
+        let mut installed = Vec::new();
+        installer
+            .prepare_install()
+            .unwrap()
+            .read_to_end(&mut installed)
             .unwrap();
-            assert_eq!(download.read_limited(256, name).unwrap(), bytes);
-        }
+        assert_eq!(installed, TEST_INSTALLER);
     }
 
     #[test]
@@ -515,7 +669,7 @@ mod tests {
             &release,
             TEST_ASSET,
             &[TEST_KEY],
-            fixture_fetch(&changed_manifest, TEST_SIGNATURE, TEST_BINARY),
+            fixture_fetch(&changed_manifest, TEST_SIGNATURE, TEST_PACKAGE),
         )
         .is_err());
 
@@ -527,7 +681,7 @@ mod tests {
                 if url.ends_with(".manifest") {
                     return Ok(false);
                 }
-                fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_BINARY)(url, 0, output)
+                fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_PACKAGE)(url, 0, output)
             },
         )
         .is_err());
@@ -536,7 +690,7 @@ mod tests {
             &release,
             TEST_ASSET,
             &[TEST_KEY],
-            fixture_fetch(TEST_MANIFEST, b"invalid signature", TEST_BINARY),
+            fixture_fetch(TEST_MANIFEST, b"invalid signature", TEST_PACKAGE),
         )
         .is_err());
 
@@ -548,7 +702,7 @@ mod tests {
                 if url.ends_with(".minisig") {
                     return Ok(false);
                 }
-                fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_BINARY)(url, 0, output)
+                fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_PACKAGE)(url, 0, output)
             },
         )
         .is_err());
@@ -558,7 +712,7 @@ mod tests {
             &substituted,
             TEST_ASSET,
             &[TEST_KEY],
-            fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_BINARY),
+            fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_PACKAGE),
         )
         .is_err());
     }
@@ -580,14 +734,14 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
             &release,
             TEST_ASSET,
             &[OTHER_KEY],
-            fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_BINARY),
+            fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_PACKAGE),
         )
         .is_err());
         assert!(download_verified_asset_with_keys(
             &release,
             TEST_ASSET,
             &[OTHER_KEY],
-            fixture_fetch(TEST_MANIFEST, LEGACY_SIGNATURE, TEST_BINARY),
+            fixture_fetch(TEST_MANIFEST, LEGACY_SIGNATURE, TEST_PACKAGE),
         )
         .is_err());
 
@@ -595,7 +749,7 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
             &release,
             TEST_ASSET,
             &[OTHER_KEY, TEST_KEY],
-            fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_BINARY),
+            fixture_fetch(TEST_MANIFEST, TEST_SIGNATURE, TEST_PACKAGE),
         )
         .unwrap();
         assert!(download.prepare_install().is_ok());
@@ -609,7 +763,7 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
             &release,
             TEST_ASSET,
             &[TEST_KEY],
-            fixture_fetch(&oversized_manifest, TEST_SIGNATURE, TEST_BINARY),
+            fixture_fetch(&oversized_manifest, TEST_SIGNATURE, TEST_PACKAGE),
         )
         .is_err());
 
@@ -618,7 +772,7 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
             &release,
             TEST_ASSET,
             &[TEST_KEY],
-            fixture_fetch(TEST_MANIFEST, &oversized_signature, TEST_BINARY),
+            fixture_fetch(TEST_MANIFEST, &oversized_signature, TEST_PACKAGE),
         )
         .is_err());
     }
