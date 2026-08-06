@@ -31,6 +31,7 @@ pub struct Parsed {
     pub bridge_nic: Option<String>,
     pub tap_mtu: Option<String>,
     pub all: bool,
+    pub reinstall: bool,
     pub headless: bool,
     pub dry: bool,
     pub help: bool,
@@ -83,6 +84,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             "--bridge-nic" => p.bridge_nic = Some(take(&mut i, a)?),
             "--tap-mtu" => p.tap_mtu = Some(take(&mut i, a)?),
             "--all" => p.all = true,
+            "--reinstall" => p.reinstall = true,
             "-y" | "--yes" => p.headless = true,
             "--dry-run" | "-n" => p.dry = true,
             "-h" | "--help" => p.help = true,
@@ -420,6 +422,7 @@ mod tests {
             "br0",
             "--tap-mtu",
             "1400",
+            "--reinstall",
         ]))
         .unwrap();
         assert_eq!(p.mode, Some(Mode::Client));
@@ -438,6 +441,7 @@ mod tests {
         assert_eq!(p.tap.as_deref(), Some("zn0"));
         assert_eq!(p.bridge.as_deref(), Some("br0"));
         assert_eq!(p.tap_mtu.as_deref(), Some("1400"));
+        assert!(p.reinstall);
     }
 
     #[test]

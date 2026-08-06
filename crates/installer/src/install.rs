@@ -326,7 +326,7 @@ fn peer_steps(cfg: &Config) -> (String, String) {
                 )
             };
             (
-                "Read ZERONAT_CLIENT_SECRET from /etc/zeronat/.env on the server. Run this on the client and enter that value at the hidden prompt:".into(),
+                "Copy ZERONAT_CLIENT_SECRET from /etc/zeronat/.env on the server. Run this on the client and enter the credential at the hidden prompt:".into(),
                 cmd,
             )
         }
@@ -677,6 +677,8 @@ fn dry_run(cfg: &Config, _sub: &str, r: &mut dyn Runner) -> Result<Outcome, Stri
 /// the service, and/or pull the latest image and recreate the container. Config
 /// (env file, unit, compose file) is left untouched.
 pub fn upgrade(offer: &UpgradeOffer, host: &Host, r: &mut dyn Runner) -> Result<Outcome, String> {
+    validate_installed_version("systemd", offer.systemd.as_deref())?;
+    validate_installed_version("docker", offer.docker.as_deref())?;
     validate_upgrade_credentials(host)?;
     validate_upgrade_deployments(offer, host)?;
     if offer.systemd.is_some() {
@@ -722,7 +724,7 @@ fn validate_upgrade_credentials(host: &Host) -> Result<(), String> {
     };
     if legacy {
         return Err(
-            "legacy shared credentials detected; rerun the installer on the server, run its client enrollment command on each client, then retry the upgrade"
+            "legacy shared credentials detected; rerun the installer on the server with --reinstall and re-enroll each client with a distinct credential before upgrading"
                 .into(),
         );
     }
@@ -1052,7 +1054,7 @@ fn validate_enrollment_values(
     credential: Option<&str>,
     source: &str,
 ) -> Result<(), String> {
-    let action = "rerun the installer on the server, run its client enrollment command on this client, then retry the upgrade";
+    let action = "rerun the installer on the server with --reinstall, then re-enroll this client with its own credential before upgrading";
     let identity =
         identity.ok_or_else(|| format!("the {source} client has no server identity; {action}"))?;
     let credential = credential
@@ -1083,7 +1085,7 @@ fn validate_client_config_layout(path: &str, body: &str) -> Result<bool, String>
     let mut exit_via: Option<String> = None;
     let mut provides_peer_session = false;
     let mut server_material = Vec::new();
-    let action = "rerun the installer on the server, run its client enrollment command on this client, then retry the upgrade";
+    let action = "rerun the installer on the server with --reinstall, then re-enroll this client with its own credential before upgrading";
 
     let finish_server = |secret: &mut Option<String>,
                          credential: &mut Option<String>,
@@ -1948,7 +1950,7 @@ mod tests {
         };
 
         assert!(error.contains("legacy shared credentials"), "{error}");
-        assert!(error.contains("rerun the installer"), "{error}");
+        assert!(error.contains("--reinstall"), "{error}");
         assert!(runner.cmds.is_empty());
     }
 

@@ -42,7 +42,7 @@ Subcommands:
 server options:
   --bind <ADDR>       Address to bind on (default: 0.0.0.0)
   --control <PORT>    Control port (default: 2222)
-  --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET)
+  --secret <64-HEX>   Server private identity secret (or env ZERONAT_SECRET)
   --client <ID>:<64-HEX>  Authorize a client id and credential (repeatable; or env
                       ZERONAT_CLIENT_ID and ZERONAT_CLIENT_SECRET)
   --admin-secret <64-HEX>  Independent remote admin secret (or env
@@ -70,7 +70,8 @@ client options:
   --secret <64-HEX>   Server public identity (or env ZERONAT_SECRET)
   --credential <64-HEX>  Client credential (or env ZERONAT_CLIENT_SECRET;
                       required)
-  --id <PREFIX>       Client id prefix (default: short hostname)
+  --id <PREFIX>       Local client label prefix (default: short hostname); server
+                      routing uses the id assigned to the credential
   --config <PATH>     Load servers/forwards/identity from a config file
   --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT, plus
                       optional +proxy (send a PROXY protocol v2 header to the
@@ -148,6 +149,9 @@ admin options:
 
 upgrade options:
   --check             Report whether a newer release exists, without applying it
+
+compatibility:
+  Server and client protocol versions must match; mixed versions are rejected
 
 Options:
   -h, --help          Print this help and exit

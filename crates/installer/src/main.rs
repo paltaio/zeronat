@@ -201,7 +201,7 @@ zeronat installer
   --ports \"443/tcp 80/tcp 51820/udp\"
   --all                     forward every port plus ICMP; keeps SSH on the server
   --control PORT            tunnel control port (default 2222)
-  --secret 64-HEX           server signing secret (server only; default: generated)
+  --secret 64-HEX           server private identity secret (server only; default: generated)
   --credential 64-HEX       server-issued client credential (client only)
   --credential-prompt       read the client credential without echo (client only)
   --server-public 64-HEX    server public identity (client only)
@@ -214,11 +214,14 @@ zeronat installer
   --bridge NAME             (with --tap) enslave the TAP to this existing bridge
   --bridge-nic NIC          (server --tap) build the bridge and enslave this NIC
   --tap-mtu N               (with --tap) TAP MTU (default 1400)
+  --reinstall               open the fresh-install wizard for an existing install
   -y, --yes                 no prompts; fail if a required value is missing
   -n, --dry-run             preview the steps without making changes
   -h, --help
 
-With no options it runs the interactive wizard. --ports, --tap, and --all are mutually exclusive.";
+Every identity and credential is 64 hexadecimal characters encoding 32 bytes.
+Server and client protocol versions must match. With no options the interactive
+wizard runs. --ports, --tap, and --all are mutually exclusive.";
 
 fn real_main() -> i32 {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -277,8 +280,8 @@ fn real_main() -> i32 {
     }
 
     let installed = sys::installed();
-    if !dry && (installed.systemd.is_some() || installed.docker.is_some()) {
-        if let Err(e) = install::preflight_upgrade(&installed, &host) {
+    if !dry {
+        if let Err(e) = preflight_existing_install(parsed.reinstall, &installed, &host) {
             eprintln!("error: {e}");
             return 1;
         }
@@ -315,7 +318,7 @@ fn real_main() -> i32 {
     // Offer an in-place upgrade as the first step when an existing install is a
     // version behind. Skipped in dry-run, which previews a fresh install and has
     // no cached privilege for the docker probe.
-    let upgrade = if dry {
+    let upgrade = if dry || parsed.reinstall {
         None
     } else {
         upgrade_offer(&installed, sys::latest_version().as_deref())
@@ -389,6 +392,18 @@ fn real_main() -> i32 {
                 tty.write_all(format!("\n  \x1b[91m✕ install failed\x1b[0m  {e}\n\n").as_bytes());
             1
         }
+    }
+}
+
+fn preflight_existing_install(
+    reinstall: bool,
+    installed: &sys::Installed,
+    host: &Host,
+) -> Result<(), String> {
+    if reinstall || (installed.systemd.is_none() && installed.docker.is_none()) {
+        Ok(())
+    } else {
+        install::preflight_upgrade(installed, host)
     }
 }
 
@@ -630,4 +645,32 @@ fn progress_view(
     lines.push(frame::row(w, hint));
     lines.push(frame::bottom(w));
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reinstall_bypasses_legacy_upgrade_preflight() {
+        let installed = sys::Installed {
+            systemd: Some("0.25.0".into()),
+            docker: None,
+            compose: false,
+        };
+        let secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let host = Host {
+            have_docker: false,
+            have_compose: false,
+            existing_secret: Some(secret.into()),
+            existing_client_secret: Some(secret.into()),
+            existing_admin_secret: None,
+            ssh_port: 22,
+        };
+
+        preflight_existing_install(true, &installed, &host).unwrap();
+        assert!(preflight_existing_install(false, &installed, &host)
+            .unwrap_err()
+            .contains("legacy shared credentials"));
+    }
 }

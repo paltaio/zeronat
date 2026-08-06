@@ -1,10 +1,10 @@
 # zeronat
 
-Minimal encrypted reverse tunnel for services behind CG-NAT. Single static Rust binary, TCP + UDP, Noise-encrypted.
+Encrypted reverse tunnel for services behind CG-NAT. Single Rust binary, TCP and UDP, Noise-encrypted.
 
-You have a service behind CG-NAT (home/office) and a cheap cloud VM with a public IP. zeronat exposes your local ports through the VM without creating accounts, no third-party services, just a VPS.
+zeronat exposes services behind CG-NAT through a public Linux host. It needs no account or hosted control plane.
 
-The server runs on the public host. The client runs behind NAT, dials out, and holds one control connection. A hit on a public port is forwarded to the matching local service on the client. Every connection is Noise-encrypted (`NNpsk0`, X25519 + ChaCha20-Poly1305 + BLAKE2s) from a shared secret.
+The server runs on the public host. The client dials out from behind NAT and holds one control connection. Traffic on a public port is forwarded to the matching local service. Noise authenticates and encrypts each connection. The server keeps its private identity secret, each client has its own credential, and remote administration uses a separate secret.
 
 ## Install
 
@@ -12,26 +12,24 @@ The server runs on the public host. The client runs behind NAT, dials out, and h
 curl -fsSL https://paltaio.github.io/zeronat/get.sh | sh
 ```
 
-Picks Docker or a systemd service, generates the secret, asks what to forward, and prints the command to run behind CG-NAT.
+The installer configures Docker or systemd, generates 32-byte credentials, and prints a client enrollment command. The launcher verifies the signed release manifest and installer digest before running the downloaded binary.
 
 ## Usage
 
 ```bash
-# Generate this once, then copy the same value to both hosts.
-SECRET="$(openssl rand -hex 32)"
-
 # On the public host:
-ZERONAT_SECRET="$SECRET" zeronat server --control 2222 --tcp 443 --udp 51820
+curl -fsSL https://paltaio.github.io/zeronat/get.sh | \
+  sh -s -- --server --ports "443/tcp 51820/udp" -y
 
-# Behind CG-NAT:
-ZERONAT_SECRET="$SECRET" zeronat client --server <public-ip>:2222 --tcp 443 --udp 51820
+# On the host behind CG-NAT, run the enrollment command printed above.
+# Enter ZERONAT_CLIENT_SECRET from the server's /etc/zeronat/.env when prompted.
 ```
 
-`--tcp 443` maps to `127.0.0.1:443`. Remap with `--tcp 443:10.0.0.5:443`; `--udp` works the same. Specs take `+` modifiers: `--tcp 443+proxy` hands the target the real client address in a PROXY protocol v2 header (`--proxy` enables it on every TCP forward), and `+idle=SECS` tunes the per-forward idle window. Open the control port (2222, UDP and TCP) on the server's firewall.
+Every secret and public identity is exactly 64 hexadecimal characters encoding 32 bytes. `--tcp 443` maps to `127.0.0.1:443`. Remap with `--tcp 443:10.0.0.5:443`; `--udp` works the same. Specs take `+` modifiers: `--tcp 443+proxy` sends a PROXY protocol v2 header to the target, and `+idle=SECS` sets the per-forward idle window. Open the control port (2222, UDP and TCP) on the server firewall.
 
 What a service behind zeronat sees, and the PROXY protocol cutover, are covered at https://paltaio.github.io/zeronat/#transparency and https://paltaio.github.io/zeronat/#proxy.
 
-Routing, all-ports forwarding, the TAP bridge, DHT discovery, and the full CLI live at https://paltaio.github.io/zeronat/.
+Routing, all-ports forwarding, TAP, DHT discovery, container privileges, verified upgrades, and the full CLI are documented at https://paltaio.github.io/zeronat/.
 
 ## License
 

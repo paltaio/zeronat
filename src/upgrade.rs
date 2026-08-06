@@ -448,7 +448,7 @@ fn validate_credential_env(body: &str) -> Result<()> {
             if identity.trim().eq_ignore_ascii_case(credential.trim())
     ) {
         return Err(
-            "legacy shared credentials detected; rerun the installer on the server, run its client enrollment command on each client, then retry the upgrade"
+            "legacy shared credentials detected; rerun the installer on the server with --reinstall and re-enroll each client with a distinct credential before upgrading"
                 .into(),
         );
     }
@@ -505,7 +505,7 @@ fn validate_enrollment_values(
     credential: Option<&str>,
     source: &str,
 ) -> Result<()> {
-    let action = "rerun the installer on the server, run its client enrollment command on this client, then retry the upgrade";
+    let action = "rerun the installer on the server with --reinstall, then re-enroll this client with its own credential before upgrading";
     let identity =
         identity.ok_or_else(|| format!("the {source} client has no server identity; {action}"))?;
     let credential = credential
@@ -527,7 +527,7 @@ fn validate_enrollment_values(
 }
 
 fn validate_client_config(path: &str, body: &str) -> Result<bool> {
-    let action = "rerun the installer on the server, run its client enrollment command on this client, then retry the upgrade";
+    let action = "rerun the installer on the server with --reinstall, then re-enroll this client with its own credential before upgrading";
     let classify = |error: crate::Error| {
         let enrollment_error = crate::clientcfg::is_enrollment_error(&error);
         let error = error.to_string();
@@ -1205,7 +1205,7 @@ mod tests {
         let legacy = "ZERONAT_SECRET=001122\nZERONAT_CLIENT_SECRET=001122\n";
         let error = validate_credential_env(legacy).unwrap_err().to_string();
         assert!(error.contains("legacy shared credentials"), "{error}");
-        assert!(error.contains("rerun the installer"), "{error}");
+        assert!(error.contains("--reinstall"), "{error}");
 
         let current = "ZERONAT_SECRET=001122\nZERONAT_CLIENT_SECRET=aabbcc\n";
         validate_credential_env(current).unwrap();
@@ -1227,7 +1227,7 @@ mod tests {
             .to_string();
 
         assert!(error.contains("legacy enrollment values"), "{error}");
-        assert!(error.contains("rerun the installer"), "{error}");
+        assert!(error.contains("--reinstall"), "{error}");
         std::fs::remove_file(path).unwrap();
     }
 
