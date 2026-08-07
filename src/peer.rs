@@ -238,6 +238,10 @@ pub struct PeerSession {
     /// Cleared when the reader reaps the peer, so a write-only owner learns
     /// the session is gone from the send side too.
     alive: Arc<AtomicBool>,
+    /// The refusal this provider's verdict carried, `None` on a ready verdict
+    /// and on every consumer session. A refused session exists only so the
+    /// verdict's retransmits can answer a repeated message three.
+    refused: Option<String>,
     _hold: PathHold,
     /// The reader owns the writer and the keepalive, so reaping a dead peer
     /// stops this party writing into the path as well, and dropping the
@@ -250,19 +254,23 @@ impl PeerSession {
     /// session is not up until the provider's ready verdict arrives; a
     /// refusal or an identity mismatch is an error.
     pub async fn consumer(path: PeerPath, identity: &PairIdentity, pair_id: u64) -> Result<Self> {
-        Self::start(path, Role::Consumer, &[], identity, pair_id).await
+        Self::start(path, Role::Consumer, &[], &[], identity, pair_id).await
     }
 
     /// The provider's side: answer the handshake, sealing `refuse` into
-    /// message two and repeating it in the verdict. An empty `refuse` accepts
-    /// the pair with a ready verdict.
+    /// message two. The verdict checks `allow` against the consumer static
+    /// message three authenticates: an identity off the list is refused as
+    /// unauthorized whatever `refuse` says, an admitted one gets `refuse`
+    /// repeated or a ready verdict, and [`refused`](Self::refused) carries
+    /// whichever reason went out.
     pub async fn provider(
         path: PeerPath,
         identity: &PairIdentity,
         pair_id: u64,
         refuse: &[u8],
+        allow: &[[u8; 32]],
     ) -> Result<Self> {
-        Self::start(path, Role::Provider, refuse, identity, pair_id).await
+        Self::start(path, Role::Provider, refuse, allow, identity, pair_id).await
     }
 
     /// Handshake over `path` and start the session's keepalive and liveness
@@ -271,6 +279,7 @@ impl PeerSession {
         path: PeerPath,
         role: Role,
         refuse: &[u8],
+        allow: &[[u8; 32]],
         identity: &PairIdentity,
         pair_id: u64,
     ) -> Result<Self> {
@@ -279,8 +288,11 @@ impl PeerSession {
             mut tx,
             hold,
         } = path;
-        let (noise, retransmit) =
-            handshake(role, refuse, &mut rx, &mut tx, identity, pair_id).await?;
+        let Handshaked {
+            noise,
+            retransmit,
+            refused,
+        } = handshake(role, refuse, allow, &mut rx, &mut tx, identity, pair_id).await?;
         let noise = Arc::new(noise);
 
         let (out, mut outbox) = mpsc::channel::<Vec<u8>>(SESSION_QUEUE);
@@ -361,9 +373,16 @@ impl PeerSession {
             out,
             inbound,
             alive,
+            refused,
             _hold: hold,
             _reader: reader,
         })
+    }
+
+    /// The refusal this provider answered the pair with, `None` when the
+    /// verdict was ready. Nothing may ride a refused session.
+    pub fn refused(&self) -> Option<&str> {
+        self.refused.as_deref()
     }
 
     /// Send one frame to the peer. A frame past [`MAX_FRAME`] is refused: it
@@ -405,6 +424,14 @@ fn session_frame(noise: &StatelessNoise, kind: u8, payload: &[u8]) -> Result<Vec
     Ok(frame)
 }
 
+/// A completed inner handshake: the transport state, the responder's answer to
+/// a repeated message three, and the refusal the responder's verdict carried.
+struct Handshaked {
+    noise: StatelessNoise,
+    retransmit: Option<Retransmit>,
+    refused: Option<String>,
+}
+
 /// Run the inner XX handshake over the path, repeating the last message sent
 /// until the exchange completes. Both parties authenticate their static keys
 /// under the pair prologue; transport keys come from the handshake split and
@@ -412,15 +439,16 @@ fn session_frame(noise: &StatelessNoise, kind: u8, payload: &[u8]) -> Result<Vec
 async fn handshake(
     role: Role,
     refuse: &[u8],
+    allow: &[[u8; 32]],
     rx: &mut PathRx,
     tx: &mut PathTx,
     identity: &PairIdentity,
     pair_id: u64,
-) -> Result<(StatelessNoise, Option<Retransmit>)> {
+) -> Result<Handshaked> {
     timeout(HANDSHAKE_DEADLINE, async {
         match role {
             Role::Consumer => handshake_initiator(rx, tx, identity, pair_id).await,
-            Role::Provider => handshake_responder(refuse, rx, tx, identity, pair_id).await,
+            Role::Provider => handshake_responder(refuse, allow, rx, tx, identity, pair_id).await,
         }
     })
     .await
@@ -435,7 +463,7 @@ async fn handshake_initiator(
     tx: &mut PathTx,
     identity: &PairIdentity,
     pair_id: u64,
-) -> Result<(StatelessNoise, Option<Retransmit>)> {
+) -> Result<Handshaked> {
     let local = public_identity(&identity.static_private);
     let prologue = pair_prologue(
         pair_id,
@@ -488,7 +516,11 @@ async fn handshake_initiator(
                     continue;
                 };
                 return match verdict.split_first() {
-                    Some((&VERDICT_READY, [])) => Ok((noise, None)),
+                    Some((&VERDICT_READY, [])) => Ok(Handshaked {
+                        noise,
+                        retransmit: None,
+                        refused: None,
+                    }),
                     Some((&VERDICT_REFUSED, reason)) => Err(format!(
                         "the provider refused the pair: {}",
                         String::from_utf8_lossy(reason)
@@ -502,16 +534,20 @@ async fn handshake_initiator(
 }
 
 /// The provider's side. The expected consumer identity in the prologue is the
-/// relay-forwarded one, which is routing information: a party that does not
-/// hold it fails the transcript at message two. The consumer is authenticated
-/// at message three, after which one sealed verdict frame answers it.
+/// relay-forwarded one, which is routing information: it selects the
+/// transcript, it admits no one. The consumer is authenticated at message
+/// three, and the verdict is decided there on the static it presented: an
+/// identity `allow` does not name is refused as unauthorized, an allowlisted
+/// identity the pair was not routed for is refused as a routing conflict, and
+/// a non-empty `refuse` refuses the rest.
 async fn handshake_responder(
     refuse: &[u8],
+    allow: &[[u8; 32]],
     rx: &mut PathRx,
     tx: &mut PathTx,
     identity: &PairIdentity,
     pair_id: u64,
-) -> Result<(StatelessNoise, Option<Retransmit>)> {
+) -> Result<Handshaked> {
     let local = public_identity(&identity.static_private);
     let prologue = pair_prologue(
         pair_id,
@@ -545,23 +581,47 @@ async fn handshake_responder(
     if !state.read_message_three(&message_three)?.is_empty() {
         return Err("unexpected payload in peer handshake message three".into());
     }
+    let presented = state
+        .remote_static()
+        .ok_or("handshake message 3 carried no static key")?;
+    // The verdict keys on the static the handshake authenticated, never on
+    // the relay-forwarded identity: possession of an allowlisted key is the
+    // only thing that admits a consumer. The two identities differ here only
+    // for a consumer that ran the transcript under a routed identity it does
+    // not hold, which is a conflict worth its own reason.
+    let refuse = if !allow.contains(&presented) {
+        format!(
+            "unauthorized consumer identity {}",
+            crate::secret::encode(presented)
+        )
+        .into_bytes()
+    } else if presented != identity.peer {
+        format!(
+            "consumer identity {} is not the identity the pair was routed for",
+            crate::secret::encode(presented)
+        )
+        .into_bytes()
+    } else {
+        refuse.to_vec()
+    };
     let noise = state.into_transport();
     let mut verdict = Vec::with_capacity(1 + refuse.len());
     if refuse.is_empty() {
         verdict.push(VERDICT_READY);
     } else {
         verdict.push(VERDICT_REFUSED);
-        verdict.extend_from_slice(refuse);
+        verdict.extend_from_slice(&refuse);
     }
     let sealed = noise.seal(&verdict)?;
     let reply = send_handshake(tx, &sealed).await?;
-    Ok((
+    Ok(Handshaked {
         noise,
-        Some(Retransmit {
+        retransmit: Some(Retransmit {
             seen: message_three,
             reply,
         }),
-    ))
+        refused: (!refuse.is_empty()).then(|| String::from_utf8_lossy(&refuse).into_owned()),
+    })
 }
 
 /// The next handshake-class frame the path delivers, stripped of its frame
@@ -628,6 +688,7 @@ fn duplex_identities(secret: &str) -> (PairIdentity, PairIdentity) {
 pub(crate) async fn duplex_pair(secret: &str, pair_id: u64) -> (PeerSession, PeerSession) {
     let (initiator, responder) = duplex_legs(secret).await;
     let (consumer_identity, provider_identity) = duplex_identities(secret);
+    let allow = [provider_identity.peer];
     tokio::try_join!(
         PeerSession::consumer(
             PeerPath::relay_stream(initiator),
@@ -639,6 +700,7 @@ pub(crate) async fn duplex_pair(secret: &str, pair_id: u64) -> (PeerSession, Pee
             &provider_identity,
             pair_id,
             &[],
+            &allow,
         ),
     )
     .expect("the inner handshake must complete on both sides")
@@ -738,6 +800,7 @@ mod tests {
     async fn a_verdict_refusal_is_an_error_distinct_from_a_mismatch() {
         let (initiator, responder) = duplex_legs("refusal legs").await;
         let (consumer_identity, provider_identity) = duplex_identities("refusal legs");
+        let allow = [provider_identity.peer];
         let (consumer, provider) = tokio::join!(
             PeerSession::consumer(PeerPath::relay_stream(initiator), &consumer_identity, 7),
             PeerSession::provider(
@@ -745,9 +808,11 @@ mod tests {
                 &provider_identity,
                 7,
                 b"already serving a pair",
+                &allow,
             ),
         );
-        provider.expect("the refusing provider still completes the handshake");
+        let provider = provider.expect("the refusing provider still completes the handshake");
+        assert_eq!(provider.refused(), Some("already serving a pair"));
         let error = consumer.err().expect("a refusal fails the consumer");
         let error = error.to_string();
         assert!(
@@ -802,5 +867,220 @@ mod tests {
             .to_string();
         assert!(error.contains("inner handshake timed out"), "{error}");
         drop(silent);
+    }
+
+    /// Drive the initiator's frames with `static_private` under a prologue
+    /// naming `claimed` as the consumer, and return the provider's verdict
+    /// plaintext.
+    async fn initiate_claiming(
+        leg: Noise,
+        static_private: [u8; 32],
+        claimed: [u8; 32],
+        provider: [u8; 32],
+        challenge: [u8; 32],
+        pair_id: u64,
+    ) -> Vec<u8> {
+        let prologue = pair_prologue(
+            pair_id,
+            crate::proto::PROVIDES_EXIT,
+            &claimed,
+            &provider,
+            &challenge,
+        );
+        let mut state = XxHandshake::initiator(&static_private, &prologue).unwrap();
+        let (mut leg_rx, mut leg_tx) = leg;
+        let mut frame = vec![FRAME_HANDSHAKE];
+        frame.extend_from_slice(&state.write_message_one(&[]));
+        leg_tx.send(&frame).await.unwrap();
+        let msg2 = loop {
+            let frame = leg_rx.recv().await.unwrap();
+            if let Some((&FRAME_HANDSHAKE, m)) = frame.split_first() {
+                break m.to_vec();
+            }
+        };
+        state.read_message_two(&msg2).unwrap();
+        let mut frame = vec![FRAME_HANDSHAKE];
+        frame.extend_from_slice(&state.write_message_three(&[]));
+        leg_tx.send(&frame).await.unwrap();
+        let noise = state.into_transport();
+        loop {
+            let frame = leg_rx.recv().await.unwrap();
+            let Some((&FRAME_HANDSHAKE, m)) = frame.split_first() else {
+                continue;
+            };
+            if m == msg2 {
+                continue;
+            }
+            if let Ok(verdict) = noise.open(m) {
+                return verdict;
+            }
+        }
+    }
+
+    // The verdict keys on the static key the handshake authenticated, so
+    // nothing the relay forwards can admit a consumer: the pair is routed for
+    // an allowlisted identity, the impostor completes the whole exchange
+    // under that routing, and only the party holding the allowlisted key is
+    // served.
+    #[tokio::test]
+    async fn the_routed_identity_admits_no_consumer_without_an_allowlisted_key() {
+        let provider_static = crate::noise::derive_psk("allowlist provider");
+        let allowed_static = crate::noise::derive_psk("allowlist consumer");
+        let impostor_static = crate::noise::derive_psk("allowlist impostor");
+        let challenge = crate::noise::derive_psk("allowlist challenge");
+        let allowed = public_identity(&allowed_static);
+        let provider_pub = public_identity(&provider_static);
+        let allow = [allowed];
+        let pair_id = 51;
+        let identity = PairIdentity::new(
+            provider_static,
+            allowed,
+            challenge,
+            crate::proto::PROVIDES_EXIT,
+        );
+
+        // The relay routed the pair for the allowlisted identity; the
+        // impostor claims it in the transcript but holds only its own key.
+        let (initiator, responder) = duplex_legs("allowlist legs").await;
+        let impostor = crate::spawn(initiate_claiming(
+            initiator,
+            impostor_static,
+            allowed,
+            provider_pub,
+            challenge,
+            pair_id,
+        ));
+        let session = PeerSession::provider(
+            PeerPath::relay_stream(responder),
+            &identity,
+            pair_id,
+            &[],
+            &allow,
+        )
+        .await
+        .unwrap();
+        let refused = session
+            .refused()
+            .expect("a key the allowlist does not name must not be served")
+            .to_string();
+        let presented = crate::secret::encode(public_identity(&impostor_static));
+        assert!(refused.contains("unauthorized"), "{refused}");
+        assert!(refused.contains(&presented), "{refused}");
+        let verdict = impostor.await.unwrap();
+        assert_eq!(verdict.first(), Some(&VERDICT_REFUSED));
+        let reason = String::from_utf8_lossy(&verdict[1..]);
+        assert!(reason.contains("unauthorized"), "{reason}");
+        drop(session);
+
+        // The allowlisted consumer itself is served under the same routing.
+        let (initiator, responder) = duplex_legs("allowlist legs served").await;
+        let consumer_identity = PairIdentity::new(
+            allowed_static,
+            provider_pub,
+            challenge,
+            crate::proto::PROVIDES_EXIT,
+        );
+        let (consumer, provider) = tokio::try_join!(
+            PeerSession::consumer(
+                PeerPath::relay_stream(initiator),
+                &consumer_identity,
+                pair_id
+            ),
+            PeerSession::provider(
+                PeerPath::relay_stream(responder),
+                &identity,
+                pair_id,
+                &[],
+                &allow,
+            ),
+        )
+        .expect("the allowlisted key must be served");
+        assert!(provider.refused().is_none());
+        drop((consumer, provider));
+    }
+
+    // An unlisted consumer is refused in the verdict: the provider's session
+    // reports the refusal, which is what keeps anything from riding the pair,
+    // and the consumer surfaces it as the provider's refusal, distinct from
+    // the identity-mismatch error its own check raises.
+    #[tokio::test]
+    async fn a_consumer_absent_from_the_allowlist_gets_an_unauthorized_refusal() {
+        let (initiator, responder) = duplex_legs("unlisted legs").await;
+        let (consumer_identity, provider_identity) = duplex_identities("unlisted legs");
+        let allow = [[0x5A; 32]];
+        let (consumer, provider) = tokio::join!(
+            PeerSession::consumer(PeerPath::relay_stream(initiator), &consumer_identity, 13),
+            PeerSession::provider(
+                PeerPath::relay_stream(responder),
+                &provider_identity,
+                13,
+                &[],
+                &allow,
+            ),
+        );
+        let provider = provider.expect("the refusing provider still completes the handshake");
+        let refused = provider
+            .refused()
+            .expect("an unlisted consumer must be refused");
+        let presented = crate::secret::encode(provider_identity.peer);
+        assert!(refused.contains("unauthorized"), "{refused}");
+        assert!(refused.contains(&presented), "{refused}");
+        let error = consumer
+            .err()
+            .expect("an unauthorized refusal fails the consumer")
+            .to_string();
+        assert!(error.contains("the provider refused the pair"), "{error}");
+        assert!(error.contains("unauthorized"), "{error}");
+        assert!(!error.contains("peer identity mismatch"), "{error}");
+    }
+
+    // An allowlisted key that is not the identity the pair was routed for is
+    // still refused: the two disagree only when the relay lied or paired
+    // stale state, and the routing must not stand in for the key.
+    #[tokio::test]
+    async fn an_allowlisted_key_the_pair_was_not_routed_for_is_refused() {
+        let provider_static = crate::noise::derive_psk("conflict provider");
+        let routed_static = crate::noise::derive_psk("conflict routed");
+        let other_static = crate::noise::derive_psk("conflict other");
+        let challenge = crate::noise::derive_psk("conflict challenge");
+        let routed = public_identity(&routed_static);
+        let other = public_identity(&other_static);
+        let allow = [routed, other];
+        let pair_id = 52;
+        let identity = PairIdentity::new(
+            provider_static,
+            routed,
+            challenge,
+            crate::proto::PROVIDES_EXIT,
+        );
+
+        let (initiator, responder) = duplex_legs("conflict legs").await;
+        let byzantine = crate::spawn(initiate_claiming(
+            initiator,
+            other_static,
+            routed,
+            public_identity(&provider_static),
+            challenge,
+            pair_id,
+        ));
+        let session = PeerSession::provider(
+            PeerPath::relay_stream(responder),
+            &identity,
+            pair_id,
+            &[],
+            &allow,
+        )
+        .await
+        .unwrap();
+        let refused = session
+            .refused()
+            .expect("an identity the pair was not routed for must be refused")
+            .to_string();
+        assert!(refused.contains("routed for"), "{refused}");
+        assert!(refused.contains(&crate::secret::encode(other)), "{refused}");
+        assert!(!refused.contains("unauthorized"), "{refused}");
+        let verdict = byzantine.await.unwrap();
+        assert_eq!(verdict.first(), Some(&VERDICT_REFUSED));
+        drop(session);
     }
 }

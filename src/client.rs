@@ -661,6 +661,7 @@ pub fn peer_slots(tun: Option<&CfgTun>, peer: Option<&CfgPeer>) -> Result<Vec<Pe
         }
     }
     if let Some(peer) = peer {
+        let allow = peer.allow_identities()?;
         if peer.exit {
             // Masquerading onto the tun the pair rides would send the
             // consumer's traffic back into the tunnel carrying it.
@@ -677,6 +678,7 @@ pub fn peer_slots(tun: Option<&CfgTun>, peer: Option<&CfgPeer>) -> Result<Vec<Pe
                     mtu: DEFAULT_TAP_MTU,
                     iface: peer.exit_iface.clone(),
                 })),
+                allow: allow.clone(),
             });
         }
         if let Some(bridge) = &peer.segment {
@@ -694,6 +696,7 @@ pub fn peer_slots(tun: Option<&CfgTun>, peer: Option<&CfgPeer>) -> Result<Vec<Pe
                     mtu: DEFAULT_TAP_MTU,
                     bridge: bridge.clone(),
                 })),
+                allow,
             });
         }
     }
@@ -3425,6 +3428,7 @@ mod tests {
         PeerSlotSpec::Provider {
             provides: bit,
             adapter: None,
+            allow: Vec::new(),
         }
     }
 
@@ -3437,6 +3441,7 @@ mod tests {
                 mtu: 1400,
                 iface: None,
             })),
+            allow: Vec::new(),
         }
     }
 
@@ -3449,6 +3454,7 @@ mod tests {
                 mtu: 1400,
                 bridge: bridge.into(),
             })),
+            allow: Vec::new(),
         }
     }
 
@@ -3544,6 +3550,7 @@ mod tests {
             exit: true,
             exit_iface: iface.map(Into::into),
             segment: None,
+            allow: vec!["a".repeat(64)],
         };
         let Err(err) = peer_slots(None, Some(&peer(Some(DEFAULT_PEER_EXIT_NAME)))) else {
             panic!("the provider's own tun must be refused as its egress");
@@ -3565,6 +3572,7 @@ mod tests {
             exit: false,
             exit_iface: None,
             segment: Some(segment.into()),
+            allow: vec!["a".repeat(64)],
         };
         let slots = peer_slots(None, Some(&peer("br0"))).unwrap();
         assert_eq!(slots.len(), 1);

@@ -82,35 +82,44 @@ pub(crate) fn split_kv(line: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// Lex one leading double-quoted string, returning it and the slice after the
+/// closing quote.
+fn lex_string(value: &str, n: usize) -> Result<(String, &str)> {
+    let rest = value
+        .strip_prefix('"')
+        .ok_or_else(|| err(n, "expected a quoted string"))?;
+    let mut out = String::new();
+    let mut chars = rest.char_indices();
+    loop {
+        let (i, c) = chars.next().ok_or_else(|| err(n, "unterminated string"))?;
+        match c {
+            '"' => return Ok((out, &rest[i + 1..])),
+            '\\' => {
+                let (_, esc) = chars.next().ok_or_else(|| err(n, "unterminated string"))?;
+                match esc {
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    other => {
+                        return Err(err(n, &format!("invalid string escape `\\{other}`")));
+                    }
+                }
+            }
+            c if (c as u32) < 0x20 => {
+                return Err(err(n, "control character in string"));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
 /// Lex one scalar from an already-trimmed value slice, rejecting trailing junk.
 fn lex_scalar(value: &str, n: usize) -> Result<Scalar> {
     if value == "true" || value == "false" {
         return Ok(Scalar::Bool(value == "true"));
     }
-    if let Some(rest) = value.strip_prefix('"') {
-        let mut out = String::new();
-        let mut chars = rest.chars();
-        loop {
-            let c = chars.next().ok_or_else(|| err(n, "unterminated string"))?;
-            match c {
-                '"' => break,
-                '\\' => {
-                    let esc = chars.next().ok_or_else(|| err(n, "unterminated string"))?;
-                    match esc {
-                        '"' => out.push('"'),
-                        '\\' => out.push('\\'),
-                        other => {
-                            return Err(err(n, &format!("invalid string escape `\\{other}`")));
-                        }
-                    }
-                }
-                c if (c as u32) < 0x20 => {
-                    return Err(err(n, "control character in string"));
-                }
-                c => out.push(c),
-            }
-        }
-        if chars.as_str().trim().is_empty() {
+    if value.starts_with('"') {
+        let (out, rest) = lex_string(value, n)?;
+        if rest.trim().is_empty() {
             Ok(Scalar::Str(out))
         } else {
             Err(err(n, "trailing characters after string value"))
@@ -129,6 +138,28 @@ pub(crate) fn parse_string(value: &str, n: usize) -> Result<String> {
         Scalar::Str(s) => Ok(s),
         Scalar::Int(_) | Scalar::Bool(_) => Err(err(n, "expected a string value")),
     }
+}
+
+/// Parse a `["a", "b"]` list of quoted strings. A trailing comma is accepted;
+/// anything else between the brackets that is not a quoted string is an error.
+pub(crate) fn parse_string_list(value: &str, n: usize) -> Result<Vec<String>> {
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .ok_or_else(|| err(n, "expected a list of quoted strings"))?;
+    let mut out = Vec::new();
+    let mut rest = inner.trim_start();
+    while !rest.is_empty() {
+        let (s, after) = lex_string(rest, n)?;
+        out.push(s);
+        rest = after.trim_start();
+        match rest.strip_prefix(',') {
+            Some(tail) => rest = tail.trim_start(),
+            None if rest.is_empty() => break,
+            None => return Err(err(n, "expected `,` between list entries")),
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn parse_int(value: &str, n: usize) -> Result<u16> {

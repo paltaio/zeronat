@@ -15,7 +15,8 @@ use std::str::FromStr;
 use crate::client::Transport;
 use crate::clientproto::ServerSecret;
 use crate::config::codec::{
-    err, parse_bool, parse_int, parse_string, parse_u32, quote, reject_dup, split_kv, strip_comment,
+    err, parse_bool, parse_int, parse_string, parse_string_list, parse_u32, quote, reject_dup,
+    split_kv, strip_comment,
 };
 use crate::config::parse_proto;
 use crate::config::LoadError;
@@ -102,6 +103,31 @@ pub struct CfgPeer {
     /// Attach consumers to this node's L2 segment, naming the bridge the
     /// segment's interface belongs to.
     pub segment: Option<String>,
+    /// The consumer identities this node's providers admit, each 64 hex
+    /// characters. Required non-empty when `exit` or `segment` is set.
+    pub allow: Vec<String>,
+}
+
+impl CfgPeer {
+    /// The allowlist as decoded identities. A malformed entry is an error, and
+    /// so is an empty list when any provider capability is set: a provider no
+    /// consumer may use serves nothing.
+    pub fn allow_identities(&self) -> Result<Vec<[u8; 32]>> {
+        let mut allow = Vec::with_capacity(self.allow.len());
+        for entry in &self.allow {
+            allow.push(crate::secret::decode(entry).map_err(|_| -> crate::Error {
+                format!("[peer] allow entry `{entry}` must be a 64-hex peer identity").into()
+            })?);
+        }
+        if (self.exit || self.segment.is_some()) && allow.is_empty() {
+            return Err(
+                "[peer] allow must name at least one consumer identity when `exit` or `segment` \
+                 is set"
+                    .into(),
+            );
+        }
+        Ok(allow)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -156,6 +182,9 @@ impl ClientConfig {
             crate::secret::decode(peer).map_err(|_| -> crate::Error {
                 "[tun] exit_via must be a 64-hex peer identity".into()
             })?;
+        }
+        if let Some(peer) = &self.peer {
+            peer.allow_identities()?;
         }
         let mut names: HashSet<&str> = HashSet::new();
         for s in &self.servers {
@@ -269,6 +298,7 @@ struct PartialRecord {
     exit_via: Option<String>,
     exit_iface: Option<String>,
     segment: Option<String>,
+    allow: Option<Vec<String>>,
 }
 
 /// Load a client config. A missing file yields the default (empty) config so a
@@ -445,6 +475,7 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
                     "exit" => record.exit = Some(parse_bool(value, n)?),
                     "exit_iface" => record.exit_iface = Some(parse_string(value, n)?),
                     "segment" => record.segment = Some(parse_string(value, n)?),
+                    "allow" => record.allow = Some(parse_string_list(value, n)?),
                     other => {
                         return Err(err(n, &format!("unknown key `{other}` in [peer]")));
                     }
@@ -594,6 +625,7 @@ fn close_record(
                 exit,
                 exit_iface,
                 segment,
+                allow: record.allow.take().unwrap_or_default(),
             });
         }
         Section::None | Section::Client => {}
@@ -759,6 +791,10 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
         }
         if let Some(bridge) = &peer.segment {
             out.push_str(&format!("segment = {}\n", quote(bridge)));
+        }
+        if !peer.allow.is_empty() {
+            let entries: Vec<String> = peer.allow.iter().map(|id| quote(id)).collect();
+            out.push_str(&format!("allow = [{}]\n", entries.join(", ")));
         }
     }
 
@@ -1005,7 +1041,8 @@ mod tests {
              [[forwards]]\nproto = \"tcp\"\nport = 443\n\
              [[pppoe]]\nname = \"wan\"\nusername = \"u\"\n\
              [tun]\ndev = \"zn0\"\nexit = true\nexit_via = \"{TEST_SECRET}\"\n\
-             [peer]\nexit = true\nexit_iface = \"wan0\"\nsegment = \"eth1\"\n",
+             [peer]\nexit = true\nexit_iface = \"wan0\"\nsegment = \"eth1\"\n\
+             allow = [\"{TEST_SECRET}\", \"{OTHER_SECRET}\"]\n",
         ))
         .unwrap();
         cfg.validate().unwrap();
@@ -1016,6 +1053,7 @@ mod tests {
         assert!(peer.exit);
         assert_eq!(peer.exit_iface.as_deref(), Some("wan0"));
         assert_eq!(peer.segment.as_deref(), Some("eth1"));
+        assert_eq!(peer.allow, [TEST_SECRET, OTHER_SECRET]);
         assert_eq!(parse_client(&serialize_client(&cfg)).unwrap(), cfg);
 
         // An exit provider without a named interface takes the default-route
@@ -1028,6 +1066,40 @@ mod tests {
         let none = parse_client("[peer]\n").unwrap();
         assert_eq!(none.peer, Some(CfgPeer::default()));
         assert_eq!(parse_client(&serialize_client(&none)).unwrap(), none);
+    }
+
+    // A provider no consumer may use is a boot error naming the key, an
+    // allow entry must be an identity, and a consumer-only config needs no
+    // allowlist.
+    #[test]
+    fn a_provider_requires_a_consumer_allowlist() {
+        let with_key = |peer: &str| format!("[client]\npeer_secret = \"{OTHER_SECRET}\"\n{peer}");
+        for provider in [
+            "[peer]\nexit = true\n",
+            "[peer]\nsegment = \"eth1\"\n",
+            "[peer]\nexit = true\nallow = []\n",
+        ] {
+            let error = parse_client(&with_key(provider))
+                .unwrap()
+                .validate()
+                .unwrap_err();
+            assert!(error.to_string().contains("[peer] allow"), "{error}");
+        }
+
+        let malformed = with_key("[peer]\nexit = true\nallow = [\"office\"]\n");
+        let error = parse_client(&malformed).unwrap().validate().unwrap_err();
+        assert!(error.to_string().contains("[peer] allow"), "{error}");
+        assert!(error.to_string().contains("office"), "{error}");
+
+        let consumer = with_key(&format!("[tun]\nexit_via = \"{TEST_SECRET}\"\n"));
+        parse_client(&consumer).unwrap().validate().unwrap();
+
+        let listed = with_key(&format!(
+            "[peer]\nexit = true\nsegment = \"eth1\"\nallow = [\"{TEST_SECRET}\"]\n"
+        ));
+        let cfg = parse_client(&listed).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(parse_client(&serialize_client(&cfg)).unwrap(), cfg);
     }
 
     #[test]
@@ -1132,6 +1204,12 @@ mod tests {
             "[peer]\nsegment = \"\"\n",
             "[peer]\nfoo = 1\n",
             "[peer]\n[peer]\n",
+            // `allow` is a list of quoted strings.
+            "[peer]\nallow = \"a\"\n",
+            "[peer]\nallow = [\"a\" \"b\"]\n",
+            "[peer]\nallow = [1]\n",
+            "[peer]\nallow = [\"a\"\n",
+            "[peer]\nallow = [\"a]\n",
             "[peer]\nexit = true\nexit_iface = \"\"\n",
             // The masquerade the interface names is what `exit` turns on.
             "[peer]\nexit_iface = \"wan0\"\n",

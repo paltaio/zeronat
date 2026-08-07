@@ -3116,9 +3116,12 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
         let path = dir.join("client.toml");
         let sock = dir.join("client.sock");
         let peer_secret = zeronat::secret::encode([0x42; 32]);
+        // The provider's allowlist is operator config; an attach reuses it.
+        let office = peer_identity_hex("office");
         let text = format!(
             "[client]\nactive = \"home\"\npeer_secret = \"{peer_secret}\"\n\
-             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n"
+             [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n\
+             [peer]\nallow = [\"{office}\"]\n"
         );
         std::fs::write(&path, &text).unwrap();
         let cfg = zeronat::clientcfg::parse_client(&text).unwrap();
@@ -3154,7 +3157,6 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
 
         // A consumer names the peer it exits through, which the file records
         // as the `[tun]` table feeding that slot.
-        let office = peer_identity_hex("office");
         zeronat::client_admin::attach_peer(Some(&sock), office.clone(), None, false, false)
             .await
             .expect("attach the exit consumer");
@@ -3181,7 +3183,7 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
 
         // Detaching every slot takes the client back to the park, and the file
         // back to the servers it started with.
-        zeronat::client_admin::detach_peer(Some(&sock), office)
+        zeronat::client_admin::detach_peer(Some(&sock), office.clone())
             .await
             .expect("detach the consumer");
         zeronat::client_admin::detach_provider(Some(&sock), "exit")
@@ -3191,7 +3193,11 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
         let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
         on_disk.validate().unwrap();
         assert!(on_disk.tun.is_none());
-        assert!(on_disk.peer.is_none());
+        // The allowlist is operator config, so the table keeps it while the
+        // detached provider's keys are gone.
+        let peer = on_disk.peer.as_ref().expect("the allowlist stays recorded");
+        assert!(!peer.exit && peer.exit_iface.is_none() && peer.segment.is_none());
+        assert_eq!(peer.allow, [office]);
         assert_eq!(on_disk.servers.len(), 1);
 
         let err = zeronat::client_admin::detach_provider(Some(&sock), "exit")
@@ -5595,9 +5601,10 @@ async fn assert_inner_session(
     let challenge = [7u8; 32];
     let consumer_identity = pair_identity("c", "prov", challenge, PROVIDES_EXIT);
     let provider_identity = pair_identity("prov", "c", challenge, PROVIDES_EXIT);
+    let allow = [peer_identity_of("c")];
     let (mut consumer, mut provider) = tokio::try_join!(
         zeronat::peer::PeerSession::consumer(consumer, &consumer_identity, pair_id),
-        zeronat::peer::PeerSession::provider(provider, &provider_identity, pair_id, &[]),
+        zeronat::peer::PeerSession::provider(provider, &provider_identity, pair_id, &[], &allow),
     )
     .expect("the inner handshake must complete on both sides");
     for payload in [
@@ -5733,6 +5740,7 @@ async fn peer_inner_handshake_carries_the_providers_refusal() {
         let challenge = [7u8; 32];
         let consumer_identity = pair_identity("c", "prov", challenge, PROVIDES_EXIT);
         let provider_identity = pair_identity("prov", "c", challenge, PROVIDES_EXIT);
+        let allow = [peer_identity_of("c")];
 
         let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
         let (p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
@@ -5747,6 +5755,7 @@ async fn peer_inner_handshake_carries_the_providers_refusal() {
                 &provider_identity,
                 pair.pair_id,
                 b"peer_busy",
+                &allow,
             ),
         );
         provider.expect("the refusing provider still completes the handshake");
@@ -6032,6 +6041,7 @@ async fn run_two_slot_test(transport: zeronat::client::Transport, punched: bool)
         provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
             provides: PROVIDES_EXIT,
             adapter: None,
+            allow: vec![peer_identity_of(&consumer_id)],
         }];
         provider.peer_sessions = Some(prov_tx);
         tokio::spawn(zeronat::client::run_switchable(
@@ -6140,6 +6150,9 @@ async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
         provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
             provides: PROVIDES_EXIT,
             adapter: None,
+            // The second consumer is allowlisted too, so the refusal it reads
+            // is the busy slot, not its own identity.
+            allow: vec![peer_identity_of(&consumer_id), peer_identity_of("c2")],
         }];
         provider.peer_sessions = Some(prov_tx);
         tokio::spawn(zeronat::client::run_switchable(
@@ -6288,6 +6301,7 @@ async fn peer_exit_provider_refuses_a_pair_it_cannot_serve() {
                     iface: Some("znx0".into()),
                 },
             )),
+            allow: vec![peer_identity_of("c")],
         }];
         tokio::spawn(zeronat::client::run_switchable(
             zeronat::client::ActiveTarget::new(target()),
@@ -6340,6 +6354,7 @@ async fn peer_segment_provider_refuses_a_pair_it_cannot_serve() {
                     bridge: "zeronat-no-such-bridge".into(),
                 },
             )),
+            allow: vec![peer_identity_of("c")],
         }];
         tokio::spawn(zeronat::client::run_switchable(
             zeronat::client::ActiveTarget::new(target()),
@@ -6474,11 +6489,13 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
         let leg_id = recv_relay_open(&mut pr, pair_id, "prov").await;
         let (leg, _leg_pump) = dgram_leg(control, leg_id).await;
         let identity = pair_identity("prov", &consumer_id, challenge, PROVIDES_EXIT);
+        let allow = [peer_identity_of(&consumer_id)];
         let mut provider = zeronat::peer::PeerSession::provider(
             zeronat::peer::PeerPath::relay_dgram(leg),
             &identity,
             pair_id,
             &[],
+            &allow,
         )
         .await
         .expect("the slot never opened its relay leg");

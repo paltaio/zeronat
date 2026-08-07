@@ -509,6 +509,7 @@ mod pty {
             peers: vec![zeronat::client::PeerSlotSpec::Provider {
                 provides: PROVIDES_EXIT,
                 adapter: None,
+                allow: vec![zeronat::noise::public_identity(&peer_static(&client_id))],
             }],
             peer_sessions: Some(prov_tx),
         };

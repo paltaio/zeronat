@@ -672,6 +672,15 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                 )
             } else {
                 let mut record = CfgPeer::default();
+                // The allowlist is operator config, not an attach field: the
+                // slot takes it from the saved `[peer]` table, and a provider
+                // no consumer may use is refused here as boot refuses it.
+                if let Some(p) = &state.persist {
+                    let cfg = p.cfg.lock().unwrap();
+                    if let Some(saved) = &cfg.peer {
+                        record.allow = saved.allow.clone();
+                    }
+                }
                 // The key a provider's capability writes, matched exhaustively
                 // so no undefined bit is filed under a defined one.
                 match want {
@@ -1632,7 +1641,8 @@ mod tests {
         let dir = temp_dir("attachbad");
         let path = dir.join("client.toml");
         let text = format!(
-            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n"
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\
+             [peer]\nallow = [\"{DEPOT_ID}\"]\n"
         );
         std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
@@ -1747,6 +1757,15 @@ mod tests {
         assert!(!ok);
         assert!(msg.contains("peer_secret"), "{msg}");
 
+        // A provider no consumer may use is refused: with no `[peer] allow`
+        // in the saved config there is nobody to admit.
+        let unlisted = idle_state("a");
+        let (ok, msg) = mutate(&unlisted, attach_provider(PROVIDES_EXIT, "")).await;
+        assert!(!ok);
+        assert!(msg.contains("[peer] allow"), "{msg}");
+        let (ok, msg) = mutate(&unlisted, attach_consumer(OFFICE_ID, "", false, false)).await;
+        assert!(ok, "a consumer needs no allowlist: {msg}");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1804,7 +1823,8 @@ mod tests {
         let path = dir.join("client.toml");
         let text = format!(
             "[client]\npeer_secret = \"{OTHER_SECRET}\"\n\n\
-             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n"
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\n\
+             [peer]\nallow = [\"{DEPOT_ID}\"]\n"
         );
         std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
@@ -1834,6 +1854,7 @@ mod tests {
         assert!(peer.exit);
         assert_eq!(peer.exit_iface.as_deref(), Some("wan0"));
         assert_eq!(peer.segment.as_deref(), Some("br0"));
+        assert_eq!(peer.allow, [DEPOT_ID]);
 
         // Detaching names the slot the same way attaching did: the peer and
         // capability for a consumer, the capability alone for a provider.
@@ -1869,8 +1890,9 @@ mod tests {
         assert_eq!(peer.exit_iface, None);
         assert_eq!(peer.segment.as_deref(), Some("br0"));
 
-        // Detaching the last provider drops a table that would declare
-        // nothing, and the detached slots are gone from the set.
+        // Detaching the last provider clears its keys; the allowlist is
+        // operator config and stays for the next provider, so the table
+        // survives with it. The detached slots are gone from the set.
         let (ok, msg) = mutate(
             &state,
             ClientMsg::DetachPeer {
@@ -1882,7 +1904,9 @@ mod tests {
         assert!(ok, "{msg}");
         let on_disk = crate::clientcfg::load(&path).unwrap();
         on_disk.validate().unwrap();
-        assert!(on_disk.peer.is_none());
+        let peer = on_disk.peer.as_ref().unwrap();
+        assert!(!peer.exit && peer.segment.is_none());
+        assert_eq!(peer.allow, [DEPOT_ID]);
         let (ok, _) = mutate(
             &state,
             ClientMsg::DetachPeer {

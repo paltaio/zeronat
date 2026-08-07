@@ -360,6 +360,9 @@ pub enum PeerSlotSpec {
         /// pairs to the frame seam, which is what the slot set's owner takes
         /// when it drives the sessions itself.
         adapter: Option<ProviderAdapter>,
+        /// The consumer identities this provider admits, checked against the
+        /// static key each pair's handshake authenticates.
+        allow: Vec<[u8; 32]>,
     },
 }
 
@@ -634,8 +637,12 @@ pub(crate) fn spawn(
                 } => crate::spawn(consumer_slot(
                     peer_id, want, adapter, secret, control, sink, status,
                 )),
-                PeerSlotSpec::Provider { provides, adapter } => crate::spawn(provider_slot(
-                    provides, adapter, secret, control, sink, status,
+                PeerSlotSpec::Provider {
+                    provides,
+                    adapter,
+                    allow,
+                } => crate::spawn(provider_slot(
+                    provides, adapter, allow, secret, control, sink, status,
                 )),
             })
         })
@@ -830,6 +837,7 @@ const NO_TUN_DEVICE: &str =
 async fn provider_slot(
     provides: u8,
     adapter: Option<ProviderAdapter>,
+    allow: Vec<[u8; 32]>,
     secret: String,
     control: PeerControl,
     sink: SessionSink,
@@ -932,6 +940,7 @@ async fn provider_slot(
                         peer_id,
                         provides,
                         generation,
+                        allow: allow.clone(),
                     },
                     session,
                     pair_rx,
@@ -1254,12 +1263,14 @@ fn segment_precheck(segment: &PeerSegment) -> Result<()> {
     }
 }
 
-/// What a `PeerProbe` tells a provider about the pair it starts.
+/// What a provider pair task starts from: the `PeerProbe` fields and the
+/// slot's consumer allowlist.
 struct PairStart {
     pair_id: u64,
     peer_id: crate::proto::PeerIdentity,
     provides: u8,
     generation: u64,
+    allow: Vec<[u8; 32]>,
 }
 
 /// Serve one pair on a provider slot: probe, take the path the punch or the
@@ -1279,6 +1290,7 @@ async fn provider_pair(
         peer_id,
         provides,
         generation,
+        allow,
     } = start;
     let peer_hex = crate::secret::encode(peer_id);
     let exclusive = provides == PROVIDES_EXIT;
@@ -1288,7 +1300,7 @@ async fn provider_pair(
                 settle_path(pair_id, &peer_hex, &session.peer_id, &session, &mut rx).await?;
             // The relay-forwarded consumer identity selects the prologue
             // expectation; the handshake authenticates the consumer's static
-            // at message three.
+            // at message three, where the allowlist decides the verdict.
             let pair = PairIdentity::new(session.peer_static, peer_id, challenge, provides);
             // An adapter that cannot come up refuses before it takes the slot,
             // so a provider stuck on its own config never reads as busy.
@@ -1312,17 +1324,23 @@ async fn provider_pair(
             };
             let (peer, path) = handshake_under_relay_authority(
                 settled,
-                Side::Provider(&refuse),
+                Side::Provider {
+                    refuse: &refuse,
+                    allow: &allow,
+                },
                 pair_id,
                 &pair,
                 &session,
                 &mut rx,
             )
             .await?;
-            Ok(if refuse.is_empty() {
-                Served::Taken(peer, path, hold)
-            } else {
-                Served::Refused(String::from_utf8_lossy(&refuse).into_owned(), peer)
+            // The verdict decides, so a pair the handshake refused - busy,
+            // broken bringup, or an unauthorized consumer - never reaches an
+            // adapter.
+            let refused = peer.refused().map(str::to_string);
+            Ok(match refused {
+                None => Served::Taken(peer, path, hold),
+                Some(reason) => Served::Refused(reason, peer),
             })
         };
         tokio::select! {
@@ -1543,15 +1561,22 @@ async fn inner_handshake(
 ) -> Result<PeerSession> {
     match side {
         Side::Consumer => PeerSession::consumer(path, identity, pair_id).await,
-        Side::Provider(refuse) => PeerSession::provider(path, identity, pair_id, refuse).await,
+        Side::Provider { refuse, allow } => {
+            PeerSession::provider(path, identity, pair_id, refuse, allow).await
+        }
     }
 }
 
-/// Which end of the pair a slot runs, and what a provider answers with.
+/// Which end of the pair a slot runs, and what a provider answers with: the
+/// refusal it can state before it knows who is asking, and the identities it
+/// admits once the handshake says who that is.
 #[derive(Clone, Copy)]
 enum Side<'a> {
     Consumer,
-    Provider(&'a [u8]),
+    Provider {
+        refuse: &'a [u8],
+        allow: &'a [[u8; 32]],
+    },
 }
 
 /// Which way a pair settled before its leg is opened.
@@ -1853,6 +1878,7 @@ mod tests {
         let slot = AbortOnDrop(crate::spawn(provider_slot(
             PROVIDES_EXIT,
             None,
+            Vec::new(),
             "secret".into(),
             control.clone(),
             None,
