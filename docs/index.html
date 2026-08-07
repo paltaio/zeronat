@@ -149,9 +149,9 @@
     <section id="install">
       <h2>Install</h2>
 <pre><code>curl -fsSL https://paltaio.github.io/zeronat/get.sh | sh</code></pre>
-      <p>The installer configures Docker or systemd, generates the 32-byte server identity, client
+      <p>The installer configures Docker, systemd, OpenRC, or procd, generates the 32-byte server identity, client
       credential, and admin secret from the operating system random source, then prints a client enrollment command. The launcher resolves an exact release,
-      verifies its Minisign manifest, and checks the installer length and SHA-256 digest before execution.</p>
+      verifies its Minisign manifest, and checks the platform package length and SHA-256 digest before running the bundled installer.</p>
 <pre><code>IMAGE="ghcr.io/paltaio/zeronat@sha256:&lt;64-hex-image-digest&gt;"
 docker pull "$IMAGE"</code></pre>
       <p>Use the image digest published with the release. Compose requires

@@ -1,6 +1,6 @@
 //! `zeronat upgrade`: detect how this host runs zeronat and, when a newer release
 //! is published, fetch it and restart in place. It orchestrates the host's own
-//! tools (curl, docker, systemctl) the way the installer does, because the
+//! tools (curl, docker, and the host service manager) the way the installer does, because the
 //! scratch container ships nothing it could upgrade itself with. Meant to run on
 //! the host, not inside the container.
 
@@ -11,8 +11,9 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use zeronat_install_support::{
     curl_fetch_command, download_release_image_with_keys, download_verified_asset_with_keys,
-    extract_package_member, replace_image_reference_in_env, DownloadFile, SelectedRelease,
-    TrustedKey, PACKAGE_BINARY,
+    extract_package_member, install_file_command, installed_service_command,
+    installed_service_manager, replace_image_reference_in_env, DownloadFile, SelectedRelease,
+    ServiceInstall, ServiceManager, TrustedKey, PACKAGE_BINARY, SERVICE_BINARY_PATH,
 };
 
 #[cfg(not(test))]
@@ -31,7 +32,7 @@ const TEST_RELEASE_SIGNATURE: &[u8] =
     include_bytes!("../crates/install-support/tests/fixtures/v0.25.1.manifest.minisig");
 #[cfg(test)]
 const TEST_RELEASE_PACKAGE: &[u8] = include_bytes!(
-    "../crates/install-support/tests/fixtures/zeronat-v0.25.1-x86_64-unknown-linux-musl.tar"
+    "../crates/install-support/tests/fixtures/zeronat-v0.25.1-x86_64-unknown-linux-musl.tar.gz"
 );
 #[cfg(test)]
 const TEST_RELEASE_BINARY: &[u8] =
@@ -41,8 +42,9 @@ const TEST_RELEASE_IMAGE: &str = "ghcr.io/paltaio/zeronat@sha256:000000000000000
 
 const ENV_FILE: &str = "/etc/zeronat/.env";
 const COMPOSE_FILE: &str = "/etc/zeronat/compose.yml";
-const BIN_PATH: &str = "/usr/local/bin/zeronat";
-const UNIT_FILE: &str = "/etc/systemd/system/zeronat.service";
+const BIN_PATH: &str = SERVICE_BINARY_PATH;
+const UNIT_FILE: &str = ServiceManager::Systemd.unit_path();
+const INIT_SCRIPT: &str = ServiceManager::Procd.unit_path();
 const CONTAINER: &str = "zeronat";
 const IMAGE_REPOSITORY: &str = "ghcr.io/paltaio/zeronat";
 const CONTAINER_USER: &str = "65532:65532";
@@ -104,49 +106,50 @@ impl UpgradeRunner for CommandRunner {
 }
 
 /// Check for a newer release and, unless `check_only`, upgrade every zeronat
-/// deployment found on this host (the systemd binary and/or a docker container).
+/// deployment found on this host (a host service and/or a docker container).
 pub fn run(check_only: bool) -> Result<()> {
     // Probe locally first so a host with nothing to upgrade fails fast, before
     // any network round-trip.
-    let systemd = systemd_version();
+    let service = service_deployment();
     let docker = docker_deployment();
 
-    if systemd.is_none() && docker.is_none() {
+    if service.is_none() && docker.is_none() {
         return Err(format!(
-            "no zeronat deployment found here (looked for {UNIT_FILE} with {BIN_PATH}, \
+            "no zeronat deployment found here (looked for {UNIT_FILE}, {INIT_SCRIPT}, and {BIN_PATH}, \
              and a docker container named {CONTAINER})"
         )
         .into());
     }
 
-    if let Some(version) = &systemd {
-        validate_installed_version("systemd", version)?;
+    if let Some(deployment) = &service {
+        validate_installed_version(deployment.manager.name(), &deployment.version)?;
     }
     if let Some(deployment) = &docker {
         validate_installed_version("docker", &deployment.version)?;
     }
 
     if !check_only {
-        validate_installed_credentials(systemd.is_some(), docker.as_ref())?;
+        validate_installed_credentials(service.as_ref(), docker.as_ref())?;
     }
 
     let latest = latest_release()?;
     let latest_version = latest.version();
-    let systemd_newer = systemd
+    let service_newer = service
         .as_ref()
-        .is_some_and(|current| version_newer(latest_version, current));
+        .is_some_and(|deployment| version_newer(latest_version, &deployment.version));
     let docker_newer = docker
         .as_ref()
         .is_some_and(|deployment| version_newer(latest_version, &deployment.version));
     let mut applied = false;
 
-    if let Some(current) = &systemd {
+    if let Some(deployment) = &service {
         println!(
-            "systemd: {}",
-            status_line(current, latest_version, systemd_newer)
+            "{}: {}",
+            deployment.manager.name(),
+            status_line(&deployment.version, latest_version, service_newer)
         );
-        if systemd_newer && !check_only {
-            upgrade_systemd(&latest)?;
+        if service_newer && !check_only {
+            upgrade_service(&latest, deployment.manager)?;
             applied = true;
         }
     }
@@ -173,7 +176,7 @@ pub fn run(check_only: bool) -> Result<()> {
 }
 
 fn validate_installed_credentials(
-    has_systemd: bool,
+    service: Option<&ServiceInstall>,
     docker: Option<&DockerDeployment>,
 ) -> Result<()> {
     let env = if Path::new(ENV_FILE).exists() {
@@ -184,16 +187,14 @@ fn validate_installed_credentials(
     };
     validate_credential_env(&env)?;
 
-    if has_systemd {
-        let unit = std::fs::read_to_string(UNIT_FILE)
-            .map_err(|e| format!("reading {UNIT_FILE} before upgrade: {e}"))?;
-        let command: Vec<&str> = unit
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("ExecStart="))
-            .map(str::split_whitespace)
-            .map(Iterator::collect)
-            .ok_or_else(|| format!("cannot determine the zeronat command in {UNIT_FILE}"))?;
-        validate_deployment_command(&command, "systemd", &env)?;
+    if let Some(deployment) = service {
+        let path = deployment.manager.unit_path();
+        let unit = std::fs::read_to_string(path)
+            .map_err(|e| format!("reading {path} before upgrade: {e}"))?;
+        let command = installed_service_command(deployment.manager, &unit)
+            .ok_or_else(|| format!("cannot determine the zeronat command in {path}"))?;
+        let command: Vec<&str> = command.iter().map(String::as_str).collect();
+        validate_deployment_command(&command, deployment.manager.name(), &env)?;
     }
 
     if let Some(deployment) = docker {
@@ -601,12 +602,21 @@ fn status_line(current: &str, latest: &str, newer: bool) -> String {
 
 // ---- discovery -----------------------------------------------------------
 
-fn systemd_version() -> Option<String> {
-    if Path::new(UNIT_FILE).exists() && Path::new(BIN_PATH).exists() {
-        Some(binary_version(BIN_PATH))
-    } else {
-        None
+fn service_deployment() -> Option<ServiceInstall> {
+    if !Path::new(BIN_PATH).exists() {
+        return None;
     }
+    let systemd_unit_exists = Path::new(UNIT_FILE).exists();
+    let init_script = if systemd_unit_exists {
+        None
+    } else {
+        std::fs::read_to_string(INIT_SCRIPT).ok()
+    };
+    let manager = installed_service_manager(systemd_unit_exists, init_script.as_deref())?;
+    Some(ServiceInstall {
+        manager,
+        version: binary_version(BIN_PATH),
+    })
 }
 
 /// Ask an installed binary its version; "unknown" when it predates `--version`
@@ -676,8 +686,8 @@ fn docker_mode() -> Option<DockerMode> {
 
 // ---- apply ---------------------------------------------------------------
 
-fn upgrade_systemd(release: &SelectedRelease) -> Result<()> {
-    upgrade_systemd_with(release, &mut CommandRunner)
+fn upgrade_service(release: &SelectedRelease, manager: ServiceManager) -> Result<()> {
+    upgrade_service_with(release, manager, &mut CommandRunner)
 }
 
 fn download_asset_with(
@@ -723,14 +733,11 @@ fn install_download_with(
     runner: &mut dyn UpgradeRunner,
 ) -> Result<()> {
     let input = download.prepare_install()?;
+    let (program, args) = install_file_command(destination, mode);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let installed = runner
-        .run_with_stdin(
-            true,
-            "install",
-            &["-m", mode, "/dev/stdin", destination],
-            input,
-        )
-        .map_err(|e| format!("running install: {e}"))?;
+        .run_with_stdin(true, program, &args, input)
+        .map_err(|e| format!("installing {destination}: {e}"))?;
     if installed.status.success() {
         Ok(())
     } else {
@@ -753,22 +760,35 @@ fn install_bytes_with(
     install_download_with(&mut download, mode, destination, runner)
 }
 
-fn upgrade_systemd_with(release: &SelectedRelease, runner: &mut dyn UpgradeRunner) -> Result<()> {
+fn upgrade_service_with(
+    release: &SelectedRelease,
+    manager: ServiceManager,
+    runner: &mut dyn UpgradeRunner,
+) -> Result<()> {
     if !have("curl") {
         return Err("curl is required to download the new binary".into());
     }
     let target = arch_target()?;
     let asset_name = release.package_name(target)?;
-    println!("systemd: downloading {asset_name} ({})", release.version());
+    println!(
+        "{}: downloading {asset_name} ({})",
+        manager.name(),
+        release.version()
+    );
     let mut package = download_asset_with(release, &asset_name, runner)?;
     let mut binary = extract_package_member(&mut package, PACKAGE_BINARY)?;
     install_download_with(&mut binary, "0755", BIN_PATH, runner)?;
-    println!("systemd: restarting service");
+    println!("{}: restarting service", manager.name());
+    let (program, args): (&str, &[&str]) = match manager {
+        ServiceManager::Systemd => ("systemctl", &["restart", "zeronat"]),
+        ServiceManager::OpenRc => ("rc-service", &["zeronat", "restart"]),
+        ServiceManager::Procd => (INIT_SCRIPT, &["restart"]),
+    };
     let res = runner
-        .run(true, "systemctl", &["restart", "zeronat"])
-        .map_err(|e| format!("running systemctl: {e}"))?;
+        .run(true, program, args)
+        .map_err(|e| format!("running {program}: {e}"))?;
     if !res.status.success() {
-        return Err(format!("systemctl restart: {}", errtext(&res)).into());
+        return Err(format!("{}: {}", args.join(" "), errtext(&res)).into());
     }
     Ok(())
 }
@@ -1121,8 +1141,8 @@ fn arch_target() -> Result<&'static str> {
         "aarch64" | "arm64" => "aarch64-unknown-linux-musl",
         "armv7l" => "armv7-unknown-linux-musleabihf",
         "armv6l" => "arm-unknown-linux-musleabihf",
-        "mips" => "mips-unknown-linux-gnu",
-        "mipsel" => "mipsel-unknown-linux-gnu",
+        "mips" => "mips-unknown-linux-musl",
+        "mipsel" => "mipsel-unknown-linux-musl",
         "mips64" => "mips64-unknown-linux-gnuabi64",
         "mips64el" => "mips64el-unknown-linux-gnuabi64",
         other => return Err(format!("unsupported architecture '{other}'").into()),
@@ -1286,31 +1306,35 @@ mod tests {
     }
 
     #[test]
-    fn systemd_upgrade_installs_the_held_download() {
-        let mut runner = FakeUpgradeRunner {
-            commands: Vec::new(),
-            installed: Vec::new(),
-        };
-
+    fn native_service_upgrades_install_the_held_download_and_restart() {
         let release = SelectedRelease::from_version("0.25.1").unwrap();
-        upgrade_systemd_with(&release, &mut runner).unwrap();
+        for (manager, restart) in [
+            (ServiceManager::Systemd, "systemctl restart zeronat"),
+            (ServiceManager::OpenRc, "rc-service zeronat restart"),
+            (ServiceManager::Procd, "/etc/init.d/zeronat restart"),
+        ] {
+            let mut runner = FakeUpgradeRunner {
+                commands: Vec::new(),
+                installed: Vec::new(),
+            };
+            upgrade_service_with(&release, manager, &mut runner).unwrap();
 
-        assert_eq!(runner.installed, TEST_RELEASE_BINARY);
-        assert!(runner
-            .commands
-            .iter()
-            .any(|command| command.starts_with("sh -c ")
-                && command.contains("ulimit -f")
-                && command.contains(" curl --fail ")
-                && command.contains("/zeronat-v0.25.1-linux-amd64.tar")
-                && !command.contains(" -o ")));
-        assert!(runner
-            .commands
-            .iter()
-            .any(|command| { command == "install -m 0755 /dev/stdin /usr/local/bin/zeronat" }));
-        assert!(runner
-            .commands
-            .contains(&"systemctl restart zeronat".to_string()));
+            assert_eq!(runner.installed, TEST_RELEASE_BINARY);
+            assert!(runner
+                .commands
+                .iter()
+                .any(|command| command.starts_with("sh -c ")
+                    && command.contains("ulimit -f")
+                    && command.contains(" curl --fail ")
+                    && command.contains("/zeronat-v0.25.1-linux-amd64.tar.gz")
+                    && !command.contains(" -o ")));
+            assert!(runner.commands.iter().any(|command| {
+                command.starts_with("sh -c ")
+                    && command.contains("mktemp \"${destination}.XXXXXX\"")
+                    && command.contains("/usr/local/bin/zeronat 0755")
+            }));
+            assert!(runner.commands.contains(&restart.to_string()));
+        }
     }
 
     #[test]

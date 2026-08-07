@@ -5,6 +5,8 @@
 use zntui::key::Key;
 use zntui::style::{Color, Line, Style, ACCENT, BAD, GOOD, MUTED, PLAIN, WARN};
 
+use crate::sys::{ServiceInstall, ServiceManager};
+
 const BOLD: Style = Style::fg(Color::Default).bold();
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -15,7 +17,7 @@ pub enum Mode {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Method {
     Docker,
-    Systemd,
+    Service,
 }
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Deploy {
@@ -42,12 +44,12 @@ struct PortItem {
 }
 
 /// An available upgrade for an existing install, shown as the first wizard step.
-/// `systemd` and `docker` hold the current version of each deployment that has a
+/// `service` and `docker` hold the current version of each deployment that has a
 /// newer release; a deployment already current is omitted.
 #[derive(Clone)]
 pub struct UpgradeOffer {
     pub latest: String,
-    pub systemd: Option<String>,
+    pub service: Option<ServiceInstall>,
     pub docker: Option<String>,
     pub compose: bool,
 }
@@ -66,6 +68,7 @@ const COMMON_PORTS: &[(&str, &str)] = &[
 pub struct Config {
     pub mode: Mode,
     pub method: Method,
+    pub service_manager: Option<ServiceManager>,
     pub deploy: Deploy,
     pub kind: Kind,
     pub ports: String,
@@ -100,14 +103,20 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(have_docker: bool, have_compose: bool, existing_secret: Option<String>) -> Config {
+    pub fn new(
+        have_docker: bool,
+        have_compose: bool,
+        service_manager: Option<ServiceManager>,
+        existing_secret: Option<String>,
+    ) -> Config {
         Config {
             mode: Mode::Server,
             method: if have_docker {
                 Method::Docker
             } else {
-                Method::Systemd
+                Method::Service
             },
+            service_manager,
             deploy: Deploy::Compose,
             kind: Kind::Ports,
             ports: String::new(),
@@ -378,25 +387,32 @@ impl App {
                     desc: "machine behind CG-NAT or a dynamic IP",
                 },
             ],
-            Step::Method => {
-                if self.cfg.have_docker {
+            Step::Method => match (self.cfg.have_docker, self.cfg.service_manager) {
+                (true, Some(manager)) => {
                     vec![
                         Opt {
                             label: "Docker",
                             desc: "run as a container (detected)",
                         },
                         Opt {
-                            label: "systemd",
+                            label: manager.name(),
                             desc: "download a static binary and run as a service",
                         },
                     ]
-                } else {
+                }
+                (false, Some(manager)) => {
                     vec![Opt {
-                        label: "systemd",
+                        label: manager.name(),
                         desc: "download a static binary and run as a service",
                     }]
                 }
-            }
+                (_, None) => {
+                    vec![Opt {
+                        label: "Docker",
+                        desc: "run as a container (detected)",
+                    }]
+                }
+            },
             Step::Deploy => {
                 if self.cfg.have_compose {
                     vec![
@@ -493,7 +509,11 @@ impl App {
     fn current_selection(&self) -> usize {
         match self.step {
             Step::Mode => (self.cfg.mode == Mode::Client) as usize,
-            Step::Method => (self.cfg.method == Method::Systemd && self.cfg.have_docker) as usize,
+            Step::Method => {
+                (self.cfg.method == Method::Service
+                    && self.cfg.have_docker
+                    && self.cfg.service_manager.is_some()) as usize
+            }
             Step::Deploy => (self.cfg.deploy == Deploy::Run && self.cfg.have_compose) as usize,
             Step::Kind => match self.cfg.kind {
                 Kind::Ports => 0,
@@ -526,10 +546,12 @@ impl App {
                 }
             }
             Step::Method => {
-                self.cfg.method = if self.cfg.have_docker && self.sel == 0 {
+                self.cfg.method = if self.cfg.have_docker
+                    && (self.cfg.service_manager.is_none() || self.sel == 0)
+                {
                     Method::Docker
                 } else {
-                    Method::Systemd
+                    Method::Service
                 };
             }
             Step::Deploy => {
@@ -955,8 +977,8 @@ impl App {
                 l.add(GOOD, &u.latest);
                 body.push(zntui::frame::row(w, l));
             };
-            if let Some(c) = &u.systemd {
-                row("systemd", c);
+            if let Some(service) = &u.service {
+                row(service.manager.name(), &service.version);
             }
             if let Some(c) = &u.docker {
                 row("docker", c);
@@ -1037,7 +1059,10 @@ impl App {
                         "run"
                     }
                 ),
-                Method::Systemd => "systemd".to_string(),
+                Method::Service => self.cfg.service_manager.map_or_else(
+                    || "service".to_string(),
+                    |manager| manager.name().to_string(),
+                ),
             },
             PLAIN,
         );
@@ -1136,7 +1161,10 @@ mod tests {
 
     #[test]
     fn entered_secret_uses_the_runtime_format() {
-        let mut app = App::new(Config::new(false, false, None), None);
+        let mut app = App::new(
+            Config::new(false, false, Some(ServiceManager::Systemd), None),
+            None,
+        );
         app.step = Step::SecretEntry;
         app.input = "short".into();
         assert!(!app.commit_input());
@@ -1149,7 +1177,15 @@ mod tests {
 
     #[test]
     fn reused_secret_is_validated() {
-        let mut app = App::new(Config::new(false, false, Some("short".into())), None);
+        let mut app = App::new(
+            Config::new(
+                false,
+                false,
+                Some(ServiceManager::Systemd),
+                Some("short".into()),
+            ),
+            None,
+        );
         app.step = Step::Secret;
         app.sel = 0;
         assert!(!app.apply_selection());
@@ -1158,7 +1194,7 @@ mod tests {
 
     #[test]
     fn client_enrollment_collects_credential_and_server_identity() {
-        let mut cfg = Config::new(false, false, None);
+        let mut cfg = Config::new(false, false, Some(ServiceManager::Systemd), None);
         cfg.mode = Mode::Client;
         let mut app = App::new(cfg, None);
         app.step = Step::Secret;

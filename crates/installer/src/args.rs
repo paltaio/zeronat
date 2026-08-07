@@ -5,7 +5,7 @@
 //! `build` combines those overrides with probed host state into a final Config,
 //! applying the same precedence and validation the flow needs.
 
-use crate::sys;
+use crate::sys::{self, ServiceManager};
 use crate::ui::{Config, Deploy, Kind, Method, Mode};
 
 /// Raw flag values, before any host probing or derivation. Every field is
@@ -41,6 +41,7 @@ pub struct Parsed {
 pub struct Host {
     pub have_docker: bool,
     pub have_compose: bool,
+    pub service_manager: Option<ServiceManager>,
     pub existing_secret: Option<String>,
     pub existing_client_secret: Option<String>,
     pub existing_admin_secret: Option<String>,
@@ -138,6 +139,7 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
     let mut cfg = Config::new(
         host.have_docker,
         host.have_compose,
+        host.service_manager,
         host.existing_secret.clone(),
     );
     cfg.existing_client_secret = host.existing_client_secret.clone();
@@ -159,27 +161,47 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
         _ => {}
     }
 
-    // method: default docker if present else systemd.
+    // method: default docker if present, otherwise use the detected service manager.
     cfg.method = if host.have_docker {
         Method::Docker
     } else {
-        Method::Systemd
+        Method::Service
     };
     if let Some(m) = &p.method {
         match m.as_str() {
             "docker" => {
                 if !host.have_docker {
-                    return Err("docker not installed; use --method systemd".into());
+                    return Err("docker is not installed".into());
                 }
                 cfg.method = Method::Docker;
             }
-            "systemd" => cfg.method = Method::Systemd,
+            "systemd" | "openrc" | "procd" => {
+                let requested = match m.as_str() {
+                    "systemd" => ServiceManager::Systemd,
+                    "openrc" => ServiceManager::OpenRc,
+                    "procd" => ServiceManager::Procd,
+                    _ => return Err("unsupported service manager".into()),
+                };
+                if host.service_manager != Some(requested) {
+                    return Err(format!(
+                        "{} was not detected on this host",
+                        requested.name()
+                    ));
+                }
+                cfg.method = Method::Service;
+                cfg.service_manager = Some(requested);
+            }
             other => {
                 if headless {
-                    return Err(format!("method must be docker or systemd (got '{other}')"));
+                    return Err(format!(
+                        "method must be docker, systemd, openrc, or procd (got '{other}')"
+                    ));
                 }
             }
         }
+    }
+    if cfg.method == Method::Service && cfg.service_manager.is_none() {
+        return Err("no supported service manager was detected".into());
     }
 
     // deploy (docker only): default compose, fall back to run if compose missing.
@@ -384,6 +406,7 @@ mod tests {
         Host {
             have_docker: false,
             have_compose: false,
+            service_manager: Some(ServiceManager::Systemd),
             existing_secret: None,
             existing_client_secret: None,
             existing_admin_secret: None,
@@ -807,6 +830,21 @@ mod tests {
         ]))
         .unwrap();
         assert!(build(&p, &host(), p.headless).is_err());
+    }
+
+    #[test]
+    fn service_method_must_match_the_detected_manager() {
+        let p = parse(&s(&[
+            "-y", "--server", "--ports", "80/tcp", "--method", "openrc",
+        ]))
+        .unwrap();
+        assert!(build(&p, &host(), p.headless).is_err());
+
+        let mut h = host();
+        h.service_manager = Some(ServiceManager::OpenRc);
+        let cfg = build(&p, &h, p.headless).unwrap();
+        assert_eq!(cfg.method, Method::Service);
+        assert_eq!(cfg.service_manager, Some(ServiceManager::OpenRc));
     }
 
     #[test]

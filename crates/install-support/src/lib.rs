@@ -6,12 +6,40 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 mod release;
+mod service;
 
 pub use release::{
     curl_fetch_command, download_release_image_with_keys, download_verified_asset_with_keys,
     extract_package_member, SelectedRelease, TrustedKey, PACKAGE_BINARY, PACKAGE_INSTALLER,
     TRUSTED_RELEASE_KEYS,
 };
+pub use service::{
+    installed_service_command, installed_service_manager, ServiceInstall, ServiceManager,
+    SERVICE_BINARY_PATH,
+};
+
+pub fn install_file_command(destination: &str, mode: &str) -> (&'static str, Vec<String>) {
+    let script = "set -eu
+destination=$1
+mode=$2
+umask 077
+temporary=$(mktemp \"${destination}.XXXXXX\")
+trap 'rm -f \"$temporary\"' EXIT HUP INT TERM
+cat > \"$temporary\"
+chmod \"$mode\" \"$temporary\"
+mv -f \"$temporary\" \"$destination\"
+trap - EXIT HUP INT TERM";
+    (
+        "sh",
+        vec![
+            "-c".into(),
+            script.into(),
+            "zeronat-install".into(),
+            destination.into(),
+            mode.into(),
+        ],
+    )
+}
 
 pub fn replace_image_reference_in_env(body: &[u8], image: &str) -> Result<Vec<u8>, String> {
     let text = std::str::from_utf8(body)
@@ -238,9 +266,11 @@ fn effective_uid() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{replace_image_reference_in_env, DownloadFile};
+    use super::{install_file_command, replace_image_reference_in_env, DownloadFile};
     use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
@@ -313,5 +343,34 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn install_command_writes_through_a_private_sibling() {
+        let base = test_dir("install-command");
+        let destination = base.join("zeronat");
+        std::fs::write(&destination, b"old").unwrap();
+        let destination = destination.to_str().unwrap();
+        let (program, args) = install_file_command(destination, "0755");
+        let mut child = Command::new(program)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"new binary")
+            .unwrap();
+
+        assert!(child.wait().unwrap().success());
+        assert_eq!(std::fs::read(destination).unwrap(), b"new binary");
+        assert_eq!(
+            std::fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 1);
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

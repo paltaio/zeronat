@@ -196,7 +196,7 @@ zeronat installer
   curl -fsSL https://paltaio.github.io/zeronat/get.sh | sh -s -- [options]
 
   --server | --client       side to install on this machine
-  --method docker|systemd   install method (default: docker if present, else systemd)
+  --method METHOD           docker, systemd, openrc, or procd
   --deploy compose|run      (docker only) compose file or plain docker run
   --ports \"443/tcp 80/tcp 51820/udp\"
   --all                     forward every port plus ICMP; keeps SSH on the server
@@ -262,6 +262,11 @@ fn real_main() -> i32 {
     }
     let have_docker = sys::have("docker");
     let have_compose = have_docker && sys::have_compose();
+    let service_manager = sys::service_manager();
+    if !have_docker && service_manager.is_none() {
+        eprintln!("error: no supported service manager or Docker installation was detected");
+        return 1;
+    }
     // Dry-run previews use the stored credentials that installation would reuse.
     let existing = sys::existing_secret();
     let existing_admin = sys::existing_admin_secret();
@@ -269,6 +274,7 @@ fn real_main() -> i32 {
     let host = Host {
         have_docker,
         have_compose,
+        service_manager,
         existing_secret: existing,
         existing_client_secret: existing_client,
         existing_admin_secret: existing_admin,
@@ -400,7 +406,7 @@ fn preflight_existing_install(
     installed: &sys::Installed,
     host: &Host,
 ) -> Result<(), String> {
-    if reinstall || (installed.systemd.is_none() && installed.docker.is_none()) {
+    if reinstall || (installed.service.is_none() && installed.docker.is_none()) {
         Ok(())
     } else {
         install::preflight_upgrade(installed, host)
@@ -412,22 +418,22 @@ fn preflight_existing_install(
 /// behind (or the latest version could not be determined).
 fn upgrade_offer(installed: &sys::Installed, latest: Option<&str>) -> Option<ui::UpgradeOffer> {
     let latest = latest?;
-    let systemd = installed
-        .systemd
+    let service = installed
+        .service
         .as_ref()
-        .filter(|c| sys::version_newer(latest, c))
+        .filter(|install| sys::version_newer(latest, &install.version))
         .cloned();
     let docker = installed
         .docker
         .as_ref()
         .filter(|c| sys::version_newer(latest, c))
         .cloned();
-    if systemd.is_none() && docker.is_none() {
+    if service.is_none() && docker.is_none() {
         return None;
     }
     Some(ui::UpgradeOffer {
         latest: latest.to_string(),
-        systemd,
+        service,
         docker,
         compose: installed.compose,
     })
@@ -654,7 +660,10 @@ mod tests {
     #[test]
     fn reinstall_bypasses_legacy_upgrade_preflight() {
         let installed = sys::Installed {
-            systemd: Some("0.25.0".into()),
+            service: Some(sys::ServiceInstall {
+                manager: sys::ServiceManager::Systemd,
+                version: "0.25.0".into(),
+            }),
             docker: None,
             compose: false,
         };
@@ -662,6 +671,7 @@ mod tests {
         let host = Host {
             have_docker: false,
             have_compose: false,
+            service_manager: Some(sys::ServiceManager::Systemd),
             existing_secret: Some(secret.into()),
             existing_client_secret: Some(secret.into()),
             existing_admin_secret: None,

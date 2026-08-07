@@ -3,7 +3,8 @@
 //! here touches the terminal, so it is safe to call while the TUI is on screen.
 
 use std::process::{Command, Output};
-use zeronat_install_support::SelectedRelease;
+use zeronat_install_support::{installed_service_manager, SelectedRelease, SERVICE_BINARY_PATH};
+pub use zeronat_install_support::{ServiceInstall, ServiceManager};
 
 pub fn is_root() -> bool {
     // SAFETY: geteuid has no failure mode and does not dereference memory.
@@ -26,6 +27,28 @@ pub fn have_compose() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+pub fn service_manager() -> Option<ServiceManager> {
+    detect_service_manager(|path| std::path::Path::new(path).exists(), have)
+}
+
+fn detect_service_manager(
+    exists: impl Fn(&str) -> bool,
+    command_exists: impl Fn(&str) -> bool,
+) -> Option<ServiceManager> {
+    if exists("/run/systemd/system") && command_exists("systemctl") {
+        Some(ServiceManager::Systemd)
+    } else if exists("/etc/rc.common") && exists("/sbin/procd") {
+        Some(ServiceManager::Procd)
+    } else if exists("/sbin/openrc-run")
+        && command_exists("rc-service")
+        && command_exists("rc-update")
+    {
+        Some(ServiceManager::OpenRc)
+    } else {
+        None
+    }
 }
 
 /// `docker compose` vs the legacy `docker-compose`; empty if neither is present.
@@ -220,31 +243,37 @@ pub fn ssh_port() -> u16 {
 }
 
 /// Versions of any zeronat already installed on this host, used to offer an
-/// upgrade before a fresh install. `systemd` is the installed binary's version;
-/// `docker` is the version the running container reports. Either is None when
-/// that deployment is absent.
+/// upgrade before a fresh install.
 pub struct Installed {
-    pub systemd: Option<String>,
+    pub service: Option<ServiceInstall>,
     pub docker: Option<String>,
     pub compose: bool,
 }
 
 pub fn installed() -> Installed {
     Installed {
-        systemd: systemd_version(),
+        service: service_version(),
         docker: docker_version(),
         compose: std::path::Path::new("/etc/zeronat/compose.yml").exists(),
     }
 }
 
-fn systemd_version() -> Option<String> {
-    let unit = std::path::Path::new("/etc/systemd/system/zeronat.service");
-    let bin = "/usr/local/bin/zeronat";
-    if unit.exists() && std::path::Path::new(bin).exists() {
-        Some(binary_version(bin))
-    } else {
-        None
+fn service_version() -> Option<ServiceInstall> {
+    let bin = SERVICE_BINARY_PATH;
+    if !std::path::Path::new(bin).exists() {
+        return None;
     }
+    let systemd_unit_exists = std::path::Path::new(ServiceManager::Systemd.unit_path()).exists();
+    let init_script = if systemd_unit_exists {
+        None
+    } else {
+        std::fs::read_to_string(ServiceManager::OpenRc.unit_path()).ok()
+    };
+    let manager = installed_service_manager(systemd_unit_exists, init_script.as_deref())?;
+    Some(ServiceInstall {
+        manager,
+        version: binary_version(bin),
+    })
 }
 
 /// "unknown" when the binary predates `--version` or cannot run.
@@ -352,8 +381,8 @@ pub fn arch_target() -> Result<&'static str, String> {
         "aarch64" | "arm64" => "aarch64-unknown-linux-musl",
         "armv7l" => "armv7-unknown-linux-musleabihf",
         "armv6l" => "arm-unknown-linux-musleabihf",
-        "mips" => "mips-unknown-linux-gnu",
-        "mipsel" => "mipsel-unknown-linux-gnu",
+        "mips" => "mips-unknown-linux-musl",
+        "mipsel" => "mipsel-unknown-linux-musl",
         "mips64" => "mips64-unknown-linux-gnuabi64",
         "mips64el" => "mips64el-unknown-linux-gnuabi64",
         other => return Err(format!("unsupported arch '{other}'")),
@@ -405,5 +434,26 @@ mod tests {
         assert!(!version_newer("unknown", "0.14.0"));
         assert!(!version_newer("0.14.0", "0.13"));
         assert!(!version_newer("0.14.0", "0.13.0-rc1"));
+    }
+
+    #[test]
+    fn service_manager_detection_uses_the_running_init_system() {
+        let systemd = detect_service_manager(
+            |path| path == "/run/systemd/system",
+            |command| command == "systemctl",
+        );
+        assert_eq!(systemd, Some(ServiceManager::Systemd));
+
+        let procd = detect_service_manager(
+            |path| matches!(path, "/etc/rc.common" | "/sbin/procd"),
+            |_| false,
+        );
+        assert_eq!(procd, Some(ServiceManager::Procd));
+
+        let openrc = detect_service_manager(
+            |path| path == "/sbin/openrc-run",
+            |command| matches!(command, "rc-service" | "rc-update"),
+        );
+        assert_eq!(openrc, Some(ServiceManager::OpenRc));
     }
 }

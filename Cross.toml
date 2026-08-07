@@ -1,0 +1,11 @@
+[target.mips-unknown-linux-musl]
+build-std = true
+pre-build = [
+  "echo '' | mips-linux-muslsf-gcc -x c -c -o /tmp/empty.o - && ar rcs /usr/local/mips-linux-muslsf/lib/libunwind.a /tmp/empty.o",
+]
+
+[target.mipsel-unknown-linux-musl]
+build-std = true
+pre-build = [
+  "echo '' | mipsel-linux-muslsf-gcc -x c -c -o /tmp/empty.o - && ar rcs /usr/local/mipsel-linux-muslsf/lib/libunwind.a /tmp/empty.o",
+]

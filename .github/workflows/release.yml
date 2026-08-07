@@ -24,8 +24,8 @@ jobs:
           - armv7-unknown-linux-gnueabihf
           - armv7-unknown-linux-musleabihf
           # mips (tier 3, built from source via build-std)
-          - mips-unknown-linux-gnu
-          - mipsel-unknown-linux-gnu
+          - mips-unknown-linux-musl
+          - mipsel-unknown-linux-musl
           - mips64-unknown-linux-gnuabi64
           - mips64el-unknown-linux-gnuabi64
     steps:
@@ -52,9 +52,16 @@ jobs:
         env:
           RUSTFLAGS: '-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort -Cforce-unwind-tables=no --cfg curve25519_dalek_backend="serial"'
         run: |
+          target=${{ matrix.target }}
+          case "$target" in
+            mips-unknown-linux-musl|mipsel-unknown-linux-musl)
+              RUSTFLAGS="$RUSTFLAGS -Ctarget-feature=+crt-static -Clink-self-contained=no"
+              export RUSTFLAGS
+              ;;
+          esac
           cross build --release --locked \
             -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
-            --target ${{ matrix.target }}
+            --target "$target"
 
       - name: Package
         run: install -D "target/${{ matrix.target }}/release/zeronat" "out/zeronat"
@@ -127,8 +134,8 @@ jobs:
           - aarch64-unknown-linux-musl
           - armv7-unknown-linux-musleabihf
           - arm-unknown-linux-musleabihf
-          - mips-unknown-linux-gnu
-          - mipsel-unknown-linux-gnu
+          - mips-unknown-linux-musl
+          - mipsel-unknown-linux-musl
           - mips64-unknown-linux-gnuabi64
           - mips64el-unknown-linux-gnuabi64
     steps:
@@ -149,9 +156,16 @@ jobs:
         env:
           RUSTFLAGS: '-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort -Cforce-unwind-tables=no'
         run: |
+          target=${{ matrix.target }}
+          case "$target" in
+            mips-unknown-linux-musl|mipsel-unknown-linux-musl)
+              RUSTFLAGS="$RUSTFLAGS -Ctarget-feature=+crt-static -Clink-self-contained=no"
+              export RUSTFLAGS
+              ;;
+          esac
           cross build --release --locked \
             -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
-            --target ${{ matrix.target }} -p zeronat-installer
+            --target "$target" -p zeronat-installer
 
       - name: Stage installer
         run: install -D "target/${{ matrix.target }}/release/zeronat-installer" "out/zeronat-installer-${{ matrix.target }}"
@@ -243,8 +257,8 @@ jobs:
               arm-unknown-linux-musleabihf) platform=linux-armv6 ;;
               armv7-unknown-linux-gnueabihf) platform=linux-armv7-gnu ;;
               armv7-unknown-linux-musleabihf) platform=linux-armv7 ;;
-              mips-unknown-linux-gnu) platform=linux-mips ;;
-              mipsel-unknown-linux-gnu) platform=linux-mipsel ;;
+              mips-unknown-linux-musl) platform=linux-mips ;;
+              mipsel-unknown-linux-musl) platform=linux-mipsel ;;
               mips64-unknown-linux-gnuabi64) platform=linux-mips64 ;;
               mips64el-unknown-linux-gnuabi64) platform=linux-mips64el ;;
               x86_64-unknown-freebsd) platform=freebsd-amd64 ;;
@@ -262,8 +276,8 @@ jobs:
               members+=(zeronat-installer)
             fi
             tar --format=ustar --owner=0 --group=0 --numeric-owner \
-              --mtime="@$source_date_epoch" -cf "out/zeronat-$tag-$platform.tar" \
-              -C "$package_dir" "${members[@]}"
+              --mtime="@$source_date_epoch" -cf - -C "$package_dir" "${members[@]}" \
+              | gzip -9 -n > "out/zeronat-$tag-$platform.tar.gz"
             rm -rf "$package_dir"
           done
 
@@ -283,11 +297,11 @@ jobs:
             echo "release $tag already exists" >&2
             exit 1
           fi
-          test "$(find out -maxdepth 1 -type f -name "zeronat-$tag-*.tar" | wc -l)" -eq 14
+          test "$(find out -maxdepth 1 -type f -name "zeronat-$tag-*.tar.gz" | wc -l)" -eq 14
           installer_packages=0
           expected_with_installer=$(printf 'zeronat\nzeronat-installer')
-          for package in out/zeronat-*.tar; do
-            members=$(tar -tf "$package")
+          for package in out/zeronat-*.tar.gz; do
+            members=$(tar -tzf "$package")
             if test "$members" = zeronat; then
               continue
             fi
@@ -338,7 +352,7 @@ jobs:
             printf 'zeronat-release-v2 %s\n' "$tag"
             printf 'zeronat-image %s\n' "$(cat image-references/zeronat-image.txt)"
             printf 'znpppoe-image %s\n' "$(cat image-references/znpppoe-image.txt)"
-            for asset in out/zeronat-*.tar; do
+            for asset in out/zeronat-*.tar.gz; do
               printf '%s %s %s\n' \
                 "$(sha256sum "$asset" | awk '{print $1}')" \
                 "$(stat -c '%s' "$asset")" \
@@ -358,7 +372,7 @@ jobs:
           tag=${GITHUB_REF#refs/tags/}
           manifest="out/release.manifest"
           signature="out/release.manifest.minisig"
-          release_assets=(out/zeronat-*.tar "$manifest" "$signature")
+          release_assets=(out/zeronat-*.tar.gz "$manifest" "$signature")
           test "${#release_assets[@]}" -eq 16
           git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
           test "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA"

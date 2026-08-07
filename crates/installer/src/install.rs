@@ -7,8 +7,9 @@ use std::io::Write as _;
 use std::process::Output;
 use zeronat_install_support::{
     curl_fetch_command, download_release_image_with_keys, download_verified_asset_with_keys,
-    extract_package_member, replace_image_reference_in_env, DownloadFile, SelectedRelease,
-    TrustedKey, PACKAGE_BINARY,
+    extract_package_member, install_file_command, installed_service_command,
+    replace_image_reference_in_env, DownloadFile, SelectedRelease, TrustedKey, PACKAGE_BINARY,
+    SERVICE_BINARY_PATH,
 };
 
 #[cfg(not(test))]
@@ -26,11 +27,11 @@ const TEST_RELEASE_SIGNATURE: &[u8] =
     include_bytes!("../../install-support/tests/fixtures/v0.25.1.manifest.minisig");
 #[cfg(test)]
 const TEST_RELEASE_PACKAGE: &[u8] = include_bytes!(
-    "../../install-support/tests/fixtures/zeronat-v0.25.1-x86_64-unknown-linux-musl.tar"
+    "../../install-support/tests/fixtures/zeronat-v0.25.1-x86_64-unknown-linux-musl.tar.gz"
 );
 use crate::args::Host;
 use crate::bridge;
-use crate::sys::{self, errtext, ok};
+use crate::sys::{self, errtext, ok, ServiceManager};
 use crate::ui::{Config, Deploy, Kind, Method, Mode, UpgradeOffer};
 
 /// Seconds the operator has to confirm a risky bridge before it auto-reverts.
@@ -49,8 +50,10 @@ const COMPOSE_FILE: &str = "/etc/zeronat/compose.yml";
 /// servers have per-port routes worth persisting.
 const DATA_DIR: &str = "/etc/zeronat/data";
 const CONFIG_FILE: &str = "/etc/zeronat/data/server.toml";
-const BIN_PATH: &str = "/usr/local/bin/zeronat";
-const UNIT: &str = "/etc/systemd/system/zeronat.service";
+const BIN_DIR: &str = "/usr/local/bin";
+const BIN_PATH: &str = SERVICE_BINARY_PATH;
+const INIT_SCRIPT: &str = ServiceManager::Procd.unit_path();
+const OPENRC_LOG: &str = "/var/log/zeronat.log";
 const COMPOSE: &[u8] = include_bytes!("../../../compose.yml");
 const COMPOSE_BRIDGE: &[u8] = include_bytes!("../../../compose.bridge.yml");
 
@@ -87,7 +90,7 @@ struct Started {
 
 enum InstallTarget {
     Docker { image: String },
-    Systemd,
+    Service,
 }
 
 /// Drives the install. Every external command goes through `run` so the UI can
@@ -143,12 +146,9 @@ fn download_binary(
     let mut package = download_asset(r, release, &asset_name)?;
     let mut binary = extract_package_member(&mut package, PACKAGE_BINARY)?;
     let input = binary.prepare_install()?;
-    let out = r.run_with_stdin(
-        true,
-        "install",
-        &["-m", "0755", "/dev/stdin", BIN_PATH],
-        input,
-    )?;
+    let (program, args) = install_file_command(BIN_PATH, "0755");
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = r.run_with_stdin(true, program, &args, input)?;
     if !ok(&out) {
         return Err(format!("install binary: {}", errtext(&out)));
     }
@@ -194,8 +194,7 @@ fn image_for_config_render(version: &str) -> Result<String, String> {
     Ok(format!("{IMAGE_REPOSITORY}:{version}"))
 }
 
-/// Write `content` to `dest` with `mode` as root: stage a temp file and let the
-/// runner's `install` set the mode and ownership.
+/// Write `content` to `dest` with `mode` as root through a temporary sibling.
 fn place(r: &mut dyn Runner, content: &[u8], mode: &str, dest: &str) -> Result<(), String> {
     let mut staged = DownloadFile::create()?;
     staged
@@ -208,7 +207,9 @@ fn place(r: &mut dyn Runner, content: &[u8], mode: &str, dest: &str) -> Result<(
 }
 
 fn place_file(r: &mut dyn Runner, input: &File, mode: &str, dest: &str) -> Result<(), String> {
-    let out = r.run_with_stdin(true, "install", &["-m", mode, "/dev/stdin", dest], input)?;
+    let (program, args) = install_file_command(dest, mode);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = r.run_with_stdin(true, program, &args, input)?;
     if ok(&out) {
         Ok(())
     } else {
@@ -319,7 +320,7 @@ fn console_cmd(cfg: &Config) -> Option<String> {
         // container receives ZERONAT_ADMIN_SECRET from its env file.
         Method::Docker => format!("docker exec -it zeronat /zeronat admin --server {target}"),
         // sudo lets admin read the root-owned installer environment file.
-        Method::Systemd => format!("sudo {BIN_PATH} admin --server {target}"),
+        Method::Service => format!("sudo {BIN_PATH} admin --server {target}"),
     })
 }
 
@@ -416,7 +417,7 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
             let image = download_image_reference(r, &release)?;
             InstallTarget::Docker { image }
         }
-        Method::Systemd => InstallTarget::Systemd,
+        Method::Service => InstallTarget::Service,
     };
 
     r.step(format!("preparing {ETC_DIR}"));
@@ -427,17 +428,20 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
     // Port-forwarding servers persist routes into DATA_DIR; the dir must exist so
     // the mount source is present and the server's atomic rewrite has a temp dir.
     if cfg.mode == Mode::Server && cfg.kind == Kind::Ports {
-        let out = if cfg.method == Method::Docker {
-            r.run(
-                true,
-                "install",
-                &["-d", "-m", "0700", "-o", "65532", "-g", "65532", DATA_DIR],
-            )?
-        } else {
-            r.run(true, "mkdir", &["-p", DATA_DIR])?
-        };
+        let out = r.run(true, "mkdir", &["-p", DATA_DIR])?;
         if !ok(&out) {
             return Err(format!("prepare {DATA_DIR}: {}", errtext(&out)));
+        }
+        if cfg.method == Method::Docker {
+            for (program, args) in [
+                ("chmod", &["0700", DATA_DIR][..]),
+                ("chown", &["65532:65532", DATA_DIR][..]),
+            ] {
+                let out = r.run(true, program, args)?;
+                if !ok(&out) {
+                    return Err(format!("prepare {DATA_DIR}: {}", errtext(&out)));
+                }
+            }
         }
     }
 
@@ -451,7 +455,7 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
 
     let started = match &target {
         InstallTarget::Docker { image } => install_docker(cfg, &sub, image, r)?,
-        InstallTarget::Systemd => install_systemd(cfg, &sub, r)?,
+        InstallTarget::Service => install_service(cfg, &sub, r)?,
     };
 
     let mut cmds = vec![Cmd {
@@ -659,21 +663,21 @@ fn dry_run(cfg: &Config, _sub: &str, r: &mut dyn Runner) -> Result<Outcome, Stri
                 },
             ]
         }
-        Method::Systemd => {
+        Method::Service => {
             let target = sys::arch_target().unwrap_or("this arch");
+            let manager = cfg
+                .service_manager
+                .ok_or("no supported service manager was detected")?;
             r.info(format!("target {target}"));
-            dstep(r, "would download the binary and write a systemd unit");
+            dstep(
+                r,
+                &format!(
+                    "would download the binary and write a {} service",
+                    manager.name()
+                ),
+            );
             dstep(r, "would enable and restart the service");
-            vec![
-                Cmd {
-                    label: "status",
-                    cmd: "systemctl status zeronat".into(),
-                },
-                Cmd {
-                    label: "logs",
-                    cmd: "journalctl -u zeronat -f".into(),
-                },
-            ]
+            service_commands(manager)
         }
     };
     if let Some(console) = console_cmd(cfg) {
@@ -695,12 +699,14 @@ fn dry_run(cfg: &Config, _sub: &str, r: &mut dyn Runner) -> Result<Outcome, Stri
 /// Upgrade the existing install in place: download the latest binary and restart
 /// the service, and/or install signed container metadata and recreate the container.
 pub fn upgrade(offer: &UpgradeOffer, host: &Host, r: &mut dyn Runner) -> Result<Outcome, String> {
-    validate_installed_version("systemd", offer.systemd.as_deref())?;
+    if let Some(service) = &offer.service {
+        validate_installed_version(service.manager.name(), Some(&service.version))?;
+    }
     validate_installed_version("docker", offer.docker.as_deref())?;
     validate_upgrade_credentials(host)?;
     validate_upgrade_deployments(offer, host)?;
-    if offer.systemd.is_some() {
-        upgrade_systemd(offer, r)?;
+    if offer.service.is_some() {
+        upgrade_service(offer, r)?;
     }
     if offer.docker.is_some() {
         upgrade_docker(offer, r)?;
@@ -710,11 +716,13 @@ pub fn upgrade(offer: &UpgradeOffer, host: &Host, r: &mut dyn Runner) -> Result<
 
 pub fn preflight_upgrade(installed: &sys::Installed, host: &Host) -> Result<(), String> {
     validate_upgrade_credentials(host)?;
-    validate_installed_version("systemd", installed.systemd.as_deref())?;
+    if let Some(service) = &installed.service {
+        validate_installed_version(service.manager.name(), Some(&service.version))?;
+    }
     validate_installed_version("docker", installed.docker.as_deref())?;
     let offer = UpgradeOffer {
         latest: String::new(),
-        systemd: installed.systemd.clone(),
+        service: installed.service.clone(),
         docker: installed.docker.clone(),
         compose: installed.compose,
     };
@@ -750,18 +758,16 @@ fn validate_upgrade_credentials(host: &Host) -> Result<(), String> {
 }
 
 fn validate_upgrade_deployments(offer: &UpgradeOffer, host: &Host) -> Result<(), String> {
-    if offer.systemd.is_some() {
-        let out = sys::run(true, "cat", &[UNIT])?;
+    if let Some(service) = &offer.service {
+        let path = service.manager.unit_path();
+        let out = sys::run(true, "cat", &[path])?;
         if !ok(&out) {
-            return Err(format!("reading {UNIT} before upgrade: {}", errtext(&out)));
+            return Err(format!("reading {path} before upgrade: {}", errtext(&out)));
         }
-        let unit = String::from_utf8_lossy(&out.stdout);
-        let command: Vec<String> = unit
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("ExecStart="))
-            .map(|line| line.split_whitespace().map(str::to_string).collect())
-            .ok_or_else(|| format!("cannot determine the zeronat command in {UNIT}"))?;
-        validate_upgrade_command(&command, "systemd", host)?;
+        let command =
+            installed_service_command(service.manager, &String::from_utf8_lossy(&out.stdout))
+                .ok_or_else(|| format!("cannot determine the zeronat command in {path}"))?;
+        validate_upgrade_command(&command, service.manager.name(), host)?;
     }
 
     if offer.docker.is_some() {
@@ -1307,7 +1313,11 @@ fn config_bool(line: &str, key: &str) -> Result<Option<bool>, String> {
     }
 }
 
-fn upgrade_systemd(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<(), String> {
+fn upgrade_service(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<(), String> {
+    let service = offer
+        .service
+        .as_ref()
+        .ok_or("cannot determine the installed service manager")?;
     let target = sys::arch_target()?;
     r.info(format!("target {target}"));
     let release = SelectedRelease::from_version(&offer.latest)?;
@@ -1316,10 +1326,7 @@ fn upgrade_systemd(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<(), Strin
     download_binary(r, &release, target)?;
 
     r.step("restarting service".into());
-    let out = r.run(true, "systemctl", &["restart", "zeronat"])?;
-    if !ok(&out) {
-        return Err(format!("systemctl restart: {}", errtext(&out)));
-    }
+    restart_service(service.manager, r)?;
     Ok(())
 }
 
@@ -1563,8 +1570,13 @@ fn inspect_image_env(r: &mut dyn Runner, image: &str) -> Result<Vec<String>, Str
 
 fn upgrade_outcome(offer: &UpgradeOffer) -> Outcome {
     let mut parts = Vec::new();
-    if let Some(c) = &offer.systemd {
-        parts.push(format!("systemd {c} -> {}", offer.latest));
+    if let Some(service) = &offer.service {
+        parts.push(format!(
+            "{} {} -> {}",
+            service.manager.name(),
+            service.version,
+            offer.latest
+        ));
     }
     if let Some(c) = &offer.docker {
         parts.push(format!("docker {c} -> {}", offer.latest));
@@ -1596,17 +1608,10 @@ fn upgrade_outcome(offer: &UpgradeOffer) -> Outcome {
                 },
             ]
         }
+    } else if let Some(service) = &offer.service {
+        service_commands(service.manager)
     } else {
-        vec![
-            Cmd {
-                label: "status",
-                cmd: "systemctl status zeronat".into(),
-            },
-            Cmd {
-                label: "logs",
-                cmd: "journalctl -u zeronat -f".into(),
-            },
-        ]
+        Vec::new()
     };
     Outcome {
         headline: format!("zeronat upgraded: {summary}"),
@@ -1711,7 +1716,7 @@ fn install_docker(
             args.extend(["-v".into(), format!("{DATA_DIR}:{DATA_DIR}")]);
         }
         args.extend(["--env-file".into(), ENV_FILE.into(), image.into()]);
-        args.extend(sub.split_whitespace().map(|s| s.to_string()));
+        args.extend(service_args(sub)?.into_iter().map(str::to_string));
         let aref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         r.step("starting container".into());
         let out = r.run(true, "docker", &aref)?;
@@ -1759,54 +1764,91 @@ fn compose(
     }
 }
 
-fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started, String> {
-    let target = sys::arch_target()?;
-    r.info(format!("target {target}"));
-    let release = release_for_install()?;
+fn service_args(sub: &str) -> Result<Vec<&str>, String> {
+    sub.split_whitespace()
+        .map(|arg| {
+            let supported = arg.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'-' | b'_' | b'.' | b':' | b'/' | b'[' | b']' | b'%' | b'@' | b'+'
+                    )
+            });
+            if supported {
+                Ok(arg)
+            } else {
+                Err("deployment arguments contain unsupported characters".to_string())
+            }
+        })
+        .collect()
+}
 
-    r.step("downloading zeronat binary".into());
-    download_binary(r, &release, target)?;
+fn service_content(manager: ServiceManager, cfg: &Config, sub: &str) -> Result<String, String> {
+    let args = service_args(sub)?.join(" ");
+    let mode = mode_str(cfg);
+    Ok(match manager {
+        ServiceManager::Systemd => format!(
+            "[Unit]\n\
+             Description=zeronat {mode}\n\
+             After=network-online.target\n\
+             Wants=network-online.target\n\n\
+             [Service]\n\
+             EnvironmentFile={ENV_FILE}\n\
+             StateDirectory=zeronat\n\
+             ExecStart={BIN_PATH} {args}\n\
+             Restart=always\n\
+             RestartSec=3\n\n\
+             [Install]\n\
+             WantedBy=multi-user.target\n"
+        ),
+        ServiceManager::OpenRc => format!(
+            "#!/sbin/openrc-run\n\n\
+             description=\"zeronat {mode}\"\n\
+             supervisor=\"supervise-daemon\"\n\
+             command=\"{BIN_PATH}\"\n\
+             command_args=\"{args}\"\n\
+             pidfile=\"/run/zeronat.pid\"\n\
+             respawn_delay=3\n\
+             respawn_max=0\n\
+             output_log=\"{OPENRC_LOG}\"\n\
+             error_log=\"{OPENRC_LOG}\"\n\
+             required_files=\"{ENV_FILE}\"\n\n\
+             set -a\n\
+             . {ENV_FILE}\n\
+             set +a\n\n\
+             depend() {{\n\
+                 need net\n\
+             }}\n\n\
+             start_pre() {{\n\
+                 checkpath --file --mode 0644 \"$output_log\"\n\
+             }}\n"
+        ),
+        ServiceManager::Procd => format!(
+            "#!/bin/sh /etc/rc.common\n\n\
+             START=95\n\
+             STOP=05\n\
+             USE_PROCD=1\n\n\
+             start_service() {{\n\
+                 . {ENV_FILE}\n\n\
+                 procd_open_instance\n\
+                 procd_set_param command {BIN_PATH} {args}\n\
+                 procd_set_param env \"ZERONAT_SECRET=$ZERONAT_SECRET\"\n\
+                 [ -z \"${{ZERONAT_CLIENT_ID+x}}\" ] || procd_append_param env \"ZERONAT_CLIENT_ID=$ZERONAT_CLIENT_ID\"\n\
+                 [ -z \"${{ZERONAT_CLIENT_SECRET+x}}\" ] || procd_append_param env \"ZERONAT_CLIENT_SECRET=$ZERONAT_CLIENT_SECRET\"\n\
+                 [ -z \"${{ZERONAT_ADMIN_SECRET+x}}\" ] || procd_append_param env \"ZERONAT_ADMIN_SECRET=$ZERONAT_ADMIN_SECRET\"\n\
+                 procd_set_param file {ENV_FILE}\n\
+                 procd_set_param respawn 3600 3 0\n\
+                 procd_set_param stdout 1\n\
+                 procd_set_param stderr 1\n\
+                 procd_close_instance\n\
+             }}\n"
+        ),
+    })
+}
 
-    r.step("writing systemd unit".into());
-    let mode = match cfg.mode {
-        Mode::Server => "server",
-        Mode::Client => "client",
-    };
-    let unit = format!(
-        "[Unit]\n\
-         Description=zeronat {mode}\n\
-         After=network-online.target\n\
-         Wants=network-online.target\n\n\
-         [Service]\n\
-         EnvironmentFile={ENV_FILE}\n\
-         StateDirectory=zeronat\n\
-         ExecStart={BIN_PATH} {sub}\n\
-         Restart=always\n\
-         RestartSec=3\n\n\
-         [Install]\n\
-         WantedBy=multi-user.target\n"
-    );
-    place(r, unit.as_bytes(), "0644", UNIT)?;
-
-    r.step("enabling service".into());
-    let out = r.run(true, "systemctl", &["daemon-reload"])?;
-    if !ok(&out) {
-        return Err(format!("daemon-reload: {}", errtext(&out)));
-    }
-    let out = r.run(true, "systemctl", &["enable", "zeronat"])?;
-    if !ok(&out) {
-        return Err(format!("enable: {}", errtext(&out)));
-    }
-    // `enable --now` is a no-op on an already-active unit, so a re-install with
-    // a changed env file or unit would keep running the old config. Restart
-    // applies it; on a fresh install it is the start.
-    let out = r.run(true, "systemctl", &["restart", "zeronat"])?;
-    if !ok(&out) {
-        return Err(format!("restart: {}", errtext(&out)));
-    }
-    Ok(Started {
-        ran: "systemctl enable zeronat && systemctl restart zeronat".into(),
-        cmds: vec![
+fn service_commands(manager: ServiceManager) -> Vec<Cmd> {
+    match manager {
+        ServiceManager::Systemd => vec![
             Cmd {
                 label: "status",
                 cmd: "systemctl status zeronat".into(),
@@ -1816,8 +1858,88 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Starte
                 cmd: "journalctl -u zeronat -f".into(),
             },
         ],
+        ServiceManager::OpenRc => vec![
+            Cmd {
+                label: "status",
+                cmd: "rc-service zeronat status".into(),
+            },
+            Cmd {
+                label: "logs",
+                cmd: format!("tail -f {OPENRC_LOG}"),
+            },
+        ],
+        ServiceManager::Procd => vec![
+            Cmd {
+                label: "status",
+                cmd: "/etc/init.d/zeronat status".into(),
+            },
+            Cmd {
+                label: "logs",
+                cmd: "logread -e zeronat -f".into(),
+            },
+        ],
+    }
+}
+
+fn restart_service(manager: ServiceManager, r: &mut dyn Runner) -> Result<String, String> {
+    let commands: &[(&str, &[&str])] = match manager {
+        ServiceManager::Systemd => &[
+            ("systemctl", &["daemon-reload"]),
+            ("systemctl", &["enable", "zeronat"]),
+            ("systemctl", &["restart", "zeronat"]),
+        ],
+        ServiceManager::OpenRc => &[
+            ("rc-update", &["add", "zeronat", "default"]),
+            ("rc-service", &["zeronat", "restart"]),
+        ],
+        ServiceManager::Procd => &[(INIT_SCRIPT, &["enable"]), (INIT_SCRIPT, &["restart"])],
+    };
+    for (program, args) in commands {
+        let out = r.run(true, program, args)?;
+        if !ok(&out) {
+            return Err(format!("{}: {}", args.join(" "), errtext(&out)));
+        }
+    }
+    Ok(commands
+        .iter()
+        .map(|(program, args)| format!("{program} {}", args.join(" ")))
+        .collect::<Vec<_>>()
+        .join(" && "))
+}
+
+fn install_service(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started, String> {
+    let target = sys::arch_target()?;
+    r.info(format!("target {target}"));
+    let release = release_for_install()?;
+
+    let out = r.run(true, "mkdir", &["-p", BIN_DIR])?;
+    if !ok(&out) {
+        return Err(format!("mkdir {BIN_DIR}: {}", errtext(&out)));
+    }
+
+    r.step("downloading zeronat binary".into());
+    download_binary(r, &release, target)?;
+
+    let manager = cfg
+        .service_manager
+        .ok_or("no supported service manager was detected")?;
+    r.step(format!("writing {} service", manager.name()));
+    let content = service_content(manager, cfg, sub)?;
+    let mode = if manager == ServiceManager::Systemd {
+        "0644"
+    } else {
+        "0755"
+    };
+    place(r, content.as_bytes(), mode, manager.unit_path())?;
+
+    r.step("enabling service".into());
+    let ran = restart_service(manager, r)?;
+    Ok(Started {
+        ran,
+        cmds: service_commands(manager),
         note: Some(format!(
-            "change deployment settings in {ENV_FILE} and {UNIT}"
+            "change deployment settings in {ENV_FILE} and {}",
+            manager.unit_path()
         )),
     })
 }
@@ -1826,17 +1948,19 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Starte
 mod tests {
     use super::{
         check_forwards, compose, compose_content, console_cmd, deployment_role, env_file, execute,
-        install_docker, install_systemd, parse_compose_deployment, peer_steps, subcmd, upgrade,
-        validate_client_config_layout, validate_container_env, validate_installed_version,
-        InstallTarget, Runner, COMPOSE, COMPOSE_BRIDGE, COMPOSE_FILE, TEST_RELEASE_MANIFEST,
-        TEST_RELEASE_PACKAGE, TEST_RELEASE_SIGNATURE,
+        install_docker, install_service, installed_service_command, parse_compose_deployment,
+        peer_steps, service_content, subcmd, upgrade, validate_client_config_layout,
+        validate_container_env, validate_installed_version, InstallTarget, Runner, COMPOSE,
+        COMPOSE_BRIDGE, COMPOSE_FILE, TEST_RELEASE_MANIFEST, TEST_RELEASE_PACKAGE,
+        TEST_RELEASE_SIGNATURE,
     };
     use crate::args::Host;
+    use crate::sys::{ServiceInstall, ServiceManager};
     use crate::ui::{Config, Deploy, Kind, Method, Mode, UpgradeOffer};
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
     use std::path::PathBuf;
-    use std::process::Output;
+    use std::process::{Command, Output, Stdio};
 
     const TEST_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
     const TEST_ADMIN_SECRET: &str =
@@ -1844,7 +1968,7 @@ mod tests {
     const TEST_IMAGE: &str = "ghcr.io/paltaio/zeronat@sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
     fn cfg() -> Config {
-        let mut cfg = Config::new(false, false, None);
+        let mut cfg = Config::new(false, false, Some(ServiceManager::Systemd), None);
         cfg.secret = TEST_SECRET.into();
         cfg.admin_secret = TEST_ADMIN_SECRET.into();
         cfg
@@ -1965,7 +2089,7 @@ mod tests {
         let mut c = cfg();
         c.mode = Mode::Server;
 
-        let result = install_systemd(&c, "server", &mut r);
+        let result = install_service(&c, "server", &mut r);
         let path = r.path.expect("curl should receive an output file");
         let remained = path.parent().unwrap().exists();
 
@@ -1986,13 +2110,17 @@ mod tests {
     fn upgrade_refuses_legacy_shared_credentials_before_commands() {
         let offer = UpgradeOffer {
             latest: "0.25.1".into(),
-            systemd: Some("0.24.0".into()),
+            service: Some(ServiceInstall {
+                manager: ServiceManager::Systemd,
+                version: "0.24.0".into(),
+            }),
             docker: None,
             compose: false,
         };
         let host = Host {
             have_docker: false,
             have_compose: false,
+            service_manager: Some(ServiceManager::Systemd),
             existing_secret: Some(TEST_SECRET.into()),
             existing_client_secret: Some(TEST_SECRET.to_ascii_uppercase()),
             existing_admin_secret: Some(TEST_ADMIN_SECRET.into()),
@@ -2257,16 +2385,98 @@ mod tests {
         let mut r = FakeRunner { cmds: Vec::new() };
         let mut c = cfg();
         c.mode = Mode::Server;
-        install_systemd(&c, "server", &mut r).unwrap();
+        install_service(&c, "server", &mut r).unwrap();
 
         let reload = r.cmds.iter().position(|c| c == "systemctl daemon-reload");
         let restart = r.cmds.iter().position(|c| c == "systemctl restart zeronat");
         assert!(r
             .cmds
             .iter()
-            .any(|command| command.contains("/zeronat-v0.25.1-linux-amd64.tar")));
+            .any(|command| command.contains("/zeronat-v0.25.1-linux-amd64.tar.gz")));
         assert!(r.cmds.contains(&"systemctl enable zeronat".to_string()));
         assert!(restart.unwrap() > reload.unwrap());
+    }
+
+    #[test]
+    fn native_service_files_preserve_the_command_and_load_the_env_file() {
+        let c = cfg();
+        let sub = "server --control 2222 --tcp 443";
+
+        for manager in [
+            ServiceManager::Systemd,
+            ServiceManager::OpenRc,
+            ServiceManager::Procd,
+        ] {
+            let content = service_content(manager, &c, sub).unwrap();
+            let command = installed_service_command(manager, &content).unwrap();
+            assert_eq!(
+                command,
+                [
+                    "/usr/local/bin/zeronat",
+                    "server",
+                    "--control",
+                    "2222",
+                    "--tcp",
+                    "443"
+                ]
+            );
+            assert!(content.contains("/etc/zeronat/.env"));
+            assert!(!content.contains(TEST_SECRET));
+        }
+    }
+
+    #[test]
+    fn init_scripts_have_valid_shell_syntax() {
+        let c = cfg();
+        for manager in [ServiceManager::OpenRc, ServiceManager::Procd] {
+            let content = service_content(manager, &c, "server --control 2222").unwrap();
+            let mut child = Command::new("sh")
+                .arg("-n")
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(content.as_bytes())
+                .unwrap();
+            assert!(child.wait().unwrap().success(), "{}", manager.name());
+        }
+    }
+
+    #[test]
+    fn openrc_and_procd_installs_enable_and_restart_the_service() {
+        for (manager, enable, restart) in [
+            (
+                ServiceManager::OpenRc,
+                "rc-update add zeronat default",
+                "rc-service zeronat restart",
+            ),
+            (
+                ServiceManager::Procd,
+                "/etc/init.d/zeronat enable",
+                "/etc/init.d/zeronat restart",
+            ),
+        ] {
+            let mut r = FakeRunner { cmds: Vec::new() };
+            let mut c = cfg();
+            c.service_manager = Some(manager);
+            install_service(&c, "server --control 2222", &mut r).unwrap();
+            assert!(r.cmds.contains(&enable.to_string()));
+            assert!(r.cmds.contains(&restart.to_string()));
+        }
+    }
+
+    #[test]
+    fn service_files_reject_shell_metacharacters() {
+        let c = cfg();
+        assert!(service_content(
+            ServiceManager::OpenRc,
+            &c,
+            "client --server $(touch /tmp/owned)"
+        )
+        .is_err());
     }
 
     #[test]
@@ -2279,7 +2489,7 @@ mod tests {
             console_cmd(&c).unwrap(),
             "docker exec -it zeronat /zeronat admin --server 127.0.0.1:2222"
         );
-        c.method = Method::Systemd;
+        c.method = Method::Service;
         assert_eq!(
             console_cmd(&c).unwrap(),
             "sudo /usr/local/bin/zeronat admin --server 127.0.0.1:2222"
@@ -2301,7 +2511,7 @@ mod tests {
         c.mode = Mode::Server;
         let credential = zeronat_secret::client_credential(TEST_SECRET).unwrap();
         let public = zeronat_secret::server_public(TEST_SECRET).unwrap();
-        let server = env_file(&c, "server --control 2222", &InstallTarget::Systemd).unwrap();
+        let server = env_file(&c, "server --control 2222", &InstallTarget::Service).unwrap();
         assert!(server.contains(&format!("ZERONAT_SECRET={TEST_SECRET}\n")));
         assert!(server.contains("ZERONAT_CLIENT_ID=client\n"));
         assert!(server.contains(&format!("ZERONAT_CLIENT_SECRET={credential}\n")));
@@ -2313,7 +2523,7 @@ mod tests {
         let client = env_file(
             &c,
             "client --server 127.0.0.1:2222",
-            &InstallTarget::Systemd,
+            &InstallTarget::Service,
         )
         .unwrap();
         assert!(client.contains(&format!("ZERONAT_SECRET={public}\n")));
@@ -2524,7 +2734,7 @@ mod tests {
     fn generated_systemd_summary_contains_no_reusable_credential() {
         let mut c = cfg();
         c.mode = Mode::Server;
-        c.method = Method::Systemd;
+        c.method = Method::Service;
         c.use_dht = true;
         c.ports = "443/tcp".into();
         let mut runner = FakeRunner { cmds: Vec::new() };

@@ -32,7 +32,7 @@ case "$(uname -m)" in
   *) unsupported "no prebuilt installer for $(uname -m)." ;;
 esac
 
-for tool in curl grep awk minisign sha256sum mktemp tail wc tr chmod tar; do
+for tool in curl grep awk minisign sha256sum mktemp tail wc tr chmod tar gzip; do
   command -v "$tool" >/dev/null 2>&1 || unsupported "$tool is required."
 done
 
@@ -52,7 +52,7 @@ printf '%s\n' "$TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-
 
 MANIFEST_NAME="release.manifest"
 SIGNATURE_NAME="release.manifest.minisig"
-ASSET_NAME="zeronat-$TAG-$PLATFORM.tar"
+ASSET_NAME="zeronat-$TAG-$PLATFORM.tar.gz"
 DOWNLOAD_BASE="$RELEASE_ORIGIN/releases/download/$TAG"
 
 TMP_DIR=$(mktemp -d)
@@ -138,11 +138,11 @@ fetch "$DOWNLOAD_BASE/$ASSET_NAME" "$LENGTH" "$PACKAGE" \
 [ "$(sha256sum "$PACKAGE" | awk '{print $1}')" = "$DIGEST" ] \
   || unsupported "the package digest does not match the signed manifest."
 
-MEMBERS=$(tar -tf "$PACKAGE") || unsupported "the release package is malformed."
+MEMBERS=$(gzip -dc "$PACKAGE" | tar -tf -) || unsupported "the release package is malformed."
 EXPECTED_MEMBERS=$(printf '%s\n%s\n' zeronat zeronat-installer)
 [ "$MEMBERS" = "$EXPECTED_MEMBERS" ] \
   || unsupported "the release package has unexpected contents."
-tar -xOf "$PACKAGE" zeronat-installer > "$INSTALLER" \
+gzip -dc "$PACKAGE" | tar -xOf - zeronat-installer > "$INSTALLER" \
   || unsupported "the release package has no installer."
 [ -s "$INSTALLER" ] || unsupported "the release package has an empty installer."
 chmod +x "$INSTALLER"

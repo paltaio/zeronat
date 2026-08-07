@@ -1,4 +1,5 @@
 use crate::DownloadFile;
+use flate2::read::GzDecoder;
 use minisign_verify::{PublicKey, Signature};
 use std::collections::HashSet;
 use std::fs::File;
@@ -83,15 +84,15 @@ impl SelectedRelease {
             "arm-unknown-linux-musleabihf" => "linux-armv6",
             "armv7-unknown-linux-gnueabihf" => "linux-armv7-gnu",
             "armv7-unknown-linux-musleabihf" => "linux-armv7",
-            "mips-unknown-linux-gnu" => "linux-mips",
-            "mipsel-unknown-linux-gnu" => "linux-mipsel",
+            "mips-unknown-linux-musl" => "linux-mips",
+            "mipsel-unknown-linux-musl" => "linux-mipsel",
             "mips64-unknown-linux-gnuabi64" => "linux-mips64",
             "mips64el-unknown-linux-gnuabi64" => "linux-mips64el",
             "x86_64-unknown-freebsd" => "freebsd-amd64",
             "aarch64-unknown-freebsd" => "freebsd-arm64",
             _ => return Err(format!("unsupported release target {target}")),
         };
-        Ok(format!("zeronat-{}-{platform}.tar", self.tag))
+        Ok(format!("zeronat-{}-{platform}.tar.gz", self.tag))
     }
 
     fn download_url(&self, name: &str) -> String {
@@ -176,10 +177,11 @@ pub fn extract_package_member(
         .prepare_install()?
         .try_clone()
         .map_err(|e| format!("failed to read release package: {e}"))?;
-    let mut archive = tar::Archive::new(input);
+    let mut archive = tar::Archive::new(GzDecoder::new(input));
     let mut output = DownloadFile::create()?;
     let mut seen = HashSet::new();
     let mut found = false;
+    let mut expanded_size = 0u64;
 
     let entries = archive
         .entries()
@@ -193,6 +195,12 @@ pub fn extract_package_member(
             || !entry.header().entry_type().is_file()
         {
             return Err("release package contains an unsupported member".into());
+        }
+        expanded_size = expanded_size
+            .checked_add(entry.size())
+            .ok_or_else(|| "release package expanded size is invalid".to_string())?;
+        if expanded_size > ARTIFACT_LIMIT {
+            return Err("release package expanded size exceeds the limit".into());
         }
         if !seen.insert(name.to_string()) {
             return Err("release package contains a duplicate member".into());
@@ -465,9 +473,9 @@ mod tests {
     };
     const TEST_MANIFEST: &[u8] = include_bytes!("../tests/fixtures/v0.25.1.manifest");
     const TEST_SIGNATURE: &[u8] = include_bytes!("../tests/fixtures/v0.25.1.manifest.minisig");
-    const TEST_ASSET: &str = "zeronat-v0.25.1-linux-amd64.tar";
+    const TEST_ASSET: &str = "zeronat-v0.25.1-linux-amd64.tar.gz";
     const TEST_PACKAGE: &[u8] =
-        include_bytes!("../tests/fixtures/zeronat-v0.25.1-x86_64-unknown-linux-musl.tar");
+        include_bytes!("../tests/fixtures/zeronat-v0.25.1-x86_64-unknown-linux-musl.tar.gz");
     const TEST_BINARY: &[u8] = include_bytes!("../tests/fixtures/zeronat");
     const TEST_INSTALLER: &[u8] = include_bytes!("../tests/fixtures/zeronat-installer");
 
@@ -503,15 +511,15 @@ mod tests {
 
         assert_eq!(
             release.package_name("x86_64-unknown-linux-musl").unwrap(),
-            "zeronat-v0.25.1-linux-amd64.tar"
+            "zeronat-v0.25.1-linux-amd64.tar.gz"
         );
         assert_eq!(
             release.package_name("aarch64-unknown-linux-gnu").unwrap(),
-            "zeronat-v0.25.1-linux-arm64-gnu.tar"
+            "zeronat-v0.25.1-linux-arm64-gnu.tar.gz"
         );
         assert_eq!(
             release.package_name("x86_64-unknown-freebsd").unwrap(),
-            "zeronat-v0.25.1-freebsd-amd64.tar"
+            "zeronat-v0.25.1-freebsd-amd64.tar.gz"
         );
         assert!(release.package_name("x86_64-apple-darwin").is_err());
     }
@@ -559,26 +567,28 @@ mod tests {
             "{MANIFEST_PREFIX} v1.2.3\n\
              zeronat-image {ZERONAT_IMAGE_PREFIX}{digest}\n\
              znpppoe-image {ZNPPPOE_IMAGE_PREFIX}{digest}\n\
-             {digest} 17 zeronat-v1.2.3-linux-amd64.tar\n"
+             {digest} 17 zeronat-v1.2.3-linux-amd64.tar.gz\n"
         );
         assert!(parse_manifest(
             valid.as_bytes(),
             "v1.2.3",
-            Some("zeronat-v1.2.3-linux-amd64.tar")
+            Some("zeronat-v1.2.3-linux-amd64.tar.gz")
         )
         .is_ok());
         assert!(parse_manifest(
             valid.as_bytes(),
             "v1.2.4",
-            Some("zeronat-v1.2.3-linux-amd64.tar")
+            Some("zeronat-v1.2.3-linux-amd64.tar.gz")
         )
         .is_err());
-        assert!(
-            parse_manifest(valid.as_bytes(), "v1.2.3", Some("zeronat-v1.2.3-other.tar"))
-                .unwrap()
-                .selected
-                .is_none()
-        );
+        assert!(parse_manifest(
+            valid.as_bytes(),
+            "v1.2.3",
+            Some("zeronat-v1.2.3-other.tar.gz")
+        )
+        .unwrap()
+        .selected
+        .is_none());
 
         let duplicate = format!(
             "{MANIFEST_PREFIX} v1.2.3\n\
@@ -650,6 +660,30 @@ mod tests {
             .read_to_end(&mut installed)
             .unwrap();
         assert_eq!(installed, TEST_INSTALLER);
+    }
+
+    #[test]
+    fn package_extraction_rejects_excessive_expanded_size() {
+        let mut header = tar::Header::new_ustar();
+        header.set_path(PACKAGE_BINARY).unwrap();
+        header.set_size(ARTIFACT_LIMIT + 1);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(header.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut package = DownloadFile::create().unwrap();
+        package
+            .output()
+            .try_clone()
+            .unwrap()
+            .write_all(&compressed)
+            .unwrap();
+
+        let error = extract_package_member(&mut package, PACKAGE_BINARY)
+            .err()
+            .unwrap();
+        assert!(error.contains("expanded size exceeds"), "{error}");
     }
 
     #[test]

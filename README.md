@@ -12,8 +12,6 @@ The server runs on the public host. The client dials out from behind NAT and hol
 curl -fsSL https://paltaio.github.io/zeronat/get.sh | sh
 ```
 
-The installer configures Docker or systemd, generates 32-byte credentials, and prints a client enrollment command. The launcher verifies the signed release manifest and installer digest before running the downloaded binary.
-
 ## Usage
 
 ```bash

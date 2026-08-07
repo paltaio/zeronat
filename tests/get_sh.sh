@@ -22,7 +22,7 @@ public_base64=$(sed -n '2p' "$public")
 
 tag=v0.25.1
 platform=linux-amd64
-asset="zeronat-$tag-$platform.tar"
+asset="zeronat-$tag-$platform.tar.gz"
 manifest=release.manifest
 signature=release.manifest.minisig
 marker="$tmp/ran"
@@ -34,7 +34,8 @@ SH
 chmod +x "$fixtures/zeronat-installer"
 cp "$fixtures/zeronat-installer" "$fixtures/zeronat"
 tar --format=ustar --owner=0 --group=0 --numeric-owner --mtime='@0' \
-  -cf "$fixtures/$asset" -C "$fixtures" zeronat zeronat-installer
+  -cf - -C "$fixtures" zeronat zeronat-installer \
+  | gzip -9 -n > "$fixtures/$asset"
 digest=$(sha256sum "$fixtures/$asset" | awk '{print $1}')
 length=$(wc -c < "$fixtures/$asset" | tr -d ' ')
 printf 'zeronat-release-v2 %s\n%s\n%s\n%s %s %s\n' \
