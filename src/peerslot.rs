@@ -1992,4 +1992,120 @@ mod tests {
         };
         assert_eq!(err.to_string(), "the server refused the pair: peer offline");
     }
+
+    /// Drive one provider pair to its verdict against a consumer holding
+    /// `consumer_static`. The test stands in for the relay: it answers the
+    /// leg the provider opens and runs the consumer's handshake over the
+    /// spliced records. Returns the consumer's outcome and whatever session
+    /// the pair handed to the slot's owner.
+    async fn provider_pair_outcome(
+        allow: Vec<[u8; 32]>,
+        consumer_static: [u8; 32],
+    ) -> (Result<PeerSession>, Option<PeerSlotSession>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = PeerControl::default();
+        let (tx, _sent) = mpsc::channel(8);
+        let mut session = control_session(tx);
+        session.server = listener.local_addr().unwrap().to_string();
+        let provider_pub = crate::noise::public_identity(&session.peer_static);
+        let credentials: crate::noise::ClientCredentials = [(
+            crate::noise::client_selector(&session.credential_psk),
+            (session.client_id.clone(), session.credential_psk),
+        )]
+        .into_iter()
+        .collect();
+        let _live = control.install(session);
+        let (generation, session) = control.live().expect("the session is installed");
+        let consumer_pub = crate::noise::public_identity(&consumer_static);
+        let challenge = [9u8; 32];
+        let (sink, mut handed_rx) = mpsc::channel(1);
+        let (pair_tx, pair_rx) = mpsc::channel(SLOT_QUEUE);
+        let mut pair = AbortOnDrop(crate::spawn(provider_pair(
+            PairStart {
+                pair_id: 1,
+                peer_id: consumer_pub,
+                provides: PROVIDES_EXIT,
+                generation,
+                allow,
+            },
+            session,
+            pair_rx,
+            control.pair_guard(1),
+            control.clone(),
+            PairOwner {
+                sink: Some(sink),
+                adapter: None,
+            },
+            Arc::new(AtomicBool::new(false)),
+        )));
+        for msg in [
+            Msg::PeerProbe {
+                pair_id: 1,
+                peer_id: consumer_pub,
+                probe_id: 1,
+                probe_capability: [0u8; crate::proto::CAPABILITY_LEN],
+                challenge,
+                provides: PROVIDES_EXIT,
+            },
+            Msg::PeerInfo {
+                pair_id: 1,
+                candidates: Vec::new(),
+            },
+            Msg::PeerRelayOpen {
+                pair_id: 1,
+                id: 1,
+                capability: [0u8; crate::proto::CAPABILITY_LEN],
+            },
+        ] {
+            pair_tx.try_send(msg).unwrap();
+        }
+        let (sock, _) = timeout(Duration::from_secs(20), listener.accept())
+            .await
+            .expect("the provider never opened its leg")
+            .unwrap();
+        let (_auth, (mut nr, nw)) = crate::noise::server_handshake_remote(sock, &credentials, None)
+            .await
+            .expect("the leg handshake failed");
+        nr.recv().await.expect("the leg claim never arrived");
+        let identity = PairIdentity::new(consumer_static, provider_pub, challenge, PROVIDES_EXIT);
+        let consumer = PeerSession::consumer(PeerPath::relay_stream((nr, nw)), &identity, 1).await;
+        let handed = timeout(Duration::from_secs(20), async {
+            tokio::select! {
+                handed = handed_rx.recv() => handed,
+                _ = &mut pair.0 => None,
+            }
+        })
+        .await
+        .expect("the pair task never settled")
+        .or_else(|| handed_rx.try_recv().ok());
+        (consumer, handed)
+    }
+
+    // The allowlist holds on the provider's side: a consumer off the list is
+    // refused in the verdict, the pair task keeps the refused session, and
+    // nothing reaches the slot's owner.
+    #[tokio::test]
+    async fn an_unlisted_consumer_never_reaches_the_slot_owner() {
+        let (consumer, handed) = provider_pair_outcome(vec![[0x5A; 32]], [3u8; 32]).await;
+        let error = consumer
+            .err()
+            .expect("an unlisted consumer must be refused")
+            .to_string();
+        assert!(error.contains("the provider refused the pair"), "{error}");
+        assert!(error.contains("unauthorized"), "{error}");
+        assert!(handed.is_none(), "a refused pair must not be handed over");
+    }
+
+    // An allowlisted consumer is served: the pair hands its session to the
+    // slot's owner under the identity the verdict admitted.
+    #[tokio::test]
+    async fn an_allowlisted_consumer_is_handed_to_the_slot_owner() {
+        let consumer_static = [3u8; 32];
+        let consumer_pub = crate::noise::public_identity(&consumer_static);
+        let (consumer, handed) = provider_pair_outcome(vec![consumer_pub], consumer_static).await;
+        consumer.expect("an allowlisted consumer must be served");
+        let handed = handed.expect("a served pair must reach the slot's owner");
+        assert_eq!(handed.peer_id, crate::secret::encode(consumer_pub));
+        assert_eq!(handed.want, PROVIDES_EXIT);
+    }
 }
