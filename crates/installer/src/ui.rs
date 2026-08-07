@@ -88,6 +88,9 @@ pub struct Config {
     pub server_addr: String,
     pub secret: String,
     pub admin_secret: String,
+    /// The credential the DHT record is keyed by; resolved when `use_dht` is
+    /// set, empty otherwise.
+    pub discovery: String,
     pub secret_mode: SecretMode,
     pub have_docker: bool,
     pub have_compose: bool,
@@ -123,6 +126,7 @@ impl Config {
             server_addr: String::new(),
             secret: String::new(),
             admin_secret: String::new(),
+            discovery: String::new(),
             secret_mode: if existing_secret.is_some() {
                 SecretMode::Reuse
             } else {
@@ -150,6 +154,7 @@ enum Step {
     BridgeName,
     SshExclude,
     Discovery,
+    DiscoveryEntry,
     ServerAddr,
     Control,
     Secret,
@@ -218,6 +223,7 @@ impl App {
             Step::Tap
                 | Step::BridgeNic
                 | Step::BridgeName
+                | Step::DiscoveryEntry
                 | Step::ServerAddr
                 | Step::Control
                 | Step::SecretEntry
@@ -246,10 +252,12 @@ impl App {
             Step::Ports | Step::Tap | Step::SshExclude => Step::Discovery,
             Step::Discovery => match self.cfg.mode {
                 Mode::Server => Step::Control,
-                Mode::Client if self.cfg.use_dht => Step::Secret,
+                // A dht client joins an existing server, so it pastes that
+                // server's discovery credential next.
+                Mode::Client if self.cfg.use_dht => Step::DiscoveryEntry,
                 Mode::Client => Step::ServerAddr,
             },
-            Step::ServerAddr => Step::Secret,
+            Step::DiscoveryEntry | Step::ServerAddr => Step::Secret,
             Step::Control => Step::Secret,
             Step::Secret if self.cfg.secret_mode == SecretMode::Enter => Step::SecretEntry,
             Step::Secret => Step::Summary,
@@ -272,6 +280,7 @@ impl App {
                 Step::Tap => self.cfg.tap.clone(),
                 Step::BridgeNic => self.cfg.bridge_nic.clone(),
                 Step::BridgeName => self.cfg.bridge.clone(),
+                Step::DiscoveryEntry => self.cfg.discovery.clone(),
                 Step::ServerAddr => self.cfg.server_addr.clone(),
                 Step::Control => self.cfg.control.clone(),
                 _ => String::new(),
@@ -603,7 +612,27 @@ impl App {
                     return false;
                 }
             },
+            Step::DiscoveryEntry => match zeronat_secret::normalize(&v) {
+                Ok(discovery) if discovery == self.cfg.secret => {
+                    self.error =
+                        Some("discovery credential must differ from the shared secret".into());
+                    return false;
+                }
+                Ok(discovery) => self.cfg.discovery = discovery,
+                Err(e) => {
+                    self.error = Some(e.to_string());
+                    return false;
+                }
+            },
             Step::SecretEntry => match zeronat_secret::normalize(&v) {
+                Ok(secret)
+                    if self.cfg.use_dht
+                        && !self.cfg.discovery.is_empty()
+                        && secret == self.cfg.discovery =>
+                {
+                    self.error = Some("secret must differ from the discovery credential".into());
+                    return false;
+                }
                 Ok(secret) => self.cfg.secret = secret,
                 Err(e) => {
                     self.error = Some(e.to_string());
@@ -823,6 +852,7 @@ impl App {
                 Mode::Server => "How will clients reach this server?",
                 Mode::Client => "How should the client find the server?",
             },
+            Step::DiscoveryEntry => "Enter the server's discovery credential",
             Step::ServerAddr => "Server address",
             Step::Control => "Tunnel control port",
             Step::Secret => "Shared secret",
@@ -947,6 +977,7 @@ impl App {
                 h
             }
             Step::BridgeName => "the TAP is enslaved to this existing bridge".into(),
+            Step::DiscoveryEntry => "64 hex characters; the server install printed it".into(),
             Step::ServerAddr => "HOST or HOST:PORT (default port 2222)".into(),
             Step::Control => "the UDP/TCP port the tunnel control runs on".into(),
             Step::SecretEntry => "64 hex characters; use the same value on both sides".into(),
@@ -1007,7 +1038,10 @@ impl App {
             }
         }
         match self.cfg.mode {
-            Mode::Client if self.cfg.use_dht => add("server", "via DHT".to_string(), PLAIN),
+            Mode::Client if self.cfg.use_dht => {
+                add("server", "via DHT".to_string(), PLAIN);
+                add("discovery", self.cfg.discovery.clone(), GOOD);
+            }
             Mode::Client => add("server", self.cfg.server_addr.clone(), PLAIN),
             Mode::Server if self.cfg.use_dht => add("discovery", "DHT publish".to_string(), PLAIN),
             Mode::Server => add("control", self.cfg.control.clone(), PLAIN),
@@ -1075,6 +1109,37 @@ mod tests {
         app.input = "A".repeat(64);
         assert!(app.commit_input());
         assert_eq!(app.cfg.secret, "a".repeat(64));
+    }
+
+    // A client choosing dht is routed to the discovery entry, which takes only
+    // a 64-hex value distinct from the shared secret.
+    #[test]
+    fn dht_client_enters_the_discovery_credential() {
+        let mut app = App::new(Config::new(false, false, None), None);
+        app.cfg.mode = Mode::Client;
+        app.cfg.secret = "a".repeat(64);
+        app.enter(Step::Discovery);
+        app.sel = 1;
+        app.on_key(Key::Enter);
+        assert!(app.step == Step::DiscoveryEntry);
+        assert!(app.cfg.use_dht);
+
+        app.input = "short".into();
+        assert!(!app.commit_input());
+        app.input = "a".repeat(64);
+        assert!(!app.commit_input());
+        assert!(app.error.as_deref().unwrap().contains("differ"));
+        app.input = "B".repeat(64);
+        assert!(app.commit_input());
+        assert_eq!(app.cfg.discovery, "b".repeat(64));
+
+        // The reverse holds at the secret entry: a secret equal to the entered
+        // discovery credential stays on the step.
+        app.step = Step::SecretEntry;
+        app.input = "b".repeat(64);
+        assert!(!app.commit_input());
+        app.input = "c".repeat(64);
+        assert!(app.commit_input());
     }
 
     #[test]

@@ -1186,6 +1186,10 @@ pub struct ServerSettings {
     pub bind: Ipv4Addr,
     pub control_port: u16,
     pub secret: String,
+    /// The credential the DHT record is keyed by; required with `dht`, unused
+    /// otherwise. Never derived from `secret`, so handing out discovery does
+    /// not hand out session access.
+    pub discovery: Option<String>,
     pub client_credentials: Vec<ClientCredentialSpec>,
     pub admin_secret: Option<String>,
     pub server_id: String,
@@ -1240,6 +1244,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         bind,
         control_port,
         secret,
+        discovery,
         client_credentials,
         admin_secret,
         server_id,
@@ -1257,6 +1262,9 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         file_exit_iface,
     } = settings;
     let secret = crate::secret::normalize(&secret)?;
+    let discovery = discovery
+        .map(|value| crate::secret::normalize(&value))
+        .transpose()?;
     let mut authorized_clients = ClientCredentials::new();
     let mut authorized_ids = HashSet::new();
     for credential in client_credentials {
@@ -1288,6 +1296,20 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         })
     {
         return Err("admin secret must differ from network and client credentials".into());
+    }
+    if let Some(d) = discovery.as_deref() {
+        let d_psk = crate::noise::derive_psk(d);
+        if d == secret
+            || admin_secret.as_deref() == Some(d)
+            || authorized_clients
+                .values()
+                .any(|(_, client)| *client == d_psk)
+        {
+            return Err(
+                "discovery credential must differ from network, client, and admin credentials"
+                    .into(),
+            );
+        }
     }
 
     // The TUN NAT guard tears the rules down when this future is dropped: on the
@@ -1355,11 +1377,17 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
     if let Some(ann) = dht {
         #[cfg(feature = "dht")]
         {
-            let secret = secret.clone();
+            let Some(discovery) = discovery else {
+                return Err(
+                    "--server dht needs a discovery credential; pass --discovery or set \
+                            ZERONAT_DISCOVERY_SECRET"
+                        .into(),
+                );
+            };
             let ip = ann.ip;
             let port = ann.port.unwrap_or(control_port);
             crate::spawn(async move {
-                crate::dht::announce_loop(&secret, ip, port).await;
+                crate::dht::announce_loop(&discovery, ip, port).await;
             });
         }
         #[cfg(not(feature = "dht"))]

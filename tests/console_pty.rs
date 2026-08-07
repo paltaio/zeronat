@@ -316,6 +316,7 @@ mod pty {
             bind: std::net::Ipv4Addr::LOCALHOST,
             control_port: control,
             secret: SECRET.into(),
+            discovery: None,
             admin_secret: Some(OTHER_SECRET.into()),
             client_credentials: vec![
                 zeronat::server::ClientCredentialSpec {
@@ -476,6 +477,7 @@ mod pty {
             addr: format!("127.0.0.1:{control}"),
             secret: SECRET.into(),
             credential: SECRET.into(),
+            discovery: None,
             transport: zeronat::client::Transport::Tcp,
         };
         let away = zeronat::client::ServerTarget {
@@ -483,6 +485,7 @@ mod pty {
             addr: "192.0.2.9:9000".into(),
             secret: OTHER_SECRET.into(),
             credential: OTHER_SECRET.into(),
+            discovery: None,
             transport: zeronat::client::Transport::Tcp,
         };
         // The peer the console client exits through: a second client

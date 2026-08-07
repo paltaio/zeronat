@@ -169,6 +169,12 @@ pub fn existing_admin_secret() -> Option<String> {
     existing_env_value("ZERONAT_ADMIN_SECRET")
 }
 
+/// A discovery secret already on disk, so a re-run keeps the DHT record
+/// resolvable by existing clients.
+pub fn existing_discovery_secret() -> Option<String> {
+    existing_env_value("ZERONAT_DISCOVERY_SECRET")
+}
+
 fn existing_env_value(key: &str) -> Option<String> {
     let out = run(true, "cat", &["/etc/zeronat/.env"]).ok()?;
     if !out.status.success() {

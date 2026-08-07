@@ -1,7 +1,10 @@
 //! Server discovery over the Mainline DHT. The server publishes its reachable
 //! address as a signed, encrypted BEP44 mutable item; the client looks it up.
-//! Both derive the signing key, salt, and sealing key from the shared secret, so
-//! there is no out-of-band key exchange.
+//! Both derive the signing key, salt, and sealing key from a shared discovery
+//! credential, so there is no out-of-band key exchange. The discovery
+//! credential is independent of the session secret: holding it locates the
+//! server but does not authenticate a session, and the session secret alone
+//! can neither publish nor read a record.
 
 mod bencode;
 mod bep44;
@@ -28,9 +31,10 @@ const COLD_START_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// A cached server address older than this is ignored, forcing a fresh DHT
 /// resolve so a stale-but-accepting old IP cannot pin the client forever.
 const CACHE_TTL: Duration = Duration::from_secs(6 * 3600);
-const ADDR_VERSION: u8 = 0x01;
+const ADDR_VERSION: u8 = 0x02;
 
-/// Secret-derived DHT identity shared by both peers.
+/// DHT identity derived from the discovery credential, shared by the publisher
+/// and every resolver holding that credential.
 pub struct Identity {
     signing: SigningKey,
     pubkey: [u8; 32],
@@ -40,12 +44,12 @@ pub struct Identity {
 }
 
 impl Identity {
-    pub fn derive(secret: &str) -> Result<Self> {
-        let secret = crate::secret::normalize(secret)?;
-        let signing = SigningKey::from_bytes(&blake(b"zeronat-dht-ed25519-v1", &secret));
+    pub fn derive(discovery: &str) -> Result<Self> {
+        let discovery = crate::secret::normalize(discovery)?;
+        let signing = SigningKey::from_bytes(&blake(b"zeronat-dht-ed25519-v2", &discovery));
         let pubkey = signing.verifying_key().to_bytes();
-        let salt = blake(b"zeronat-dht-salt-v1", &secret)[..20].to_vec();
-        let addr_key = blake(b"zeronat-dht-addr-key-v1", &secret);
+        let salt = blake(b"zeronat-dht-salt-v2", &discovery)[..20].to_vec();
+        let addr_key = blake(b"zeronat-dht-addr-key-v2", &discovery);
         let target = bep44::target(&pubkey, Some(&salt));
         Ok(Identity {
             signing,
@@ -57,10 +61,10 @@ impl Identity {
     }
 }
 
-fn blake(domain: &[u8], secret: &str) -> [u8; 32] {
+fn blake(domain: &[u8], credential: &str) -> [u8; 32] {
     let mut h = Blake2s256::new();
     h.update(domain);
-    h.update(secret.as_bytes());
+    h.update(credential.as_bytes());
     h.finalize().into()
 }
 
@@ -116,6 +120,28 @@ fn aead_nonce(n: u64) -> Nonce {
     Nonce::from(nonce)
 }
 
+/// The signed, sealed BEP44 record for `ip:port` at `seq`: the value bytes and
+/// their signature under `id`'s key and salt.
+fn sealed_record(id: &Identity, ip: Ipv4Addr, port: u16, seq: i64) -> (Vec<u8>, [u8; 64]) {
+    let v = seal_addr(&id.addr_key, ip, port, seq);
+    let sig = bep44::sign(&id.signing, Some(&id.salt), seq, &v);
+    (v, sig)
+}
+
+/// The address carried by one looked-up value, if it is a record `id` accepts:
+/// published under `id`'s public key, signed over `id`'s salt, and sealed with
+/// `id`'s address key.
+fn accept(id: &Identity, val: &node::Value) -> Option<SocketAddr> {
+    if val.k != id.pubkey {
+        return None;
+    }
+    if !bep44::verify(&val.k, Some(&id.salt), val.seq, &val.v, &val.sig) {
+        return None;
+    }
+    let (ip, port) = open_addr(&id.addr_key, &val.v)?;
+    Some(SocketAddr::new(IpAddr::V4(ip), port))
+}
+
 /// Publish the server address once. With `announce_ip` unset, the IP is the one
 /// the DHT reports seeing us from (BEP42). Returns the announced IP and the
 /// number of nodes that stored the record.
@@ -133,8 +159,7 @@ async fn publish(
     let ip = announce_ip
         .or(lookup.external_ip)
         .ok_or("could not determine external IP from the DHT; pass --announce-ip")?;
-    let v = seal_addr(&id.addr_key, ip, port, seq);
-    let sig = bep44::sign(&id.signing, Some(&id.salt), seq, &v);
+    let (v, sig) = sealed_record(id, ip, port, seq);
     let stored = node
         .put(&id.pubkey, Some(&id.salt), seq, &v, &sig, &lookup.storers)
         .await;
@@ -147,14 +172,8 @@ pub async fn resolve(id: &Identity) -> Result<SocketAddr> {
     let mut values = node.lookup(id.target).await?.values;
     values.sort_by_key(|v| std::cmp::Reverse(v.seq));
     for val in values {
-        if val.k != id.pubkey {
-            continue;
-        }
-        if !bep44::verify(&val.k, Some(&id.salt), val.seq, &val.v, &val.sig) {
-            continue;
-        }
-        if let Some((ip, port)) = open_addr(&id.addr_key, &val.v) {
-            return Ok(SocketAddr::new(IpAddr::V4(ip), port));
+        if let Some(addr) = accept(id, &val) {
+            return Ok(addr);
         }
     }
     Err("no valid DHT record found".into())
@@ -162,11 +181,11 @@ pub async fn resolve(id: &Identity) -> Result<SocketAddr> {
 
 /// Republish the server address forever, refreshing the IP each cycle so a
 /// changed WAN address propagates within one interval.
-pub async fn announce_loop(secret: &str, announce_ip: Option<Ipv4Addr>, port: u16) {
-    let id = match Identity::derive(secret) {
+pub async fn announce_loop(discovery: &str, announce_ip: Option<Ipv4Addr>, port: u16) {
+    let id = match Identity::derive(discovery) {
         Ok(id) => id,
         Err(e) => {
-            crate::elog!("dht: invalid secret: {e}");
+            crate::elog!("dht: invalid discovery credential: {e}");
             return;
         }
     };
@@ -333,10 +352,69 @@ mod tests {
     }
 
     #[test]
-    fn identity_rejects_invalid_runtime_secrets() {
+    fn identity_rejects_invalid_discovery_credentials() {
         assert!(Identity::derive("short").is_err());
         assert!(Identity::derive(&"g".repeat(64)).is_err());
         assert!(Identity::derive(&"a".repeat(64)).is_ok());
+    }
+
+    // The record path each side runs, minus the network: the publisher builds
+    // its value through `sealed_record` and a resolver admits looked-up values
+    // through `accept`, exactly as `publish` and `resolve` do.
+    #[test]
+    fn session_secret_cannot_publish_or_resolve_a_discovery_record() {
+        let discovery = "a".repeat(64);
+        let session = "b".repeat(64);
+        let server = Identity::derive(&discovery).unwrap();
+        let session_holder = Identity::derive(&session).unwrap();
+        let ip = Ipv4Addr::new(203, 0, 113, 7);
+        let seq = 1_700_000_000;
+
+        // The record published under the discovery credential resolves for a
+        // holder of that credential and for no one keyed by the session secret.
+        let (v, sig) = sealed_record(&server, ip, 2222, seq);
+        let published = node::Value {
+            k: server.pubkey,
+            seq,
+            v,
+            sig,
+        };
+        assert_eq!(
+            accept(&server, &published),
+            Some(SocketAddr::new(IpAddr::V4(ip), 2222))
+        );
+        assert_eq!(accept(&session_holder, &published), None);
+
+        // A record built from the session secret is not accepted by the
+        // discovery side, even when stamped with the discovery public key.
+        let (v, sig) = sealed_record(&session_holder, ip, 2222, seq);
+        assert_eq!(
+            accept(
+                &server,
+                &node::Value {
+                    k: session_holder.pubkey,
+                    seq,
+                    v: v.clone(),
+                    sig,
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            accept(
+                &server,
+                &node::Value {
+                    k: server.pubkey,
+                    seq,
+                    v,
+                    sig,
+                }
+            ),
+            None
+        );
+
+        // The two credentials do not even address the same DHT slot.
+        assert_ne!(server.target, session_holder.target);
     }
 
     #[test]

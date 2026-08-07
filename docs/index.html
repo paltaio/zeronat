@@ -325,6 +325,7 @@ transport = "auto"
 name = "backup"
 addr = "dht"
 secret = "&lt;different-64-hex-secret&gt;"
+discovery = "&lt;64-hex-discovery-credential&gt;"
 
 [[forwards]]
 proto = "tcp"
@@ -584,13 +585,19 @@ zeronat client admin detach-provider exit</code></pre>
     <section id="dht">
       <h2>DHT discovery</h2>
       <p>For a server on a dynamic IP, <code>--server dht</code> publishes its address to the BitTorrent
-      Mainline DHT and the client looks it up. The lookup key is derived from the shared secret; the
-      published address is signed and encrypted.</p>
-<pre><code><span class="c"># Server publishes its address; IP is auto-detected from the DHT:</span>
-ZERONAT_SECRET="$SECRET" zeronat server --server dht --tcp 443
+      Mainline DHT and the client looks it up. The lookup key is derived from a discovery credential,
+      separate from the secret; the published address is signed and encrypted. A holder of the
+      discovery credential can find the server but cannot open a session, and the secret alone can
+      neither publish nor read the record. Both sides need the same discovery credential, which must
+      differ from every secret.</p>
+<pre><code><span class="c"># Generate once, like the secret, and copy to both hosts:</span>
+DISCOVERY="$(openssl rand -hex 32)"
+
+<span class="c"># Server publishes its address; IP is auto-detected from the DHT:</span>
+ZERONAT_SECRET="$SECRET" ZERONAT_DISCOVERY_SECRET="$DISCOVERY" zeronat server --server dht --tcp 443
 
 <span class="c"># Client finds the server through the DHT:</span>
-ZERONAT_SECRET="$SECRET" zeronat client --server dht --tcp 443</code></pre>
+ZERONAT_SECRET="$SECRET" ZERONAT_DISCOVERY_SECRET="$DISCOVERY" zeronat client --server dht --tcp 443</code></pre>
       <p><code>--announce-ip &lt;ip&gt;</code> overrides the detected IP and <code>--announce-port &lt;port&gt;</code>
       the announced port (default: the control port) when the server sits behind a port-forward. The client
       caches the last-known address and re-queries the DHT only when it stops working.</p>
@@ -603,7 +610,8 @@ ZERONAT_SECRET="$SECRET" zeronat client --server dht --tcp 443</code></pre>
       privileges. The server is a normal L2 bridge to the PPPoE segment (<code>--tap</code>, see above); the
       proxy credentials are separate from the PPPoE login, and the username selects the egress session.</p>
 <pre><code>docker run -d --name znpppoe -p 127.0.0.1:1080:1080 -p 127.0.0.1:8081:8081 \
-  -e ZN_SECRET="$SECRET" -e ZN_USER=&lt;pppoe-user&gt; -e ZN_PASSWORD=&lt;pppoe-pass&gt; \
+  -e ZN_SECRET="$SECRET" -e ZN_DISCOVERY_SECRET="$DISCOVERY" \
+  -e ZN_USER=&lt;pppoe-user&gt; -e ZN_PASSWORD=&lt;pppoe-pass&gt; \
   -e ZN_PROXY_USER=proxy -e ZN_PROXY_PASS=&lt;proxy-pass&gt; \
   ghcr.io/paltaio/znpppoe --dht --connections 50 \
   --socks-listen 0.0.0.0:1080 --http-listen 0.0.0.0:8081</code></pre>
@@ -650,6 +658,7 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
           <tr><td><code>--tap-mtu &lt;N&gt;</code></td><td>TAP MTU (default 1400)</td></tr>
           <tr><td><code>--bridge &lt;NAME&gt;</code></td><td>Enslave the TAP to this existing bridge</td></tr>
           <tr><td><code>--server dht</code></td><td>Publish this server's address to the DHT for discovery</td></tr>
+          <tr><td><code>--discovery &lt;64-HEX&gt;</code></td><td>Discovery credential the DHT record is keyed by (or env <code>ZERONAT_DISCOVERY_SECRET</code>); required with <code>--server dht</code></td></tr>
           <tr><td><code>--announce-ip &lt;IP&gt;</code></td><td>Public IPv4 to announce (default: auto-detected via DHT)</td></tr>
           <tr><td><code>--announce-port &lt;P&gt;</code></td><td>Public port to announce (default: control port)</td></tr>
         </tbody>
@@ -660,6 +669,7 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
         <tbody>
           <tr><td><code>--server &lt;ADDR&gt;</code></td><td>Server control address <code>host:port</code>, or <code>dht</code> to discover via DHT</td></tr>
           <tr><td><code>--secret &lt;64-HEX&gt;</code></td><td>32-byte hex secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
+          <tr><td><code>--discovery &lt;64-HEX&gt;</code></td><td>Discovery credential of the server's DHT record (or env <code>ZERONAT_DISCOVERY_SECRET</code>); required with <code>--server dht</code></td></tr>
           <tr><td><code>--id &lt;PREFIX&gt;</code></td><td>Client id prefix (default: short hostname)</td></tr>
           <tr><td><code>--config &lt;PATH&gt;</code></td><td>Load servers, forwards, and identity from a config file</td></tr>
           <tr><td><code>--tcp &lt;SPEC&gt;</code></td><td>Forward TCP: <code>PORT</code> | <code>PORT:LOCALPORT</code> | <code>PORT:HOST:PORT</code>, with optional <code>+proxy</code> and <code>+idle=SECS</code> (repeatable)</td></tr>

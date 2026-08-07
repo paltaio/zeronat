@@ -72,6 +72,7 @@ pub fn peer(
     server: &str,
     secret: &str,
     credential: &str,
+    discovery: Option<&str>,
     peer_secret: &str,
     id_prefix: &str,
     peer: PeerId<'_>,
@@ -81,6 +82,7 @@ pub fn peer(
         addr: server.to_string(),
         secret: secret.to_string(),
         credential: credential.to_string(),
+        discovery: discovery.map(str::to_string),
         transport: Transport::Auto,
     };
     let (tx, rx) = mpsc::channel(1);

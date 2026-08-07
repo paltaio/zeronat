@@ -205,6 +205,9 @@ zeronat installer
   --admin-secret 64-HEX     server admin secret (default: generated)
   --server-addr HOST[:PORT] (client only) where the server is reachable
   --dht                     find the server over the DHT (dynamic IP, no fixed address)
+  --discovery 64-HEX        (with --dht) credential the DHT record is keyed by
+                            (server default: generated; a client passes the
+                            value its server's install printed)
   --announce-ip IP          (server, with --dht) public IPv4 to announce
   --announce-port PORT      (server, with --dht) public port to announce
   --tap NAME                L2 bridge instead of ports: relay raw Ethernet/PPPoE (Linux)
@@ -248,11 +251,13 @@ fn real_main() -> i32 {
     // Dry-run previews use the stored credentials that installation would reuse.
     let existing = sys::existing_secret();
     let existing_admin = sys::existing_admin_secret();
+    let existing_discovery = sys::existing_discovery_secret();
     let host = Host {
         have_docker,
         have_compose,
         existing_secret: existing,
         existing_admin_secret: existing_admin,
+        existing_discovery_secret: existing_discovery,
         ssh_port: sys::ssh_port(),
     };
 
@@ -334,7 +339,7 @@ fn real_main() -> i32 {
         };
         let result = match (do_upgrade, &offer) {
             (true, Some(o)) => install::upgrade(o, &mut runner),
-            _ => args::finalize_credentials(&mut cfg, &parsed, &host)
+            _ => args::finalize_credentials(&mut cfg, &parsed, &host, true)
                 .and_then(|()| install::execute(&cfg, dry, &mut runner)),
         };
         (result, runner.log)

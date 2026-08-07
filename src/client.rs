@@ -385,7 +385,7 @@ enum Link {
 }
 
 /// How the server's control address is found: a fixed `host:port`, or looked up
-/// on the DHT by a secret-derived key.
+/// on the DHT by a key derived from the discovery credential.
 enum Discovery {
     Static(String),
     #[cfg(feature = "dht")]
@@ -393,15 +393,19 @@ enum Discovery {
 }
 
 impl Discovery {
-    fn new(server: &str, secret: &str) -> Result<Self> {
+    fn new(server: &str, discovery: Option<&str>) -> Result<Self> {
         if server == "dht" {
             #[cfg(feature = "dht")]
-            return Ok(Discovery::Dht(Arc::new(crate::dht::Identity::derive(
-                secret,
-            )?)));
+            {
+                let discovery =
+                    discovery.ok_or("a dht server profile needs a `discovery` credential")?;
+                return Ok(Discovery::Dht(Arc::new(crate::dht::Identity::derive(
+                    discovery,
+                )?)));
+            }
             #[cfg(not(feature = "dht"))]
             {
-                let _ = secret;
+                let _ = discovery;
                 return Err("this build has no dht support; pass --server host:port".into());
             }
         }
@@ -437,14 +441,18 @@ impl Discovery {
     }
 }
 
-/// One dialable server profile: address (`"dht"` or `host:port`), the secret
-/// that authenticates it, and the transport policy.
+/// One dialable server profile: address (`"dht"` or `host:port`), the secrets
+/// that authenticate it, the discovery credential a `"dht"` address resolves
+/// under, and the transport policy.
 #[derive(Clone)]
 pub struct ServerTarget {
     pub name: String,
     pub addr: String,
     pub secret: String,
     pub credential: String,
+    /// The credential the server's DHT record is keyed by; required when
+    /// `addr` is `"dht"`, unused otherwise.
+    pub discovery: Option<String>,
     pub transport: Transport,
 }
 
@@ -491,10 +499,31 @@ impl SharedServers {
         list.len() != before
     }
 
+    /// The name of the profile whose discovery credential decodes to `secret`,
+    /// if any. Decoded comparison, so case differences in the stored hex do
+    /// not hide a match.
+    pub(crate) fn discovery_owner(&self, secret: &[u8; 32]) -> Option<String> {
+        self.inner.lock().unwrap().iter().find_map(|s| {
+            let discovery = crate::secret::decode(s.discovery.as_deref()?).ok()?;
+            (discovery == *secret).then(|| s.name.clone())
+        })
+    }
+
     /// Whether a profile with exactly these fields is configured.
-    fn contains(&self, name: &str, addr: &str, secret: &str, credential: &str) -> bool {
+    fn contains(
+        &self,
+        name: &str,
+        addr: &str,
+        secret: &str,
+        credential: &str,
+        discovery: Option<&str>,
+    ) -> bool {
         self.inner.lock().unwrap().iter().any(|s| {
-            s.name == name && s.addr == addr && s.secret == secret && s.credential == credential
+            s.name == name
+                && s.addr == addr
+                && s.secret == secret
+                && s.credential == credential
+                && s.discovery.as_deref() == discovery
         })
     }
 
@@ -528,19 +557,21 @@ struct DialState {
 /// `prune` drops entries for removed profiles, so the memo stays bounded by the
 /// configured set.
 #[derive(Default)]
-struct DialMemo(HashMap<(String, String, String, String), DialState>);
+struct DialMemo(HashMap<(String, String, String, String, Option<String>), DialState>);
 
 impl DialMemo {
     /// Drop entries whose profile is gone, keeping the active target's, so
     /// remove/add cycles cannot grow the memo past the configured set.
     fn prune(&mut self, servers: &SharedServers, active: &ServerTarget) {
-        self.0.retain(|(name, addr, secret, credential), _| {
-            (*name == active.name
-                && *addr == active.addr
-                && *secret == active.secret
-                && *credential == active.credential)
-                || servers.contains(name, addr, secret, credential)
-        });
+        self.0
+            .retain(|(name, addr, secret, credential, discovery), _| {
+                (*name == active.name
+                    && *addr == active.addr
+                    && *secret == active.secret
+                    && *credential == active.credential
+                    && *discovery == active.discovery)
+                    || servers.contains(name, addr, secret, credential, discovery.as_deref())
+            });
     }
 
     fn state(&mut self, target: &ServerTarget) -> Result<&mut DialState> {
@@ -549,13 +580,14 @@ impl DialMemo {
             target.addr.clone(),
             target.secret.clone(),
             target.credential.clone(),
+            target.discovery.clone(),
         );
         match self.0.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
             std::collections::hash_map::Entry::Vacant(e) => Ok(e.insert(DialState {
                 psk: crate::noise::derive_psk(&target.secret),
                 credential_psk: crate::noise::derive_psk(&target.credential),
-                discovery: Discovery::new(&target.addr, &target.secret)?,
+                discovery: Discovery::new(&target.addr, target.discovery.as_deref())?,
             })),
         }
     }
@@ -892,6 +924,9 @@ impl ActiveTarget {
         let mut state = self.state.lock().unwrap();
         state.target.secret = crate::secret::normalize(&state.target.secret)?;
         state.target.credential = crate::secret::normalize(&state.target.credential)?;
+        if let Some(discovery) = &state.target.discovery {
+            state.target.discovery = Some(crate::secret::normalize(discovery)?);
+        }
         Ok(())
     }
 
@@ -1123,6 +1158,7 @@ pub async fn run(
     server: String,
     secret: String,
     credential: String,
+    discovery: Option<String>,
     tcp: Vec<Forward>,
     udp: Vec<Forward>,
     transport: Transport,
@@ -1137,6 +1173,7 @@ pub async fn run(
         addr: server,
         secret,
         credential,
+        discovery,
         transport,
     };
     // A CLI-declared pppoe session gets a fixed handle so admin can name it.
@@ -1239,6 +1276,9 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
     for target in &mut servers {
         target.secret = crate::secret::normalize(&target.secret)?;
         target.credential = crate::secret::normalize(&target.credential)?;
+        if let Some(discovery) = &target.discovery {
+            target.discovery = Some(crate::secret::normalize(discovery)?);
+        }
     }
     let client_id = crate::identity::derive_client_id(id_prefix.as_deref());
     let peer_static = peer_secret
@@ -1255,6 +1295,10 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         let known = |target: &ServerTarget| {
             crate::secret::decode(&target.secret).is_ok_and(|v| v == *peer_static)
                 || crate::secret::decode(&target.credential).is_ok_and(|v| v == *peer_static)
+                || target
+                    .discovery
+                    .as_deref()
+                    .is_some_and(|d| crate::secret::decode(d).is_ok_and(|v| v == *peer_static))
         };
         if known(&active.state.lock().unwrap().target) || servers.iter().any(known) {
             return Err(
@@ -2966,6 +3010,7 @@ mod tests {
             addr: "127.0.0.1:1".into(),
             secret: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
             credential: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
+            discovery: None,
             transport: Transport::Tcp,
         }
     }
@@ -3122,19 +3167,21 @@ mod tests {
         let servers = SharedServers::new(vec![b.clone()]);
         memo.prune(&servers, &a);
         // a survives as the active target, b's stale entry is gone.
-        let keys: Vec<&(String, String, String, String)> = memo.0.keys().collect();
+        let keys: Vec<&(String, String, String, String, Option<String>)> = memo.0.keys().collect();
         assert_eq!(memo.0.len(), 2, "{keys:?}");
         assert!(memo.0.contains_key(&(
             b.name.clone(),
             b.addr.clone(),
             b.secret.clone(),
             b.credential.clone(),
+            b.discovery.clone(),
         )));
         assert!(memo.0.contains_key(&(
             a.name.clone(),
             a.addr.clone(),
             a.secret.clone(),
             a.credential.clone(),
+            a.discovery.clone(),
         )));
     }
 

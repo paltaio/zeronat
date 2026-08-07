@@ -22,20 +22,21 @@ use zeronat::proto::Msg;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where the server lives: a fixed address, or a DHT identity resolved at dial
-/// time (and re-resolved on reconnect). The DHT identity is derived from the same
-/// secret the server announces under.
+/// time (and re-resolved on reconnect). The DHT identity is derived from the
+/// discovery credential the server announces under, never from the session
+/// secret.
 pub enum Target {
     Host(SocketAddr),
     Dht(Arc<zeronat::dht::Identity>),
 }
 
 impl Target {
-    pub fn new(host: Option<&str>, dht: bool, secret: &str) -> Result<Target> {
-        let secret = zeronat::secret::normalize(secret)?;
+    pub fn new(host: Option<&str>, dht: bool, discovery: Option<&str>) -> Result<Target> {
         if dht {
+            let discovery = discovery.context("ZN_DISCOVERY_SECRET env is required with --dht")?;
             Ok(Target::Dht(Arc::new(
-                zeronat::dht::Identity::derive(&secret)
-                    .map_err(|e| anyhow!("invalid ZN_SECRET: {e}"))?,
+                zeronat::dht::Identity::derive(discovery)
+                    .map_err(|e| anyhow!("invalid ZN_DISCOVERY_SECRET: {e}"))?,
             )))
         } else {
             let h = host.context("--host IP:PORT or --dht is required")?;

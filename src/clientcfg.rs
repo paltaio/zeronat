@@ -31,6 +31,9 @@ pub struct CfgServer {
     pub addr: String,
     pub secret: ServerSecret,
     pub credential: ServerSecret,
+    /// The credential the server's DHT record is keyed by; required when
+    /// `addr` is `"dht"`.
+    pub discovery: Option<ServerSecret>,
     pub transport: Transport,
 }
 
@@ -187,6 +190,7 @@ impl ClientConfig {
             peer.allow_identities()?;
         }
         let mut names: HashSet<&str> = HashSet::new();
+        let mut session_keys: Vec<[u8; 32]> = Vec::new();
         for s in &self.servers {
             let secret = crate::secret::decode(&s.secret.0)
                 .map_err(|e| -> crate::Error { format!("server `{}` {e}", s.name).into() })?;
@@ -203,6 +207,38 @@ impl ClientConfig {
             }
             if !names.insert(&s.name) {
                 return Err(format!("duplicate server name `{}`", s.name).into());
+            }
+            session_keys.push(secret);
+            session_keys.push(credential);
+        }
+        // The discovery credential must not double as any authenticating
+        // value in the file: whoever holds it may locate a server, nothing
+        // more.
+        for s in &self.servers {
+            let discovery = s
+                .discovery
+                .as_ref()
+                .map(|d| crate::secret::decode(&d.0))
+                .transpose()
+                .map_err(|e| -> crate::Error {
+                    format!("server `{}` `discovery` {e}", s.name).into()
+                })?;
+            let Some(discovery) = discovery else {
+                if s.addr == "dht" {
+                    return Err(format!(
+                        "server `{}` uses addr = \"dht\" and needs a `discovery` credential",
+                        s.name
+                    )
+                    .into());
+                }
+                continue;
+            };
+            if session_keys.contains(&discovery) || peer_secret == Some(discovery) {
+                return Err(format!(
+                    "server `{}` `discovery` must differ from every secret and credential in the file",
+                    s.name
+                )
+                .into());
             }
         }
         if let Some(active) = &self.active {
@@ -275,6 +311,7 @@ struct PartialRecord {
     addr: Option<String>,
     secret: Option<String>,
     credential: Option<String>,
+    discovery: Option<String>,
     transport: Option<Transport>,
     proto: Option<Proto>,
     port: Option<u16>,
@@ -403,6 +440,7 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
                     "addr" => record.addr = Some(parse_string(value, n)?),
                     "secret" => record.secret = Some(parse_string(value, n)?),
                     "credential" => record.credential = Some(parse_string(value, n)?),
+                    "discovery" => record.discovery = Some(parse_string(value, n)?),
                     "transport" => record.transport = Some(parse_transport(value, n)?),
                     other => {
                         return Err(err(n, &format!("unknown key `{other}` in [[servers]]")));
@@ -523,6 +561,7 @@ fn close_record(
                 addr,
                 secret: ServerSecret(secret),
                 credential: ServerSecret(credential),
+                discovery: record.discovery.take().map(ServerSecret),
                 transport: record.transport.take().unwrap_or(Transport::Auto),
             });
         }
@@ -703,6 +742,9 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
         out.push_str(&format!("addr = {}\n", quote(&s.addr)));
         out.push_str(&format!("secret = {}\n", quote(&s.secret.0)));
         out.push_str(&format!("credential = {}\n", quote(&s.credential.0)));
+        if let Some(discovery) = &s.discovery {
+            out.push_str(&format!("discovery = {}\n", quote(&discovery.0)));
+        }
         if s.transport != Transport::Auto {
             out.push_str(&format!(
                 "transport = {}\n",
@@ -807,6 +849,8 @@ mod tests {
 
     const TEST_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
     const OTHER_SECRET: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+    const DISCOVERY_SECRET: &str =
+        "5555555555555555555555555555555555555555555555555555555555555555";
 
     fn sample() -> ClientConfig {
         ClientConfig {
@@ -820,6 +864,7 @@ mod tests {
                     addr: "dht".into(),
                     secret: ServerSecret(TEST_SECRET.into()),
                     credential: ServerSecret(TEST_SECRET.into()),
+                    discovery: Some(ServerSecret(DISCOVERY_SECRET.into())),
                     transport: Transport::Auto,
                 },
                 CfgServer {
@@ -827,6 +872,7 @@ mod tests {
                     addr: "203.0.113.10:2222".into(),
                     secret: ServerSecret(OTHER_SECRET.into()),
                     credential: ServerSecret(OTHER_SECRET.into()),
+                    discovery: None,
                     transport: Transport::Tcp,
                 },
             ],
@@ -883,6 +929,7 @@ mod tests {
         let s = format!("{cfg:?}");
         assert!(!s.contains(TEST_SECRET), "{s}");
         assert!(!s.contains(OTHER_SECRET), "{s}");
+        assert!(!s.contains(DISCOVERY_SECRET), "{s}");
         assert!(!s.contains(peer_secret), "{s}");
         assert!(s.contains("home"));
     }
@@ -958,6 +1005,67 @@ mod tests {
         assert!(uppercase.validate().is_ok());
     }
 
+    // A dht profile is resolvable only through its discovery credential, so
+    // the entry must carry one, well formed and never a value that also
+    // authenticates something.
+    #[test]
+    fn dht_server_requires_its_own_discovery_credential() {
+        let entry = |addr: &str, extra: &str| {
+            format!(
+                "[[servers]]\nname = \"home\"\naddr = \"{addr}\"\nsecret = \"{TEST_SECRET}\"\n\
+                 credential = \"{OTHER_SECRET}\"\n{extra}"
+            )
+        };
+
+        let missing = parse_client(&entry("dht", "")).unwrap();
+        let error = missing.validate().unwrap_err().to_string();
+        assert!(error.contains("server `home`"), "{error}");
+        assert!(error.contains("`discovery`"), "{error}");
+
+        let malformed = parse_client(&entry("dht", "discovery = \"short\"\n")).unwrap();
+        let error = malformed.validate().unwrap_err().to_string();
+        assert!(error.contains("`discovery`"), "{error}");
+
+        let ok = parse_client(&entry(
+            "dht",
+            &format!("discovery = \"{DISCOVERY_SECRET}\"\n"),
+        ))
+        .unwrap();
+        ok.validate().unwrap();
+        assert_eq!(parse_client(&serialize_client(&ok)).unwrap(), ok);
+
+        // A host:port profile needs no discovery credential and may keep one.
+        parse_client(&entry("203.0.113.10:2222", ""))
+            .unwrap()
+            .validate()
+            .unwrap();
+        let kept = parse_client(&entry(
+            "203.0.113.10:2222",
+            &format!("discovery = \"{DISCOVERY_SECRET}\"\n"),
+        ))
+        .unwrap();
+        kept.validate().unwrap();
+        assert_eq!(parse_client(&serialize_client(&kept)).unwrap(), kept);
+
+        // Reusing any secret, credential, or peer key as the discovery
+        // credential collapses the separation and is refused.
+        for copied in [TEST_SECRET, &TEST_SECRET.to_ascii_uppercase(), OTHER_SECRET] {
+            let cfg = parse_client(&entry("dht", &format!("discovery = \"{copied}\"\n"))).unwrap();
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("must differ"), "{error}");
+        }
+        let peer_copy = format!(
+            "[client]\npeer_secret = \"{DISCOVERY_SECRET}\"\n{}",
+            entry("dht", &format!("discovery = \"{DISCOVERY_SECRET}\"\n"))
+        );
+        let error = parse_client(&peer_copy)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must differ"), "{error}");
+    }
+
     #[test]
     fn roundtrip_devices() {
         let tap = ClientConfig {
@@ -966,6 +1074,7 @@ mod tests {
                 addr: "dht".into(),
                 secret: ServerSecret(TEST_SECRET.into()),
                 credential: ServerSecret(TEST_SECRET.into()),
+                discovery: Some(ServerSecret(DISCOVERY_SECRET.into())),
                 transport: Transport::Auto,
             }],
             tap: Some(CfgTap {
@@ -1105,7 +1214,7 @@ mod tests {
     #[test]
     fn entry_defaults() {
         let cfg = parse_client(
-            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
+            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\ndiscovery = \"5555555555555555555555555555555555555555555555555555555555555555\"\n\
              [[forwards]]\nproto = \"tcp\"\nport = 8080\n\
              [[pppoe]]\nname = \"wan\"\nusername = \"u\"\n",
         )
@@ -1244,10 +1353,10 @@ mod tests {
     fn semantic_errors_parse_but_fail_validate() {
         let cases = [
             // active names no [[servers]] entry.
-            "[client]\nactive = \"gone\"\n[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n",
+            "[client]\nactive = \"gone\"\n[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:2222\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n",
             // Duplicate server names.
-            "[[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
-             [[servers]]\nname = \"a\"\naddr = \"dht\"\nsecret = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\n",
+            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:2222\"\nsecret = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:2222\"\nsecret = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\n",
             // Duplicate (proto, port) forwards.
             "[[forwards]]\nproto = \"tcp\"\nport = 443\n[[forwards]]\nproto = \"tcp\"\nport = 443\n",
             // More than one autostart.

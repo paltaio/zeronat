@@ -249,8 +249,8 @@ fn peer_steps(cfg: &Config) -> (String, String) {
         Mode::Server => {
             let cmd = if cfg.use_dht {
                 format!(
-                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --dht --secret {} {fwd} -y",
-                    cfg.secret
+                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --dht --secret {} --discovery {} {fwd} -y",
+                    cfg.secret, cfg.discovery
                 )
             } else {
                 let host = sys::pub_ip();
@@ -266,7 +266,7 @@ fn peer_steps(cfg: &Config) -> (String, String) {
         }
         Mode::Client => {
             let disc = if cfg.use_dht {
-                "--dht".to_string()
+                format!("--dht --discovery {}", cfg.discovery)
             } else {
                 // The server must listen on the port the client dials, which is
                 // the one in the entered address (falling back to the default).
@@ -317,7 +317,7 @@ fn check_forwards(cfg: &Config) -> Result<(), String> {
 }
 
 fn env_file(cfg: &Config, sub: &str) -> String {
-    let role = if cfg.mode == Mode::Server {
+    let mut role = if cfg.mode == Mode::Server {
         format!(
             "ZERONAT_CLIENT_ID=client\nZERONAT_CLIENT_SECRET={}\nZERONAT_ADMIN_SECRET={}\n",
             cfg.secret, cfg.admin_secret
@@ -325,6 +325,9 @@ fn env_file(cfg: &Config, sub: &str) -> String {
     } else {
         format!("ZERONAT_CLIENT_SECRET={}\n", cfg.secret)
     };
+    if cfg.use_dht {
+        role.push_str(&format!("ZERONAT_DISCOVERY_SECRET={}\n", cfg.discovery));
+    }
     if cfg.method == Method::Docker && cfg.deploy == Deploy::Compose {
         format!("ZERONAT_SECRET={}\n{role}ZERONAT_ARGS={sub}\n", cfg.secret)
     } else {
@@ -996,6 +999,8 @@ mod tests {
     const TEST_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
     const TEST_ADMIN_SECRET: &str =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_DISCOVERY_SECRET: &str =
+        "5555555555555555555555555555555555555555555555555555555555555555";
 
     fn cfg() -> Config {
         let mut cfg = Config::new(false, false, None);
@@ -1174,6 +1179,45 @@ mod tests {
         assert!(client.contains(&format!("ZERONAT_CLIENT_SECRET={TEST_SECRET}\n")));
         assert!(!client.contains("ZERONAT_CLIENT_ID="));
         assert!(!client.contains("ZERONAT_ADMIN_SECRET="));
+    }
+
+    // A dht install carries the discovery secret in the env file it writes and
+    // in the one-liner for the other machine; a host:port install carries
+    // neither.
+    #[test]
+    fn dht_install_carries_the_discovery_secret() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.use_dht = true;
+        c.discovery = TEST_DISCOVERY_SECRET.into();
+        c.ports = "80/tcp".into();
+        let env = env_file(&c, "server --control 2222");
+        assert!(env.contains(&format!(
+            "ZERONAT_DISCOVERY_SECRET={TEST_DISCOVERY_SECRET}\n"
+        )));
+        let (_, cmd) = peer_steps(&c);
+        assert!(
+            cmd.contains(&format!("--discovery {TEST_DISCOVERY_SECRET}")),
+            "{cmd}"
+        );
+
+        c.mode = Mode::Client;
+        let env = env_file(&c, "client --server dht");
+        assert!(env.contains(&format!(
+            "ZERONAT_DISCOVERY_SECRET={TEST_DISCOVERY_SECRET}\n"
+        )));
+        let (_, cmd) = peer_steps(&c);
+        assert!(
+            cmd.contains(&format!("--discovery {TEST_DISCOVERY_SECRET}")),
+            "{cmd}"
+        );
+
+        c.use_dht = false;
+        c.server_addr = "vps.example:9000".into();
+        let env = env_file(&c, "client --server vps.example:9000");
+        assert!(!env.contains("ZERONAT_DISCOVERY_SECRET"));
+        let (_, cmd) = peer_steps(&c);
+        assert!(!cmd.contains("--discovery"), "{cmd}");
     }
 
     #[test]

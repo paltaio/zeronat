@@ -51,6 +51,8 @@ server options:
   --tap-mtu <N>       TAP/TUN MTU (default: 1400; alias --tun-mtu)
   --bridge <NAME>     Enslave the TAP to this existing bridge
   --server dht        Publish this server's address to the DHT for discovery
+  --discovery <64-HEX>  Discovery credential the DHT record is keyed by (or env
+                      ZERONAT_DISCOVERY_SECRET); required with --server dht
   --announce-ip <IP>  Public IPv4 to announce (default: auto-detected via DHT)
   --announce-port <P> Public port to announce (default: control port)
 
@@ -59,6 +61,9 @@ client options:
   --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET)
   --credential <64-HEX>  Client credential (or env ZERONAT_CLIENT_SECRET;
                       defaults to --secret)
+  --discovery <64-HEX>  Discovery credential the server's DHT record is keyed
+                      by (or env ZERONAT_DISCOVERY_SECRET); required with
+                      --server dht
   --id <PREFIX>       Client id prefix (default: short hostname)
   --config <PATH>     Load servers/forwards/identity from a config file
   --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT, plus
@@ -147,6 +152,7 @@ enum Cmd {
         bind: Option<Ipv4Addr>,
         control: Option<u16>,
         secret: String,
+        discovery: Option<String>,
         client_credentials: Vec<server::ClientCredentialSpec>,
         admin_secret: Option<String>,
         server_id: Option<String>,
@@ -167,6 +173,7 @@ enum Cmd {
         server: Option<String>,
         secret: Option<String>,
         credential: Option<String>,
+        discovery: Option<String>,
         id_prefix: Option<String>,
         tcp: Vec<String>,
         udp: Vec<String>,
@@ -625,6 +632,7 @@ fn parse_args() -> Result<Cmd> {
         let mut bind: Option<Ipv4Addr> = None;
         let mut control: Option<u16> = None;
         let mut secret: Option<String> = None;
+        let mut discovery: Option<String> = None;
         let mut client_credentials = Vec::new();
         let mut admin_secret: Option<String> = None;
         let mut server_id: Option<String> = None;
@@ -684,6 +692,9 @@ fn parse_args() -> Result<Cmd> {
                 }
                 "--secret" => {
                     secret = Some(iter.next().ok_or("--secret requires a value")?);
+                }
+                "--discovery" => {
+                    discovery = Some(iter.next().ok_or("--discovery requires a value")?);
                 }
                 "--client" => {
                     let value = iter.next().ok_or("--client requires ID:64-HEX")?;
@@ -757,6 +768,10 @@ fn parse_args() -> Result<Cmd> {
                 .or_else(|| std::env::var("ZERONAT_SECRET").ok())
                 .ok_or("--secret or ZERONAT_SECRET is required")?,
         )?;
+        let discovery = discovery.or_else(|| std::env::var("ZERONAT_DISCOVERY_SECRET").ok());
+        if dht && discovery.is_none() {
+            return Err("--server dht requires --discovery or ZERONAT_DISCOVERY_SECRET".into());
+        }
         let admin_secret = admin_secret.or_else(|| std::env::var("ZERONAT_ADMIN_SECRET").ok());
         if client_credentials.is_empty() {
             match (
@@ -787,6 +802,7 @@ fn parse_args() -> Result<Cmd> {
             bind,
             control,
             secret,
+            discovery,
             client_credentials,
             admin_secret,
             server_id,
@@ -808,6 +824,7 @@ fn parse_args() -> Result<Cmd> {
         let mut server: Option<String> = None;
         let mut secret: Option<String> = None;
         let mut credential: Option<String> = None;
+        let mut discovery: Option<String> = None;
         let mut id_prefix: Option<String> = None;
         let mut tcp: Vec<String> = Vec::new();
         let mut udp: Vec<String> = Vec::new();
@@ -855,6 +872,9 @@ fn parse_args() -> Result<Cmd> {
                 }
                 "--credential" => {
                     credential = Some(iter.next().ok_or("--credential requires a value")?);
+                }
+                "--discovery" => {
+                    discovery = Some(iter.next().ok_or("--discovery requires a value")?);
                 }
                 "--id" => {
                     id_prefix = Some(iter.next().ok_or("--id requires a value")?);
@@ -933,6 +953,7 @@ fn parse_args() -> Result<Cmd> {
             server,
             secret,
             credential,
+            discovery,
             id_prefix,
             tcp,
             udp,
@@ -1090,6 +1111,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             bind,
             control,
             secret,
+            discovery,
             client_credentials,
             admin_secret,
             server_id,
@@ -1367,6 +1389,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 bind: bind_ip,
                 control_port,
                 secret,
+                discovery,
                 client_credentials,
                 admin_secret,
                 server_id,
@@ -1389,6 +1412,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             server,
             secret,
             credential,
+            discovery,
             id_prefix,
             tcp,
             udp,
@@ -1472,6 +1496,9 @@ async fn run(cmd: Cmd) -> Result<()> {
                 }
                 if credential.is_some() {
                     zeronat::elog!("config overrides --credential");
+                }
+                if discovery.is_some() {
+                    zeronat::elog!("config overrides --discovery");
                 }
                 if let Some(v) = &transport {
                     zeronat::elog!("config overrides --transport '{v}'");
@@ -1560,6 +1587,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                         addr: s.addr.clone(),
                         secret: s.secret.0.clone(),
                         credential: s.credential.0.clone(),
+                        discovery: s.discovery.as_ref().map(|d| d.0.clone()),
                         transport: s.transport,
                     })
                     .collect();
@@ -1568,6 +1596,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                     addr: srv.addr.clone(),
                     secret: srv.secret.0.clone(),
                     credential: srv.credential.0.clone(),
+                    discovery: srv.discovery.as_ref().map(|d| d.0.clone()),
                     transport: srv.transport,
                 };
 
@@ -1612,6 +1641,22 @@ async fn run(cmd: Cmd) -> Result<()> {
                         .or_else(|| std::env::var("ZERONAT_CLIENT_SECRET").ok())
                         .unwrap_or_else(|| secret.clone()),
                 )?;
+                let discovery =
+                    discovery.or_else(|| std::env::var("ZERONAT_DISCOVERY_SECRET").ok());
+                let discovery = match (server == "dht", discovery) {
+                    (true, None) => {
+                        return Err(
+                            "--server dht requires --discovery or ZERONAT_DISCOVERY_SECRET".into(),
+                        );
+                    }
+                    (_, Some(value)) => Some(runtime_secret(value)?),
+                    (false, None) => None,
+                };
+                if discovery.as_deref() == Some(secret.as_str())
+                    || discovery.as_deref() == Some(credential.as_str())
+                {
+                    return Err("--discovery must differ from --secret and --credential".into());
+                }
                 if tun && bridge.is_some() {
                     return Err("--bridge applies to --tap only, not --tun".into());
                 }
@@ -1749,8 +1794,8 @@ async fn run(cmd: Cmd) -> Result<()> {
                     ),
                 }
                 client::run(
-                    server, secret, credential, tcp, udp, transport, tap, tun, pppoe, id_prefix,
-                    control,
+                    server, secret, credential, discovery, tcp, udp, transport, tap, tun, pppoe,
+                    id_prefix, control,
                 )
                 .await
             }
@@ -1971,6 +2016,7 @@ mod tests {
             addr: format!("{name}.example:2222"),
             secret: zeronat::clientproto::ServerSecret("s".into()),
             credential: zeronat::clientproto::ServerSecret("s".into()),
+            discovery: None,
             transport: zeronat::client::Transport::Auto,
         }
     }

@@ -17,6 +17,7 @@ pub struct Parsed {
     pub deploy: Option<String>,
     pub secret: Option<String>,
     pub admin_secret: Option<String>,
+    pub discovery: Option<String>,
     pub control: Option<String>,
     pub ports: Option<String>,
     pub server_addr: Option<String>,
@@ -39,6 +40,7 @@ pub struct Host {
     pub have_compose: bool,
     pub existing_secret: Option<String>,
     pub existing_admin_secret: Option<String>,
+    pub existing_discovery_secret: Option<String>,
     pub ssh_port: u16,
 }
 
@@ -61,6 +63,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             "--deploy" => p.deploy = Some(take(&mut i, a)?),
             "--secret" => p.secret = Some(take(&mut i, a)?),
             "--admin-secret" => p.admin_secret = Some(take(&mut i, a)?),
+            "--discovery" => p.discovery = Some(take(&mut i, a)?),
             "--control" => p.control = Some(take(&mut i, a)?),
             "--ports" => p.ports = Some(take(&mut i, a)?),
             "--server-addr" | "--addr" => p.server_addr = Some(take(&mut i, a)?),
@@ -259,15 +262,54 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
         sys::gen_secret()?
     };
     cfg.secret = secret;
-    finalize_credentials(&mut cfg, p, host)?;
+    finalize_credentials(&mut cfg, p, host, headless)?;
 
     Ok(cfg)
 }
 
-/// Normalize the client secret, then clear the admin secret for clients or
-/// resolve it for servers.
-pub fn finalize_credentials(cfg: &mut Config, p: &Parsed, host: &Host) -> Result<(), String> {
+/// Normalize the client secret, resolve the discovery credential, then clear
+/// the admin secret for clients or resolve it for servers. The discovery
+/// precedence is wizard value > --discovery > on-disk; only a server may
+/// generate one, because a client's discovery credential belongs to the server
+/// it joins. With `complete` a dht client missing one is an error; without it
+/// the value is left empty for the wizard to collect.
+pub fn finalize_credentials(
+    cfg: &mut Config,
+    p: &Parsed,
+    host: &Host,
+    complete: bool,
+) -> Result<(), String> {
     cfg.secret = zeronat_secret::normalize(&cfg.secret).map_err(|e| format!("client {e}"))?;
+    if cfg.use_dht {
+        let discovery = if !cfg.discovery.is_empty() {
+            cfg.discovery.clone()
+        } else if let Some(s) = &p.discovery {
+            s.clone()
+        } else if let Some(s) = &host.existing_discovery_secret {
+            s.clone()
+        } else if !complete {
+            String::new()
+        } else if cfg.mode == Mode::Server {
+            sys::gen_secret()?
+        } else {
+            return Err(
+                "client needs --discovery 64-HEX; the server install prints it in the client \
+                 command"
+                    .into(),
+            );
+        };
+        if discovery.is_empty() {
+            cfg.discovery.clear();
+        } else {
+            cfg.discovery =
+                zeronat_secret::normalize(&discovery).map_err(|e| format!("discovery {e}"))?;
+            if cfg.discovery == cfg.secret {
+                return Err("discovery secret must differ from the client secret".into());
+            }
+        }
+    } else {
+        cfg.discovery.clear();
+    }
     if cfg.mode != Mode::Server {
         cfg.admin_secret.clear();
         return Ok(());
@@ -288,6 +330,9 @@ pub fn finalize_credentials(cfg: &mut Config, p: &Parsed, host: &Host) -> Result
         zeronat_secret::normalize(&admin_secret).map_err(|e| format!("admin {e}"))?;
     if cfg.admin_secret == cfg.secret {
         return Err("admin secret must differ from the client secret".into());
+    }
+    if cfg.use_dht && cfg.admin_secret == cfg.discovery {
+        return Err("admin secret must differ from the discovery secret".into());
     }
     Ok(())
 }
@@ -310,8 +355,86 @@ mod tests {
             have_compose: false,
             existing_secret: None,
             existing_admin_secret: None,
+            existing_discovery_secret: None,
             ssh_port: 22,
         }
+    }
+
+    // A dht setup resolves a discovery secret as --discovery > on-disk, refuses
+    // one that doubles as the client secret, and a host:port setup keeps none.
+    // Only a server may generate one: a dht client with no discovery from any
+    // source errors instead of inventing a credential that names no server.
+    #[test]
+    fn dht_resolves_a_discovery_secret() {
+        let dht = |extra: &[&str]| {
+            let mut args = vec!["-y", "--client", "--dht", "--ports", "443/tcp"];
+            args.extend_from_slice(extra);
+            parse(&s(&args)).unwrap()
+        };
+
+        let err = build(&dht(&["--secret", FLAG_SECRET]), &host(), true)
+            .err()
+            .unwrap();
+        assert!(err.contains("--discovery"), "{err}");
+
+        let p = parse(&s(&[
+            "-y",
+            "--server",
+            "--dht",
+            "--ports",
+            "443/tcp",
+            "--secret",
+            FLAG_SECRET,
+        ]))
+        .unwrap();
+        let cfg = build(&p, &host(), true).unwrap();
+        assert_eq!(cfg.discovery.len(), 64);
+        assert_ne!(cfg.discovery, cfg.secret);
+
+        let p = dht(&["--secret", FLAG_SECRET, "--discovery", DISK_SECRET]);
+        assert_eq!(build(&p, &host(), true).unwrap().discovery, DISK_SECRET);
+
+        let mut h = host();
+        h.existing_discovery_secret = Some(ADMIN_SECRET.into());
+        let cfg = build(&dht(&["--secret", FLAG_SECRET]), &h, true).unwrap();
+        assert_eq!(cfg.discovery, ADMIN_SECRET);
+
+        let p = dht(&["--secret", FLAG_SECRET, "--discovery", FLAG_SECRET]);
+        assert!(build(&p, &host(), true).is_err());
+
+        let p = parse(&s(&[
+            "-y",
+            "--client",
+            "--server-addr",
+            "1.2.3.4",
+            "--ports",
+            "443/tcp",
+            "--secret",
+            FLAG_SECRET,
+            "--discovery",
+            DISK_SECRET,
+        ]))
+        .unwrap();
+        assert!(build(&p, &host(), true).unwrap().discovery.is_empty());
+    }
+
+    // The wizard collects a dht client's discovery credential, so the
+    // pre-wizard build leaves it empty instead of erroring; the post-wizard
+    // pass errors when the wizard somehow finished without one and keeps the
+    // entered value otherwise.
+    #[test]
+    fn wizard_dht_client_defers_the_discovery_credential() {
+        let p = parse(&s(&["--client", "--dht", "--secret", FLAG_SECRET])).unwrap();
+        let h = host();
+        let mut cfg = build(&p, &h, false).unwrap();
+        assert!(cfg.discovery.is_empty());
+
+        let err = finalize_credentials(&mut cfg, &p, &h, true).unwrap_err();
+        assert!(err.contains("--discovery"), "{err}");
+
+        cfg.discovery = DISK_SECRET.into();
+        finalize_credentials(&mut cfg, &p, &h, true).unwrap();
+        assert_eq!(cfg.discovery, DISK_SECRET);
     }
 
     #[test]
@@ -572,7 +695,7 @@ mod tests {
         assert!(cfg.admin_secret.is_empty());
 
         cfg.mode = Mode::Server;
-        finalize_credentials(&mut cfg, &p, &h).unwrap();
+        finalize_credentials(&mut cfg, &p, &h, true).unwrap();
 
         assert_eq!(cfg.admin_secret, ADMIN_SECRET);
     }
@@ -593,7 +716,7 @@ mod tests {
         cfg.secret = ADMIN_SECRET.into();
 
         assert_eq!(
-            finalize_credentials(&mut cfg, &p, &h).unwrap_err(),
+            finalize_credentials(&mut cfg, &p, &h, true).unwrap_err(),
             "admin secret must differ from the client secret"
         );
     }

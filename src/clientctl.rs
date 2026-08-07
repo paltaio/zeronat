@@ -435,20 +435,39 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                 Err(e) => return (false, format!("server {e}")),
             };
             if addr == "dht" {
-                if cfg!(not(feature = "dht")) {
-                    return (false, "this build has no dht support; use host:port".into());
-                }
-            } else if !valid_host_port(&addr) {
+                // The admin message carries no discovery credential, so a dht
+                // profile added here could never resolve.
                 return (
                     false,
-                    format!("addr must be \"dht\" or host:port, got `{addr}`"),
+                    "a dht profile needs a `discovery` credential; declare it in the config file"
+                        .into(),
                 );
+            }
+            if !valid_host_port(&addr) {
+                return (false, format!("addr must be host:port, got `{addr}`"));
+            }
+            // The boot validation rejects a file where any secret doubles as a
+            // `discovery` credential; a profile persisted past that rule would
+            // keep the daemon down on the next start.
+            match crate::secret::decode(&secret.0) {
+                Ok(key) => {
+                    if let Some(owner) = state.servers.discovery_owner(&key) {
+                        return (
+                            false,
+                            format!(
+                                "secret matches the `discovery` credential of server `{owner}`"
+                            ),
+                        );
+                    }
+                }
+                Err(e) => return (false, format!("server {e}")),
             }
             let target = ServerTarget {
                 name: name.clone(),
                 addr: addr.clone(),
                 secret: secret.0.clone(),
                 credential: secret.0.clone(),
+                discovery: None,
                 transport,
             };
             // Name uniqueness also protects the empty-name `Connect` sentinel.
@@ -461,6 +480,7 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                     addr,
                     credential: secret.clone(),
                     secret,
+                    discovery: None,
                     transport,
                 })
             })
@@ -822,17 +842,28 @@ fn attach_fields(
 }
 
 /// Refusal for a profile this build cannot dial. Dialing a `"dht"` profile
-/// without dht support is a fatal discovery error in the reconnect loop, which
-/// would kill the daemon after the acceptance reply; refusing the retarget
-/// here keeps the loop away from it. Config-declared profiles hit this too:
-/// boot only dials the active profile, so the others were never checked.
+/// without dht support or without a discovery credential is a fatal discovery
+/// error in the reconnect loop, which would kill the daemon after the
+/// acceptance reply; refusing the retarget here keeps the loop away from it.
+/// Config-declared profiles hit this too: boot only dials the active profile,
+/// so the others were never checked.
 fn undialable(target: &ServerTarget, dht_supported: bool) -> Option<String> {
-    (target.addr == "dht" && !dht_supported).then(|| {
-        format!(
+    if target.addr != "dht" {
+        return None;
+    }
+    if !dht_supported {
+        return Some(format!(
             "`{}` is a dht profile and this build has no dht support",
             target.name
-        )
-    })
+        ));
+    }
+    if target.discovery.is_none() {
+        return Some(format!(
+            "`{}` is a dht profile with no `discovery` credential",
+            target.name
+        ));
+    }
+    None
 }
 
 /// `host:port` with a non-empty host and a non-zero port. Hostnames resolve
@@ -909,7 +940,23 @@ mod tests {
             addr: format!("127.0.0.1:{port}"),
             secret: TEST_SECRET.into(),
             credential: TEST_SECRET.into(),
+            discovery: None,
             transport: Transport::Tcp,
+        }
+    }
+
+    /// A dht profile carrying its discovery credential, as the config loader
+    /// would admit it.
+    fn dht_target(name: &str) -> ServerTarget {
+        ServerTarget {
+            name: name.into(),
+            addr: "dht".into(),
+            secret: TEST_SECRET.into(),
+            credential: TEST_SECRET.into(),
+            discovery: Some(
+                "5555555555555555555555555555555555555555555555555555555555555555".into(),
+            ),
+            transport: Transport::Auto,
         }
     }
 
@@ -1415,22 +1462,77 @@ mod tests {
     }
 
     /// A `"dht"` profile is dialable exactly when the build carries dht
-    /// support; the refusal message names the profile.
+    /// support and the profile carries its discovery credential; the refusal
+    /// message names the profile.
     #[test]
-    fn undialable_keys_on_dht_support() {
-        let dht = ServerTarget {
-            name: "roam".into(),
-            addr: "dht".into(),
-            secret: TEST_SECRET.into(),
-            credential: TEST_SECRET.into(),
-            transport: Transport::Auto,
-        };
+    fn undialable_keys_on_dht_support_and_discovery() {
+        let dht = dht_target("roam");
         assert!(undialable(&dht, true).is_none());
         let msg = undialable(&dht, false).unwrap();
         assert!(msg.contains("`roam`"), "{msg}");
         assert!(msg.contains("dht"), "{msg}");
+
+        let mut bare = dht_target("roam");
+        bare.discovery = None;
+        let msg = undialable(&bare, true).unwrap();
+        assert!(msg.contains("`roam`"), "{msg}");
+        assert!(msg.contains("`discovery`"), "{msg}");
+
         assert!(undialable(&server_target("a", 1), false).is_none());
         assert!(undialable(&server_target("a", 1), true).is_none());
+    }
+
+    /// The admin message carries no discovery credential, so a dht profile
+    /// cannot be added over the socket; the refusal points at the config file.
+    #[tokio::test]
+    async fn add_server_refuses_a_dht_profile() {
+        let state = idle_state("a");
+        let (ok, msg) = mutate(&state, add_server("roam", "dht", OTHER_SECRET)).await;
+        assert!(!ok);
+        assert!(msg.contains("`discovery`"), "{msg}");
+        assert!(snapshot(&state).servers.is_empty());
+    }
+
+    /// A new profile's secret must not equal any profile's `discovery`
+    /// credential: the persisted file would fail the boot validation and the
+    /// daemon would stay down on the next start. The refusal names the owning
+    /// profile and matches on the decoded value, so hex case cannot slip one
+    /// through.
+    #[tokio::test]
+    async fn add_server_refuses_a_secret_matching_a_discovery_credential() {
+        let discovery: String = "5".repeat(64);
+        let dir = temp_dir("addsrvdisc");
+        let path = dir.join("client.toml");
+        let text = format!(
+            "[[servers]]\nname = \"roam\"\naddr = \"dht\"\nsecret = \"{TEST_SECRET}\"\n\
+             discovery = \"{discovery}\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let mut state = idle_state("a");
+        state.servers = SharedServers::new(vec![dht_target("roam")]);
+        state.persist = Some(Persist::new(
+            path.clone(),
+            crate::clientcfg::parse_client(&text).unwrap(),
+        ));
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        for secret in [discovery.clone(), discovery.to_uppercase()] {
+            let (ok, msg) = mutate(&state, add_server("b", "127.0.0.1:2", &secret)).await;
+            assert!(!ok, "{msg}");
+            assert!(msg.contains("`roam`"), "{msg}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(snapshot(&state).servers.len(), 1);
+
+        // A distinct secret is accepted and the saved file still passes the
+        // boot validation.
+        let (ok, msg) = mutate(&state, add_server("b", "127.0.0.1:2", OTHER_SECRET)).await;
+        assert!(ok, "{msg}");
+        let on_disk = crate::clientcfg::load(&path).unwrap();
+        on_disk.validate().unwrap();
+        assert_eq!(on_disk.servers.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Retargeting to a config-declared dht profile must not reach the
@@ -1440,14 +1542,7 @@ mod tests {
     #[tokio::test]
     async fn select_and_connect_refuse_a_dht_profile_without_dht_support() {
         let mut state = idle_state("a");
-        let dht = ServerTarget {
-            name: "roam".into(),
-            addr: "dht".into(),
-            secret: TEST_SECRET.into(),
-            credential: TEST_SECRET.into(),
-            transport: Transport::Auto,
-        };
-        state.servers = SharedServers::new(vec![server_target("a", 1), dht]);
+        state.servers = SharedServers::new(vec![server_target("a", 1), dht_target("roam")]);
 
         let (ok, msg) = mutate(
             &state,
@@ -1477,14 +1572,7 @@ mod tests {
     #[tokio::test]
     async fn select_and_connect_accept_a_dht_profile_with_dht_support() {
         let mut state = idle_state("a");
-        let dht = ServerTarget {
-            name: "roam".into(),
-            addr: "dht".into(),
-            secret: TEST_SECRET.into(),
-            credential: TEST_SECRET.into(),
-            transport: Transport::Auto,
-        };
-        state.servers = SharedServers::new(vec![server_target("a", 1), dht]);
+        state.servers = SharedServers::new(vec![server_target("a", 1), dht_target("roam")]);
         state.forwards = SharedForwards::new(vec![tcp_fwd(443)], Vec::new());
 
         let (ok, msg) = mutate(

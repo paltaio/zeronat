@@ -25,6 +25,7 @@ const SECRET_E: &str = "3333444455556666777788889999aaaabbbbccccddddeeeeffff0000
 const SECRET_F: &str = "444455556666777788889999aaaabbbbccccddddeeeeffff0000111122223333";
 const SECRET_G: &str = "55556666777788889999aaaabbbbccccddddeeeeffff00001111222233334444";
 const ADMIN_SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const DISCOVERY_SECRET: &str = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f";
 
 /// Build a `ServerSettings` for a config-less (runtime-only) server: localhost
 /// bind, removable runtime-sourced listeners, no routes, no config file. The
@@ -52,6 +53,7 @@ fn cli_settings(control: u16, tcp: Vec<u16>, udp: Vec<u16>) -> ServerSettings {
         bind: Ipv4Addr::LOCALHOST,
         control_port: control,
         secret: SECRET.into(),
+        discovery: None,
         admin_secret: Some(ADMIN_SECRET.into()),
         client_credentials: vec![
             ClientCredentialSpec {
@@ -283,6 +285,7 @@ async fn start_tagged_pair(
             format!("127.0.0.1:{control}"),
             SECRET.into(),
             credential.into(),
+            None,
             tcp_map,
             udp_map,
             zeronat::client::Transport::Tcp,
@@ -338,6 +341,7 @@ fn start_tunnel(transport: zeronat::client::Transport) -> Tunnel {
         format!("127.0.0.1:{control}"),
         SECRET.into(),
         SECRET.into(),
+        None,
         vec![fwd(public_tcp, local_tcp)],
         vec![fwd(public_udp, local_udp)],
         transport,
@@ -376,6 +380,42 @@ async fn remote_connect(
         }
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The discovery credential locates a dht server and is handed to parties that
+/// must not open sessions. Against a running server configured with both a
+/// session secret and a discovery credential, a session-credential handshake on
+/// the control port succeeds and a discovery-credential handshake is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_credential_cannot_open_a_session() {
+    let control = free_port();
+    let mut settings = cli_settings(control, vec![], vec![]);
+    settings.discovery = Some(DISCOVERY_SECRET.into());
+    tokio::spawn(zeronat::server::run(settings));
+
+    let body = async {
+        // The session credential connects, so the listener is up and admitting
+        // (an always-refuse server fails here).
+        let session_psk = zeronat::noise::derive_psk(SECRET);
+        let _live = remote_connect(control, &session_psk, zeronat::noise::AuthRole::Client).await;
+
+        let discovery_psk = zeronat::noise::derive_psk(DISCOVERY_SECRET);
+        let sock = TcpStream::connect(("127.0.0.1", control)).await.unwrap();
+        sock.set_nodelay(true).ok();
+        let refused = zeronat::noise::client_handshake_remote(
+            sock,
+            &discovery_psk,
+            zeronat::noise::AuthRole::Client,
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "the discovery credential opened a session"
+        );
+    };
+    timeout(Duration::from_secs(20), body)
+        .await
+        .expect("handshakes did not resolve within 20s");
 }
 
 async fn recv_open_claim(r: &mut zeronat::noise::NoiseReader) -> (u64, zeronat::proto::Capability) {
@@ -652,6 +692,7 @@ async fn udp_control_answers_on_the_dialed_address() {
         format!("127.0.0.2:{control}"),
         SECRET.into(),
         SECRET.into(),
+        None,
         vec![fwd(public_tcp, local_tcp)],
         vec![],
         zeronat::client::Transport::Udp,
@@ -690,6 +731,7 @@ async fn run_udp_forward_source_test(transport: zeronat::client::Transport) {
         format!("127.0.0.1:{control}"),
         SECRET.into(),
         SECRET.into(),
+        None,
         vec![],
         vec![fwd(public_udp, local_udp)],
         transport,
@@ -1642,6 +1684,7 @@ async fn reconnect_same_id_supersede() {
             format!("127.0.0.1:{control}"),
             SECRET.into(),
             SECRET.into(),
+            None,
             vec![fwd(public_tcp, local_tcp)],
             vec![],
             zeronat::client::Transport::Tcp,
@@ -1655,6 +1698,7 @@ async fn reconnect_same_id_supersede() {
             format!("127.0.0.1:{control}"),
             SECRET.into(),
             SECRET.into(),
+            None,
             vec![fwd(public_tcp, local_tcp)],
             vec![],
             zeronat::client::Transport::Tcp,
@@ -1723,6 +1767,7 @@ async fn config_autosave_persists_route() {
             format!("127.0.0.1:{control}"),
             SECRET.into(),
             SECRET.into(),
+            None,
             vec![fwd(public_tcp, local_tcp)],
             vec![],
             zeronat::client::Transport::Tcp,
@@ -1811,6 +1856,7 @@ async fn cli_listener_remove_refused() {
             format!("127.0.0.1:{control}"),
             SECRET.into(),
             SECRET.into(),
+            None,
             vec![fwd(public_tcp, local_tcp)],
             vec![],
             zeronat::client::Transport::Tcp,
@@ -1867,6 +1913,7 @@ async fn runtime_node_does_not_persist() {
             format!("127.0.0.1:{control}"),
             SECRET.into(),
             SECRET.into(),
+            None,
             vec![fwd(public_tcp, local_tcp)],
             vec![],
             zeronat::client::Transport::Tcp,
@@ -1980,6 +2027,7 @@ async fn run_proxy_header_test(transport: zeronat::client::Transport) {
         format!("127.0.0.1:{control}"),
         SECRET.into(),
         SECRET.into(),
+        None,
         vec![forward],
         vec![],
         transport,
@@ -2185,6 +2233,7 @@ async fn proxy_forward_refuses_headerless_open() {
             format!("127.0.0.1:{control}"),
             SECRET.into(),
             SECRET.into(),
+            None,
             vec![forward],
             vec![],
             zeronat::client::Transport::Tcp,
@@ -2233,6 +2282,7 @@ fn server_target(name: &str, control: u16, secret: &str) -> zeronat::client::Ser
         addr: format!("127.0.0.1:{control}"),
         secret: secret.into(),
         credential: SECRET.into(),
+        discovery: None,
         transport: zeronat::client::Transport::Tcp,
     }
 }
@@ -2388,6 +2438,7 @@ async fn dropping_client_future_aborts_session() {
             format!("127.0.0.1:{control}"),
             SECRET.into(),
             SECRET.into(),
+            None,
             vec![fwd(public_tcp, local_tcp)],
             vec![],
             zeronat::client::Transport::Tcp,
@@ -2430,6 +2481,7 @@ async fn client_admin_socket_serves_snapshot() {
             format!("127.0.0.1:{control}"),
             SECRET.into(),
             SECRET.into(),
+            None,
             vec![fwd(public_tcp, local_tcp)],
             vec![],
             zeronat::client::Transport::Tcp,
@@ -6061,6 +6113,7 @@ async fn run_two_slot_test(transport: zeronat::client::Transport, punched: bool)
             addr: format!("127.0.0.1:{control}"),
             secret: SECRET.into(),
             credential: credential.into(),
+            discovery: None,
             transport,
         };
 
@@ -6170,6 +6223,7 @@ async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
             addr: format!("127.0.0.1:{control}"),
             secret: SECRET.into(),
             credential: credential.into(),
+            discovery: None,
             transport: zeronat::client::Transport::Udp,
         };
 
@@ -6314,6 +6368,7 @@ async fn peer_exit_provider_refuses_a_pair_it_cannot_serve() {
             addr: format!("127.0.0.1:{control}"),
             secret: SECRET.into(),
             credential: SECRET_F.into(),
+            discovery: None,
             transport: zeronat::client::Transport::Tcp,
         };
 
@@ -6369,6 +6424,7 @@ async fn peer_segment_provider_refuses_a_pair_it_cannot_serve() {
             addr: format!("127.0.0.1:{control}"),
             secret: SECRET.into(),
             credential: SECRET_F.into(),
+            discovery: None,
             transport: zeronat::client::Transport::Tcp,
         };
 
@@ -6461,6 +6517,7 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
                 addr: format!("127.0.0.1:{control}"),
                 secret: SECRET.into(),
                 credential: SECRET_G.into(),
+                discovery: None,
                 transport: zeronat::client::Transport::Udp,
             }],
             vec![],
@@ -6479,6 +6536,7 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
             addr: format!("127.0.0.1:{control}"),
             secret: SECRET.into(),
             credential: SECRET_G.into(),
+            discovery: None,
             transport: zeronat::client::Transport::Udp,
         };
         tokio::spawn(zeronat::client::run_switchable(
