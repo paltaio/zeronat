@@ -62,6 +62,20 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(90);
 /// and drops the socket when none is free, so stalled TCP peers hold at most
 /// this many pre-authentication sockets and tasks.
 const MAX_INFLIGHT_HANDSHAKES: usize = 256;
+/// Ceiling on concurrent public connections per forwarded TCP port: every
+/// accepted connection whose bridge task is still running, from the open
+/// window through bridge teardown. Each listener owns its own count, so a
+/// flooded port sheds only its own overflow and every other port keeps
+/// admitting.
+const MAX_CONNS_PER_TCP_FORWARD: usize = 256;
+/// Ceiling on tracked public sources per forwarded UDP port. A datagram from a
+/// new source at the cap is dropped after one inline eviction pass over dead
+/// entries; a known source keeps its slot, so a source flood cannot evict or
+/// starve an established flow. Per listener, like the TCP cap.
+const MAX_SOURCES_PER_UDP_FORWARD: usize = 256;
+/// Minimum spacing between a listener's at-capacity drop log lines, so a flood
+/// held at the cap cannot turn the log into its own denial of service.
+const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
 /// Pause after a transient accept/recv error so a persistent failure (e.g. EMFILE
 /// under fd pressure) does not spin the listener loop at 100% CPU.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
@@ -91,6 +105,17 @@ struct PendingUdpAdmission {
 /// cannot evict or starve an established session.
 fn admit_new_udp_session(session_count: usize) -> bool {
     session_count < MAX_UDP_SESSIONS
+}
+
+/// Whether an at-capacity drop should log now. Stamps `last` when it fires, so
+/// each listener logs at most once per `DROP_LOG_INTERVAL`.
+fn drop_log_due(last: &mut Option<Instant>, now: Instant) -> bool {
+    if last.is_none_or(|at| now.duration_since(at) >= DROP_LOG_INTERVAL) {
+        *last = Some(now);
+        true
+    } else {
+        false
+    }
 }
 
 fn record_udp_admission(
@@ -2395,6 +2420,7 @@ async fn tcp_listener(
     cancel: Arc<Notify>,
     bridges: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 ) {
+    let mut last_drop_log = None;
     loop {
         let (public, peer) = tokio::select! {
             _ = cancel.notified() => break,
@@ -2409,6 +2435,25 @@ async fn tcp_listener(
                 }
             },
         };
+        // Admit against this listener's own live-task count, so one flooded
+        // port cannot spend another port's capacity. Dropping `public` closes
+        // the socket before it can pin a task, a pending entry, or a client
+        // open.
+        let at_cap = {
+            let mut active = bridges.lock().unwrap();
+            active.retain(|h| !h.is_finished());
+            active.len() >= MAX_CONNS_PER_TCP_FORWARD
+        };
+        if at_cap {
+            if drop_log_due(&mut last_drop_log, Instant::now()) {
+                crate::elog!(
+                    "tcp listener {bind_ip}:{port}: \
+                     {MAX_CONNS_PER_TCP_FORWARD} connections active, \
+                     dropping new connections ({peer})"
+                );
+            }
+            continue;
+        }
         let srv = srv.clone();
         let handle = crate::spawn(async move {
             // The accept's peer and local addresses feed a PROXY header when the
@@ -2438,10 +2483,7 @@ async fn tcp_listener(
                 _ = session_cancelled(&mut session_cancel) => {}
             }
         });
-        let mut active = bridges.lock().unwrap();
-        active.push(handle);
-        // Bound the tracking vector over a long-lived listener.
-        active.retain(|h| !h.is_finished());
+        bridges.lock().unwrap().push(handle);
     }
 }
 
@@ -2467,6 +2509,7 @@ async fn udp_listener(
     // source that sends once and vanishes cannot pin a dead Sender slot forever.
     let mut sessions: HashMap<SocketAddr, (mpsc::Sender<Vec<u8>>, Instant, Duration)> =
         HashMap::new();
+    let mut last_drop_log = None;
     let mut buf = [0u8; 65535];
     let mut sweep = tokio::time::interval(UDP_SWEEP_INTERVAL);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2517,6 +2560,27 @@ async fn udp_listener(
         } else {
             data
         };
+
+        // Admit the new source against this listener's own session count, so a
+        // source flood on one port cannot spend another port's capacity. At the
+        // cap, one eviction pass reclaims dead entries the sweep has not
+        // reached yet; a source refused here parks nothing and reaches no
+        // client.
+        if sessions.len() >= MAX_SOURCES_PER_UDP_FORWARD {
+            let now = Instant::now();
+            sessions
+                .retain(|_, (tx, last, ttl)| !tx.is_closed() && now.duration_since(*last) < *ttl);
+            if sessions.len() >= MAX_SOURCES_PER_UDP_FORWARD {
+                if drop_log_due(&mut last_drop_log, now) {
+                    crate::elog!(
+                        "udp listener {bind_ip}:{port}: \
+                         {MAX_SOURCES_PER_UDP_FORWARD} sources active, \
+                         dropping datagrams from new sources ({src})"
+                    );
+                }
+                continue;
+            }
+        }
 
         // Resolve the client serving this listener before parking the source. A
         // source with no route (and no single-client fallback) is dropped.
@@ -3049,6 +3113,25 @@ mod tests {
         assert!(admit_new_udp_session(MAX_UDP_SESSIONS - 1));
         assert!(!admit_new_udp_session(MAX_UDP_SESSIONS));
         assert!(!admit_new_udp_session(MAX_UDP_SESSIONS + 10_000));
+    }
+
+    // The first drop after a quiet period always logs, and a sustained flood
+    // logs once per interval instead of once per drop.
+    #[test]
+    fn drop_log_fires_first_then_once_per_interval() {
+        let start = Instant::now();
+        let mut last = None;
+        assert!(drop_log_due(&mut last, start));
+        assert!(!drop_log_due(&mut last, start));
+        assert!(!drop_log_due(
+            &mut last,
+            start + DROP_LOG_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(drop_log_due(&mut last, start + DROP_LOG_INTERVAL));
+        assert!(!drop_log_due(
+            &mut last,
+            start + DROP_LOG_INTERVAL + Duration::from_millis(1)
+        ));
     }
 
     // The control loop only gates *unknown* sources on the cap; a known source
@@ -3595,6 +3678,193 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             srv.known_peer_identities.lock().unwrap().insert(identity);
         }
         (tx, rx)
+    }
+
+    // The connection cap is per listener: with one TCP forward held at
+    // MAX_CONNS_PER_TCP_FORWARD, the overflow connection is closed and opens
+    // nothing, while a connection to a different forwarded port is admitted.
+    // Deleting the cap check admits the overflow, so the closed-socket read
+    // and the exact pending count both fail against a broken cap.
+    #[tokio::test]
+    async fn a_saturated_tcp_forward_does_not_starve_another_port() {
+        use tokio::io::AsyncReadExt;
+
+        let srv = test_server();
+        let (_tx, mut control_rx) = register_peer_client(&srv, "client", None);
+        let drain = crate::spawn(async move { while control_rx.recv().await.is_some() {} });
+
+        let mut ports = Vec::new();
+        for _ in 0..2 {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let cancel = Arc::new(Notify::new());
+            let bridges = Arc::new(Mutex::new(Vec::new()));
+            let task = crate::spawn(tcp_listener(
+                srv.clone(),
+                listener,
+                Ipv4Addr::LOCALHOST,
+                port,
+                cancel.clone(),
+                bridges.clone(),
+            ));
+            ports.push((port, cancel, bridges, task));
+        }
+
+        let mut held = Vec::new();
+        timeout(Duration::from_secs(10), async {
+            for _ in 0..MAX_CONNS_PER_TCP_FORWARD {
+                held.push(
+                    TcpStream::connect((Ipv4Addr::LOCALHOST, ports[0].0))
+                        .await
+                        .unwrap(),
+                );
+            }
+            while srv.pending.lock().unwrap().len() < MAX_CONNS_PER_TCP_FORWARD {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the flooded port never reached its cap");
+
+        let mut extra = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[0].0))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1];
+        let read = timeout(Duration::from_secs(5), extra.read(&mut buf))
+            .await
+            .expect("the overflow connection was not closed");
+        assert!(matches!(read, Ok(0) | Err(_)));
+        assert_eq!(srv.pending.lock().unwrap().len(), MAX_CONNS_PER_TCP_FORWARD);
+
+        let _admitted = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[1].0))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while srv.pending.lock().unwrap().len() < MAX_CONNS_PER_TCP_FORWARD + 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the quiet port stopped admitting while the other was saturated");
+
+        for (_, cancel, bridges, task) in ports {
+            cancel.notify_one();
+            task.await.unwrap();
+            for bridge in bridges.lock().unwrap().drain(..) {
+                bridge.abort();
+            }
+        }
+        drain.abort();
+    }
+
+    // The source cap is per listener: with one UDP forward tracking
+    // MAX_SOURCES_PER_UDP_FORWARD sources, a fresh source on that port parks
+    // nothing (proved through a barrier datagram that shows the refused one
+    // was processed), while a fresh source on a different forwarded port is
+    // admitted. Deleting the cap check parks the refused source, so the
+    // exact pending count and the absent-entry check both fail against a
+    // broken cap.
+    #[tokio::test]
+    async fn a_saturated_udp_forward_does_not_starve_another_port() {
+        let srv = test_server();
+        let (_tx, mut control_rx) =
+            register_peer_client_with(&srv, "client", None, ActiveTransport::Udp);
+        let drain = crate::spawn(async move { while control_rx.recv().await.is_some() {} });
+
+        let mut ports = Vec::new();
+        for _ in 0..2 {
+            let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            crate::pktinfo::record_local_addr(&socket).unwrap();
+            let addr = socket.local_addr().unwrap();
+            let cancel = Arc::new(Notify::new());
+            let flush = Arc::new(Notify::new());
+            let task = crate::spawn(udp_listener(
+                srv.clone(),
+                socket,
+                Ipv4Addr::LOCALHOST,
+                addr.port(),
+                cancel.clone(),
+                flush,
+            ));
+            ports.push((addr, cancel, task));
+        }
+
+        let mut sources = Vec::new();
+        timeout(Duration::from_secs(10), async {
+            while srv.udp_pending.lock().unwrap().len() < MAX_SOURCES_PER_UDP_FORWARD {
+                let source = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                source.send_to(b"x", ports[0].0).await.unwrap();
+                sources.push(source);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the flooded port never reached its cap");
+
+        let refused = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let refused_addr = refused.local_addr().unwrap();
+        refused.send_to(b"x", ports[0].0).await.unwrap();
+
+        // A barrier datagram from an established source, sent after the
+        // refused one, proves the listener has processed both once it lands.
+        let (barrier_id, barrier_src) = {
+            let pending = srv.udp_pending.lock().unwrap();
+            let (id, entry) = pending.iter().next().unwrap();
+            (*id, entry.public_src)
+        };
+        let barrier_source = sources
+            .iter()
+            .find(|s| s.local_addr().unwrap() == barrier_src)
+            .unwrap();
+        barrier_source
+            .send_to(b"barrier", ports[0].0)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let received = srv
+                    .udp_pending
+                    .lock()
+                    .unwrap()
+                    .get_mut(&barrier_id)
+                    .and_then(|entry| entry.dgram_rx.try_recv().ok());
+                if received.as_deref() == Some(b"barrier") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the saturated port stopped serving its established sources");
+
+        {
+            let pending = srv.udp_pending.lock().unwrap();
+            assert_eq!(pending.len(), MAX_SOURCES_PER_UDP_FORWARD);
+            assert!(pending.values().all(|e| e.public_src != refused_addr));
+        }
+
+        let admitted = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let admitted_addr = admitted.local_addr().unwrap();
+        admitted.send_to(b"x", ports[1].0).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !srv
+                .udp_pending
+                .lock()
+                .unwrap()
+                .values()
+                .any(|e| e.public_src == admitted_addr)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the quiet port stopped admitting while the other was saturated");
+
+        for (_, cancel, task) in ports {
+            cancel.notify_one();
+            task.await.unwrap();
+        }
+        drain.abort();
     }
 
     // Every PeerConnect failure names its reason: an identity no announce has
