@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+pub mod release;
+
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};

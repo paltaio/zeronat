@@ -48,9 +48,16 @@ jobs:
         with:
           tool: cross
 
+      - name: Require the release public key
+        env:
+          ZERONAT_RELEASE_PUBKEY: ${{ vars.ZERONAT_RELEASE_PUBKEY }}
+        run: |
+          printf '%s' "$ZERONAT_RELEASE_PUBKEY" | grep -Eq '^[0-9a-f]{64}$' || { echo "ZERONAT_RELEASE_PUBKEY is not a 64-hex ed25519 public key; an installer built without it cannot verify downloads"; exit 1; }
+
       - name: Build installer
         env:
           RUSTFLAGS: '-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort -Cforce-unwind-tables=no'
+          ZERONAT_RELEASE_PUBKEY: ${{ vars.ZERONAT_RELEASE_PUBKEY }}
         run: |
           cross build --release --locked \
             -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
@@ -88,6 +95,7 @@ jobs:
           for d in artifacts/installer-*; do
             cp "$d"/zeronat-installer-* _site/
           done
+          (cd _site && sha256sum zeronat-installer-* > SHA256SUMS)
           touch _site/.nojekyll
 
       - uses: actions/upload-pages-artifact@v5

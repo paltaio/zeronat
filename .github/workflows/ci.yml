@@ -19,3 +19,11 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  get-sh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify get.sh download checks
+        run: sh tests/get_sh.sh

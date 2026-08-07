@@ -3,7 +3,12 @@
 //! TUI can show live progress; an error short-circuits with a message.
 
 use std::fs::File;
+use std::io::{Seek, SeekFrom};
 use std::process::Output;
+use zeronat_install_support::release::{
+    embedded_public_key, ReleaseManifest, MANIFEST_LIMIT, MANIFEST_NAME, SIGNATURE_LIMIT,
+    SIGNATURE_NAME,
+};
 use zeronat_install_support::DownloadFile;
 
 use crate::bridge;
@@ -17,7 +22,8 @@ const BRIDGE_TIMEOUT: u32 = 30;
 const INSTALL_URL: &str = "https://paltaio.github.io/zeronat/get.sh";
 // Internal fetches (compose templates) hit the repo directly to stay current.
 const RAW_BASE: &str = "https://raw.githubusercontent.com/paltaio/zeronat/main";
-const RELEASE_BASE: &str = "https://github.com/paltaio/zeronat/releases/latest/download";
+const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/paltaio/zeronat/releases/download";
+const LATEST_URL: &str = "https://github.com/paltaio/zeronat/releases/latest";
 const IMAGE: &str = "ghcr.io/paltaio/zeronat:latest";
 const ETC_DIR: &str = "/etc/zeronat";
 const ENV_FILE: &str = "/etc/zeronat/.env";
@@ -87,13 +93,97 @@ pub trait Runner {
     fn confirm(&mut self, prompt: &str, secs: u32) -> bool;
 }
 
-fn download_binary(r: &mut dyn Runner, url: &str, target: &str) -> Result<(), String> {
+fn release_key() -> Result<[u8; 32], String> {
+    embedded_public_key()
+        .ok_or_else(|| "this build has no release public key and cannot verify downloads".into())
+}
+
+/// Fetch a small release file (manifest or signature) into memory, bounded by
+/// `limit` so a hostile server cannot balloon the download.
+fn fetch_small(r: &mut dyn Runner, url: &str, limit: u64) -> Result<Vec<u8>, String> {
+    let out = r.run(
+        false,
+        "curl",
+        &[
+            "-fsSL",
+            "--max-filesize",
+            &limit.to_string(),
+            "--max-time",
+            "60",
+            url,
+        ],
+    )?;
+    if !ok(&out) {
+        return Err(format!("download failed for {url}"));
+    }
+    if out.stdout.len() as u64 > limit {
+        return Err(format!("{url} exceeds its size limit"));
+    }
+    Ok(out.stdout)
+}
+
+/// Download the latest release binary and install it to `BIN_PATH`, after
+/// verifying the release's signed manifest and the binary's digest against it.
+/// Everything is fetched from the resolved tag, not `latest`, so the manifest
+/// and the binary cannot straddle a release published mid-install.
+fn download_binary(r: &mut dyn Runner, public_key: &[u8; 32], target: &str) -> Result<(), String> {
+    let out = r.run(
+        false,
+        "curl",
+        &[
+            "-fsSL",
+            "-I",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            "--max-time",
+            "15",
+            LATEST_URL,
+        ],
+    )?;
+    if !ok(&out) {
+        return Err("could not resolve the latest release".into());
+    }
+    let version = sys::version_from_url(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| "could not resolve the latest release".to_string())?;
+    let base = format!("{RELEASE_DOWNLOAD_BASE}/v{version}");
+    let manifest = fetch_small(r, &format!("{base}/{MANIFEST_NAME}"), MANIFEST_LIMIT)?;
+    let signature = fetch_small(r, &format!("{base}/{SIGNATURE_NAME}"), SIGNATURE_LIMIT)?;
+    let manifest = ReleaseManifest::verify(&manifest, &signature, public_key)?;
+    if manifest.version() != version {
+        return Err(format!(
+            "the signed release manifest is for {} but the release tag is v{version}",
+            manifest.version()
+        ));
+    }
+
+    let name = format!("zeronat-{target}");
+    let size = manifest
+        .expected_size(&name)
+        .ok_or_else(|| format!("the release manifest has no entry for {name}"))?;
     let mut download = DownloadFile::create()?;
-    let out = r.run_with_stdout(false, "curl", &["-fsSL", url], download.output())?;
+    let out = r.run_with_stdout(
+        false,
+        "curl",
+        &[
+            "-fsSL",
+            "--max-filesize",
+            &size.to_string(),
+            "--max-time",
+            "180",
+            &format!("{base}/{name}"),
+        ],
+        download.output(),
+    )?;
     if !ok(&out) {
         return Err(format!("download failed (no release asset for {target}?)"));
     }
-    let input = download.prepare_install()?;
+    let mut input = download.prepare_install()?;
+    manifest.verify_artifact(&name, input)?;
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("failed to read downloaded binary: {e}"))?;
     let out = r.run_with_stdin(
         true,
         "install",
@@ -621,12 +711,12 @@ pub fn upgrade(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<Outcome, Stri
 }
 
 fn upgrade_systemd(r: &mut dyn Runner) -> Result<(), String> {
+    let key = release_key()?;
     let target = sys::arch_target()?;
     r.info(format!("target {target}"));
-    let url = format!("{RELEASE_BASE}/zeronat-{target}");
 
     r.step("downloading latest binary".into());
-    download_binary(r, &url, target)?;
+    download_binary(r, &key, target)?;
 
     r.step("restarting service".into());
     let out = r.run(true, "systemctl", &["restart", "zeronat"])?;
@@ -923,12 +1013,20 @@ fn compose(r: &mut dyn Runner, prog: &str, base: &[String], verb: &str) -> Resul
 }
 
 fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started, String> {
+    install_systemd_with(cfg, sub, &release_key()?, r)
+}
+
+fn install_systemd_with(
+    cfg: &Config,
+    sub: &str,
+    public_key: &[u8; 32],
+    r: &mut dyn Runner,
+) -> Result<Started, String> {
     let target = sys::arch_target()?;
     r.info(format!("target {target}"));
-    let url = format!("{RELEASE_BASE}/zeronat-{target}");
 
     r.step("downloading zeronat binary".into());
-    download_binary(r, &url, target)?;
+    download_binary(r, public_key, target)?;
 
     r.step("writing systemd unit".into());
     let mode = match cfg.mode {
@@ -988,9 +1086,12 @@ fn install_systemd(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Starte
 #[cfg(test)]
 mod tests {
     use super::{
-        check_forwards, console_cmd, env_file, install_systemd, peer_steps, subcmd, Runner,
+        check_forwards, console_cmd, env_file, install_systemd_with, peer_steps, subcmd, Runner,
+        MANIFEST_NAME, SIGNATURE_NAME,
     };
     use crate::ui::{Config, Kind, Method, Mode};
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
     use std::path::PathBuf;
@@ -1009,9 +1110,67 @@ mod tests {
         cfg
     }
 
-    /// Records every command instead of running it; all commands succeed.
+    fn test_key() -> (SigningKey, [u8; 32]) {
+        let mut seed = [0u8; 32];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut seed))
+            .unwrap();
+        let signing = SigningKey::from_bytes(&seed);
+        let public = signing.verifying_key().to_bytes();
+        (signing, public)
+    }
+
+    /// A signed release for the running host: the tag redirect, the manifest
+    /// listing `content` under this host's target name, and its signature.
+    struct TestRelease {
+        public: [u8; 32],
+        redirect: Vec<u8>,
+        manifest: Vec<u8>,
+        signature: Vec<u8>,
+    }
+
+    fn test_release(content: &[u8]) -> TestRelease {
+        let (signing, public) = test_key();
+        let name = format!("zeronat-{}", crate::sys::arch_target().unwrap());
+        let digest = zeronat_secret::encode(Sha256::digest(content).into());
+        let manifest = format!(
+            "zeronat-release-v1 v0.25.1\n{digest} {} {name}\n",
+            content.len()
+        )
+        .into_bytes();
+        let signature = signing
+            .sign(&manifest)
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+            .into_bytes();
+        TestRelease {
+            public,
+            redirect: b"https://github.com/paltaio/zeronat/releases/tag/v0.25.1".to_vec(),
+            manifest,
+            signature,
+        }
+    }
+
+    fn release_response(release: &TestRelease, args: &[&str]) -> Vec<u8> {
+        let url = args.last().copied().unwrap_or_default();
+        if url.ends_with("/releases/latest") {
+            release.redirect.clone()
+        } else if url.ends_with(MANIFEST_NAME) {
+            release.manifest.clone()
+        } else if url.ends_with(SIGNATURE_NAME) {
+            release.signature.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Records every command instead of running it; all commands succeed, and
+    /// curl fetches answer from the fake release.
     struct FakeRunner {
         cmds: Vec<String>,
+        release: TestRelease,
     }
 
     impl Runner for FakeRunner {
@@ -1022,7 +1181,7 @@ mod tests {
             self.cmds.push(format!("{program} {}", args.join(" ")));
             Ok(Output {
                 status: std::process::ExitStatus::from_raw(0),
-                stdout: Vec::new(),
+                stdout: release_response(&self.release, args),
                 stderr: Vec::new(),
             })
         }
@@ -1060,17 +1219,18 @@ mod tests {
 
     struct FailedDownloadRunner {
         path: Option<PathBuf>,
+        release: TestRelease,
     }
 
     impl Runner for FailedDownloadRunner {
         fn step(&mut self, _: String) {}
         fn info(&mut self, _: String) {}
-        fn run(&mut self, _: bool, _: &str, _: &[&str]) -> Result<Output, String> {
+        fn run(&mut self, _: bool, _: &str, args: &[&str]) -> Result<Output, String> {
             use std::os::unix::process::ExitStatusExt;
 
             Ok(Output {
                 status: std::process::ExitStatus::from_raw(0),
-                stdout: Vec::new(),
+                stdout: release_response(&self.release, args),
                 stderr: Vec::new(),
             })
         }
@@ -1112,11 +1272,16 @@ mod tests {
 
     #[test]
     fn systemd_install_cleans_failed_download() {
-        let mut r = FailedDownloadRunner { path: None };
+        let release = test_release(b"downloaded binary");
+        let public = release.public;
+        let mut r = FailedDownloadRunner {
+            path: None,
+            release,
+        };
         let mut c = cfg();
         c.mode = Mode::Server;
 
-        let result = install_systemd(&c, "server", &mut r);
+        let result = install_systemd_with(&c, "server", &public, &mut r);
         let path = r.path.expect("curl should receive an output file");
         let remained = path.parent().unwrap().exists();
 
@@ -1126,15 +1291,40 @@ mod tests {
 
     #[test]
     fn systemd_install_restarts_after_writing_config() {
-        let mut r = FakeRunner { cmds: Vec::new() };
+        let release = test_release(b"downloaded binary");
+        let public = release.public;
+        let mut r = FakeRunner {
+            cmds: Vec::new(),
+            release,
+        };
         let mut c = cfg();
         c.mode = Mode::Server;
-        install_systemd(&c, "server", &mut r).unwrap();
+        install_systemd_with(&c, "server", &public, &mut r).unwrap();
 
         let reload = r.cmds.iter().position(|c| c == "systemctl daemon-reload");
         let restart = r.cmds.iter().position(|c| c == "systemctl restart zeronat");
         assert!(r.cmds.contains(&"systemctl enable zeronat".to_string()));
         assert!(restart.unwrap() > reload.unwrap());
+    }
+
+    // The downloaded bytes disagree with the signed manifest, so the install
+    // step must never run; FakeRunner's stdin handler would record it.
+    #[test]
+    fn systemd_install_refuses_a_download_that_does_not_match_the_manifest() {
+        let release = test_release(b"a different binary");
+        let public = release.public;
+        let mut r = FakeRunner {
+            cmds: Vec::new(),
+            release,
+        };
+        let mut c = cfg();
+        c.mode = Mode::Server;
+
+        assert!(install_systemd_with(&c, "server", &public, &mut r).is_err());
+        assert!(
+            !r.cmds.iter().any(|c| c.starts_with("install ")),
+            "unverified binary was installed"
+        );
     }
 
     #[test]

@@ -727,14 +727,19 @@ dependencies = [
 name = "zeronat-install-support"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "libc",
+ "sha2",
+ "zeronat-secret",
 ]
 
 [[package]]
 name = "zeronat-installer"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "libc",
+ "sha2",
  "zeronat-install-support",
  "zeronat-secret",
  "zntui",

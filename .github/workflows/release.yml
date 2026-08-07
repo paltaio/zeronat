@@ -48,9 +48,17 @@ jobs:
           echo "$v"
           echo "$v" | grep -q 'getrandom v0\.2\.' || { echo "getrandom drifted off 0.2.x; MIPS build will break"; exit 1; }
 
+      - name: Require the release public key on tag builds
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          ZERONAT_RELEASE_PUBKEY: ${{ vars.ZERONAT_RELEASE_PUBKEY }}
+        run: |
+          printf '%s' "$ZERONAT_RELEASE_PUBKEY" | grep -Eq '^[0-9a-f]{64}$' || { echo "ZERONAT_RELEASE_PUBKEY is not a 64-hex ed25519 public key; a release binary built without it cannot verify upgrades"; exit 1; }
+
       - name: Build
         env:
           RUSTFLAGS: '-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort -Cforce-unwind-tables=no --cfg curve25519_dalek_backend="serial"'
+          ZERONAT_RELEASE_PUBKEY: ${{ vars.ZERONAT_RELEASE_PUBKEY }}
         run: |
           cross build --release --locked \
             -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
@@ -94,9 +102,17 @@ jobs:
         with:
           tool: cargo-zigbuild
 
+      - name: Require the release public key on tag builds
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          ZERONAT_RELEASE_PUBKEY: ${{ vars.ZERONAT_RELEASE_PUBKEY }}
+        run: |
+          printf '%s' "$ZERONAT_RELEASE_PUBKEY" | grep -Eq '^[0-9a-f]{64}$' || { echo "ZERONAT_RELEASE_PUBKEY is not a 64-hex ed25519 public key; a release binary built without it cannot verify upgrades"; exit 1; }
+
       - name: Build
         env:
           RUSTFLAGS: '-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort -Cforce-unwind-tables=no --cfg curve25519_dalek_backend="serial"'
+          ZERONAT_RELEASE_PUBKEY: ${{ vars.ZERONAT_RELEASE_PUBKEY }}
         run: |
           cargo zigbuild --release --locked \
             -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
@@ -163,6 +179,9 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -178,9 +197,27 @@ jobs:
               install -m 0755 "$d/zeronat" "out/zeronat-${name}"
             fi
           done
+      - name: Write and sign the release manifest
+        env:
+          LC_ALL: C
+          ZERONAT_RELEASE_SIGNING_KEY: ${{ secrets.ZERONAT_RELEASE_SIGNING_KEY }}
+        run: |
+          {
+            printf 'zeronat-release-v1 %s\n' "$GITHUB_REF_NAME"
+            for f in out/zeronat-*; do
+              digest=$(sha256sum "$f")
+              printf '%s %s %s\n' "${digest%% *}" "$(wc -c < "$f" | tr -d ' ')" "${f#out/}"
+            done
+          } > release.manifest
+          cargo run --locked -p zeronat-install-support --bin sign-release \
+            < release.manifest > release.manifest.sig
+          mv release.manifest release.manifest.sig out/
       - uses: softprops/action-gh-release@v3
         with:
-          files: out/zeronat-*
+          files: |
+            out/zeronat-*
+            out/release.manifest
+            out/release.manifest.sig
 
   docker:
     needs: binaries
