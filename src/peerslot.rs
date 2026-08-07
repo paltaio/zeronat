@@ -770,7 +770,13 @@ async fn pair_as_consumer(
                 pair_id, status, ..
             } => match status {
                 PeerStatus::Accepted => break pair_id,
-                other => return Err(format!("the server refused the pair: {other:?}").into()),
+                other => {
+                    return Err(format!(
+                        "the server refused the pair: {}",
+                        crate::proto::status_name(other)
+                    )
+                    .into())
+                }
             },
             _ => continue,
         }
@@ -1937,5 +1943,49 @@ mod tests {
             });
         }
         drop(slot);
+    }
+
+    // A refused result ends the cycle with an error naming the status, which
+    // is what the slot logs against the peer it asked for.
+    #[tokio::test]
+    async fn a_refusal_names_its_status() {
+        let control = PeerControl::default();
+        let (tx, mut sent) = mpsc::channel(8);
+        let session = control_session(tx);
+        let _live = control.install(session.clone());
+        let peer_id = crate::secret::encode(PROV_IDENTITY);
+        let (mut rx, _route) = control.register_consumer(&peer_id, PROVIDES_EXIT);
+        let cycle = crate::spawn({
+            let peer_id = peer_id.clone();
+            let control = control.clone();
+            async move {
+                pair_as_consumer(
+                    &peer_id,
+                    PROV_IDENTITY,
+                    PROVIDES_EXIT,
+                    &session,
+                    &mut rx,
+                    &control,
+                )
+                .await
+            }
+        });
+        // The refusal answers the connect, so it must land after the ask: the
+        // cycle drains stale frames before asking.
+        let asked = timeout(Duration::from_secs(10), next_connect(&mut sent))
+            .await
+            .expect("the cycle never asked");
+        assert_eq!(asked, PROV_IDENTITY);
+        control.route(Msg::PeerResult {
+            peer_id: PROV_IDENTITY,
+            want: PROVIDES_EXIT,
+            pair_id: 0,
+            status: PeerStatus::PeerOffline,
+        });
+        let err = match cycle.await.unwrap() {
+            Ok(_) => panic!("a refused result must end the cycle"),
+            Err(e) => e,
+        };
+        assert_eq!(err.to_string(), "the server refused the pair: peer offline");
     }
 }

@@ -41,6 +41,8 @@ pub enum PeerStatus {
     PeerOffline,
     NotProvided,
     PeerBusy,
+    /// The server could not allocate the pair.
+    ServerFailure,
 }
 
 /// The path a party settled on for a pair, reported in `PeerPath`.
@@ -50,13 +52,20 @@ pub enum PathStatus {
     Relay,
 }
 
-/// Why the server refused a `PeerAnnounce`, reported in `PeerAnnounceRefuse`.
+/// Why a peer claim was refused or withdrawn, reported in
+/// `PeerAnnounceRefuse`: at the announce exchange, or later when another
+/// session's proof displaces a standing claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerRefuseReason {
     /// The announced identity is not a usable x25519 public key.
     MalformedIdentity,
     /// The proof did not demonstrate possession of the announced identity.
     FailedProof,
+    /// The server could not mint a challenge for the announce.
+    ChallengeFailed,
+    /// Another session proved possession of the identity, displacing this
+    /// claim.
+    IdentityClaimed,
 }
 
 impl std::fmt::Display for PeerRefuseReason {
@@ -64,6 +73,8 @@ impl std::fmt::Display for PeerRefuseReason {
         f.write_str(match self {
             PeerRefuseReason::MalformedIdentity => "malformed identity",
             PeerRefuseReason::FailedProof => "failed proof",
+            PeerRefuseReason::ChallengeFailed => "challenge failed",
+            PeerRefuseReason::IdentityClaimed => "identity claimed by another session",
         })
     }
 }
@@ -376,6 +387,7 @@ fn peer_status_byte(s: PeerStatus) -> u8 {
         PeerStatus::PeerOffline => 2,
         PeerStatus::NotProvided => 3,
         PeerStatus::PeerBusy => 4,
+        PeerStatus::ServerFailure => 5,
     }
 }
 
@@ -386,6 +398,7 @@ fn peer_status_from_byte(n: u8) -> Result<PeerStatus> {
         2 => Ok(PeerStatus::PeerOffline),
         3 => Ok(PeerStatus::NotProvided),
         4 => Ok(PeerStatus::PeerBusy),
+        5 => Ok(PeerStatus::ServerFailure),
         n => Err(format!("unknown peer status byte {n}").into()),
     }
 }
@@ -394,6 +407,8 @@ fn refuse_reason_byte(r: PeerRefuseReason) -> u8 {
     match r {
         PeerRefuseReason::MalformedIdentity => 0,
         PeerRefuseReason::FailedProof => 1,
+        PeerRefuseReason::ChallengeFailed => 2,
+        PeerRefuseReason::IdentityClaimed => 3,
     }
 }
 
@@ -401,6 +416,8 @@ fn refuse_reason_from_byte(n: u8) -> Result<PeerRefuseReason> {
     match n {
         0 => Ok(PeerRefuseReason::MalformedIdentity),
         1 => Ok(PeerRefuseReason::FailedProof),
+        2 => Ok(PeerRefuseReason::ChallengeFailed),
+        3 => Ok(PeerRefuseReason::IdentityClaimed),
         n => Err(format!("unknown refuse reason byte {n}").into()),
     }
 }
@@ -444,6 +461,18 @@ pub fn settled_path_from_byte(n: u8) -> Result<Option<PathStatus>> {
         1 => Ok(Some(PathStatus::Direct)),
         2 => Ok(Some(PathStatus::Relay)),
         n => Err(format!("unknown settled path byte {n}").into()),
+    }
+}
+
+/// Lowercase `PeerStatus` name for logs and refusals.
+pub fn status_name(s: PeerStatus) -> &'static str {
+    match s {
+        PeerStatus::Accepted => "accepted",
+        PeerStatus::UnknownPeer => "unknown peer",
+        PeerStatus::PeerOffline => "peer offline",
+        PeerStatus::NotProvided => "capability not provided",
+        PeerStatus::PeerBusy => "peer busy",
+        PeerStatus::ServerFailure => "server failure",
     }
 }
 
@@ -2263,6 +2292,8 @@ mod tests {
         for reason in [
             PeerRefuseReason::MalformedIdentity,
             PeerRefuseReason::FailedProof,
+            PeerRefuseReason::ChallengeFailed,
+            PeerRefuseReason::IdentityClaimed,
         ] {
             match roundtrip(&Msg::PeerAnnounceRefuse { reason }) {
                 Msg::PeerAnnounceRefuse { reason: got } => assert_eq!(got, reason),
@@ -2320,6 +2351,7 @@ mod tests {
             PeerStatus::PeerOffline,
             PeerStatus::NotProvided,
             PeerStatus::PeerBusy,
+            PeerStatus::ServerFailure,
         ] {
             for want in [PROVIDES_EXIT, PROVIDES_SEGMENT] {
                 let m = Msg::PeerResult {
@@ -2365,7 +2397,7 @@ mod tests {
         assert!(Msg::decode(&junk).is_err());
         // An unknown status byte (the last byte) errors.
         let mut bad_status = good.clone();
-        *bad_status.last_mut().unwrap() = 5;
+        *bad_status.last_mut().unwrap() = 6;
         assert!(Msg::decode(&bad_status).is_err());
         // The want byte follows the identity: zero bits, both bits, and an
         // undefined bit all error.
