@@ -36,7 +36,7 @@ pub fn generate() -> Result<String, getrandom::Error> {
     Ok(encode(bytes))
 }
 
-fn encode(bytes: [u8; BYTE_LEN]) -> String {
+pub fn encode(bytes: [u8; BYTE_LEN]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(HEX_LEN);
     for byte in bytes {

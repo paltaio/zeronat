@@ -20,7 +20,7 @@ use crate::client::{
 };
 use crate::clientproto::{ClientPeerSlotEntry, LinkStatus, PeerSlotCell};
 use crate::kcp::Session;
-use crate::peer::{PeerPath, PeerSession};
+use crate::peer::{PairIdentity, PeerPath, PeerSession};
 use crate::proto::{provides_name, Msg, PathStatus, PeerStatus, PROVIDES_EXIT};
 use crate::punch::{punch, PunchOutcome};
 use crate::Result;
@@ -43,15 +43,15 @@ const SLOT_QUEUE: usize = 16;
 /// Frames queued in each direction between a live slot and its owner.
 const FRAME_QUEUE: usize = 64;
 
-/// What a provider seals into message two when its exclusive slot already
-/// serves a pair.
+/// What a provider refuses a pair with when its exclusive slot already
+/// serves one.
 const REFUSE_BUSY: &[u8] = b"already serving a pair";
 
-/// How long a refused pair holds its path open after sealing the answer. The
-/// refusal rides message two, and dropping the path as that frame is written
-/// takes the frame down with it on a relayed pair, where the splice ends the
-/// moment either leg does. Holding lets the answer land, and lets a consumer
-/// that lost it repeat its message one and be answered again.
+/// How long a refused pair holds its path open after sealing the verdict.
+/// Dropping the path as that frame is written takes the frame down with it on
+/// a relayed pair, where the splice ends the moment either leg does. Holding
+/// lets the verdict land, and lets a consumer that lost it repeat its message
+/// three and be answered again.
 const REFUSAL_LINGER: Duration = Duration::from_secs(2);
 
 /// The live control session as a peer slot sees it: the frame sender, what a
@@ -64,6 +64,10 @@ pub struct ControlSession {
     pub client_id: String,
     pub psk: [u8; 32],
     pub credential_psk: [u8; 32],
+    /// This client's static x25519 private key for peer sessions.
+    pub peer_static: [u8; 32],
+    /// The public identity `peer_static` derives, as 64 hex characters.
+    pub peer_id: String,
     /// The KCP session under a udp control channel. `None` on tcp, where the
     /// party never probes and opens its relay leg as a fresh connection.
     pub sess: Option<Arc<Session>>,
@@ -180,7 +184,10 @@ impl PeerControl {
                     pair_id,
                     status,
                 } => {
-                    let tx = routes.results.get(&(peer_id.clone(), *want)).cloned();
+                    let tx = routes
+                        .results
+                        .get(&(crate::secret::encode(*peer_id), *want))
+                        .cloned();
                     // Binding the pair here rather than in the slot leaves no
                     // window for the pair's own frames to arrive first.
                     if let Some(tx) = &tx {
@@ -649,6 +656,16 @@ async fn consumer_slot(
     sink: SessionSink,
     status: PeerSlotCell,
 ) {
+    // The configured peer is a 64-hex identity; inbound frames are routed by
+    // its canonical rendering.
+    let identity = match crate::secret::decode(&peer_id) {
+        Ok(identity) => identity,
+        Err(e) => {
+            crate::elog!("peer {peer_id}: {e}");
+            return;
+        }
+    };
+    let peer_id = crate::secret::encode(identity);
     let (mut rx, _route) = control.register_consumer(&peer_id, want);
     let _status = status.hold();
     let mut backoff = Backoff::default();
@@ -664,7 +681,7 @@ async fn consumer_slot(
         let paired = match adapter.as_ref().map(ConsumerAdapter::precheck) {
             Some(Err(e)) => Err(e),
             _ => {
-                let cycle = pair_as_consumer(&peer_id, want, &session, &mut rx, &control);
+                let cycle = pair_as_consumer(&peer_id, identity, want, &session, &mut rx, &control);
                 tokio::select! {
                     _ = control.wait_gone(generation) => Err("the control session ended".into()),
                     r = timeout(CYCLE_DEADLINE, cycle) => match r {
@@ -718,6 +735,7 @@ async fn consumer_slot(
 /// the inner handshake as the initiator.
 async fn pair_as_consumer(
     peer_id: &str,
+    identity: crate::proto::PeerIdentity,
     want: u8,
     session: &ControlSession,
     rx: &mut mpsc::Receiver<Msg>,
@@ -731,7 +749,7 @@ async fn pair_as_consumer(
         .tx
         .send(
             Msg::PeerConnect {
-                peer_id: peer_id.to_string(),
+                peer_id: identity,
                 want,
             }
             .encode(),
@@ -753,16 +771,14 @@ async fn pair_as_consumer(
     // The binding lives as long as the cycle: the relay open stays
     // authoritative until the inner handshake completes.
     let _pair = control.pair_guard(pair_id);
-    let settled = settle_path(pair_id, peer_id, &session.client_id, session, rx).await?;
-    let (peer, answer, path) =
-        handshake_under_relay_authority(settled, Side::Consumer, pair_id, session, rx).await?;
-    if !answer.is_empty() {
-        return Err(format!(
-            "the provider refused the pair: {}",
-            String::from_utf8_lossy(&answer)
-        )
-        .into());
-    }
+    let (settled, challenge) = settle_path(pair_id, peer_id, &session.peer_id, session, rx).await?;
+    // The expected identity is the one the config names, never the one the
+    // relay forwarded: the handshake verifies the provider's static against
+    // it at message two.
+    let pair = PairIdentity::new(session.peer_static, identity, challenge, want);
+    let (peer, path) =
+        handshake_under_relay_authority(settled, Side::Consumer, pair_id, &pair, session, rx)
+            .await?;
     Ok((peer, path))
 }
 
@@ -902,7 +918,7 @@ async fn provider_slot(
         match msg {
             Msg::PeerProbe {
                 pair_id,
-                ref peer_id,
+                peer_id,
                 provides,
                 ..
             } => {
@@ -913,11 +929,10 @@ async fn provider_slot(
                 let task = provider_pair(
                     PairStart {
                         pair_id,
-                        peer_id: peer_id.clone(),
+                        peer_id,
                         provides,
                         generation,
                     },
-                    session.client_id.clone(),
                     session,
                     pair_rx,
                     control.pair_guard(pair_id),
@@ -1242,7 +1257,7 @@ fn segment_precheck(segment: &PeerSegment) -> Result<()> {
 /// What a `PeerProbe` tells a provider about the pair it starts.
 struct PairStart {
     pair_id: u64,
-    peer_id: String,
+    peer_id: crate::proto::PeerIdentity,
     provides: u8,
     generation: u64,
 }
@@ -1250,10 +1265,8 @@ struct PairStart {
 /// Serve one pair on a provider slot: probe, take the path the punch or the
 /// relay authority hands it, answer the inner handshake, and hold the session
 /// until it dies.
-#[allow(clippy::too_many_arguments)]
 async fn provider_pair(
     start: PairStart,
-    client_id: String,
     session: ControlSession,
     mut rx: mpsc::Receiver<Msg>,
     _pair: RouteGuard,
@@ -1267,10 +1280,16 @@ async fn provider_pair(
         provides,
         generation,
     } = start;
+    let peer_hex = crate::secret::encode(peer_id);
     let exclusive = provides == PROVIDES_EXIT;
     let served: Result<Served> = {
         let cycle = async {
-            let settled = settle_path(pair_id, &peer_id, &client_id, &session, &mut rx).await?;
+            let (settled, challenge) =
+                settle_path(pair_id, &peer_hex, &session.peer_id, &session, &mut rx).await?;
+            // The relay-forwarded consumer identity selects the prologue
+            // expectation; the handshake authenticates the consumer's static
+            // at message three.
+            let pair = PairIdentity::new(session.peer_static, peer_id, challenge, provides);
             // An adapter that cannot come up refuses before it takes the slot,
             // so a provider stuck on its own config never reads as busy.
             let broken = owner
@@ -1291,10 +1310,11 @@ async fn provider_pair(
                 None if exclusive && hold.is_none() => REFUSE_BUSY.to_vec(),
                 None => Vec::new(),
             };
-            let (peer, _, path) = handshake_under_relay_authority(
+            let (peer, path) = handshake_under_relay_authority(
                 settled,
                 Side::Provider(&refuse),
                 pair_id,
+                &pair,
                 &session,
                 &mut rx,
             )
@@ -1321,7 +1341,7 @@ async fn provider_pair(
                 adapter
                     .served
                     .send(ServedPair {
-                        peer_id,
+                        peer_id: peer_hex,
                         session: peer,
                         hold,
                     })
@@ -1330,9 +1350,9 @@ async fn provider_pair(
             }
             None => {
                 let bit = provides_name(provides);
-                crate::elog!("peer {peer_id}: {bit} pair up");
-                run_session(peer, &peer_id, provides, path, &owner.sink).await;
-                crate::elog!("peer {peer_id}: {bit} pair ended");
+                crate::elog!("peer {peer_hex}: {bit} pair up");
+                run_session(peer, &peer_hex, provides, path, &owner.sink).await;
+                crate::elog!("peer {peer_hex}: {bit} pair ended");
             }
         },
         Ok(Served::Refused(reason, mut peer)) => {
@@ -1378,15 +1398,17 @@ impl Drop for BusyGuard {
 /// carried, and settle on the relay leg when the authority arrives. The relay
 /// open is authoritative, so its delivery drops the punch future whatever the
 /// punch was doing, taking the in-flight handshakes and the probe socket with
-/// it.
+/// it. Returns the settled path with the pair challenge the probe carried,
+/// which the inner handshake binds into its prologue.
 async fn settle_path(
     pair_id: u64,
     peer_id: &str,
-    client_id: &str,
+    local_id: &str,
     session: &ControlSession,
     rx: &mut mpsc::Receiver<Msg>,
-) -> Result<SettledPath> {
+) -> Result<(SettledPath, [u8; 32])> {
     let mut probe: Option<ProbeSession> = None;
+    let mut pair_challenge: Option<[u8; 32]> = None;
     let candidates = loop {
         match next_frame(rx).await? {
             // A tcp control transport never probes: the frame is the pair
@@ -1396,8 +1418,10 @@ async fn settle_path(
                 pair_id: got,
                 probe_id,
                 probe_capability,
+                challenge,
                 ..
             } if got == pair_id => {
+                pair_challenge = Some(challenge);
                 if let Some(server) = udp_server(session)? {
                     probe = Some(
                         probe_candidates(server, &session.psk, (probe_id, probe_capability))
@@ -1412,6 +1436,7 @@ async fn settle_path(
             _ => continue,
         }
     };
+    let challenge = pair_challenge.ok_or("the pair challenge never arrived")?;
 
     let settled = match probe {
         Some(probe) => {
@@ -1419,7 +1444,7 @@ async fn settle_path(
                 probe,
                 &candidates,
                 pair_id,
-                client_id,
+                local_id,
                 peer_id,
                 &session.psk,
                 &session.tx,
@@ -1446,13 +1471,14 @@ async fn settle_path(
     let (leg_id, capability) = match settled {
         Settled::Punched(PunchOutcome::Direct(link)) => {
             let peer = link.peer;
-            return Ok(SettledPath::Direct(PeerPath::direct(link), peer));
+            return Ok((SettledPath::Direct(PeerPath::direct(link), peer), challenge));
         }
         Settled::Punched(PunchOutcome::Relay) => wait_relay_open(rx, pair_id).await?,
         Settled::Relay(claim) => claim,
     };
-    Ok(SettledPath::Relayed(
-        open_leg(session, leg_id, capability).await?,
+    Ok((
+        SettledPath::Relayed(open_leg(session, leg_id, capability).await?),
+        challenge,
     ))
 }
 
@@ -1482,48 +1508,42 @@ async fn handshake_under_relay_authority(
     settled: SettledPath,
     side: Side<'_>,
     pair_id: u64,
+    identity: &PairIdentity,
     session: &ControlSession,
     rx: &mut mpsc::Receiver<Msg>,
-) -> Result<(PeerSession, Vec<u8>, PairPath)> {
+) -> Result<(PeerSession, PairPath)> {
     let (direct, peer) = match settled {
         SettledPath::Relayed(path) => {
-            let (peer_session, answer) = inner_handshake(side, path, &session.psk, pair_id).await?;
-            return Ok((peer_session, answer, PairPath::Relayed));
+            let peer_session = inner_handshake(side, path, identity, pair_id).await?;
+            return Ok((peer_session, PairPath::Relayed));
         }
         SettledPath::Direct(path, peer) => (path, peer),
     };
     let raced = tokio::select! {
-        r = inner_handshake(side, direct, &session.psk, pair_id) => Raced::Handshake(r),
+        r = inner_handshake(side, direct, identity, pair_id) => Raced::Handshake(r),
         id = wait_relay_open(rx, pair_id) => Raced::Relay(id?),
     };
     match raced {
-        Raced::Handshake(r) => {
-            let (peer_session, answer) = r?;
-            Ok((peer_session, answer, PairPath::Direct(peer)))
-        }
+        Raced::Handshake(r) => Ok((r?, PairPath::Direct(peer))),
         // The direct path went down with the losing future above.
         Raced::Relay((leg_id, capability)) => {
             let leg = open_leg(session, leg_id, capability).await?;
-            let (peer_session, answer) = inner_handshake(side, leg, &session.psk, pair_id).await?;
-            Ok((peer_session, answer, PairPath::Relayed))
+            let peer_session = inner_handshake(side, leg, identity, pair_id).await?;
+            Ok((peer_session, PairPath::Relayed))
         }
     }
 }
 
-/// The inner handshake for this party's end of the pair, with the provider's
-/// message-two payload either read or sealed.
+/// The inner handshake for this party's end of the pair.
 async fn inner_handshake(
     side: Side<'_>,
     path: PeerPath,
-    psk: &[u8; 32],
+    identity: &PairIdentity,
     pair_id: u64,
-) -> Result<(PeerSession, Vec<u8>)> {
+) -> Result<PeerSession> {
     match side {
-        Side::Consumer => PeerSession::consumer(path, psk, pair_id).await,
-        Side::Provider(refuse) => Ok((
-            PeerSession::provider(path, psk, pair_id, refuse).await?,
-            Vec::new(),
-        )),
+        Side::Consumer => PeerSession::consumer(path, identity, pair_id).await,
+        Side::Provider(refuse) => PeerSession::provider(path, identity, pair_id, refuse).await,
     }
 }
 
@@ -1550,7 +1570,7 @@ enum SettledPath {
 
 /// Which of the inner handshake and the relay open landed first.
 enum Raced {
-    Handshake(Result<(PeerSession, Vec<u8>)>),
+    Handshake(Result<PeerSession>),
     Relay((u64, crate::proto::Capability)),
 }
 
@@ -1653,12 +1673,15 @@ mod tests {
     use super::*;
 
     fn control_session(tx: mpsc::Sender<Vec<u8>>) -> ControlSession {
+        let peer_static = [7u8; 32];
         ControlSession {
             tx,
             server: "127.0.0.1:1".into(),
             client_id: "c".into(),
             psk: [7u8; 32],
             credential_psk: [8u8; 32],
+            peer_id: crate::secret::encode(crate::noise::public_identity(&peer_static)),
+            peer_static,
             sess: None,
         }
     }
@@ -1672,8 +1695,11 @@ mod tests {
         assert!(v6.punched_v4().is_empty());
     }
 
+    /// The identity of a test provider, as the wire and the config carry it.
+    const PROV_IDENTITY: crate::proto::PeerIdentity = [0xAB; 32];
+
     /// The peer named by the next `PeerConnect` the slot sends.
-    async fn next_connect(rx: &mut mpsc::Receiver<Vec<u8>>) -> String {
+    async fn next_connect(rx: &mut mpsc::Receiver<Vec<u8>>) -> crate::proto::PeerIdentity {
         loop {
             let frame = rx.recv().await.expect("the slot stopped asking");
             if let Ok(Msg::PeerConnect { peer_id, .. }) = Msg::decode(&frame) {
@@ -1694,7 +1720,7 @@ mod tests {
         let _live = control.install(control_session(tx));
         let status = PeerSlotCell::default();
         let slot = AbortOnDrop(crate::spawn(consumer_slot(
-            "prov".into(),
+            crate::secret::encode(PROV_IDENTITY),
             PROVIDES_EXIT,
             None,
             "secret".into(),
@@ -1706,13 +1732,13 @@ mod tests {
         let asked = timeout(CYCLE_DEADLINE, next_connect(&mut sent))
             .await
             .expect("the slot never asked");
-        assert_eq!(asked, "prov");
+        assert_eq!(asked, PROV_IDENTITY);
         // The whole pairing is the slot's dial, and it carries no path.
         assert_eq!(status.get(), (LinkStatus::Dialing, None));
         // The server accepts the pair and then goes silent: no `PeerProbe`
         // ever follows.
         control.route(Msg::PeerResult {
-            peer_id: "prov".into(),
+            peer_id: PROV_IDENTITY,
             want: PROVIDES_EXIT,
             pair_id: 9,
             status: PeerStatus::Accepted,
@@ -1721,7 +1747,7 @@ mod tests {
         let again = timeout(CYCLE_DEADLINE * 2, next_connect(&mut sent))
             .await
             .expect("the slot never re-armed after the deadline");
-        assert_eq!(again, "prov");
+        assert_eq!(again, PROV_IDENTITY);
         // A slot the loop tears down reports offline rather than the state it
         // died in.
         drop(slot);
@@ -1863,7 +1889,7 @@ mod tests {
         let (tx, mut sent) = mpsc::channel(8);
         let _live = control.install(control_session(tx));
         let slot = AbortOnDrop(crate::spawn(consumer_slot(
-            "prov".into(),
+            crate::secret::encode(PROV_IDENTITY),
             PROVIDES_EXIT,
             None,
             "secret".into(),
@@ -1876,9 +1902,9 @@ mod tests {
             let asked = timeout(CYCLE_DEADLINE, next_connect(&mut sent))
                 .await
                 .expect("the slot never asked");
-            assert_eq!(asked, "prov");
+            assert_eq!(asked, PROV_IDENTITY);
             control.route(Msg::PeerResult {
-                peer_id: "prov".into(),
+                peer_id: PROV_IDENTITY,
                 want: PROVIDES_EXIT,
                 pair_id: 0,
                 status: PeerStatus::PeerBusy,

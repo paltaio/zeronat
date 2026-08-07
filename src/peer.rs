@@ -2,17 +2,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tokio::time::{interval_at, sleep, timeout, Instant};
+use tokio::time::{interval_at, timeout, Instant};
 
 use crate::client::{AbortOnDrop, RelayDgramLeg, PING_INTERVAL};
 use crate::dgram::{DgramRx, DgramTx, Frame};
 use crate::kcp::ConvGuard;
-use crate::noise::{
-    client_handshake_stateless_reply, server_handshake_stateless, Noise, NoiseReader, NoiseWriter,
-    StatelessNoise,
-};
+use crate::noise::{public_identity, Noise, NoiseReader, NoiseWriter, StatelessNoise, XxHandshake};
 use crate::punch::{LinkHold, PeerLink};
 use crate::{Error, Result};
 
@@ -31,23 +27,22 @@ const PEER_MISSES: u64 = 3;
 pub const PEER_DEADLINE: Duration =
     Duration::from_secs(PEER_KEEPALIVE.as_secs() * (PEER_MISSES + 1));
 
-/// How long the inner handshake tries before giving up. Either message can be
+/// How long the inner handshake tries before giving up. Any message can be
 /// lost, so neither side trusts one delivery: each repeats its last message on
 /// [`HANDSHAKE_RETRY`] until the exchange completes or this passes.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 const HANDSHAKE_RETRY: Duration = Duration::from_millis(500);
 
-/// Room for one handshake message in each direction of the duplex the
-/// handshake runs over; the messages are under a hundred bytes.
-const HANDSHAKE_BUF: usize = 4096;
-
 /// Leading byte of every frame this layer emits, naming what follows: a raw
-/// handshake message, or a sealed session frame. A party still handshaking
-/// feeds its state machine only handshake messages, since that machine
-/// consumes its transcript on the first thing it reads and cannot be
-/// restarted. The byte rides outside the seal.
+/// handshake message (or the transport-sealed verdict that ends the
+/// handshake), or a sealed session frame. The byte rides outside the seal.
 pub const FRAME_HANDSHAKE: u8 = 0x00;
 pub const FRAME_SESSION: u8 = 0x01;
+
+/// First byte of the provider's transport-sealed verdict frame: the pair is
+/// served, or refused with the reason in the remaining bytes.
+pub const VERDICT_READY: u8 = 0x00;
+pub const VERDICT_REFUSED: u8 = 0x01;
 
 /// First byte of a sealed frame's plaintext. It keeps a keepalive apart from
 /// an adapter frame, and with the frame byte outside it no frame this layer
@@ -79,6 +74,55 @@ const SESSION_QUEUE: usize = 256;
 enum Role {
     Consumer,
     Provider,
+}
+
+/// What one party brings to the pair's inner handshake: its static private
+/// key, the identity it expects on the other end, and the pair challenge the
+/// server minted.
+#[derive(Clone)]
+pub struct PairIdentity {
+    static_private: [u8; 32],
+    peer: [u8; 32],
+    challenge: [u8; 32],
+    provides: u8,
+}
+
+impl PairIdentity {
+    pub fn new(
+        static_private: [u8; 32],
+        peer: [u8; 32],
+        challenge: [u8; 32],
+        provides: u8,
+    ) -> Self {
+        PairIdentity {
+            static_private,
+            peer,
+            challenge,
+            provides,
+        }
+    }
+}
+
+/// The transcript prologue both parties must agree on: a domain tag, the
+/// protocol version, the pair and its capability, the two identities in role
+/// order, and the pair challenge. A handshake message replayed across
+/// pairings or roles hashes a different transcript and authenticates nothing.
+pub fn pair_prologue(
+    pair_id: u64,
+    provides: u8,
+    consumer: &[u8; 32],
+    provider: &[u8; 32],
+    challenge: &[u8; 32],
+) -> Vec<u8> {
+    let mut prologue = Vec::with_capacity(21 + 1 + 8 + 1 + 32 + 32 + 32);
+    prologue.extend_from_slice(b"zeronat-peer-noise-v1");
+    prologue.push(crate::identity::PROTO_VERSION);
+    prologue.extend_from_slice(&pair_id.to_be_bytes());
+    prologue.push(provides);
+    prologue.extend_from_slice(consumer);
+    prologue.extend_from_slice(provider);
+    prologue.extend_from_slice(challenge);
+    prologue
 }
 
 /// The read half of a framed peer path.
@@ -175,18 +219,18 @@ impl PeerPath {
     }
 }
 
-/// A responder's answer to a message one it already handled: the message it
-/// consumed, and the frame to send again if that copy comes back because the
-/// first answer was lost.
+/// A responder's answer to a message three it already handled: the message it
+/// consumed, and the verdict frame to send again if that copy comes back
+/// because the first answer was lost.
 struct Retransmit {
     seen: Vec<u8>,
     reply: Vec<u8>,
 }
 
 /// An encrypted frame session between two peers. Both sides handshake
-/// `NNpsk0` with the deployment secret over the path that came up, so a
-/// relayed pair moves ciphertext the server holds no key for and direct and
-/// relayed are the same thing above this layer.
+/// `Noise_XX_25519_ChaChaPoly_BLAKE2s` between their static keys over the
+/// path that came up, so a relayed pair moves ciphertext the server holds no
+/// key for and direct and relayed are the same thing above this layer.
 pub struct PeerSession {
     noise: Arc<StatelessNoise>,
     out: mpsc::Sender<Vec<u8>>,
@@ -202,42 +246,41 @@ pub struct PeerSession {
 }
 
 impl PeerSession {
-    /// The consumer's side: run the handshake's initiator over `path` and
-    /// return the session with the provider's answer, which is empty when it
-    /// accepted the pair.
-    pub async fn consumer(path: PeerPath, psk: &[u8; 32], pair_id: u64) -> Result<(Self, Vec<u8>)> {
-        Self::start(path, Role::Consumer, &[], psk, pair_id).await
+    /// The consumer's side: run the handshake's initiator over `path`. The
+    /// session is not up until the provider's ready verdict arrives; a
+    /// refusal or an identity mismatch is an error.
+    pub async fn consumer(path: PeerPath, identity: &PairIdentity, pair_id: u64) -> Result<Self> {
+        Self::start(path, Role::Consumer, &[], identity, pair_id).await
     }
 
     /// The provider's side: answer the handshake, sealing `refuse` into
-    /// message two. An empty payload accepts the pair.
+    /// message two and repeating it in the verdict. An empty `refuse` accepts
+    /// the pair with a ready verdict.
     pub async fn provider(
         path: PeerPath,
-        psk: &[u8; 32],
+        identity: &PairIdentity,
         pair_id: u64,
         refuse: &[u8],
     ) -> Result<Self> {
-        let (session, _) = Self::start(path, Role::Provider, refuse, psk, pair_id).await?;
-        Ok(session)
+        Self::start(path, Role::Provider, refuse, identity, pair_id).await
     }
 
     /// Handshake over `path` and start the session's keepalive and liveness
-    /// watch. `pair_id` rides the handshake payload, so a responder rejects a
-    /// party that names another pair.
+    /// watch.
     async fn start(
         path: PeerPath,
         role: Role,
         refuse: &[u8],
-        psk: &[u8; 32],
+        identity: &PairIdentity,
         pair_id: u64,
-    ) -> Result<(Self, Vec<u8>)> {
+    ) -> Result<Self> {
         let PeerPath {
             mut rx,
             mut tx,
             hold,
         } = path;
-        let (noise, answer, retransmit) =
-            handshake(role, refuse, &mut rx, &mut tx, psk, pair_id).await?;
+        let (noise, retransmit) =
+            handshake(role, refuse, &mut rx, &mut tx, identity, pair_id).await?;
         let noise = Arc::new(noise);
 
         let (out, mut outbox) = mpsc::channel::<Vec<u8>>(SESSION_QUEUE);
@@ -296,9 +339,9 @@ impl PeerSession {
                                 }
                             }
                         }
-                        // The peer repeating the message one this party
-                        // answered: its message two was lost on the way, so
-                        // send that answer again.
+                        // The peer repeating the message three this party
+                        // answered: its verdict was lost on the way, so send
+                        // it again.
                         Some((&FRAME_HANDSHAKE, msg)) => {
                             if let Some(again) = &retransmit {
                                 if again.seen == msg {
@@ -313,17 +356,14 @@ impl PeerSession {
             }))
         };
 
-        Ok((
-            PeerSession {
-                noise,
-                out,
-                inbound,
-                alive,
-                _hold: hold,
-                _reader: reader,
-            },
-            answer,
-        ))
+        Ok(PeerSession {
+            noise,
+            out,
+            inbound,
+            alive,
+            _hold: hold,
+            _reader: reader,
+        })
     }
 
     /// Send one frame to the peer. A frame past [`MAX_FRAME`] is refused: it
@@ -365,112 +405,177 @@ fn session_frame(noise: &StatelessNoise, kind: u8, payload: &[u8]) -> Result<Vec
     Ok(frame)
 }
 
-/// Run the inner handshake over the path, repeating the last message sent
-/// until the exchange completes. The existing stateless `NNpsk0` state machine
-/// drives it over a duplex: whatever it writes leaves as one path frame, and
-/// the handshake messages the path delivers are fed back in. Returns the
-/// transport keys, the responder's message-two payload, and the answer to
-/// repeat for a responder.
+/// Run the inner XX handshake over the path, repeating the last message sent
+/// until the exchange completes. Both parties authenticate their static keys
+/// under the pair prologue; transport keys come from the handshake split and
+/// feed the same directional datagram state the sessions run on.
 async fn handshake(
     role: Role,
     refuse: &[u8],
     rx: &mut PathRx,
     tx: &mut PathTx,
-    psk: &[u8; 32],
+    identity: &PairIdentity,
     pair_id: u64,
-) -> Result<(StatelessNoise, Vec<u8>, Option<Retransmit>)> {
-    let (mine, theirs) = tokio::io::duplex(HANDSHAKE_BUF);
-    let (mut mine_rx, mut mine_tx) = tokio::io::split(mine);
-    let mut task = {
-        let psk = *psk;
-        let refuse = refuse.to_vec();
-        AbortOnDrop(crate::spawn(async move {
-            match role {
-                Role::Consumer => client_handshake_stateless_reply(theirs, &psk, pair_id).await,
-                Role::Provider => {
-                    let (id, noise) = server_handshake_stateless(theirs, &psk, &refuse).await?;
-                    if id != pair_id {
-                        return Err("inner handshake names another pair".into());
-                    }
-                    Ok((noise, Vec::new()))
-                }
-            }
-        }))
-    };
+) -> Result<(StatelessNoise, Option<Retransmit>)> {
+    timeout(HANDSHAKE_DEADLINE, async {
+        match role {
+            Role::Consumer => handshake_initiator(rx, tx, identity, pair_id).await,
+            Role::Provider => handshake_responder(refuse, rx, tx, identity, pair_id).await,
+        }
+    })
+    .await
+    .map_err(|_| -> Error { "inner handshake timed out".into() })?
+}
 
-    let mut written = Vec::new();
-    let mut last_sent: Option<Vec<u8>> = None;
-    let mut first_seen: Option<Vec<u8>> = None;
-    let mut resend = interval_at(Instant::now() + HANDSHAKE_RETRY, HANDSHAKE_RETRY);
-    let deadline = sleep(HANDSHAKE_DEADLINE);
-    tokio::pin!(deadline);
-
-    let (noise, answer) = loop {
-        // Biased so the finished state machine is seen before its side of the
-        // duplex is read again: that half closes when it returns, and a closed
-        // read is ready forever.
+/// The consumer's side: message one, then verify the provider's static key
+/// against the identity the config names, then message three and the verdict
+/// wait. Not up until the verdict reads ready.
+async fn handshake_initiator(
+    rx: &mut PathRx,
+    tx: &mut PathTx,
+    identity: &PairIdentity,
+    pair_id: u64,
+) -> Result<(StatelessNoise, Option<Retransmit>)> {
+    let local = public_identity(&identity.static_private);
+    let prologue = pair_prologue(
+        pair_id,
+        identity.provides,
+        &local,
+        &identity.peer,
+        &identity.challenge,
+    );
+    let mut state = XxHandshake::initiator(&identity.static_private, &prologue)?;
+    let frame_one = send_handshake(tx, &state.write_message_one(&[])).await?;
+    let mut retry = interval_at(Instant::now() + HANDSHAKE_RETRY, HANDSHAKE_RETRY);
+    let message_two = loop {
         tokio::select! {
-            biased;
-            _ = &mut deadline => return Err("inner handshake timed out".into()),
-            done = &mut task.0 => break done??,
-            read = mine_rx.read_buf(&mut written) => {
-                read?;
-                for msg in take_messages(&mut written) {
-                    last_sent = Some(send_handshake(tx, &msg).await?);
+            _ = retry.tick() => tx.send(&frame_one).await?,
+            message = recv_handshake(rx) => break message?,
+        }
+    };
+    // Message two's payload carries the refusal a provider can state before
+    // it knows who is asking; the verdict repeats it, so only the verdict is
+    // acted on.
+    state.read_message_two(&message_two)?;
+    let presented = state
+        .remote_static()
+        .ok_or("handshake message 2 carried no static key")?;
+    if presented != identity.peer {
+        return Err(format!(
+            "peer identity mismatch: expected {}, presented {}",
+            crate::secret::encode(identity.peer),
+            crate::secret::encode(presented),
+        )
+        .into());
+    }
+    let frame_three = send_handshake(tx, &state.write_message_three(&[])).await?;
+    let noise = state.into_transport();
+    let mut retry = interval_at(Instant::now() + HANDSHAKE_RETRY, HANDSHAKE_RETRY);
+    loop {
+        tokio::select! {
+            _ = retry.tick() => tx.send(&frame_three).await?,
+            message = recv_handshake(rx) => {
+                let message = message?;
+                // A repeat of message two: the provider has not read message
+                // three yet, so send it again.
+                if message == message_two {
+                    tx.send(&frame_three).await?;
+                    continue;
                 }
-            }
-            frame = rx.recv() => {
-                let Some(frame) = frame else {
-                    return Err("peer path closed during the inner handshake".into());
-                };
-                // Only a handshake message reaches the state machine: it
-                // consumes its transcript on whatever it reads first and
-                // cannot start over, so anything else is dropped and the
-                // retransmit and the deadline decide the outcome.
-                let Some((&FRAME_HANDSHAKE, msg)) = frame.split_first() else {
+                // Anything that is not the sealed verdict is reordered or
+                // stale; the retransmits and the deadline decide the outcome.
+                let Ok(verdict) = noise.open(&message) else {
                     continue;
                 };
-                match &first_seen {
-                    // A repeat of the message already in the transcript:
-                    // feeding it in again would break the handshake, so
-                    // answer it with the last message instead.
-                    Some(seen) if seen == msg => {
-                        if let Some(frame) = &last_sent {
-                            tx.send(frame).await?;
-                        }
-                    }
-                    // Anything else arriving mid-handshake is reordered or
-                    // stale; the pipe promises neither order nor delivery.
-                    Some(_) => {}
-                    None => {
-                        mine_tx.write_all(&(msg.len() as u16).to_be_bytes()).await?;
-                        mine_tx.write_all(msg).await?;
-                        first_seen = Some(msg.to_vec());
-                    }
-                }
+                return match verdict.split_first() {
+                    Some((&VERDICT_READY, [])) => Ok((noise, None)),
+                    Some((&VERDICT_REFUSED, reason)) => Err(format!(
+                        "the provider refused the pair: {}",
+                        String::from_utf8_lossy(reason)
+                    )
+                    .into()),
+                    _ => Err("invalid peer handshake verdict".into()),
+                };
             }
-            _ = resend.tick() => {
-                if let Some(frame) = &last_sent {
-                    tx.send(frame).await?;
+        }
+    }
+}
+
+/// The provider's side. The expected consumer identity in the prologue is the
+/// relay-forwarded one, which is routing information: a party that does not
+/// hold it fails the transcript at message two. The consumer is authenticated
+/// at message three, after which one sealed verdict frame answers it.
+async fn handshake_responder(
+    refuse: &[u8],
+    rx: &mut PathRx,
+    tx: &mut PathTx,
+    identity: &PairIdentity,
+    pair_id: u64,
+) -> Result<(StatelessNoise, Option<Retransmit>)> {
+    let local = public_identity(&identity.static_private);
+    let prologue = pair_prologue(
+        pair_id,
+        identity.provides,
+        &identity.peer,
+        &local,
+        &identity.challenge,
+    );
+    let mut state = XxHandshake::responder(&identity.static_private, &prologue)?;
+    let message_one = recv_handshake(rx).await?;
+    if !state.read_message_one(&message_one)?.is_empty() {
+        return Err("unexpected payload in peer handshake message one".into());
+    }
+    let frame_two = send_handshake(tx, &state.write_message_two(refuse)).await?;
+    let mut retry = interval_at(Instant::now() + HANDSHAKE_RETRY, HANDSHAKE_RETRY);
+    let message_three = loop {
+        tokio::select! {
+            _ = retry.tick() => tx.send(&frame_two).await?,
+            message = recv_handshake(rx) => {
+                let message = message?;
+                // A repeat of message one: message two was lost on the way,
+                // so send it again.
+                if message == message_one {
+                    tx.send(&frame_two).await?;
+                    continue;
                 }
+                break message;
             }
         }
     };
-
-    // The last message can still sit in the duplex when the state machine
-    // returns, so drain what is left before the handshake stops driving.
-    while mine_rx.read_buf(&mut written).await? > 0 {}
-    for msg in take_messages(&mut written) {
-        last_sent = Some(send_handshake(tx, &msg).await?);
+    if !state.read_message_three(&message_three)?.is_empty() {
+        return Err("unexpected payload in peer handshake message three".into());
     }
+    let noise = state.into_transport();
+    let mut verdict = Vec::with_capacity(1 + refuse.len());
+    if refuse.is_empty() {
+        verdict.push(VERDICT_READY);
+    } else {
+        verdict.push(VERDICT_REFUSED);
+        verdict.extend_from_slice(refuse);
+    }
+    let sealed = noise.seal(&verdict)?;
+    let reply = send_handshake(tx, &sealed).await?;
+    Ok((
+        noise,
+        Some(Retransmit {
+            seen: message_three,
+            reply,
+        }),
+    ))
+}
 
-    // Only the responder has an answer to repeat: the initiator is done the
-    // moment message two opens.
-    let retransmit = match (role, first_seen, last_sent) {
-        (Role::Provider, Some(seen), Some(reply)) => Some(Retransmit { seen, reply }),
-        _ => None,
-    };
-    Ok((noise, answer, retransmit))
+/// The next handshake-class frame the path delivers, stripped of its frame
+/// byte. Session frames cannot appear before the handshake completes, so
+/// anything else is dropped.
+async fn recv_handshake(rx: &mut PathRx) -> Result<Vec<u8>> {
+    loop {
+        let Some(frame) = rx.recv().await else {
+            return Err("peer path closed during the inner handshake".into());
+        };
+        if let Some((&FRAME_HANDSHAKE, message)) = frame.split_first() {
+            return Ok(message.to_vec());
+        }
+    }
 }
 
 /// Send one handshake message and return the frame it went out as, for the
@@ -483,39 +588,219 @@ async fn send_handshake(tx: &mut PathTx, msg: &[u8]) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-/// Cut the whole length-delimited messages out of what the handshake wrote,
-/// leaving any partial one behind.
-fn take_messages(written: &mut Vec<u8>) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut off = 0;
-    while written.len() >= off + 2 {
-        let len = u16::from_be_bytes([written[off], written[off + 1]]) as usize;
-        if written.len() < off + 2 + len {
-            break;
-        }
-        out.push(written[off + 2..off + 2 + len].to_vec());
-        off += 2 + len;
-    }
-    written.drain(..off);
-    out
-}
-
-/// Both ends of one inner session, handshaked over a duplex standing in for a
-/// relay leg. The provider answers with an empty payload, so the pair is one
-/// an adapter can run over.
+/// Both stream legs of one relayed pair, standing in for the relay splice.
 #[cfg(test)]
-pub(crate) async fn duplex_pair(secret: &str, pair_id: u64) -> (PeerSession, PeerSession) {
+async fn duplex_legs(secret: &str) -> (Noise, Noise) {
     let psk = crate::noise::derive_psk(secret);
     let (a, b) = tokio::io::duplex(1 << 16);
     let responder =
         crate::spawn(async move { crate::noise::server_handshake(b, &psk).await.unwrap() });
     let initiator = crate::noise::client_handshake(a, &psk).await.unwrap();
-    let responder = responder.await.unwrap();
-    let ((consumer, answer), provider) = tokio::try_join!(
-        PeerSession::consumer(PeerPath::relay_stream(initiator), &psk, pair_id),
-        PeerSession::provider(PeerPath::relay_stream(responder), &psk, pair_id, &[]),
-    )
-    .expect("the inner handshake must complete on both sides");
-    assert!(answer.is_empty());
+    (initiator, responder.await.unwrap())
+}
+
+/// The two ends of a pair as [`PairIdentity`] values, with static keys and the
+/// challenge derived from `secret`.
+#[cfg(test)]
+fn duplex_identities(secret: &str) -> (PairIdentity, PairIdentity) {
+    let consumer_static = crate::noise::derive_psk(&format!("{secret}-consumer-static"));
+    let provider_static = crate::noise::derive_psk(&format!("{secret}-provider-static"));
+    let challenge = crate::noise::derive_psk(&format!("{secret}-pair-challenge"));
+    let consumer = PairIdentity::new(
+        consumer_static,
+        public_identity(&provider_static),
+        challenge,
+        crate::proto::PROVIDES_EXIT,
+    );
+    let provider = PairIdentity::new(
+        provider_static,
+        public_identity(&consumer_static),
+        challenge,
+        crate::proto::PROVIDES_EXIT,
+    );
     (consumer, provider)
+}
+
+/// Both ends of one inner session, handshaked over a duplex standing in for a
+/// relay leg. The provider answers with a ready verdict, so the pair is one
+/// an adapter can run over.
+#[cfg(test)]
+pub(crate) async fn duplex_pair(secret: &str, pair_id: u64) -> (PeerSession, PeerSession) {
+    let (initiator, responder) = duplex_legs(secret).await;
+    let (consumer_identity, provider_identity) = duplex_identities(secret);
+    tokio::try_join!(
+        PeerSession::consumer(
+            PeerPath::relay_stream(initiator),
+            &consumer_identity,
+            pair_id
+        ),
+        PeerSession::provider(
+            PeerPath::relay_stream(responder),
+            &provider_identity,
+            pair_id,
+            &[],
+        ),
+    )
+    .expect("the inner handshake must complete on both sides")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The core identity check: a party that holds everything the relay and
+    // the pairing hand out (the pair challenge, both identities, and the
+    // prologue they hash to) but not the expected static key must be rejected
+    // with the identity-mismatch error, not served and not timed out. The
+    // impostor completes its whole flow up to a ready verdict, so a broken or
+    // inverted comparison hands the consumer a live session and fails the
+    // assertion below.
+    #[tokio::test]
+    async fn a_provider_presenting_another_static_key_is_rejected_as_a_mismatch() {
+        let consumer_static = crate::noise::derive_psk("mismatch consumer");
+        let provider_static = crate::noise::derive_psk("mismatch provider");
+        let attacker_static = crate::noise::derive_psk("mismatch attacker");
+        let challenge = crate::noise::derive_psk("mismatch challenge");
+        let expected = public_identity(&provider_static);
+        let presented = public_identity(&attacker_static);
+        let pair_id = 41;
+
+        let (initiator, responder) = duplex_legs("mismatch legs").await;
+        let impostor = crate::spawn(async move {
+            let prologue = pair_prologue(
+                pair_id,
+                crate::proto::PROVIDES_EXIT,
+                &public_identity(&consumer_static),
+                &expected,
+                &challenge,
+            );
+            let mut state = XxHandshake::responder(&attacker_static, &prologue).unwrap();
+            let (mut leg_rx, mut leg_tx) = responder;
+            let msg1 = loop {
+                let Ok(frame) = leg_rx.recv().await else {
+                    return;
+                };
+                if let Some((&FRAME_HANDSHAKE, m)) = frame.split_first() {
+                    break m.to_vec();
+                }
+            };
+            if state.read_message_one(&msg1).is_err() {
+                return;
+            }
+            let mut frame = vec![FRAME_HANDSHAKE];
+            frame.extend_from_slice(&state.write_message_two(&[]));
+            if leg_tx.send(&frame).await.is_err() {
+                return;
+            }
+            let msg3 = loop {
+                let Ok(frame) = leg_rx.recv().await else {
+                    return;
+                };
+                match frame.split_first() {
+                    Some((&FRAME_HANDSHAKE, m)) if m != msg1 => break m.to_vec(),
+                    _ => continue,
+                }
+            };
+            if state.read_message_three(&msg3).is_err() {
+                return;
+            }
+            let noise = state.into_transport();
+            let Ok(sealed) = noise.seal(&[VERDICT_READY]) else {
+                return;
+            };
+            let mut frame = vec![FRAME_HANDSHAKE];
+            frame.extend_from_slice(&sealed);
+            leg_tx.send(&frame).await.ok();
+        });
+
+        let identity = PairIdentity::new(
+            consumer_static,
+            expected,
+            challenge,
+            crate::proto::PROVIDES_EXIT,
+        );
+        let outcome =
+            PeerSession::consumer(PeerPath::relay_stream(initiator), &identity, pair_id).await;
+        let error = outcome
+            .err()
+            .expect("another static key must not authenticate as the expected peer")
+            .to_string();
+        assert!(error.contains("peer identity mismatch"), "{error}");
+        assert!(error.contains(&crate::secret::encode(expected)), "{error}");
+        assert!(error.contains(&crate::secret::encode(presented)), "{error}");
+        impostor.await.unwrap();
+    }
+
+    // A provider that cannot take the pair refuses in the verdict; the
+    // consumer surfaces the reason as its own error, distinct from an
+    // identity mismatch.
+    #[tokio::test]
+    async fn a_verdict_refusal_is_an_error_distinct_from_a_mismatch() {
+        let (initiator, responder) = duplex_legs("refusal legs").await;
+        let (consumer_identity, provider_identity) = duplex_identities("refusal legs");
+        let (consumer, provider) = tokio::join!(
+            PeerSession::consumer(PeerPath::relay_stream(initiator), &consumer_identity, 7),
+            PeerSession::provider(
+                PeerPath::relay_stream(responder),
+                &provider_identity,
+                7,
+                b"already serving a pair",
+            ),
+        );
+        provider.expect("the refusing provider still completes the handshake");
+        let error = consumer.err().expect("a refusal fails the consumer");
+        let error = error.to_string();
+        assert!(
+            error.contains("the provider refused the pair: already serving a pair"),
+            "{error}"
+        );
+        assert!(!error.contains("peer identity mismatch"), "{error}");
+    }
+
+    // A completed handshake is not a session: the consumer stays down until
+    // the ready verdict arrives, and a provider that never sends one leaves
+    // it failing at the handshake deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_consumer_is_not_up_until_the_ready_verdict() {
+        let (initiator, responder) = duplex_legs("verdictless legs").await;
+        let (consumer_identity, provider_identity) = duplex_identities("verdictless legs");
+        let silent = crate::spawn(async move {
+            let prologue = pair_prologue(
+                9,
+                crate::proto::PROVIDES_EXIT,
+                &provider_identity.peer,
+                &public_identity(&provider_identity.static_private),
+                &provider_identity.challenge,
+            );
+            let mut state =
+                XxHandshake::responder(&provider_identity.static_private, &prologue).unwrap();
+            let (mut leg_rx, mut leg_tx) = responder;
+            let msg1 = loop {
+                let Ok(frame) = leg_rx.recv().await else {
+                    return;
+                };
+                if let Some((&FRAME_HANDSHAKE, m)) = frame.split_first() {
+                    break m.to_vec();
+                }
+            };
+            state.read_message_one(&msg1).unwrap();
+            let mut frame = vec![FRAME_HANDSHAKE];
+            frame.extend_from_slice(&state.write_message_two(&[]));
+            leg_tx.send(&frame).await.unwrap();
+            // Read message three and go silent: no verdict ever leaves.
+            loop {
+                if leg_rx.recv().await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let error = PeerSession::consumer(PeerPath::relay_stream(initiator), &consumer_identity, 9)
+            .await
+            .err()
+            .expect("no verdict must not produce a session")
+            .to_string();
+        assert!(error.contains("inner handshake timed out"), "{error}");
+        drop(silent);
+    }
 }

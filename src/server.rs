@@ -29,7 +29,7 @@ use crate::noise::{
 use crate::proto::BridgeEntry;
 use crate::proto::{
     proto_name, Capability, ClientEntry, FwdOptionEntry, Listener, Msg, PairEntry, PathStatus,
-    PeerStatus, Proto, RouteEntry, SnapshotBody, Source, PROVIDES_EXIT,
+    PeerIdentity, PeerStatus, Proto, RouteEntry, SnapshotBody, Source, PROVIDES_EXIT,
 };
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
@@ -174,6 +174,9 @@ struct ClientHandle {
     /// it has not announced. The server sends peer tags only to a client whose
     /// entry holds `Some`, so an old client never sees an undecodable frame.
     peer_provides: Option<u8>,
+    /// The peer identity this client's `PeerAnnounce` asserted. `PeerConnect`
+    /// resolves over these.
+    peer_identity: Option<PeerIdentity>,
     bridge_capability: Option<Capability>,
     cancel: watch::Sender<bool>,
 }
@@ -217,6 +220,9 @@ struct Pair {
     provider_id: String,
     /// The pair's capability: the consumer's validated `want` bit.
     want: u8,
+    /// The pair challenge, minted at insert and carried to both parties in
+    /// `PeerProbe`; the inner handshake binds it into its prologue.
+    challenge: [u8; 32],
     consumer: PartyProbe,
     provider: PartyProbe,
     /// Set once the `PeerInfo` frames go out, so a completing probe and the
@@ -386,9 +392,10 @@ pub(crate) struct Server {
     pending: Mutex<HashMap<u64, PendingStream>>,
     udp_pending: Mutex<HashMap<u64, UdpPending>>,
     clients: Mutex<HashMap<String, ClientHandle>>,
-    /// Every client id that has ever registered on this server, kept across
-    /// disconnects so `PeerConnect` can tell an offline peer from an unknown one.
-    known_clients: Mutex<HashSet<String>>,
+    /// Every peer identity an announce has ever asserted on this server, kept
+    /// across disconnects so `PeerConnect` can tell an offline peer from an
+    /// unknown one.
+    known_peer_identities: Mutex<HashSet<PeerIdentity>>,
     /// Accepted rendezvous pairs by `pair_id`.
     pairs: Mutex<HashMap<u64, Pair>>,
     /// Outstanding probe ids to their owning `pair_id`, letting the udp
@@ -552,7 +559,9 @@ impl Server {
     }
 
     /// Resolve a consumer's `PeerConnect` into a `PeerResult` status, inserting
-    /// a pair on acceptance. `None` means drop the frame without a reply: the
+    /// a pair on acceptance. The provider is resolved by identity over the
+    /// live announced clients; the pair itself is kept between the two
+    /// registry client ids. `None` means drop the frame without a reply: the
     /// sending session never announced or lost its registry slot. The clients
     /// guard spans the ownership check, the provider check, and the insert, so
     /// a pair only lands while both parties' entries are live and owned; a
@@ -567,38 +576,48 @@ impl Server {
         &self,
         consumer_id: &str,
         consumer_tx: &mpsc::Sender<Vec<u8>>,
-        provider_id: &str,
+        provider: &PeerIdentity,
         want: u8,
     ) -> Option<(u64, PeerStatus)> {
         let clients = self.clients.lock().unwrap();
-        let owned = clients
-            .get(consumer_id)
-            .is_some_and(|h| h.tx.same_channel(consumer_tx) && h.peer_provides.is_some());
-        if !owned {
+        let consumer = clients.get(consumer_id)?;
+        if !consumer.tx.same_channel(consumer_tx) || consumer.peer_provides.is_none() {
             return None;
         }
         // A party never pairs with itself. The punch elects its roles by
-        // comparing the two client ids, so equal ids leave both ends
+        // comparing the two identities, so equal identities leave both ends
         // responders: neither can send handshake message one, the pair burns
         // its deadline, and an exclusive provider's one slot is held by a
-        // pair that carries nothing.
-        if provider_id == consumer_id {
+        // pair that carries nothing. Until announces prove possession, two
+        // sessions can also claim one identity, so the guard refuses the
+        // identity itself, not just the consumer's own registry entry.
+        if consumer.peer_identity.as_ref() == Some(provider) {
             return Some((0, PeerStatus::UnknownPeer));
         }
-        let Some(handle) = clients.get(provider_id) else {
+        let resolved = clients
+            .iter()
+            .find(|(_, h)| h.peer_identity.as_ref() == Some(provider));
+        let Some((provider_id, handle)) = resolved else {
             drop(clients);
-            // An id that has registered before but holds no live session is
-            // offline; one this server has never seen is unknown.
-            if self.known_clients.lock().unwrap().contains(provider_id) {
+            // An identity an announce has asserted before but that no live
+            // session holds is offline; one this server has never seen is
+            // unknown.
+            if self
+                .known_peer_identities
+                .lock()
+                .unwrap()
+                .contains(provider)
+            {
                 return Some((0, PeerStatus::PeerOffline));
             }
             return Some((0, PeerStatus::UnknownPeer));
         };
+        let provider_id = provider_id.clone();
         if handle.tx.is_closed() {
             return Some((0, PeerStatus::PeerOffline));
         }
-        // A provider that never announced provides nothing, same as one whose
-        // announced bitset lacks the requested bit.
+        // A provider whose announced bitset lacks the requested bit provides
+        // nothing.
         if handle.peer_provides.is_none_or(|p| p & want == 0) {
             return Some((0, PeerStatus::NotProvided));
         }
@@ -630,12 +649,17 @@ impl Server {
             return Some((0, PeerStatus::PeerBusy));
         }
         let pair_id = self.next_id();
+        let Ok(challenge) = Self::capability() else {
+            crate::elog!("peer pair allocation failed: random source unavailable");
+            return None;
+        };
         pairs.insert(
             pair_id,
             Pair {
                 consumer_id: consumer_id.to_string(),
-                provider_id: provider_id.to_string(),
+                provider_id: provider_id.clone(),
                 want,
+                challenge,
                 consumer: PartyProbe::default(),
                 provider: PartyProbe::default(),
                 info_sent: false,
@@ -704,6 +728,7 @@ impl Server {
             let consumer_id = pair.consumer_id.clone();
             let provider_id = pair.provider_id.clone();
             let want = pair.want;
+            let challenge = pair.challenge;
             let mut probes = self.probes.lock().unwrap();
             for (id, peer_id, party) in [
                 (&consumer_id, &provider_id, &mut pair.consumer),
@@ -713,6 +738,12 @@ impl Server {
                 // pending invalidation clears this pair, and a probe must not
                 // ride a session that never announced.
                 let Some(h) = clients.get(id).filter(|h| h.peer_provides.is_some()) else {
+                    continue;
+                };
+                // The frame names the other party by identity; an entry that
+                // lost its identity mid-teardown is left to the pending
+                // invalidation like one that lost its announce.
+                let Some(peer_identity) = clients.get(peer_id).and_then(|h| h.peer_identity) else {
                     continue;
                 };
                 let probe_id = self.next_id();
@@ -742,9 +773,10 @@ impl Server {
                     h.tx.clone(),
                     Msg::PeerProbe {
                         pair_id,
-                        peer_id: peer_id.clone(),
+                        peer_id: peer_identity,
                         probe_id,
                         probe_capability,
+                        challenge,
                         provides: want,
                     }
                     .encode(),
@@ -1293,7 +1325,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         pending: Mutex::new(HashMap::new()),
         udp_pending: Mutex::new(HashMap::new()),
         clients: Mutex::new(HashMap::new()),
-        known_clients: Mutex::new(HashSet::new()),
+        known_peer_identities: Mutex::new(HashSet::new()),
         pairs: Mutex::new(HashMap::new()),
         probes: Mutex::new(HashMap::new()),
         relay_legs: Mutex::new(HashMap::new()),
@@ -1452,12 +1484,12 @@ pub(crate) async fn serve_stream(
                         fwd: Arc::new(HashMap::new()),
                         observed: peer,
                         peer_provides: None,
+                        peer_identity: None,
                         bridge_capability: Some(bridge_capability),
                         cancel,
                     },
                 )
             };
-            srv.known_clients.lock().unwrap().insert(client_id.clone());
             if let Some(superseded) = superseded {
                 crate::elog!("client {client_id} reconnected, superseding previous session");
                 superseded.cancel.send(true).ok();
@@ -1523,19 +1555,28 @@ pub(crate) async fn serve_stream(
                         // so an old client never sees an undecodable frame.
                         tx.try_send(Msg::FwdOptionsAck.encode()).ok();
                     }
-                    Ok(Msg::PeerAnnounce { provides }) => {
-                        // Record peer support only while this session still owns
-                        // its slot (same guard as FwdOptions); the recorded
-                        // entry gates every later peer tag to this client.
-                        let observed = {
+                    Ok(Msg::PeerAnnounce { provides, identity }) => {
+                        // Record peer support and the asserted identity only
+                        // while this session still owns its slot (same guard
+                        // as FwdOptions); the recorded entry gates every later
+                        // peer tag to this client.
+                        let recorded = {
                             let mut clients = srv.clients.lock().unwrap();
                             match clients.get_mut(&client_id) {
                                 Some(h) if h.tx.same_channel(&tx) => {
                                     h.peer_provides = Some(provides);
-                                    h.observed
+                                    h.peer_identity = Some(identity);
+                                    Some(h.observed)
                                 }
                                 _ => None,
                             }
+                        };
+                        let observed = match recorded {
+                            Some(observed) => {
+                                srv.known_peer_identities.lock().unwrap().insert(identity);
+                                observed
+                            }
+                            None => None,
                         };
                         // The ack echoes the control address recorded at
                         // registration; like FwdOptionsAck it is only ever sent
@@ -3007,7 +3048,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             pending: Mutex::new(HashMap::new()),
             udp_pending: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
-            known_clients: Mutex::new(HashSet::new()),
+            known_peer_identities: Mutex::new(HashSet::new()),
             pairs: Mutex::new(HashMap::new()),
             probes: Mutex::new(HashMap::new()),
             relay_legs: Mutex::new(HashMap::new()),
@@ -3239,11 +3280,18 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         client.abort();
     }
 
-    /// Insert a live client handle with the given announced peer bitset,
-    /// recording the id as registered like a real `ClientHello` does. Returns
-    /// the handle's control sender (the session identity `peer_connect`
-    /// checks) and the receiver keeping the channel open; dropping the
-    /// receiver models an entry whose control session is no longer live.
+    /// The peer identity a test client announces, derived from its id.
+    fn test_identity(id: &str) -> PeerIdentity {
+        crate::noise::public_identity(&crate::noise::derive_psk(id))
+    }
+
+    /// Insert a live client handle with the given announced peer bitset. An
+    /// announced entry (`Some` bitset) also carries the identity a real
+    /// `PeerAnnounce` records, remembered like a real announce remembers it.
+    /// Returns the handle's control sender (the session identity
+    /// `peer_connect` checks) and the receiver keeping the channel open;
+    /// dropping the receiver models an entry whose control session is no
+    /// longer live.
     fn register_peer_client(
         srv: &Server,
         id: &str,
@@ -3260,6 +3308,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
     ) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
         let (tx, rx) = mpsc::channel(8);
         let (cancel, _) = watch::channel(false);
+        let peer_identity = peer_provides.map(|_| test_identity(id));
         srv.clients.lock().unwrap().insert(
             id.into(),
             ClientHandle {
@@ -3269,17 +3318,20 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
                 fwd: Arc::new(HashMap::new()),
                 observed: None,
                 peer_provides,
+                peer_identity,
                 bridge_capability: None,
                 cancel,
             },
         );
-        srv.known_clients.lock().unwrap().insert(id.into());
+        if let Some(identity) = peer_identity {
+            srv.known_peer_identities.lock().unwrap().insert(identity);
+        }
         (tx, rx)
     }
 
-    // Every PeerConnect failure names its reason: an id the server has never
-    // seen, a registered id with no live session (torn down or mid-teardown),
-    // a provider that never announced, and one whose announced bitset lacks
+    // Every PeerConnect failure names its reason: an identity no announce has
+    // ever asserted, one a past announce asserted with no live session (torn
+    // down or mid-teardown), and a live provider whose announced bitset lacks
     // the requested bit. None of them may insert a pair.
     #[test]
     fn peer_connect_failure_statuses() {
@@ -3288,48 +3340,51 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
 
         assert_eq!(
-            srv.peer_connect("c", &c_tx, "ghost", PROVIDES_EXIT),
+            srv.peer_connect("c", &c_tx, &test_identity("ghost"), PROVIDES_EXIT),
             Some((0, PeerStatus::UnknownPeer))
         );
 
-        // A completed disconnect removes the registry entry; the id stays known.
+        // A completed disconnect removes the registry entry; the identity
+        // stays known.
         drop(register_peer_client(&srv, "left", Some(PROVIDES_EXIT)));
         srv.clients.lock().unwrap().remove("left");
         assert_eq!(
-            srv.peer_connect("c", &c_tx, "left", PROVIDES_EXIT),
+            srv.peer_connect("c", &c_tx, &test_identity("left"), PROVIDES_EXIT),
             Some((0, PeerStatus::PeerOffline))
         );
 
         // Mid-teardown the entry lingers with a closed channel; still offline.
         drop(register_peer_client(&srv, "gone", Some(PROVIDES_EXIT)));
         assert_eq!(
-            srv.peer_connect("c", &c_tx, "gone", PROVIDES_EXIT),
+            srv.peer_connect("c", &c_tx, &test_identity("gone"), PROVIDES_EXIT),
             Some((0, PeerStatus::PeerOffline))
         );
 
+        // A registered client that never announced holds no identity, so its
+        // would-be identity is one the server has never seen.
         let _mute = register_peer_client(&srv, "mute", None);
         assert_eq!(
-            srv.peer_connect("c", &c_tx, "mute", PROVIDES_EXIT),
-            Some((0, PeerStatus::NotProvided))
+            srv.peer_connect("c", &c_tx, &test_identity("mute"), PROVIDES_EXIT),
+            Some((0, PeerStatus::UnknownPeer))
         );
 
         let _seg = register_peer_client(&srv, "seg", Some(PROVIDES_SEGMENT));
         assert_eq!(
-            srv.peer_connect("c", &c_tx, "seg", PROVIDES_EXIT),
+            srv.peer_connect("c", &c_tx, &test_identity("seg"), PROVIDES_EXIT),
             Some((0, PeerStatus::NotProvided))
         );
 
-        // A party naming itself reads as unknown, whether or not it provides
-        // the capability it asks for. The punch elects roles by comparing the
-        // two ids, so a self-pair would leave both ends responders while
-        // holding the provider's exclusive slot.
+        // A party naming its own identity reads as unknown, whether or not it
+        // provides the capability it asks for. The punch elects roles by
+        // comparing the two identities, so a self-pair would leave both ends
+        // responders while holding the provider's exclusive slot.
         let (self_tx, _self_rx) = register_peer_client(&srv, "solo", Some(PROVIDES_EXIT));
         assert_eq!(
-            srv.peer_connect("solo", &self_tx, "solo", PROVIDES_EXIT),
+            srv.peer_connect("solo", &self_tx, &test_identity("solo"), PROVIDES_EXIT),
             Some((0, PeerStatus::UnknownPeer))
         );
         assert_eq!(
-            srv.peer_connect("c", &c_tx, "c", PROVIDES_EXIT),
+            srv.peer_connect("c", &c_tx, &test_identity("c"), PROVIDES_EXIT),
             Some((0, PeerStatus::UnknownPeer))
         );
 
@@ -3349,20 +3404,20 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let (c2_tx, _c2_rx) = register_peer_client(&srv, "c2", Some(0));
 
         let (exit_pair, status) = srv
-            .peer_connect("c1", &c1_tx, "prov", PROVIDES_EXIT)
+            .peer_connect("c1", &c1_tx, &test_identity("prov"), PROVIDES_EXIT)
             .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         assert_ne!(exit_pair, 0);
         assert_eq!(
-            srv.peer_connect("c2", &c2_tx, "prov", PROVIDES_EXIT),
+            srv.peer_connect("c2", &c2_tx, &test_identity("prov"), PROVIDES_EXIT),
             Some((0, PeerStatus::PeerBusy))
         );
 
         let (seg1, status1) = srv
-            .peer_connect("c1", &c1_tx, "prov", PROVIDES_SEGMENT)
+            .peer_connect("c1", &c1_tx, &test_identity("prov"), PROVIDES_SEGMENT)
             .unwrap();
         let (seg2, status2) = srv
-            .peer_connect("c2", &c2_tx, "prov", PROVIDES_SEGMENT)
+            .peer_connect("c2", &c2_tx, &test_identity("prov"), PROVIDES_SEGMENT)
             .unwrap();
         assert_eq!(status1, PeerStatus::Accepted);
         assert_eq!(status2, PeerStatus::Accepted);
@@ -3370,7 +3425,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
 
         srv.invalidate_pairs("c1");
         let (_, status) = srv
-            .peer_connect("c2", &c2_tx, "prov", PROVIDES_EXIT)
+            .peer_connect("c2", &c2_tx, &test_identity("prov"), PROVIDES_EXIT)
             .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
     }
@@ -3389,12 +3444,16 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
         let (other_tx, _other_rx) = register_peer_client(&srv, "other", Some(0));
 
-        let (first, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        let (first, status) = srv
+            .peer_connect("c", &c_tx, &test_identity("prov"), PROVIDES_EXIT)
+            .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         srv.peer_path("c", &c_tx, first, PathStatus::Relay);
         assert_eq!(srv.relay_legs.lock().unwrap().len(), 2);
 
-        let (second, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        let (second, status) = srv
+            .peer_connect("c", &c_tx, &test_identity("prov"), PROVIDES_EXIT)
+            .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         assert_ne!(second, first);
         let pairs = srv.pairs.lock().unwrap();
@@ -3406,13 +3465,13 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         // The one exclusive slot is held by the live pair, so another consumer
         // still reads busy.
         assert_eq!(
-            srv.peer_connect("other", &other_tx, "prov", PROVIDES_EXIT),
+            srv.peer_connect("other", &other_tx, &test_identity("prov"), PROVIDES_EXIT),
             Some((0, PeerStatus::PeerBusy))
         );
 
         // A connect naming a different peer replaces nothing.
         let (_, status) = srv
-            .peer_connect("c", &c_tx, "prov2", PROVIDES_EXIT)
+            .peer_connect("c", &c_tx, &test_identity("prov2"), PROVIDES_EXIT)
             .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         assert!(
@@ -3422,7 +3481,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
 
         // Neither does one naming a different capability of the same peer.
         let (_, status) = srv
-            .peer_connect("c", &c_tx, "prov", PROVIDES_SEGMENT)
+            .peer_connect("c", &c_tx, &test_identity("prov"), PROVIDES_SEGMENT)
             .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         assert!(
@@ -3452,7 +3511,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let (c2_tx, _c2_rx) = register_peer_client(&srv, "c2", Some(0));
 
         let (spliced, status) = srv
-            .peer_connect("c1", &c1_tx, "prov", PROVIDES_EXIT)
+            .peer_connect("c1", &c1_tx, &test_identity("prov"), PROVIDES_EXIT)
             .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         srv.peer_path("c1", &c1_tx, spliced, PathStatus::Relay);
@@ -3472,14 +3531,14 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             "a spliced relay outlives the claim deadline"
         );
         assert_eq!(
-            srv.peer_connect("c2", &c2_tx, "prov", PROVIDES_EXIT),
+            srv.peer_connect("c2", &c2_tx, &test_identity("prov"), PROVIDES_EXIT),
             Some((0, PeerStatus::PeerBusy))
         );
 
         // The next pair is handed its legs and neither party ever claims one.
         srv.end_relay(spliced);
         let (unclaimed, status) = srv
-            .peer_connect("c2", &c2_tx, "prov", PROVIDES_EXIT)
+            .peer_connect("c2", &c2_tx, &test_identity("prov"), PROVIDES_EXIT)
             .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         srv.peer_path("c2", &c2_tx, unclaimed, PathStatus::Relay);
@@ -3488,7 +3547,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         assert!(srv.pairs.lock().unwrap().is_empty());
         assert!(srv.relay_legs.lock().unwrap().is_empty());
         let (next, status) = srv
-            .peer_connect("c2", &c2_tx, "prov", PROVIDES_EXIT)
+            .peer_connect("c2", &c2_tx, &test_identity("prov"), PROVIDES_EXIT)
             .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         assert_ne!(next, unclaimed);
@@ -3506,20 +3565,24 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let srv = test_server();
         let live = register_peer_client(&srv, "prov", Some(PROVIDES_EXIT));
         let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
-        let (first, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        let (first, status) = srv
+            .peer_connect("c", &c_tx, &test_identity("prov"), PROVIDES_EXIT)
+            .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
 
         drop(live);
         srv.clients.lock().unwrap().remove("prov");
         srv.invalidate_pairs("prov");
         assert_eq!(
-            srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT),
+            srv.peer_connect("c", &c_tx, &test_identity("prov"), PROVIDES_EXIT),
             Some((0, PeerStatus::PeerOffline))
         );
         assert!(srv.pairs.lock().unwrap().is_empty());
 
         let (_prov_tx, _prov_rx) = register_peer_client(&srv, "prov", Some(PROVIDES_EXIT));
-        let (second, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        let (second, status) = srv
+            .peer_connect("c", &c_tx, &test_identity("prov"), PROVIDES_EXIT)
+            .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         assert_ne!(second, first);
     }
@@ -3534,8 +3597,8 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let (b_tx, _b_rx) = register_peer_client(&srv, "b", Some(PROVIDES_SEGMENT));
         let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
 
-        srv.peer_connect("b", &b_tx, "a", PROVIDES_EXIT);
-        srv.peer_connect("c", &c_tx, "b", PROVIDES_SEGMENT);
+        srv.peer_connect("b", &b_tx, &test_identity("a"), PROVIDES_EXIT);
+        srv.peer_connect("c", &c_tx, &test_identity("b"), PROVIDES_SEGMENT);
         assert_eq!(srv.pairs.lock().unwrap().len(), 2);
 
         assert_eq!(srv.invalidate_pairs("b").len(), 2);
@@ -3553,14 +3616,14 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let (new_tx, _new_rx) = register_peer_client(&srv, "c", Some(0));
 
         assert_eq!(
-            srv.peer_connect("c", &stale_tx, "prov", PROVIDES_EXIT),
+            srv.peer_connect("c", &stale_tx, &test_identity("prov"), PROVIDES_EXIT),
             None
         );
         assert!(srv.pairs.lock().unwrap().is_empty());
 
         // The session that owns the slot pairs as usual.
         let (pair_id, status) = srv
-            .peer_connect("c", &new_tx, "prov", PROVIDES_EXIT)
+            .peer_connect("c", &new_tx, &test_identity("prov"), PROVIDES_EXIT)
             .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         assert_ne!(pair_id, 0);
@@ -3608,6 +3671,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         cw.send(
             &Msg::PeerAnnounce {
                 provides: PROVIDES_EXIT,
+                identity: [3; 32],
             }
             .encode(),
         )
@@ -3622,15 +3686,13 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             Msg::PeerAnnounceAck { observed: got } => assert_eq!(got, observed),
             other => panic!("expected announce ack, got {other:?}"),
         }
-        assert_eq!(
-            srv.clients
-                .lock()
-                .unwrap()
-                .get("prov")
-                .unwrap()
-                .peer_provides,
-            Some(PROVIDES_EXIT)
-        );
+        {
+            let clients = srv.clients.lock().unwrap();
+            let handle = clients.get("prov").unwrap();
+            assert_eq!(handle.peer_provides, Some(PROVIDES_EXIT));
+            assert_eq!(handle.peer_identity, Some([3; 32]));
+        }
+        assert!(srv.known_peer_identities.lock().unwrap().contains(&[3; 32]));
         server.abort();
     }
 
@@ -3675,7 +3737,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         cr.recv().await.unwrap();
         cw.send(
             &Msg::PeerConnect {
-                peer_id: "prov".into(),
+                peer_id: test_identity("prov"),
                 want: PROVIDES_EXIT,
             }
             .encode(),
@@ -3709,7 +3771,9 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         c_rx: &mut mpsc::Receiver<Vec<u8>>,
         p_rx: &mut mpsc::Receiver<Vec<u8>>,
     ) -> (u64, u64, u64) {
-        let (pair_id, status) = srv.peer_connect("c", c_tx, "prov", PROVIDES_EXIT).unwrap();
+        let (pair_id, status) = srv
+            .peer_connect("c", c_tx, &test_identity("prov"), PROVIDES_EXIT)
+            .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         srv.start_pair_probes(pair_id);
         let probe_of = |rx: &mut mpsc::Receiver<Vec<u8>>, peer: &str| match next_msg(rx) {
@@ -3721,7 +3785,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
                 ..
             } => {
                 assert_eq!(got, pair_id);
-                assert_eq!(peer_id, peer);
+                assert_eq!(peer_id, test_identity(peer));
                 assert_eq!(provides, PROVIDES_EXIT);
                 probe_id
             }
@@ -3831,7 +3895,9 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let srv = test_server();
         let (_p_tx, mut p_rx) = register_peer_client(&srv, "prov", Some(PROVIDES_EXIT));
         let (c_tx, mut c_rx) = register_peer_client(&srv, "c", Some(0));
-        let (pair_id, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        let (pair_id, status) = srv
+            .peer_connect("c", &c_tx, &test_identity("prov"), PROVIDES_EXIT)
+            .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         srv.start_pair_probes(pair_id);
 
@@ -3845,7 +3911,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
                     ..
                 } => {
                     assert_eq!(got, pair_id);
-                    assert_eq!(peer_id, peer);
+                    assert_eq!(peer_id, test_identity(peer));
                     assert_eq!(provides, PROVIDES_EXIT);
                     probe_id
                 }
@@ -3877,7 +3943,9 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let (p_tx, _p_rx) = register_peer_client(&srv, "prov", Some(PROVIDES_EXIT));
         let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
         let (o_tx, _o_rx) = register_peer_client(&srv, "other", Some(0));
-        let (pair_id, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        let (pair_id, status) = srv
+            .peer_connect("c", &c_tx, &test_identity("prov"), PROVIDES_EXIT)
+            .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
 
         // Both slots are still empty, so a stranger's report has somewhere to
@@ -3909,7 +3977,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         srv.invalidate_pairs("c");
         let (new_tx, _new_rx) = register_peer_client(&srv, "c", Some(0));
         let (pair2, status) = srv
-            .peer_connect("c", &new_tx, "prov", PROVIDES_EXIT)
+            .peer_connect("c", &new_tx, &test_identity("prov"), PROVIDES_EXIT)
             .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         srv.peer_path("c", &c_tx, pair2, PathStatus::Direct);
@@ -3930,10 +3998,12 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let (q_tx, _q_rx) = register_peer_client(&srv, "prov2", Some(PROVIDES_EXIT));
         let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
         let (d_tx, _d_rx) = register_peer_client(&srv, "d", Some(0));
-        let (punched, status) = srv.peer_connect("c", &c_tx, "prov", PROVIDES_EXIT).unwrap();
+        let (punched, status) = srv
+            .peer_connect("c", &c_tx, &test_identity("prov"), PROVIDES_EXIT)
+            .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         let (relayed, status) = srv
-            .peer_connect("d", &d_tx, "prov2", PROVIDES_EXIT)
+            .peer_connect("d", &d_tx, &test_identity("prov2"), PROVIDES_EXIT)
             .unwrap();
         assert_eq!(status, PeerStatus::Accepted);
         let path = |consumer: &str| {

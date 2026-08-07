@@ -169,6 +169,9 @@ pub struct ControlState {
     /// set, so runtime forward edits move them; only `Connect` falls through
     /// to this chain.
     pub fallback_mode: RunMode,
+    /// Whether a `[client] peer_secret` is configured; a peer slot cannot
+    /// attach without one.
+    pub has_peer_secret: bool,
     /// `None` on a runtime-only client; mutations then stay in memory.
     pub persist: Option<Persist>,
 }
@@ -632,6 +635,14 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                     );
                 }
             }
+            // A slot cannot handshake without the static key, and persisting
+            // one would save a file boot rejects.
+            if !state.has_peer_secret {
+                return (
+                    false,
+                    "[client] peer_secret is required before a peer slot can attach".into(),
+                );
+            }
             let consumer = !peer_id.is_empty();
             // One `[tun]` table describes one L3 adapter, so a client whose
             // device body is a tun has no table left for a consumer slot and
@@ -782,6 +793,9 @@ fn attach_fields(
         }
         return Ok(());
     }
+    if crate::secret::decode(peer_id).is_err() {
+        return Err("`peer` must be a 64-hex peer identity".into());
+    }
     if !iface.is_empty() {
         return Err("`iface` applies to a provider slot".into());
     }
@@ -860,6 +874,9 @@ mod tests {
 
     const TEST_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
     const OTHER_SECRET: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+    /// Peer identities consumer attaches name.
+    const OFFICE_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const DEPOT_ID: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
     fn temp_dir(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -896,6 +913,7 @@ mod tests {
             servers: SharedServers::new(Vec::new()),
             pppoe: Vec::new(),
             fallback_mode: RunMode::Idle,
+            has_peer_secret: true,
             persist: None,
         }
     }
@@ -1627,7 +1645,7 @@ mod tests {
         let refused = [
             // Keys belonging to the other role.
             ClientMsg::AttachPeer {
-                peer_id: "office".into(),
+                peer_id: OFFICE_ID.into(),
                 want: PROVIDES_EXIT,
                 dev: String::new(),
                 exit: false,
@@ -1643,7 +1661,7 @@ mod tests {
                 iface: String::new(),
             },
             // The kill switch hardens exit routing, so it needs it on.
-            attach_consumer("office", "", false, true),
+            attach_consumer(OFFICE_ID, "", false, true),
             // A segment provider needs the bridge its tap joins, and neither
             // provider can name its own device.
             attach_provider(PROVIDES_SEGMENT, ""),
@@ -1654,7 +1672,7 @@ mod tests {
             // A segment consumer is znpppoe's `--peer`, not a slot the admin
             // socket attaches.
             ClientMsg::AttachPeer {
-                peer_id: "office".into(),
+                peer_id: OFFICE_ID.into(),
                 want: PROVIDES_SEGMENT,
                 dev: String::new(),
                 exit: false,
@@ -1671,12 +1689,12 @@ mod tests {
 
         // One `[tun]` table describes one adapter, so any second consumer is
         // refused; so is a second provider of one capability.
-        let (ok, msg) = mutate(&state, attach_consumer("office", "", true, false)).await;
+        let (ok, msg) = mutate(&state, attach_consumer(OFFICE_ID, "", true, false)).await;
         assert!(ok, "{msg}");
-        let (ok, msg) = mutate(&state, attach_consumer("depot", "zn9", false, false)).await;
+        let (ok, msg) = mutate(&state, attach_consumer(DEPOT_ID, "zn9", false, false)).await;
         assert!(!ok);
         assert!(
-            msg.contains("already has the exit consumer for `office`"),
+            msg.contains(&format!("already has the exit consumer for `{OFFICE_ID}`")),
             "{msg}"
         );
         let (ok, msg) = mutate(&state, attach_provider(PROVIDES_EXIT, "")).await;
@@ -1698,10 +1716,13 @@ mod tests {
                 },
             )))
             .unwrap();
-        let (ok, msg) = mutate(&device, attach_consumer("office", "zn0", false, false)).await;
+        let (ok, msg) = mutate(&device, attach_consumer(OFFICE_ID, "zn0", false, false)).await;
         assert!(!ok);
         assert!(msg.contains("device `zn0`"), "{msg}");
-        assert!(msg.contains("exit consumer for `office`"), "{msg}");
+        assert!(
+            msg.contains(&format!("exit consumer for `{OFFICE_ID}`")),
+            "{msg}"
+        );
         assert_eq!(snapshot(&device).mode, SessionMode::Device);
 
         // One `[tun]` table describes one adapter, so a client whose device
@@ -1715,9 +1736,16 @@ mod tests {
                 exit: false,
                 exit_strict: false,
             }));
-        let (ok, msg) = mutate(&server_tun, attach_consumer("office", "zn1", false, false)).await;
+        let (ok, msg) = mutate(&server_tun, attach_consumer(OFFICE_ID, "zn1", false, false)).await;
         assert!(!ok);
         assert!(msg.contains("[tun]"), "{msg}");
+
+        // Without a peer_secret no slot can attach at all.
+        let mut keyless = idle_state("a");
+        keyless.has_peer_secret = false;
+        let (ok, msg) = mutate(&keyless, attach_provider(PROVIDES_EXIT, "")).await;
+        assert!(!ok);
+        assert!(msg.contains("peer_secret"), "{msg}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1730,7 +1758,7 @@ mod tests {
     async fn attach_peer_refuses_what_the_boot_body_holds() {
         let dir = temp_dir("attachpark");
         let path = dir.join("client.toml");
-        let text = format!("[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\n[tap]\ndev = \"zn0\"\n");
+        let text = format!("[client]\npeer_secret = \"{OTHER_SECRET}\"\n\n[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n\n[tap]\ndev = \"zn0\"\n");
         std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
         state.fallback_mode =
@@ -1747,7 +1775,7 @@ mod tests {
         assert!(ok, "{msg}");
 
         let before = std::fs::read_to_string(&path).unwrap();
-        let (ok, msg) = mutate(&state, attach_consumer("office", "zn0", false, false)).await;
+        let (ok, msg) = mutate(&state, attach_consumer(OFFICE_ID, "zn0", false, false)).await;
         assert!(!ok);
         assert!(msg.contains("device `zn0`"), "{msg}");
         assert!(msg.contains("at boot"), "{msg}");
@@ -1755,14 +1783,14 @@ mod tests {
 
         // A device the boot body leaves free is attached, and the parked body
         // pairs nothing, which the acceptance says.
-        let (ok, msg) = mutate(&state, attach_consumer("office", "zn1", false, false)).await;
+        let (ok, msg) = mutate(&state, attach_consumer(OFFICE_ID, "zn1", false, false)).await;
         assert!(ok, "{msg}");
         assert!(msg.contains("peer slots pair"), "{msg}");
         let on_disk = crate::clientcfg::load(&path).unwrap();
         on_disk.validate().unwrap();
         assert_eq!(
             on_disk.tun.as_ref().unwrap().exit_via.as_deref(),
-            Some("office")
+            Some(OFFICE_ID)
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1775,7 +1803,8 @@ mod tests {
         let dir = temp_dir("attachok");
         let path = dir.join("client.toml");
         let text = format!(
-            "[[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n"
+            "[client]\npeer_secret = \"{OTHER_SECRET}\"\n\n\
+             [[servers]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nsecret = \"{TEST_SECRET}\"\n"
         );
         std::fs::write(&path, &text).unwrap();
         let mut state = idle_state("a");
@@ -1787,7 +1816,7 @@ mod tests {
         // A consumer with an explicit device and the exit routing on, an exit
         // provider naming its egress, and a segment provider naming its
         // bridge: three slots, three config records.
-        let (ok, msg) = mutate(&state, attach_consumer("office-b1c2", "zn1", true, true)).await;
+        let (ok, msg) = mutate(&state, attach_consumer(OFFICE_ID, "zn1", true, true)).await;
         assert!(ok, "{msg}");
         let (ok, msg) = mutate(&state, attach_provider(PROVIDES_EXIT, "wan0")).await;
         assert!(ok, "{msg}");
@@ -1797,7 +1826,7 @@ mod tests {
         let on_disk = crate::clientcfg::load(&path).unwrap();
         on_disk.validate().unwrap();
         let tun = on_disk.tun.as_ref().unwrap();
-        assert_eq!(tun.exit_via.as_deref(), Some("office-b1c2"));
+        assert_eq!(tun.exit_via.as_deref(), Some(OFFICE_ID));
         assert_eq!(tun.dev.as_deref(), Some("zn1"));
         assert!(tun.exit && tun.exit_strict);
         assert_eq!(tun.address, None);
@@ -1821,7 +1850,7 @@ mod tests {
 
         for req in [
             ClientMsg::DetachPeer {
-                peer_id: "office-b1c2".into(),
+                peer_id: OFFICE_ID.into(),
                 want: PROVIDES_EXIT,
             },
             ClientMsg::DetachPeer {
@@ -1865,7 +1894,7 @@ mod tests {
         assert!(!ok, "detaching a detached slot must be refused");
 
         // The device the detached consumer held is free again.
-        let (ok, msg) = mutate(&state, attach_consumer("other", "zn1", false, false)).await;
+        let (ok, msg) = mutate(&state, attach_consumer(DEPOT_ID, "zn1", false, false)).await;
         assert!(ok, "{msg}");
 
         std::fs::remove_dir_all(&dir).ok();

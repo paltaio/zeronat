@@ -63,6 +63,7 @@ struct Config {
     host: Option<String>,
     dht: bool,
     peer: Option<String>,
+    peer_secret: Option<String>,
     secret: String,
     credential: String,
     username: String,
@@ -83,16 +84,25 @@ fn runtime_secret(value: String) -> Result<String> {
     zeronat::secret::normalize(&value).map_err(Into::into)
 }
 
+fn runtime_peer_secret(value: String, secret: &str, credential: &str) -> Result<String> {
+    let value = runtime_secret(value)?;
+    if value == secret || value == credential {
+        bail!("ZN_PEER_SECRET must differ from ZN_SECRET and ZN_CLIENT_SECRET");
+    }
+    Ok(value)
+}
+
 fn usage() -> ! {
     eprintln!(
-        "znpppoe (--host IP:PORT | --dht) [--peer CLIENT_ID] [--connections N]\n\
+        "znpppoe (--host IP:PORT | --dht) [--peer PEER_IDENTITY] [--connections N]\n\
          [--socks-listen ADDR] [--http-listen ADDR] [--pppoe-mtu N]\n\
          [--sock-rx KIB] [--sock-tx KIB] [--max-conns N]\n\
-         --peer attaches the sessions to that client's L2 segment; the default is\n\
-         a bridge port on the server\n\
+         --peer attaches the sessions to the L2 segment of the peer with that\n\
+         64-hex identity; the default is a bridge port on the server\n\
          env: ZN_SECRET, ZN_CLIENT_SECRET, ZN_USER, ZN_PASSWORD (PPPoE login),\n\
          ZN_PROXY_USER, ZN_PROXY_PASS\n\
-         (proxy auth) required; ZN_SERVICE optional\n\
+         (proxy auth) required; ZN_SERVICE optional;\n\
+         ZN_PEER_SECRET (this process's x25519 static key) required with --peer\n\
          SOCKS5 and HTTP CONNECT proxies share auth: password = ZN_PROXY_PASS; username\n\
          <ZN_PROXY_USER> round-robins, _pppoe<K> pins session K, _s<token> is sticky\n\
          listens default to 127.0.0.1:1080 (socks) and 127.0.0.1:8081 (http)"
@@ -209,12 +219,20 @@ fn parse() -> Result<Config> {
         h.parse::<SocketAddr>()
             .with_context(|| format!("--host must be ip:port, got {h}"))?;
     }
-    if peer.as_deref().is_some_and(str::is_empty) {
-        bail!("--peer must name a client id");
+    if let Some(peer) = &peer {
+        zeronat::secret::decode(peer).context("--peer must be a 64-hex peer identity")?;
     }
     let secret = runtime_secret(std::env::var("ZN_SECRET").context("ZN_SECRET env is required")?)?;
     let credential =
         runtime_secret(std::env::var("ZN_CLIENT_SECRET").unwrap_or_else(|_| secret.clone()))?;
+    let peer_secret = peer
+        .as_ref()
+        .map(|_| {
+            std::env::var("ZN_PEER_SECRET")
+                .context("ZN_PEER_SECRET env is required with --peer")
+                .and_then(|value| runtime_peer_secret(value, &secret, &credential))
+        })
+        .transpose()?;
     let username = std::env::var("ZN_USER").context("ZN_USER env is required")?;
     let password = std::env::var("ZN_PASSWORD").context("ZN_PASSWORD env is required")?;
     let service = std::env::var("ZN_SERVICE").unwrap_or_default();
@@ -228,6 +246,7 @@ fn parse() -> Result<Config> {
         host,
         dht,
         peer,
+        peer_secret,
         secret,
         credential,
         username,
@@ -274,6 +293,7 @@ async fn main() -> Result<()> {
                 server,
                 &cfg.secret,
                 &cfg.credential,
+                cfg.peer_secret.as_deref().expect("validated peer secret"),
                 &id_prefix,
                 uplink::PeerId(peer),
             )
@@ -338,7 +358,7 @@ async fn driver_exit(driver: tokio::task::JoinHandle<()>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::runtime_secret;
+    use super::{runtime_peer_secret, runtime_secret};
 
     #[test]
     fn zn_secret_accepts_only_32_byte_hex() {
@@ -347,5 +367,16 @@ mod tests {
         for invalid in ["short".to_string(), "a".repeat(63), "g".repeat(64)] {
             assert!(runtime_secret(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn peer_secret_must_differ_from_relay_known_values() {
+        let secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let credential = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+        for copied in [secret.to_ascii_uppercase(), credential.to_string()] {
+            let error = runtime_peer_secret(copied, secret, credential).unwrap_err();
+            assert!(error.to_string().contains("ZN_PEER_SECRET must differ"));
+        }
+        assert!(runtime_peer_secret("3".repeat(64), secret, credential).is_ok());
     }
 }

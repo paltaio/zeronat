@@ -1591,6 +1591,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                     pppoe,
                     autostart,
                     id_prefix,
+                    peer_secret: file.peer_secret.as_ref().map(|s| s.0.clone()),
                     control,
                     // The shape came from the file, so admin mutations
                     // persist back to it.

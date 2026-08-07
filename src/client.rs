@@ -359,6 +359,9 @@ struct Client {
     /// The capability bits to announce once this control session is up, or
     /// `None` when no peer slot is configured and nothing is announced.
     peer_announce: Option<u8>,
+    /// The static x25519 private key peer sessions authenticate with, or
+    /// `None` when no `peer_secret` is configured.
+    peer_static: Option<[u8; 32]>,
 }
 
 /// Aborts its task when dropped. Ties a spawned task's lifetime to the scope
@@ -1150,6 +1153,7 @@ pub async fn run(
             .collect(),
         autostart,
         id_prefix,
+        peer_secret: None,
         control,
         config: None,
         peers: Vec::new(),
@@ -1180,6 +1184,9 @@ pub struct ClientSettings {
     /// Name of the pppoe session to boot when no forwards are declared.
     pub autostart: Option<String>,
     pub id_prefix: Option<String>,
+    /// The 64-hex static x25519 private key peer sessions authenticate with;
+    /// required when `peers` is non-empty.
+    pub peer_secret: Option<String>,
     pub control: Option<ControlPath>,
     /// Admin-mutation persistence: the config file and its parsed contents.
     /// `None` on a runtime-only client, whose mutations stay in memory.
@@ -1219,6 +1226,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         pppoe,
         autostart,
         id_prefix,
+        peer_secret,
         control,
         config,
         peers,
@@ -1230,6 +1238,31 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         target.credential = crate::secret::normalize(&target.credential)?;
     }
     let client_id = crate::identity::derive_client_id(id_prefix.as_deref());
+    let peer_static = peer_secret
+        .as_deref()
+        .map(crate::secret::decode)
+        .transpose()
+        .map_err(|_| -> crate::Error {
+            "client peer_secret must be 64 hexadecimal characters".into()
+        })?;
+    if !peers.is_empty() && peer_static.is_none() {
+        return Err("[client] peer_secret is required when peer sessions are configured".into());
+    }
+    if let Some(peer_static) = &peer_static {
+        let known = |target: &ServerTarget| {
+            crate::secret::decode(&target.secret).is_ok_and(|v| v == *peer_static)
+                || crate::secret::decode(&target.credential).is_ok_and(|v| v == *peer_static)
+        };
+        if known(&active.state.lock().unwrap().target) || servers.iter().any(known) {
+            return Err(
+                "client peer_secret must differ from every server secret and credential".into(),
+            );
+        }
+        crate::elog!(
+            "peer identity {}",
+            crate::secret::encode(crate::noise::public_identity(peer_static))
+        );
+    }
     #[cfg(not(target_os = "linux"))]
     if tap.is_some() || tun.is_some() {
         return Err("L2/L3 tunnel modes (--tap/--tun) are only supported on Linux".into());
@@ -1306,6 +1339,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 servers: servers.clone(),
                 pppoe,
                 fallback_mode,
+                has_peer_secret: peer_static.is_some(),
                 persist: config.map(|(path, cfg)| Persist::new(path, cfg)),
             };
             Some(AbortOnDrop(crate::spawn(listener.serve(state))))
@@ -1459,6 +1493,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 udp,
                 transport: target.transport,
                 peer_announce: announce,
+                peer_static,
             });
             // Auto only: skip the UDP probe while a flap cooldown is active. Forced
             // Udp/Tcp ignore `try_udp` and keep their fixed path.
@@ -2459,8 +2494,15 @@ async fn control_loop(
     // forward options, carrying the union of the provider bits. The slots pair
     // through the session only once the ack comes back.
     let peer_ack = Arc::new(AtomicBool::new(false));
-    if let Some(provides) = client.peer_announce {
-        tx.try_send(Msg::PeerAnnounce { provides }.encode()).ok();
+    if let (Some(provides), Some(peer_static)) = (client.peer_announce, &client.peer_static) {
+        tx.try_send(
+            Msg::PeerAnnounce {
+                provides,
+                identity: crate::noise::public_identity(peer_static),
+            }
+            .encode(),
+        )
+        .ok();
     }
     // Filled when the ack arrives; dropping it at teardown bumps the
     // generation, which fails every peer cycle that has not settled on a
@@ -2601,6 +2643,9 @@ async fn control_loop(
                             "server acknowledged peer support before client authorization".into(),
                         );
                     };
+                    let Some(peer_static) = client.peer_static else {
+                        break Err("server acknowledged peer support without a peer secret".into());
+                    };
                     crate::elog!("peer support acknowledged; control address {observed}");
                     peer_live = Some(peer.install(crate::peerslot::ControlSession {
                         tx: tx.clone(),
@@ -2608,6 +2653,8 @@ async fn control_loop(
                         client_id,
                         psk: client.psk,
                         credential_psk: client.credential_psk,
+                        peer_id: crate::secret::encode(crate::noise::public_identity(&peer_static)),
+                        peer_static,
                         sess: match link.as_ref() {
                             Link::Udp(sess, _, _) => Some(sess.clone()),
                             Link::Tcp => None,
@@ -3671,6 +3718,7 @@ mod tests {
             pppoe: vec![],
             autostart: None,
             id_prefix: Some("t".into()),
+            peer_secret: Some(crate::secret::encode([3; 32])),
             control: None,
             config: None,
             peers: vec![segment_provider_slot("zns0", "eth1")],

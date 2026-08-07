@@ -85,8 +85,8 @@ pub struct CfgTun {
     /// without a default route.
     pub exit_strict: bool,
     /// The peer whose internet connection this tunnel exits through, naming
-    /// its `client_id`. Set, the table feeds a peer consumer slot; unset, it
-    /// feeds the server slot.
+    /// its 64-hex public identity. Set, the table feeds a peer consumer slot;
+    /// unset, it feeds the server slot.
     pub exit_via: Option<String>,
 }
 
@@ -107,6 +107,9 @@ pub struct CfgPeer {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClientConfig {
     pub id: Option<String>,
+    /// The static x25519 private key peer sessions authenticate with, as 64
+    /// hex characters. Required when any peer slot is configured.
+    pub peer_secret: Option<ServerSecret>,
     /// Which `[[servers]]` entry to dial at boot; the first entry when unset.
     pub active: Option<String>,
     /// Admin socket path override.
@@ -133,13 +136,42 @@ impl ClientConfig {
     /// and device exclusivity. A violation here is a fatal boot error, kept
     /// out of `parse_client` so the file is never quarantined for it.
     pub fn validate(&self) -> Result<()> {
+        let peer_secret = self
+            .peer_secret
+            .as_ref()
+            .map(|secret| crate::secret::decode(&secret.0))
+            .transpose()
+            .map_err(|e| -> crate::Error { format!("[client] peer_secret {e}").into() })?;
+        let has_peer_slots = self.tun.as_ref().is_some_and(CfgTun::is_peer)
+            || self
+                .peer
+                .as_ref()
+                .is_some_and(|peer| peer.exit || peer.segment.is_some());
+        if has_peer_slots && peer_secret.is_none() {
+            return Err(
+                "[client] peer_secret is required when peer sessions are configured".into(),
+            );
+        }
+        if let Some(peer) = self.tun.as_ref().and_then(|tun| tun.exit_via.as_deref()) {
+            crate::secret::decode(peer).map_err(|_| -> crate::Error {
+                "[tun] exit_via must be a 64-hex peer identity".into()
+            })?;
+        }
         let mut names: HashSet<&str> = HashSet::new();
         for s in &self.servers {
-            crate::secret::decode(&s.secret.0)
+            let secret = crate::secret::decode(&s.secret.0)
                 .map_err(|e| -> crate::Error { format!("server `{}` {e}", s.name).into() })?;
-            crate::secret::decode(&s.credential.0).map_err(|e| -> crate::Error {
-                format!("server `{}` client credential {e}", s.name).into()
-            })?;
+            let credential =
+                crate::secret::decode(&s.credential.0).map_err(|e| -> crate::Error {
+                    format!("server `{}` client credential {e}", s.name).into()
+                })?;
+            if peer_secret.is_some_and(|peer| peer == secret || peer == credential) {
+                return Err(format!(
+                    "[client] peer_secret must differ from the secret and credential for server `{}`",
+                    s.name
+                )
+                .into());
+            }
             if !names.insert(&s.name) {
                 return Err(format!("duplicate server name `{}`", s.name).into());
             }
@@ -326,6 +358,7 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
                 reject_dup(&mut client_keys, key, n)?;
                 match key {
                     "id" => cfg.id = Some(parse_string(value, n)?),
+                    "peer_secret" => cfg.peer_secret = Some(ServerSecret(parse_string(value, n)?)),
                     "active" => cfg.active = Some(parse_string(value, n)?),
                     "control" => cfg.control = Some(parse_string(value, n)?),
                     other => {
@@ -604,10 +637,17 @@ fn transport_str(t: Transport) -> &'static str {
 pub fn serialize_client(cfg: &ClientConfig) -> String {
     let mut out = String::new();
 
-    if cfg.id.is_some() || cfg.active.is_some() || cfg.control.is_some() {
+    if cfg.id.is_some()
+        || cfg.peer_secret.is_some()
+        || cfg.active.is_some()
+        || cfg.control.is_some()
+    {
         out.push_str("[client]\n");
         if let Some(id) = &cfg.id {
             out.push_str(&format!("id = {}\n", quote(id)));
+        }
+        if let Some(secret) = &cfg.peer_secret {
+            out.push_str(&format!("peer_secret = {}\n", quote(&secret.0)));
         }
         if let Some(active) = &cfg.active {
             out.push_str(&format!("active = {}\n", quote(active)));
@@ -735,6 +775,7 @@ mod tests {
     fn sample() -> ClientConfig {
         ClientConfig {
             id: Some("rpi-2".into()),
+            peer_secret: None,
             active: Some("home".into()),
             control: Some("/run/zeronat/client.sock".into()),
             servers: vec![
@@ -797,13 +838,60 @@ mod tests {
     }
 
     // Assertion failures and logged errors debug-print whole configs, so a
-    // debug-printed config must not carry any server secret.
+    // debug-printed config must not carry any secret or private key.
     #[test]
     fn cfg_debug_redacts_the_server_secret() {
-        let s = format!("{:?}", sample());
+        let peer_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut cfg = sample();
+        cfg.peer_secret = Some(ServerSecret(peer_secret.into()));
+        let s = format!("{cfg:?}");
         assert!(!s.contains(TEST_SECRET), "{s}");
         assert!(!s.contains(OTHER_SECRET), "{s}");
+        assert!(!s.contains(peer_secret), "{s}");
         assert!(s.contains("home"));
+    }
+
+    // peer_secret is the trust anchor of every peer slot: it must be present
+    // when one is configured, well formed, and never a value the relay knows.
+    #[test]
+    fn peer_secret_gates_the_peer_slots() {
+        let consumer = format!("[tun]\nexit_via = \"{TEST_SECRET}\"\n");
+        let error = parse_client(&consumer).unwrap().validate().unwrap_err();
+        assert!(
+            error.to_string().contains("peer_secret is required"),
+            "{error}"
+        );
+        let provider = "[peer]\nexit = true\n";
+        let error = parse_client(provider).unwrap().validate().unwrap_err();
+        assert!(
+            error.to_string().contains("peer_secret is required"),
+            "{error}"
+        );
+
+        let malformed = "[client]\npeer_secret = \"short\"\n";
+        let error = parse_client(malformed).unwrap().validate().unwrap_err();
+        assert!(error.to_string().contains("peer_secret"), "{error}");
+
+        for copied in [TEST_SECRET.to_string(), OTHER_SECRET.to_ascii_uppercase()] {
+            let mut cfg = sample();
+            cfg.servers.truncate(1);
+            cfg.servers[0].credential = ServerSecret(OTHER_SECRET.into());
+            cfg.peer_secret = Some(ServerSecret(copied));
+            let error = cfg.validate().unwrap_err();
+            assert!(error.to_string().contains("must differ"), "{error}");
+        }
+    }
+
+    #[test]
+    fn exit_via_must_be_a_peer_identity() {
+        let named = format!(
+            "[client]\npeer_secret = \"{OTHER_SECRET}\"\n[tun]\nexit_via = \"office-b1c2\"\n"
+        );
+        let error = parse_client(&named).unwrap().validate().unwrap_err();
+        assert!(
+            error.to_string().contains("64-hex peer identity"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -912,17 +1000,18 @@ mod tests {
     // table declares the provider bits.
     #[test]
     fn peer_slot_tables_roundtrip() {
-        let cfg = parse_client(
-            "[[forwards]]\nproto = \"tcp\"\nport = 443\n\
+        let cfg = parse_client(&format!(
+            "[client]\npeer_secret = \"{OTHER_SECRET}\"\n\
+             [[forwards]]\nproto = \"tcp\"\nport = 443\n\
              [[pppoe]]\nname = \"wan\"\nusername = \"u\"\n\
-             [tun]\ndev = \"zn0\"\nexit = true\nexit_via = \"office-b1c2\"\n\
+             [tun]\ndev = \"zn0\"\nexit = true\nexit_via = \"{TEST_SECRET}\"\n\
              [peer]\nexit = true\nexit_iface = \"wan0\"\nsegment = \"eth1\"\n",
-        )
+        ))
         .unwrap();
         cfg.validate().unwrap();
         let tun = cfg.tun.as_ref().unwrap();
         assert!(tun.is_peer());
-        assert_eq!(tun.exit_via.as_deref(), Some("office-b1c2"));
+        assert_eq!(tun.exit_via.as_deref(), Some(TEST_SECRET));
         let peer = cfg.peer.as_ref().unwrap();
         assert!(peer.exit);
         assert_eq!(peer.exit_iface.as_deref(), Some("wan0"));
@@ -1092,8 +1181,6 @@ mod tests {
             "[tap]\ndev = \"t0\"\n[tun]\n",
             "[tap]\ndev = \"t0\"\n[[forwards]]\nproto = \"tcp\"\nport = 443\n",
             "[tun]\n[[pppoe]]\nname = \"w\"\nusername = \"u\"\n",
-            // A peer pair derives both ends of its subnet from the secret.
-            "[tun]\naddress = \"10.9.0.2/24\"\nexit_via = \"office-b1c2\"\n",
         ];
         for case in cases {
             let cfg = parse_client(case).unwrap_or_else(|e| {
@@ -1104,6 +1191,23 @@ mod tests {
                 "expected validate Err for:\n{case}"
             );
         }
+
+        // A peer pair derives both ends of its subnet from the secret, so a
+        // consumer table has no address of its own to take.
+        let address_with_peer = format!(
+            "[client]\npeer_secret = \"{OTHER_SECRET}\"\n\
+             [tun]\naddress = \"10.9.0.2/24\"\nexit_via = \"{TEST_SECRET}\"\n"
+        );
+        let error = parse_client(&address_with_peer)
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("`address` cannot be combined with `exit_via`"),
+            "{error}"
+        );
     }
 
     #[test]

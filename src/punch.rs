@@ -71,7 +71,7 @@ pub enum PunchOutcome {
 /// pair's `PeerInfo` carried, and report the outcome to the server on
 /// `control`.
 ///
-/// The party with the lower `client_id` is the Noise initiator and sends
+/// The party with the lower identity string is the Noise initiator and sends
 /// handshake message one to every candidate; the other cannot send message
 /// one, so it opens its own mapping with punch probes and answers the
 /// handshake. Everything rides the probe socket, whose pump is the only
@@ -91,8 +91,8 @@ pub async fn punch(
     mut probe: ProbeSession,
     candidates: &[SocketAddr],
     pair_id: u64,
-    client_id: &str,
-    peer_id: &str,
+    local_identity: &str,
+    peer_identity: &str,
     psk: &[u8; 32],
     control: &mpsc::Sender<Vec<u8>>,
 ) -> PunchOutcome {
@@ -113,7 +113,7 @@ pub async fn punch(
         return PunchOutcome::Relay;
     }
 
-    let initiator = client_id < peer_id;
+    let initiator = local_identity < peer_identity;
     // Both parties derive the same setup conv from the pair id, following the
     // UDP-forward rule, so the responder can reject a conv it did not expect.
     let conv = (pair_id as u32) | SETUP_CONV_BIT;

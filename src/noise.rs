@@ -7,9 +7,10 @@ use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use hmac::{Mac, SimpleHmac};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use x25519_dalek::{EphemeralSecret, PublicKey};
+use x25519_dalek::{x25519, EphemeralSecret, PublicKey, X25519_BASEPOINT_BYTES};
 
 const PATTERN: &[u8] = b"Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
+const XX_PATTERN: &[u8] = b"Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const MAX_MSG: usize = 65535;
 const MAX_PLAINTEXT: usize = MAX_MSG - 16;
 const HASHLEN: usize = 32;
@@ -79,6 +80,12 @@ type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 type BoxStream = Box<dyn IoStream>;
+
+/// The x25519 public key of a static private key, which is the identity a
+/// peer presents in the XX handshake.
+pub fn public_identity(private: &[u8; 32]) -> [u8; 32] {
+    x25519(*private, X25519_BASEPOINT_BYTES)
+}
 
 /// Derive the 32-byte pre-shared key from the user's passphrase.
 pub fn derive_psk(secret: &str) -> [u8; 32] {
@@ -162,16 +169,15 @@ struct SymmetricState {
 }
 
 impl SymmetricState {
-    fn new() -> Self {
+    fn new(protocol: &[u8]) -> Self {
         // InitializeSymmetric: if the protocol name is longer than HASHLEN,
-        // h = HASH(name); otherwise zero-pad it to HASHLEN. This name is
-        // longer than 32 bytes, so it hashes.
-        let h = if PATTERN.len() <= HASHLEN {
+        // h = HASH(name); otherwise zero-pad it to HASHLEN.
+        let h = if protocol.len() <= HASHLEN {
             let mut buf = [0u8; HASHLEN];
-            buf[..PATTERN.len()].copy_from_slice(PATTERN);
+            buf[..protocol.len()].copy_from_slice(protocol);
             buf
         } else {
-            blake2s(PATTERN)
+            blake2s(protocol)
         };
         SymmetricState {
             ck: h,
@@ -238,6 +244,142 @@ struct Keys {
     recv_key: [u8; 32],
 }
 
+/// One side of a `Noise_XX_25519_ChaChaPoly_BLAKE2s` handshake, driven one
+/// whole message at a time so a lossy carrier can repeat messages around it.
+/// The three messages follow pattern order: the initiator writes one and
+/// three, the responder writes two. Each party's static key is authenticated
+/// once the message carrying it has been read.
+pub struct XxHandshake {
+    ss: SymmetricState,
+    initiator: bool,
+    s_priv: [u8; 32],
+    e_priv: [u8; 32],
+    e_pub: [u8; 32],
+    re: [u8; 32],
+    rs: Option<[u8; 32]>,
+}
+
+impl XxHandshake {
+    pub fn initiator(static_private: &[u8; 32], prologue: &[u8]) -> Result<Self> {
+        Self::new(true, static_private, prologue)
+    }
+
+    pub fn responder(static_private: &[u8; 32], prologue: &[u8]) -> Result<Self> {
+        Self::new(false, static_private, prologue)
+    }
+
+    fn new(initiator: bool, static_private: &[u8; 32], prologue: &[u8]) -> Result<Self> {
+        let mut e_priv = [0u8; 32];
+        getrandom::getrandom(&mut e_priv)
+            .map_err(|e| -> Error { format!("generating an ephemeral key: {e}").into() })?;
+        let mut ss = SymmetricState::new(XX_PATTERN);
+        ss.mix_hash(prologue);
+        Ok(XxHandshake {
+            ss,
+            initiator,
+            s_priv: *static_private,
+            e_pub: public_identity(&e_priv),
+            e_priv,
+            re: [0u8; DHLEN],
+            rs: None,
+        })
+    }
+
+    /// Message one, initiator to responder: tokens [e].
+    pub fn write_message_one(&mut self, payload: &[u8]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(DHLEN + payload.len());
+        self.ss.mix_hash(&self.e_pub);
+        msg.extend_from_slice(&self.e_pub);
+        msg.extend_from_slice(&self.ss.encrypt_and_hash(payload));
+        msg
+    }
+
+    pub fn read_message_one(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
+        if msg.len() < DHLEN {
+            return Err("handshake message 1 too short".into());
+        }
+        self.re.copy_from_slice(&msg[..DHLEN]);
+        self.ss.mix_hash(&self.re);
+        self.ss.decrypt_and_hash(&msg[DHLEN..])
+    }
+
+    /// Message two, responder to initiator: tokens [e, ee, s, es].
+    pub fn write_message_two(&mut self, payload: &[u8]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(2 * DHLEN + 2 * TAGLEN + payload.len());
+        self.ss.mix_hash(&self.e_pub);
+        msg.extend_from_slice(&self.e_pub);
+        self.ss.mix_key(&x25519(self.e_priv, self.re));
+        let s_pub = public_identity(&self.s_priv);
+        msg.extend_from_slice(&self.ss.encrypt_and_hash(&s_pub));
+        self.ss.mix_key(&x25519(self.s_priv, self.re));
+        msg.extend_from_slice(&self.ss.encrypt_and_hash(payload));
+        msg
+    }
+
+    pub fn read_message_two(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
+        if msg.len() < 2 * DHLEN + 2 * TAGLEN {
+            return Err("handshake message 2 too short".into());
+        }
+        self.re.copy_from_slice(&msg[..DHLEN]);
+        self.ss.mix_hash(&self.re);
+        self.ss.mix_key(&x25519(self.e_priv, self.re));
+        let rs = self.read_static(&msg[DHLEN..DHLEN + DHLEN + TAGLEN])?;
+        self.ss.mix_key(&x25519(self.e_priv, rs));
+        self.rs = Some(rs);
+        self.ss.decrypt_and_hash(&msg[DHLEN + DHLEN + TAGLEN..])
+    }
+
+    /// Message three, initiator to responder: tokens [s, se].
+    pub fn write_message_three(&mut self, payload: &[u8]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(DHLEN + 2 * TAGLEN + payload.len());
+        let s_pub = public_identity(&self.s_priv);
+        msg.extend_from_slice(&self.ss.encrypt_and_hash(&s_pub));
+        self.ss.mix_key(&x25519(self.s_priv, self.re));
+        msg.extend_from_slice(&self.ss.encrypt_and_hash(payload));
+        msg
+    }
+
+    pub fn read_message_three(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
+        if msg.len() < DHLEN + 2 * TAGLEN {
+            return Err("handshake message 3 too short".into());
+        }
+        let rs = self.read_static(&msg[..DHLEN + TAGLEN])?;
+        self.ss.mix_key(&x25519(self.e_priv, rs));
+        self.rs = Some(rs);
+        self.ss.decrypt_and_hash(&msg[DHLEN + TAGLEN..])
+    }
+
+    fn read_static(&mut self, ct: &[u8]) -> Result<[u8; DHLEN]> {
+        self.ss
+            .decrypt_and_hash(ct)?
+            .try_into()
+            .map_err(|_| -> Error { "invalid static key in handshake".into() })
+    }
+
+    /// The peer's authenticated static key, once the message carrying it has
+    /// been read: message two for the initiator, message three for the
+    /// responder.
+    pub fn remote_static(&self) -> Option<[u8; 32]> {
+        self.rs
+    }
+
+    /// Directional datagram state from the handshake split.
+    pub fn into_transport(self) -> StatelessNoise {
+        let (t1, t2) = self.ss.split();
+        StatelessNoise::from_keys(if self.initiator {
+            Keys {
+                send_key: t1,
+                recv_key: t2,
+            }
+        } else {
+            Keys {
+                send_key: t2,
+                recv_key: t1,
+            }
+        })
+    }
+}
+
 /// Run the NNpsk0 initiator handshake to completion over `stream`, returning
 /// the transport keys and the responder's message-2 payload.
 async fn run_initiator(
@@ -246,7 +388,7 @@ async fn run_initiator(
     prologue: &[u8],
     payload1: &[u8],
 ) -> Result<(Keys, Vec<u8>)> {
-    let mut ss = SymmetricState::new();
+    let mut ss = SymmetricState::new(PATTERN);
     ss.mix_hash(prologue);
 
     // Message 1: tokens [psk, e]
@@ -293,7 +435,7 @@ async fn run_responder(
     prologue: &[u8],
     payload2: &[u8],
 ) -> Result<(Keys, Vec<u8>)> {
-    let mut ss = SymmetricState::new();
+    let mut ss = SymmetricState::new(PATTERN);
     ss.mix_hash(prologue);
 
     // Message 1: tokens [psk, e]
@@ -571,6 +713,15 @@ impl ReplayWindow {
 }
 
 impl StatelessNoise {
+    fn from_keys(keys: Keys) -> Self {
+        StatelessNoise {
+            send_key: keys.send_key,
+            recv_key: keys.recv_key,
+            send_nonce: Mutex::new(0),
+            recv_window: Mutex::new(ReplayWindow::default()),
+        }
+    }
+
     /// Encrypt `plaintext` into a `[nonce:8][ciphertext]` datagram body.
     ///
     /// # Errors
@@ -656,15 +807,7 @@ where
     payload.extend_from_slice(capability);
     let mut stream: BoxStream = Box::new(stream);
     let (keys, reply) = run_initiator(&mut stream, psk, &STATELESS_PROLOGUE, &payload).await?;
-    Ok((
-        StatelessNoise {
-            send_key: keys.send_key,
-            recv_key: keys.recv_key,
-            send_nonce: Mutex::new(0),
-            recv_window: Mutex::new(ReplayWindow::default()),
-        },
-        reply,
-    ))
+    Ok((StatelessNoise::from_keys(keys), reply))
 }
 
 /// Like [`client_handshake_stateless`], also returning the responder's
@@ -680,15 +823,7 @@ where
     let mut stream: BoxStream = Box::new(stream);
     let (keys, reply) =
         run_initiator(&mut stream, psk, &STATELESS_PROLOGUE, &id.to_be_bytes()).await?;
-    Ok((
-        StatelessNoise {
-            send_key: keys.send_key,
-            recv_key: keys.recv_key,
-            send_nonce: Mutex::new(0),
-            recv_window: Mutex::new(ReplayWindow::default()),
-        },
-        reply,
-    ))
+    Ok((StatelessNoise::from_keys(keys), reply))
 }
 
 /// Responder handshake; returns the peer's `id` and the stateless transport.
@@ -708,15 +843,7 @@ where
         return Err("missing stream id in handshake payload".into());
     }
     let id = u64::from_be_bytes(payload[..8].try_into().unwrap());
-    Ok((
-        id,
-        StatelessNoise {
-            send_key: keys.send_key,
-            recv_key: keys.recv_key,
-            send_nonce: Mutex::new(0),
-            recv_window: Mutex::new(ReplayWindow::default()),
-        },
-    ))
+    Ok((id, StatelessNoise::from_keys(keys)))
 }
 
 pub async fn server_handshake_stateless_claim<S>(
@@ -737,16 +864,7 @@ where
     let id = u64::from_be_bytes(id_bytes);
     let mut capability = [0; crate::proto::CAPABILITY_LEN];
     capability.copy_from_slice(&payload[8..]);
-    Ok((
-        id,
-        capability,
-        StatelessNoise {
-            send_key: keys.send_key,
-            recv_key: keys.recv_key,
-            send_nonce: Mutex::new(0),
-            recv_window: Mutex::new(ReplayWindow::default()),
-        },
-    ))
+    Ok((id, capability, StatelessNoise::from_keys(keys)))
 }
 
 #[cfg(test)]
@@ -1086,6 +1204,109 @@ mod tests {
         assert_eq!(sr.recv().await.unwrap(), b"snow says hi");
         sw.send(b"ours replies").await.unwrap();
         snow.await.unwrap();
+    }
+
+    fn snow_xx_params() -> NoiseParams {
+        "Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap()
+    }
+
+    #[test]
+    fn xx_interop_our_initiator_snow_responder() {
+        let prologue = b"xx interop prologue one";
+        let ours_static = derive_psk("xx ours as initiator");
+        let snow_static = derive_psk("xx snow as responder");
+        let mut ours = XxHandshake::initiator(&ours_static, prologue).unwrap();
+        let mut snow = Builder::new(snow_xx_params())
+            .local_private_key(&snow_static)
+            .prologue(prologue)
+            .build_responder()
+            .unwrap();
+        let mut buf = [0u8; MAX_MSG];
+        let mut pt = [0u8; MAX_MSG];
+
+        let msg1 = ours.write_message_one(b"one");
+        let n = snow.read_message(&msg1, &mut pt).unwrap();
+        assert_eq!(&pt[..n], b"one");
+        let n = snow.write_message(b"two", &mut buf).unwrap();
+        assert_eq!(ours.read_message_two(&buf[..n]).unwrap(), b"two");
+        assert_eq!(ours.remote_static(), Some(public_identity(&snow_static)));
+        let msg3 = ours.write_message_three(b"three");
+        let n = snow.read_message(&msg3, &mut pt).unwrap();
+        assert_eq!(&pt[..n], b"three");
+        assert_eq!(
+            snow.get_remote_static(),
+            Some(public_identity(&ours_static).as_slice())
+        );
+
+        let snow = snow.into_stateless_transport_mode().unwrap();
+        let ours = ours.into_transport();
+        let dg = ours.seal(b"datagram from ours").unwrap();
+        let nonce = u64::from_be_bytes(dg[..8].try_into().unwrap());
+        let n = snow.read_message(nonce, &dg[8..], &mut pt).unwrap();
+        assert_eq!(&pt[..n], b"datagram from ours");
+        let n = snow
+            .write_message(0, b"datagram from snow", &mut buf)
+            .unwrap();
+        let mut dg = 0u64.to_be_bytes().to_vec();
+        dg.extend_from_slice(&buf[..n]);
+        assert_eq!(ours.open(&dg).unwrap(), b"datagram from snow");
+    }
+
+    #[test]
+    fn xx_interop_snow_initiator_our_responder() {
+        let prologue = b"xx interop prologue two";
+        let snow_static = derive_psk("xx snow as initiator");
+        let ours_static = derive_psk("xx ours as responder");
+        let mut snow = Builder::new(snow_xx_params())
+            .local_private_key(&snow_static)
+            .prologue(prologue)
+            .build_initiator()
+            .unwrap();
+        let mut ours = XxHandshake::responder(&ours_static, prologue).unwrap();
+        let mut buf = [0u8; MAX_MSG];
+        let mut pt = [0u8; MAX_MSG];
+
+        let n = snow.write_message(b"one", &mut buf).unwrap();
+        assert_eq!(ours.read_message_one(&buf[..n]).unwrap(), b"one");
+        let msg2 = ours.write_message_two(b"two");
+        let n = snow.read_message(&msg2, &mut pt).unwrap();
+        assert_eq!(&pt[..n], b"two");
+        assert_eq!(
+            snow.get_remote_static(),
+            Some(public_identity(&ours_static).as_slice())
+        );
+        let n = snow.write_message(b"three", &mut buf).unwrap();
+        assert_eq!(ours.read_message_three(&buf[..n]).unwrap(), b"three");
+        assert_eq!(ours.remote_static(), Some(public_identity(&snow_static)));
+
+        let snow = snow.into_stateless_transport_mode().unwrap();
+        let ours = ours.into_transport();
+        let n = snow
+            .write_message(0, b"datagram from snow", &mut buf)
+            .unwrap();
+        let mut dg = 0u64.to_be_bytes().to_vec();
+        dg.extend_from_slice(&buf[..n]);
+        assert_eq!(ours.open(&dg).unwrap(), b"datagram from snow");
+        let dg = ours.seal(b"datagram from ours").unwrap();
+        let nonce = u64::from_be_bytes(dg[..8].try_into().unwrap());
+        let n = snow.read_message(nonce, &dg[8..], &mut pt).unwrap();
+        assert_eq!(&pt[..n], b"datagram from ours");
+    }
+
+    // Two XX handshakes differing only in prologue must not interoperate: the
+    // pair challenge and identities ride there, so a transcript replayed
+    // across pairings authenticates nothing.
+    #[test]
+    fn xx_prologue_mismatch_fails_closed() {
+        let ours_static = derive_psk("xx prologue initiator");
+        let their_static = derive_psk("xx prologue responder");
+        let mut initiator = XxHandshake::initiator(&ours_static, b"pair one").unwrap();
+        let mut responder = XxHandshake::responder(&their_static, b"pair two").unwrap();
+
+        let msg1 = initiator.write_message_one(&[]);
+        responder.read_message_one(&msg1).unwrap();
+        let msg2 = responder.write_message_two(&[]);
+        assert!(initiator.read_message_two(&msg2).is_err());
     }
 
     #[tokio::test]

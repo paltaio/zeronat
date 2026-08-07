@@ -58,19 +58,21 @@ impl Uplink {
     }
 }
 
-/// The client id of the peer serving the segment, distinct from this process's
-/// own client id.
+/// The 64-hex public identity of the peer serving the segment.
 pub struct PeerId<'a>(pub &'a str);
 
 /// Pair with `peer`'s L2 segment and hand every session that comes up to the
 /// driver. The client this starts runs no session body of its own: the control
 /// session it dials is what the pairing goes through, and the consumer slot
 /// under it asks again whenever a pair dies. The client derives its id from
-/// `id_prefix`, the same id the bridge path labels its port with.
+/// `id_prefix`, the same id the bridge path labels its port with, and
+/// authenticates the inner handshake with `peer_secret`, its own x25519
+/// static key.
 pub fn peer(
     server: &str,
     secret: &str,
     credential: &str,
+    peer_secret: &str,
     id_prefix: &str,
     peer: PeerId<'_>,
 ) -> Uplink {
@@ -91,6 +93,7 @@ pub fn peer(
         pppoe: Vec::new(),
         autostart: None,
         id_prefix: Some(id_prefix.to_string()),
+        peer_secret: Some(peer_secret.to_string()),
         control: None,
         config: None,
         peers: vec![PeerSlotSpec::Consumer {

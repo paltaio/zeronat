@@ -444,6 +444,12 @@ mod pty {
         tokio::spawn(tcp_echo(local_tcp));
         let client_id = zeronat::identity::derive_client_id(Some("pty"));
         let provider_id = zeronat::identity::derive_client_id(Some("ptyexit"));
+        // Each client's peer static key and the identity it derives; consumer
+        // config and the panels name peers by the identity.
+        let peer_static = |id: &str| zeronat::noise::derive_psk(&format!("peer-static-{id}"));
+        let peer_identity_hex =
+            |id: &str| zeronat::secret::encode(zeronat::noise::public_identity(&peer_static(id)));
+        let provider_identity = peer_identity_hex(&provider_id);
         tokio::spawn(zeronat::server::run(server_settings(
             control, public_tcp, public_udp, &client_id,
         )));
@@ -497,6 +503,7 @@ mod pty {
             pppoe: vec![],
             autostart: None,
             id_prefix: Some("ptyexit".into()),
+            peer_secret: Some(zeronat::secret::encode(peer_static(&provider_id))),
             control: None,
             config: None,
             peers: vec![zeronat::client::PeerSlotSpec::Provider {
@@ -520,10 +527,11 @@ mod pty {
             pppoe: vec![],
             autostart: None,
             id_prefix: Some("pty".into()),
+            peer_secret: Some(zeronat::secret::encode(peer_static(&client_id))),
             control: Some(zeronat::clientctl::ControlPath::Explicit(sock.clone())),
             config: Some((path.clone(), cfg)),
             peers: vec![zeronat::client::PeerSlotSpec::Consumer {
-                peer_id: provider_id.clone(),
+                peer_id: provider_identity.clone(),
                 want: PROVIDES_EXIT,
                 adapter: None,
             }],
@@ -584,16 +592,18 @@ mod pty {
             .await
             .expect("the provider slot never paired")
             .expect("the provider sink closed");
-        assert_eq!(consumer_slot.peer_id, provider_id);
-        assert_eq!(provider_slot.peer_id, client_id);
+        assert_eq!(consumer_slot.peer_id, provider_identity);
+        assert_eq!(provider_slot.peer_id, peer_identity_hex(&client_id));
 
         // The client's peers panel names the slot, the peer it exits through,
         // and the path its pair settled on.
+        // The panel truncates long peer names, so match the visible prefix.
+        let shown = format!("via {}", &provider_identity[..22]);
         wait_screen(&out, "the peer slot row", 30, |s| {
-            row_containing(s, &format!("via {provider_id}"))
+            row_containing(s, &shown)
                 .is_some_and(|r| r.contains("connected") && r.contains("relay"))
         });
-        let peer_row = row_containing(&out.screen(), &format!("via {provider_id}")).unwrap();
+        let peer_row = row_containing(&out.screen(), &shown).unwrap();
         assert!(peer_row.contains("exit"), "peer row: {peer_row}");
 
         // The fleet console lists the same pair from the server's side, with

@@ -1,6 +1,6 @@
 use blake2::{Blake2s256, Digest};
 
-pub const PROTO_VERSION: u8 = 5;
+pub const PROTO_VERSION: u8 = 6;
 
 /// Derive the tunnel's private `/24` from the secret. Both ends compute the same
 /// network with no exchange: the server takes `.1` and the single client takes

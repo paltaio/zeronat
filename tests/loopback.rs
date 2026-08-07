@@ -2255,6 +2255,7 @@ fn client_settings(
         pppoe: vec![],
         autostart: None,
         id_prefix: Some(id.into()),
+        peer_secret: None,
         control: sock.map(|p| zeronat::clientctl::ControlPath::Explicit(p.to_path_buf())),
         config: None,
         peers: vec![],
@@ -3114,8 +3115,9 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
         let dir = temp_config_dir("peerslot");
         let path = dir.join("client.toml");
         let sock = dir.join("client.sock");
+        let peer_secret = zeronat::secret::encode([0x42; 32]);
         let text = format!(
-            "[client]\nactive = \"home\"\n\
+            "[client]\nactive = \"home\"\npeer_secret = \"{peer_secret}\"\n\
              [[servers]]\nname = \"home\"\naddr = \"127.0.0.1:{control}\"\nsecret = \"{SECRET}\"\ntransport = \"tcp\"\n"
         );
         std::fs::write(&path, &text).unwrap();
@@ -3128,6 +3130,7 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
             "psl",
             Some(&sock),
         );
+        settings.peer_secret = Some(peer_secret);
         settings.config = Some((path.clone(), cfg));
         tokio::spawn(zeronat::client::run_switchable(
             zeronat::client::ActiveTarget::new(server_target("home", control, SECRET)),
@@ -3151,7 +3154,8 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
 
         // A consumer names the peer it exits through, which the file records
         // as the `[tun]` table feeding that slot.
-        zeronat::client_admin::attach_peer(Some(&sock), "office-b1c2".into(), None, false, false)
+        let office = peer_identity_hex("office");
+        zeronat::client_admin::attach_peer(Some(&sock), office.clone(), None, false, false)
             .await
             .expect("attach the exit consumer");
         let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
@@ -3160,19 +3164,24 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
 
         // A second consumer is refused, and the refusal reaches the caller as
         // an error naming the consumer this client already runs.
-        let err =
-            zeronat::client_admin::attach_peer(Some(&sock), "depot-77a1".into(), None, true, false)
-                .await
-                .expect_err("a second consumer must be refused");
+        let err = zeronat::client_admin::attach_peer(
+            Some(&sock),
+            peer_identity_hex("depot"),
+            None,
+            true,
+            false,
+        )
+        .await
+        .expect_err("a second consumer must be refused");
         assert!(
             err.to_string()
-                .contains("already has the exit consumer for `office-b1c2`"),
+                .contains(&format!("already has the exit consumer for `{office}`")),
             "{err}"
         );
 
         // Detaching every slot takes the client back to the park, and the file
         // back to the servers it started with.
-        zeronat::client_admin::detach_peer(Some(&sock), "office-b1c2".into())
+        zeronat::client_admin::detach_peer(Some(&sock), office)
             .await
             .expect("detach the consumer");
         zeronat::client_admin::detach_provider(Some(&sock), "exit")
@@ -3979,6 +3988,37 @@ async fn idle_healthy_stream_outlives_reap_udp_transport() {
         .expect("udp idle survival did not complete within 320s");
 }
 
+/// The static x25519 key a test peer authenticates with, derived from the
+/// name the test knows it by.
+fn peer_static_of(id: &str) -> [u8; 32] {
+    zeronat::noise::derive_psk(&format!("peer-static-{id}"))
+}
+
+/// The public identity `peer_static_of` derives.
+fn peer_identity_of(id: &str) -> zeronat::proto::PeerIdentity {
+    zeronat::noise::public_identity(&peer_static_of(id))
+}
+
+/// The same identity as config and log lines carry it.
+fn peer_identity_hex(id: &str) -> String {
+    zeronat::secret::encode(peer_identity_of(id))
+}
+
+/// One party's inner-handshake identity for a pair between two test peers.
+fn pair_identity(
+    local: &str,
+    peer: &str,
+    challenge: [u8; 32],
+    provides: u8,
+) -> zeronat::peer::PairIdentity {
+    zeronat::peer::PairIdentity::new(
+        peer_static_of(local),
+        peer_identity_of(peer),
+        challenge,
+        provides,
+    )
+}
+
 /// Connect a hand-rolled peer-speaking control client: Noise handshake,
 /// `ClientHello`, `PeerAnnounce`, and the ack, asserting the ack echoes this
 /// socket's own address. Retries until the control listener is accepting.
@@ -4023,9 +4063,15 @@ async fn peer_control_connect(
     )
     .await
     .unwrap();
-    w.send(&Msg::PeerAnnounce { provides }.encode())
-        .await
-        .unwrap();
+    w.send(
+        &Msg::PeerAnnounce {
+            provides,
+            identity: peer_identity_of(client_id),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
     let frame = r.recv().await.unwrap();
     match Msg::decode(&frame).unwrap() {
         Msg::ClientHelloAck { client_id, .. } => assert_eq!(client_id, expected_id),
@@ -4047,9 +4093,10 @@ async fn peer_connect(
     peer_id: &str,
     want: u8,
 ) -> (u64, PeerStatus) {
+    let identity = peer_identity_of(peer_id);
     w.send(
         &Msg::PeerConnect {
-            peer_id: peer_id.into(),
+            peer_id: identity,
             want,
         }
         .encode(),
@@ -4064,7 +4111,7 @@ async fn peer_connect(
             pair_id,
             status,
         } => {
-            assert_eq!(got, peer_id);
+            assert_eq!(got, identity);
             assert_eq!(got_want, want);
             (pair_id, status)
         }
@@ -4204,9 +4251,15 @@ async fn peer_control_connect_udp(
     )
     .await
     .unwrap();
-    w.send(&Msg::PeerAnnounce { provides }.encode())
-        .await
-        .unwrap();
+    w.send(
+        &Msg::PeerAnnounce {
+            provides,
+            identity: peer_identity_of(client_id),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
     let frame = r.recv().await.unwrap();
     match Msg::decode(&frame).unwrap() {
         Msg::ClientHelloAck { client_id, .. } => assert_eq!(client_id, expected_id),
@@ -4227,7 +4280,7 @@ async fn recv_peer_probe(
     pair_id: u64,
     peer: &str,
     want: u8,
-) -> (u64, zeronat::proto::Capability) {
+) -> ((u64, zeronat::proto::Capability), [u8; 32]) {
     let frame = r.recv().await.unwrap();
     match Msg::decode(&frame).unwrap() {
         Msg::PeerProbe {
@@ -4235,12 +4288,13 @@ async fn recv_peer_probe(
             peer_id,
             probe_id,
             probe_capability,
+            challenge,
             provides,
         } => {
             assert_eq!(got, pair_id);
-            assert_eq!(peer_id, peer);
+            assert_eq!(peer_id, peer_identity_of(peer));
             assert_eq!(provides, want);
-            (probe_id, probe_capability)
+            ((probe_id, probe_capability), challenge)
         }
         other => panic!("expected peer probe, got {other:?}"),
     }
@@ -4280,9 +4334,11 @@ async fn peer_probe_discovers_candidates_both_ways() {
         let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
         assert_eq!(status, PeerStatus::Accepted);
 
-        let c_probe = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
-        let p_probe = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
+        let (c_probe, c_challenge) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
+        let (p_probe, p_challenge) = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
         assert_ne!(c_probe, p_probe);
+        // One pair, one challenge: both parties bind the same value.
+        assert_eq!(c_challenge, p_challenge);
 
         let psk = zeronat::noise::derive_psk(SECRET);
         let server = format!("127.0.0.1:{control}").parse().unwrap();
@@ -4330,8 +4386,8 @@ async fn peer_probe_socket_queues_peer_datagrams() {
 
         let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
         assert_eq!(status, PeerStatus::Accepted);
-        let c_probe = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
-        let p_probe = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
+        let (c_probe, _) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
+        let (p_probe, _) = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
 
         let psk = zeronat::noise::derive_psk(SECRET);
         let server = format!("127.0.0.1:{control}").parse().unwrap();
@@ -4375,8 +4431,8 @@ async fn peer_probe_deadline_marks_silent_party_relay_only() {
         let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
         assert_eq!(status, PeerStatus::Accepted);
 
-        let c_probe = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
-        let _p_probe = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
+        let (c_probe, _) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
+        let (_p_probe, _) = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
 
         let psk = zeronat::noise::derive_psk(SECRET);
         let server = format!("127.0.0.1:{control}").parse().unwrap();
@@ -4412,8 +4468,8 @@ async fn peer_probe_attributes_a_pair_on_the_tcp_transport() {
         let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
         assert_eq!(status, PeerStatus::Accepted);
 
-        let c_probe = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
-        let p_probe = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
+        let (c_probe, _) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
+        let (p_probe, _) = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
         assert_ne!(c_probe, p_probe);
         assert_eq!(recv_peer_info(&mut cr, pair_id).await, Vec::new());
         assert_eq!(recv_peer_info(&mut pr, pair_id).await, Vec::new());
@@ -4448,8 +4504,8 @@ async fn punch_parties(control: u16) -> PunchParties {
 
     let (pair_id, status) = peer_connect(&mut cr, &mut cw, "prov", PROVIDES_EXIT).await;
     assert_eq!(status, PeerStatus::Accepted);
-    let c_probe = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
-    let p_probe = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
+    let (c_probe, _) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
+    let (p_probe, _) = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
 
     let psk = zeronat::noise::derive_psk(SECRET);
     let server = format!("127.0.0.1:{control}").parse().unwrap();
@@ -5505,13 +5561,14 @@ async fn assert_inner_session(
     provider: zeronat::peer::PeerPath,
     pair_id: u64,
 ) {
-    let psk = zeronat::noise::derive_psk(SECRET);
-    let ((mut consumer, answer), mut provider) = tokio::try_join!(
-        zeronat::peer::PeerSession::consumer(consumer, &psk, pair_id),
-        zeronat::peer::PeerSession::provider(provider, &psk, pair_id, &[]),
+    let challenge = [7u8; 32];
+    let consumer_identity = pair_identity("c", "prov", challenge, PROVIDES_EXIT);
+    let provider_identity = pair_identity("prov", "c", challenge, PROVIDES_EXIT);
+    let (mut consumer, mut provider) = tokio::try_join!(
+        zeronat::peer::PeerSession::consumer(consumer, &consumer_identity, pair_id),
+        zeronat::peer::PeerSession::provider(provider, &provider_identity, pair_id, &[]),
     )
     .expect("the inner handshake must complete on both sides");
-    assert!(answer.is_empty(), "an accepting provider answers empty");
     for payload in [
         b"one".as_slice(),
         b"two",
@@ -5528,7 +5585,7 @@ async fn assert_inner_session(
 }
 
 // The inner session over a punched path: the two clients handshake their own
-// NNpsk0 on top of the direct session and echo frames both ways, with nothing
+// XX on top of the direct session and echo frames both ways, with nothing
 // but the pair's own keys between them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_inner_session_echoes_over_a_punched_path() {
@@ -5633,38 +5690,48 @@ async fn peer_inner_handshake_survives_a_lossy_path() {
         .expect("lossy inner handshake flow did not complete within 60s");
 }
 
-// The provider's answer rides message two: whatever it seals there reaches the
-// consumer whole, which is the carrier a refusal needs.
+// The provider's refusal rides its sealed verdict: the provider completes the
+// handshake, and the consumer surfaces the reason as its cycle error instead
+// of a session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn peer_inner_handshake_carries_the_providers_answer() {
+async fn peer_inner_handshake_carries_the_providers_refusal() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let pair = relay_pair(control).await;
+        let challenge = [7u8; 32];
+        let consumer_identity = pair_identity("c", "prov", challenge, PROVIDES_EXIT);
+        let provider_identity = pair_identity("prov", "c", challenge, PROVIDES_EXIT);
 
         let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
         let (p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
-        let ((_consumer, answer), _provider) = tokio::try_join!(
+        let (consumer, provider) = tokio::join!(
             zeronat::peer::PeerSession::consumer(
                 zeronat::peer::PeerPath::relay_dgram(c_leg),
-                &psk,
+                &consumer_identity,
                 pair.pair_id,
             ),
             zeronat::peer::PeerSession::provider(
                 zeronat::peer::PeerPath::relay_dgram(p_leg),
-                &psk,
+                &provider_identity,
                 pair.pair_id,
                 b"peer_busy",
             ),
-        )
-        .expect("the inner handshake must complete on both sides");
-        assert_eq!(answer, b"peer_busy");
+        );
+        provider.expect("the refusing provider still completes the handshake");
+        let error = consumer
+            .err()
+            .expect("a refusal fails the consumer")
+            .to_string();
+        assert!(
+            error.contains("the provider refused the pair: peer_busy"),
+            "{error}"
+        );
     };
 
     timeout(Duration::from_secs(60), body)
         .await
-        .expect("provider answer flow did not complete within 60s");
+        .expect("provider refusal flow did not complete within 60s");
 }
 
 // A frame that is not a handshake message can reach a party still shaking
@@ -5709,19 +5776,21 @@ async fn peer_inner_handshake_ignores_frames_ahead_of_it() {
 }
 
 /// Answer an inner handshake by hand on a raw relay leg, holding the keys the
-/// server never gets. Each frame leads with the byte naming what follows, so
-/// the responder feeds its duplex the handshake messages alone.
+/// server never gets: the provider's three XX messages and a ready verdict.
+/// Each frame leads with the byte naming what follows.
 async fn raw_inner_responder(
     leg: &mut zeronat::client::RelayDgramLeg,
     pair_id: u64,
 ) -> zeronat::noise::StatelessNoise {
-    let psk = zeronat::noise::derive_psk(SECRET);
-    let (mine, theirs) = tokio::io::duplex(4096);
-    let (mut r, mut w) = tokio::io::split(mine);
-    let task =
-        tokio::spawn(
-            async move { zeronat::noise::server_handshake_stateless(theirs, &psk, &[]).await },
-        );
+    let prologue = zeronat::peer::pair_prologue(
+        pair_id,
+        PROVIDES_EXIT,
+        &peer_identity_of("c"),
+        &peer_identity_of("prov"),
+        &[7u8; 32],
+    );
+    let mut state =
+        zeronat::noise::XxHandshake::responder(&peer_static_of("prov"), &prologue).unwrap();
 
     let msg1 = loop {
         let frame = recv_dgram_frame(&mut leg.rx).await;
@@ -5729,18 +5798,27 @@ async fn raw_inner_responder(
             break msg.to_vec();
         }
     };
-    w.write_all(&(msg1.len() as u16).to_be_bytes())
-        .await
-        .unwrap();
-    w.write_all(&msg1).await.unwrap();
-    let mut len = [0u8; 2];
-    r.read_exact(&mut len).await.unwrap();
-    let mut msg2 = vec![zeronat::peer::FRAME_HANDSHAKE; 1 + u16::from_be_bytes(len) as usize];
-    r.read_exact(&mut msg2[1..]).await.unwrap();
+    state.read_message_one(&msg1).unwrap();
+    let mut msg2 = vec![zeronat::peer::FRAME_HANDSHAKE];
+    msg2.extend_from_slice(&state.write_message_two(&[]));
     leg.tx.send(&msg2).await.unwrap();
-
-    let (id, noise) = task.await.unwrap().expect("inner responder handshake");
-    assert_eq!(id, pair_id, "the initiator must name its own pair");
+    let msg3 = loop {
+        let frame = recv_dgram_frame(&mut leg.rx).await;
+        match frame.split_first() {
+            Some((&zeronat::peer::FRAME_HANDSHAKE, msg)) if msg != msg1 => break msg.to_vec(),
+            _ => continue,
+        }
+    };
+    state.read_message_three(&msg3).unwrap();
+    assert_eq!(
+        state.remote_static(),
+        Some(peer_identity_of("c")),
+        "the initiator must authenticate as the consumer"
+    );
+    let noise = state.into_transport();
+    let mut verdict = vec![zeronat::peer::FRAME_HANDSHAKE];
+    verdict.extend_from_slice(&noise.seal(&[zeronat::peer::VERDICT_READY]).unwrap());
+    leg.tx.send(&verdict).await.unwrap();
     noise
 }
 
@@ -5769,20 +5847,20 @@ async fn peer_inner_frames_cross_the_relay_sealed() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let pair = relay_pair(control).await;
+        let consumer_identity = pair_identity("c", "prov", [7u8; 32], PROVIDES_EXIT);
 
         let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
         let (mut p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
         let (consumer, noise) = tokio::join!(
             zeronat::peer::PeerSession::consumer(
                 zeronat::peer::PeerPath::relay_dgram(c_leg),
-                &psk,
+                &consumer_identity,
                 pair.pair_id,
             ),
             raw_inner_responder(&mut p_leg, pair.pair_id),
         );
-        let (consumer, _answer) = consumer.expect("the inner handshake must complete");
+        let consumer = consumer.expect("the inner handshake must complete");
 
         const NEEDLE: &[u8] = b"inner-plaintext-needle";
         consumer.send(NEEDLE).await.unwrap();
@@ -5812,8 +5890,8 @@ async fn peer_inner_session_dies_on_missed_keepalives() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let pair = relay_pair(control).await;
+        let consumer_identity = pair_identity("c", "prov", [7u8; 32], PROVIDES_EXIT);
 
         let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
         let (mut p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
@@ -5824,12 +5902,12 @@ async fn peer_inner_session_dies_on_missed_keepalives() {
         let (consumer, _noise) = tokio::join!(
             zeronat::peer::PeerSession::consumer(
                 zeronat::peer::PeerPath::relay_dgram(c_leg),
-                &psk,
+                &consumer_identity,
                 pair.pair_id,
             ),
             raw_inner_responder(&mut p_leg, pair.pair_id),
         );
-        let (mut consumer, _answer) = consumer.expect("the inner handshake must complete");
+        let mut consumer = consumer.expect("the inner handshake must complete");
 
         let dead = timeout(
             zeronat::peer::PEER_DEADLINE + zeronat::peer::PEER_KEEPALIVE / 2,
@@ -5919,6 +5997,7 @@ async fn run_two_slot_test(transport: zeronat::client::Transport, punched: bool)
 
         let (prov_tx, mut prov_rx) = tokio::sync::mpsc::channel(4);
         let mut provider = client_settings(vec![target(SECRET_F)], vec![], "provider", None);
+        provider.peer_secret = Some(zeronat::secret::encode(peer_static_of(&provider_id)));
         provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
             provides: PROVIDES_EXIT,
             adapter: None,
@@ -5936,8 +6015,9 @@ async fn run_two_slot_test(transport: zeronat::client::Transport, punched: bool)
             "consumer",
             None,
         );
+        consumer.peer_secret = Some(zeronat::secret::encode(peer_static_of(&consumer_id)));
         consumer.peers = vec![zeronat::client::PeerSlotSpec::Consumer {
-            peer_id: provider_id.clone(),
+            peer_id: peer_identity_hex(&provider_id),
             want: PROVIDES_EXIT,
             adapter: None,
         }];
@@ -5954,8 +6034,8 @@ async fn run_two_slot_test(transport: zeronat::client::Transport, punched: bool)
 
         let mut consumer_slot = next_slot_session(&mut cons_rx).await;
         let mut provider_slot = next_slot_session(&mut prov_rx).await;
-        assert_eq!(consumer_slot.peer_id, provider_id);
-        assert_eq!(provider_slot.peer_id, consumer_id);
+        assert_eq!(consumer_slot.peer_id, peer_identity_hex(&provider_id));
+        assert_eq!(provider_slot.peer_id, peer_identity_hex(&consumer_id));
         assert_eq!(consumer_slot.want, PROVIDES_EXIT);
         assert_eq!(provider_slot.want, PROVIDES_EXIT);
 
@@ -6012,7 +6092,6 @@ async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
 
         let consumer_id = zeronat::identity::derive_client_id(Some("consumer"));
         let provider_id = zeronat::identity::derive_client_id(Some("provider"));
@@ -6026,6 +6105,7 @@ async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
 
         let (prov_tx, mut prov_rx) = tokio::sync::mpsc::channel(4);
         let mut provider = client_settings(vec![target(SECRET_F)], vec![], "provider", None);
+        provider.peer_secret = Some(zeronat::secret::encode(peer_static_of(&provider_id)));
         provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
             provides: PROVIDES_EXIT,
             adapter: None,
@@ -6038,8 +6118,9 @@ async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
 
         let (cons_tx, mut cons_rx) = tokio::sync::mpsc::channel(4);
         let mut consumer = client_settings(vec![target(SECRET_G)], vec![], "consumer", None);
+        consumer.peer_secret = Some(zeronat::secret::encode(peer_static_of(&consumer_id)));
         consumer.peers = vec![zeronat::client::PeerSlotSpec::Consumer {
-            peer_id: provider_id.clone(),
+            peer_id: peer_identity_hex(&provider_id),
             want: PROVIDES_EXIT,
             adapter: None,
         }];
@@ -6075,21 +6156,28 @@ async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
                 other => panic!("unexpected status {other:?}"),
             }
         };
-        recv_peer_probe(&mut c2r, pair_id, &provider_id, PROVIDES_EXIT).await;
+        let (_probe, challenge) =
+            recv_peer_probe(&mut c2r, pair_id, &provider_id, PROVIDES_EXIT).await;
         // c2 arrived on tcp and never probes, so it reports the relay as soon
         // as the pair's info lands, whatever candidates the provider offered.
         recv_peer_info(&mut c2r, pair_id).await;
         report_path(&mut c2w, pair_id, PathStatus::Relay).await;
         let leg = recv_relay_open(&mut c2r, pair_id, "c2").await;
 
-        let (_refused, answer) = zeronat::peer::PeerSession::consumer(
+        let identity = pair_identity("c2", &provider_id, challenge, PROVIDES_EXIT);
+        let error = zeronat::peer::PeerSession::consumer(
             zeronat::peer::PeerPath::relay_stream(stream_leg(control, leg).await),
-            &psk,
+            &identity,
             pair_id,
         )
         .await
-        .expect("the provider must answer the second pair's handshake");
-        assert_eq!(answer, b"already serving a pair");
+        .err()
+        .expect("the provider must refuse the second pair in its verdict")
+        .to_string();
+        assert!(
+            error.contains("the provider refused the pair: already serving a pair"),
+            "{error}"
+        );
 
         // The pair holding the slot is still the one carrying traffic.
         cross_peer_frame(&provider_slot, &mut consumer_slot, b"still-serving").await;
@@ -6100,17 +6188,15 @@ async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
         .expect("provider-authoritative refusal did not complete within 180s");
 }
 
-/// Pair with `provider` for `want` as a relay-only consumer and return the
-/// answer its message two carried, which is empty when the provider took the
-/// pair.
-async fn pair_answer(
+/// Pair with `provider` for `want` as a relay-only consumer "c" and return
+/// the refusal the provider's verdict carried.
+async fn pair_refusal(
     control: u16,
     r: &mut zeronat::noise::NoiseReader,
     w: &mut zeronat::noise::NoiseWriter,
     provider: &str,
     want: u8,
-    psk: &[u8; 32],
-) -> Vec<u8> {
+) -> String {
     let pair_id = loop {
         let (pair_id, status) = peer_connect(r, w, provider, want).await;
         match status {
@@ -6123,18 +6209,20 @@ async fn pair_answer(
             other => panic!("unexpected status {other:?}"),
         }
     };
-    recv_peer_probe(r, pair_id, provider, want).await;
+    let (_probe, challenge) = recv_peer_probe(r, pair_id, provider, want).await;
     recv_peer_info(r, pair_id).await;
     report_path(w, pair_id, PathStatus::Relay).await;
     let leg = recv_relay_open(r, pair_id, "c").await;
-    let (_session, answer) = zeronat::peer::PeerSession::consumer(
+    let identity = pair_identity("c", provider, challenge, want);
+    zeronat::peer::PeerSession::consumer(
         zeronat::peer::PeerPath::relay_stream(stream_leg(control, leg).await),
-        psk,
+        &identity,
         pair_id,
     )
     .await
-    .expect("the provider must answer the inner handshake");
-    answer
+    .err()
+    .expect("the provider must refuse the pair in its verdict")
+    .to_string()
 }
 
 // A provider whose exit adapter cannot come up refuses the pair in message
@@ -6147,7 +6235,6 @@ async fn peer_exit_provider_refuses_a_pair_it_cannot_serve() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let provider_id = zeronat::identity::derive_client_id(Some("provider"));
         let target = || zeronat::client::ServerTarget {
             name: "home".into(),
@@ -6158,6 +6245,7 @@ async fn peer_exit_provider_refuses_a_pair_it_cannot_serve() {
         };
 
         let mut provider = client_settings(vec![target()], vec![], "provider", None);
+        provider.peer_secret = Some(zeronat::secret::encode(peer_static_of(&provider_id)));
         provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
             provides: PROVIDES_EXIT,
             // The egress names the tun the pair itself rides, which is a
@@ -6178,9 +6266,7 @@ async fn peer_exit_provider_refuses_a_pair_it_cannot_serve() {
         let (mut cr, mut cw) = peer_control_connect(control, "c", 0).await;
         wait_clients(control, 2).await;
         for _ in 0..2 {
-            let answer =
-                pair_answer(control, &mut cr, &mut cw, &provider_id, PROVIDES_EXIT, &psk).await;
-            let reason = String::from_utf8_lossy(&answer).into_owned();
+            let reason = pair_refusal(control, &mut cr, &mut cw, &provider_id, PROVIDES_EXIT).await;
             assert!(
                 reason.contains("znx0"),
                 "the refusal must name the bringup, got {reason:?}"
@@ -6203,7 +6289,6 @@ async fn peer_segment_provider_refuses_a_pair_it_cannot_serve() {
     let body = async {
         let control = free_port();
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
-        let psk = zeronat::noise::derive_psk(SECRET);
         let provider_id = zeronat::identity::derive_client_id(Some("provider"));
         let target = || zeronat::client::ServerTarget {
             name: "home".into(),
@@ -6214,6 +6299,7 @@ async fn peer_segment_provider_refuses_a_pair_it_cannot_serve() {
         };
 
         let mut provider = client_settings(vec![target()], vec![], "provider", None);
+        provider.peer_secret = Some(zeronat::secret::encode(peer_static_of(&provider_id)));
         provider.peers = vec![zeronat::client::PeerSlotSpec::Provider {
             provides: PROVIDES_SEGMENT,
             adapter: Some(zeronat::client::ProviderAdapter::Segment(
@@ -6232,16 +6318,8 @@ async fn peer_segment_provider_refuses_a_pair_it_cannot_serve() {
         let (mut cr, mut cw) = peer_control_connect(control, "c", 0).await;
         wait_clients(control, 2).await;
         for _ in 0..2 {
-            let answer = pair_answer(
-                control,
-                &mut cr,
-                &mut cw,
-                &provider_id,
-                PROVIDES_SEGMENT,
-                &psk,
-            )
-            .await;
-            let reason = String::from_utf8_lossy(&answer).into_owned();
+            let reason =
+                pair_refusal(control, &mut cr, &mut cw, &provider_id, PROVIDES_SEGMENT).await;
             assert!(
                 reason.contains("zeronat-no-such-bridge"),
                 "the refusal must name the bringup, got {reason:?}"
@@ -6259,7 +6337,7 @@ async fn peer_segment_provider_refuses_a_pair_it_cannot_serve() {
 async fn recv_pair_probe(
     r: &mut zeronat::noise::NoiseReader,
     peer: &str,
-) -> (u64, (u64, zeronat::proto::Capability)) {
+) -> (u64, (u64, zeronat::proto::Capability), [u8; 32]) {
     let frame = timeout(Duration::from_secs(30), r.recv())
         .await
         .expect("no peer probe")
@@ -6270,11 +6348,12 @@ async fn recv_pair_probe(
             peer_id,
             probe_id,
             probe_capability,
+            challenge,
             provides,
         } => {
-            assert_eq!(peer_id, peer);
+            assert_eq!(peer_id, peer_identity_of(peer));
             assert_eq!(provides, PROVIDES_EXIT);
-            (pair_id, (probe_id, probe_capability))
+            (pair_id, (probe_id, probe_capability), challenge)
         }
         other => panic!("expected peer probe, got {other:?}"),
     }
@@ -6313,8 +6392,9 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
             "consumer",
             None,
         );
+        consumer.peer_secret = Some(zeronat::secret::encode(peer_static_of(&consumer_id)));
         consumer.peers = vec![zeronat::client::PeerSlotSpec::Consumer {
-            peer_id: "prov".into(),
+            peer_id: peer_identity_hex("prov"),
             want: PROVIDES_EXIT,
             adapter: None,
         }];
@@ -6331,7 +6411,7 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
             consumer,
         ));
 
-        let (pair_id, probe_id) = recv_pair_probe(&mut pr, &consumer_id).await;
+        let (pair_id, probe_id, challenge) = recv_pair_probe(&mut pr, &consumer_id).await;
         let probe = zeronat::client::probe_candidates(server, &psk, probe_id)
             .await
             .expect("counterpart probe");
@@ -6339,14 +6419,15 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
 
         // The punch settles direct on both ends: the responder only finishes
         // once the initiator's nomination arrives, so the slot is already
-        // holding its own direct path here.
+        // holding its own direct path here. The punch elects roles off the
+        // identities, matching what the slot's own punch compares.
         let (swallow, _swallowed) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let outcome = zeronat::punch::punch(
             probe,
             &candidates,
             pair_id,
-            "prov",
-            &consumer_id,
+            &peer_identity_hex("prov"),
+            &peer_identity_hex(&consumer_id),
             &psk,
             &swallow,
         )
@@ -6361,9 +6442,10 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
         report_path(&mut pw, pair_id, PathStatus::Relay).await;
         let leg_id = recv_relay_open(&mut pr, pair_id, "prov").await;
         let (leg, _leg_pump) = dgram_leg(control, leg_id).await;
+        let identity = pair_identity("prov", &consumer_id, challenge, PROVIDES_EXIT);
         let mut provider = zeronat::peer::PeerSession::provider(
             zeronat::peer::PeerPath::relay_dgram(leg),
-            &psk,
+            &identity,
             pair_id,
             &[],
         )
