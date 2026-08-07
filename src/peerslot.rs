@@ -54,9 +54,9 @@ const REFUSE_BUSY: &[u8] = b"already serving a pair";
 /// three and be answered again.
 const REFUSAL_LINGER: Duration = Duration::from_secs(2);
 
-/// The live control session as a peer slot sees it: the frame sender, what a
-/// probe socket and a relay leg need to reach the server, and the psk of the
-/// profile the pairing is keyed by.
+/// The live control session as a peer slot sees it: the frame sender, the
+/// credential a probe or relay leg claims under, and the profile psk that
+/// keys the punch-layer session.
 #[derive(Clone)]
 pub struct ControlSession {
     pub tx: mpsc::Sender<Vec<u8>>,
@@ -1448,8 +1448,12 @@ async fn settle_path(
                 pair_challenge = Some(challenge);
                 if let Some(server) = udp_server(session)? {
                     probe = Some(
-                        probe_candidates(server, &session.psk, (probe_id, probe_capability))
-                            .await?,
+                        probe_candidates(
+                            server,
+                            &session.credential_psk,
+                            (probe_id, probe_capability),
+                        )
+                        .await?,
                     );
                 }
             }
@@ -1514,7 +1518,7 @@ async fn open_leg(
 ) -> Result<PeerPath> {
     match &session.sess {
         Some(sess) => Ok(PeerPath::relay_dgram(
-            relay_leg_dgram(sess, &session.psk, leg_id, capability).await?,
+            relay_leg_dgram(sess, &session.credential_psk, leg_id, capability).await?,
         )),
         None => Ok(PeerPath::relay_stream(
             relay_leg_stream(&session.server, &session.credential_psk, leg_id, capability).await?,

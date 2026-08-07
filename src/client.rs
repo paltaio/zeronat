@@ -1414,9 +1414,9 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         #[cfg(target_os = "linux")]
         let mut exit_routes: Option<ExitRoutes> = None;
 
-        // The psk that pairs a slot, authenticates its probe, and keys its
-        // inner handshake is the active profile's, so the slots live exactly
-        // as long as this profile does and the switch below awaits them.
+        // A slot's probe, relay leg, and punch all authenticate with the
+        // active profile's credentials, so the slots live exactly as long as
+        // this profile does and the switch below awaits them.
         // Pairing rides the control session the forwards body opens; a device
         // or pppoe body opens none, so the slots wait for a body that does.
         if !peers.is_empty() && !matches!(mode, RunMode::Forwards | RunMode::Idle) {
@@ -1741,7 +1741,7 @@ impl ProbeSession {
 /// authenticated session.
 pub async fn probe_candidates(
     server: SocketAddr,
-    psk: &[u8; 32],
+    credential_psk: &[u8; 32],
     (probe_id, probe_capability): (u64, crate::proto::Capability),
 ) -> Result<ProbeSession> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -1784,7 +1784,7 @@ pub async fn probe_candidates(
     let stream = sess.open_conv_with(CLASS_SETUP, conv);
     let (noise, reply) = tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
-        client_handshake_stateless_claim_reply(stream, psk, probe_id, &probe_capability),
+        client_handshake_stateless_claim_reply(stream, credential_psk, probe_id, &probe_capability),
     )
     .await
     .map_err(|_| -> crate::Error { "probe handshake timed out".into() })??;
@@ -1910,7 +1910,7 @@ pub async fn relay_leg_stream(
 /// server's splice keeps frame boundaries against a stream leg.
 pub async fn relay_leg_dgram(
     sess: &Session,
-    psk: &[u8; 32],
+    credential_psk: &[u8; 32],
     id: u64,
     capability: crate::proto::Capability,
 ) -> Result<RelayDgramLeg> {
@@ -1919,7 +1919,7 @@ pub async fn relay_leg_dgram(
     let noise = Arc::new(
         tokio_timeout(
             OPEN_HANDSHAKE_TIMEOUT,
-            client_handshake_stateless_claim(stream, psk, id, &capability),
+            client_handshake_stateless_claim(stream, credential_psk, id, &capability),
         )
         .await
         .map_err(|_| -> crate::Error { "relay leg handshake timed out".into() })??,
@@ -1964,7 +1964,12 @@ async fn bridge_udp(
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
     let noise = match tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
-        client_handshake_stateless_claim(stream, &client.psk, BRIDGE_ID, &lease.capability),
+        client_handshake_stateless_claim(
+            stream,
+            &client.credential_psk,
+            BRIDGE_ID,
+            &lease.capability,
+        ),
     )
     .await
     {
@@ -2239,7 +2244,12 @@ async fn pppoe_udp(
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
     let noise = match tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
-        client_handshake_stateless_claim(stream, &client.psk, BRIDGE_ID, &lease.capability),
+        client_handshake_stateless_claim(
+            stream,
+            &client.credential_psk,
+            BRIDGE_ID,
+            &lease.capability,
+        ),
     )
     .await
     {
@@ -2883,7 +2893,12 @@ async fn handle_open(
             let noise = Arc::new(
                 tokio_timeout(
                     OPEN_HANDSHAKE_TIMEOUT,
-                    client_handshake_stateless_claim(stream, &client.psk, id, &capability),
+                    client_handshake_stateless_claim(
+                        stream,
+                        &client.credential_psk,
+                        id,
+                        &capability,
+                    ),
                 )
                 .await
                 .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??,

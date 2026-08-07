@@ -300,7 +300,6 @@ async fn main() -> Result<()> {
         }
         None => uplink::Uplink::Server(uplink::Dialer::new(
             bridge::Target::new(cfg.host.as_deref(), cfg.dht, &cfg.secret)?,
-            cfg.secret.clone(),
             cfg.credential.clone(),
             client_id,
         )),

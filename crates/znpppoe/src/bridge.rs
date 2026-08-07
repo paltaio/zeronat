@@ -104,12 +104,7 @@ impl Drop for AbortOnDrop {
 /// Dial `addr`, establish the bridge setup conv, run the stateless Noise
 /// handshake, and return the bridge ready to carry L2 frames. `client_id` is
 /// announced so the server's fleet view names the port.
-pub async fn connect(
-    addr: SocketAddr,
-    secret: &str,
-    credential: &str,
-    client_id: &str,
-) -> Result<Bridge> {
+pub async fn connect(addr: SocketAddr, credential: &str, client_id: &str) -> Result<Bridge> {
     let socket = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
             .await
@@ -195,11 +190,10 @@ pub async fn connect(
         }
     }));
 
-    let psk = derive_psk(secret);
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
     let noise = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        client_handshake_stateless_claim(stream, &psk, BRIDGE_ID, &bridge_capability),
+        client_handshake_stateless_claim(stream, &credential_psk, BRIDGE_ID, &bridge_capability),
     )
     .await
     .context("bridge handshake timed out")?
@@ -239,7 +233,7 @@ mod tests {
         let metrics = tokio::runtime::Handle::current().metrics();
         let baseline = metrics.num_alive_tasks();
 
-        assert!(connect(addr, "secret", "credential", "test").await.is_err());
+        assert!(connect(addr, "credential", "test").await.is_err());
 
         for _ in 0..200 {
             tokio::time::advance(Duration::from_secs(2)).await;

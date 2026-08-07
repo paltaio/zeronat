@@ -120,17 +120,15 @@ pub fn peer(
 /// How to reach the zeronat server, so the driver can redial after a drop.
 pub struct Dialer {
     target: Target,
-    secret: String,
     credential: String,
     client_id: String,
     backoff: Duration,
 }
 
 impl Dialer {
-    pub fn new(target: Target, secret: String, credential: String, client_id: String) -> Self {
+    pub fn new(target: Target, credential: String, client_id: String) -> Self {
         Dialer {
             target,
-            secret,
             credential,
             client_id,
             backoff: BACKOFF_START,
@@ -158,7 +156,7 @@ impl Dialer {
     /// One resolve-and-dial attempt.
     async fn attempt(&self) -> Result<Bridge> {
         let addr = self.target.resolve().await?;
-        bridge::connect(addr, &self.secret, &self.credential, &self.client_id)
+        bridge::connect(addr, &self.credential, &self.client_id)
             .await
             .map_err(|e| {
                 // A cached DHT address that stopped answering is re-resolved on

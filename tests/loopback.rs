@@ -4377,14 +4377,21 @@ async fn peer_probe_discovers_candidates_both_ways() {
         // One pair, one challenge: both parties bind the same value.
         assert_eq!(c_challenge, p_challenge);
 
-        let psk = zeronat::noise::derive_psk(SECRET);
         let server = format!("127.0.0.1:{control}").parse().unwrap();
-        let mut c_sess = zeronat::client::probe_candidates(server, &psk, c_probe)
-            .await
-            .expect("consumer probe");
-        let mut p_sess = zeronat::client::probe_candidates(server, &psk, p_probe)
-            .await
-            .expect("provider probe");
+        let mut c_sess = zeronat::client::probe_candidates(
+            server,
+            &zeronat::noise::derive_psk(SECRET_C),
+            c_probe,
+        )
+        .await
+        .expect("consumer probe");
+        let mut p_sess = zeronat::client::probe_candidates(
+            server,
+            &zeronat::noise::derive_psk(SECRET_B),
+            p_probe,
+        )
+        .await
+        .expect("provider probe");
         // The public candidate is the probe socket's mapping as the server
         // observed it: over loopback, the socket's own port unchanged.
         assert_eq!(
@@ -4426,14 +4433,21 @@ async fn peer_probe_socket_queues_peer_datagrams() {
         let (c_probe, _) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
         let (p_probe, _) = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
 
-        let psk = zeronat::noise::derive_psk(SECRET);
         let server = format!("127.0.0.1:{control}").parse().unwrap();
-        let mut c_sess = zeronat::client::probe_candidates(server, &psk, c_probe)
-            .await
-            .expect("consumer probe");
-        let p_sess = zeronat::client::probe_candidates(server, &psk, p_probe)
-            .await
-            .expect("provider probe");
+        let mut c_sess = zeronat::client::probe_candidates(
+            server,
+            &zeronat::noise::derive_psk(SECRET_C),
+            c_probe,
+        )
+        .await
+        .expect("consumer probe");
+        let p_sess = zeronat::client::probe_candidates(
+            server,
+            &zeronat::noise::derive_psk(SECRET_B),
+            p_probe,
+        )
+        .await
+        .expect("provider probe");
 
         p_sess
             .socket
@@ -4471,11 +4485,14 @@ async fn peer_probe_deadline_marks_silent_party_relay_only() {
         let (c_probe, _) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
         let (_p_probe, _) = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
 
-        let psk = zeronat::noise::derive_psk(SECRET);
         let server = format!("127.0.0.1:{control}").parse().unwrap();
-        let c_sess = zeronat::client::probe_candidates(server, &psk, c_probe)
-            .await
-            .expect("consumer probe");
+        let c_sess = zeronat::client::probe_candidates(
+            server,
+            &zeronat::noise::derive_psk(SECRET_C),
+            c_probe,
+        )
+        .await
+        .expect("consumer probe");
 
         assert_eq!(recv_peer_info(&mut cr, pair_id).await, Vec::new());
         assert_eq!(
@@ -4544,14 +4561,15 @@ async fn punch_parties(control: u16) -> PunchParties {
     let (c_probe, _) = recv_peer_probe(&mut cr, pair_id, "prov", PROVIDES_EXIT).await;
     let (p_probe, _) = recv_peer_probe(&mut pr, pair_id, "c", PROVIDES_EXIT).await;
 
-    let psk = zeronat::noise::derive_psk(SECRET);
     let server = format!("127.0.0.1:{control}").parse().unwrap();
-    let c_sess = zeronat::client::probe_candidates(server, &psk, c_probe)
-        .await
-        .expect("consumer probe");
-    let p_sess = zeronat::client::probe_candidates(server, &psk, p_probe)
-        .await
-        .expect("provider probe");
+    let c_sess =
+        zeronat::client::probe_candidates(server, &zeronat::noise::derive_psk(SECRET_C), c_probe)
+            .await
+            .expect("consumer probe");
+    let p_sess =
+        zeronat::client::probe_candidates(server, &zeronat::noise::derive_psk(SECRET_B), p_probe)
+            .await
+            .expect("provider probe");
     let c_cands = recv_peer_info(&mut cr, pair_id).await;
     let p_cands = recv_peer_info(&mut pr, pair_id).await;
 
@@ -4836,6 +4854,12 @@ async fn peer_punch_deadline_reports_relay() {
 async fn probe_resends_local_candidate_until_peer_info() {
     let body = async {
         let psk = zeronat::noise::derive_psk(SECRET);
+        let credentials: zeronat::noise::ClientCredentials = [(
+            zeronat::noise::client_selector(&psk),
+            ("probe-client".to_string(), psk),
+        )]
+        .into_iter()
+        .collect();
         let socket = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let addr = socket.local_addr().unwrap();
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel::<std::net::SocketAddr>(16);
@@ -4879,12 +4903,17 @@ async fn probe_resends_local_candidate_until_peer_info() {
                     zeronat::kcp::route(&sess, &buf[..n])
                 {
                     let frames_tx = frames_tx.clone();
+                    let credentials = credentials.clone();
                     tokio::spawn(async move {
                         let reply = zeronat::proto::encode_sockaddr(src);
-                        let (_id, _capability, noise) =
-                            zeronat::noise::server_handshake_stateless_claim(stream, &psk, &reply)
-                                .await
-                                .unwrap();
+                        let (_client_id, _id, _capability, noise) =
+                            zeronat::noise::server_handshake_stateless_claim(
+                                stream,
+                                &credentials,
+                                &reply,
+                            )
+                            .await
+                            .unwrap();
                         let (inbound, _guard) = sess.register_dgram(conv);
                         let mut rx =
                             zeronat::dgram::DgramRx::new(inbound, std::sync::Arc::new(noise));
@@ -5242,7 +5271,7 @@ async fn dgram_leg_via(
     claim: RelayClaim,
 ) -> (zeronat::client::RelayDgramLeg, tokio::task::JoinHandle<()>) {
     use zeronat::kcp::{route, session};
-    let psk = zeronat::noise::derive_psk(SECRET);
+    let psk = zeronat::noise::derive_psk(claim.credential);
     let socket = std::sync::Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
     socket.connect(server).await.unwrap();
     zeronat::admission::admit(&socket, server).await.unwrap();
@@ -6458,9 +6487,13 @@ async fn peer_slot_takes_a_relay_open_after_its_punch_won() {
         ));
 
         let (pair_id, probe_id, challenge) = recv_pair_probe(&mut pr, &consumer_id).await;
-        let probe = zeronat::client::probe_candidates(server, &psk, probe_id)
-            .await
-            .expect("counterpart probe");
+        let probe = zeronat::client::probe_candidates(
+            server,
+            &zeronat::noise::derive_psk(SECRET_B),
+            probe_id,
+        )
+        .await
+        .expect("counterpart probe");
         let candidates = recv_peer_info(&mut pr, pair_id).await;
 
         // The punch settles direct on both ends: the responder only finishes

@@ -58,6 +58,22 @@ pub enum AuthIdentity {
 
 pub type ClientCredentials = HashMap<[u8; CLIENT_SELECTOR_LEN], (String, [u8; 32])>;
 
+fn parse_remote_preface(
+    preface: &[u8; REMOTE_PREFACE_LEN],
+) -> Result<(AuthRole, [u8; CLIENT_SELECTOR_LEN])> {
+    if preface[..2] != REMOTE_PREFACE_MAGIC {
+        return Err("unsupported remote handshake preface".into());
+    }
+    if preface[2] != crate::identity::PROTO_VERSION {
+        return Err("unsupported protocol version".into());
+    }
+    let role = AuthRole::from_byte(preface[3])?;
+    let selector: [u8; CLIENT_SELECTOR_LEN] = preface[4..]
+        .try_into()
+        .map_err(|_| -> Error { "invalid client credential selector".into() })?;
+    Ok((role, selector))
+}
+
 pub fn client_selector(psk: &[u8; 32]) -> [u8; CLIENT_SELECTOR_LEN] {
     let mut h = Blake2s256::new();
     h.update(b"zeronat-client-credential-selector-v1");
@@ -622,18 +638,9 @@ where
 {
     let mut preface = [0u8; REMOTE_PREFACE_LEN];
     stream.read_exact(&mut preface).await?;
-    if preface[..2] != REMOTE_PREFACE_MAGIC {
-        return Err("unsupported remote handshake preface".into());
-    }
-    if preface[2] != crate::identity::PROTO_VERSION {
-        return Err("unsupported protocol version".into());
-    }
-    let role = AuthRole::from_byte(preface[3])?;
+    let (role, selector) = parse_remote_preface(&preface)?;
     let (identity, psk) = match role {
         AuthRole::Client => {
-            let selector: [u8; CLIENT_SELECTOR_LEN] = preface[4..]
-                .try_into()
-                .map_err(|_| -> Error { "invalid client credential selector".into() })?;
             let (client_id, psk) = clients.get(&selector).ok_or("unknown client credential")?;
             (AuthIdentity::Client(client_id.clone()), psk)
         }
@@ -876,9 +883,13 @@ where
     Ok(noise)
 }
 
+/// Initiator handshake for a claim over a setup conv: probe, relay leg, UDP
+/// forward, or bridge. The credential-selector preface names the client
+/// credential the handshake is keyed by, so the responder learns which client
+/// is claiming `id` before any claim state is touched.
 pub async fn client_handshake_stateless_claim<S>(
     stream: S,
-    psk: &[u8; 32],
+    credential_psk: &[u8; 32],
     id: u64,
     capability: &crate::proto::Capability,
 ) -> Result<StatelessNoise>
@@ -886,24 +897,29 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (noise, _reply) =
-        client_handshake_stateless_claim_reply(stream, psk, id, capability).await?;
+        client_handshake_stateless_claim_reply(stream, credential_psk, id, capability).await?;
     Ok(noise)
 }
 
+/// Like [`client_handshake_stateless_claim`], also returning the responder's
+/// message-2 payload.
 pub async fn client_handshake_stateless_claim_reply<S>(
-    stream: S,
-    psk: &[u8; 32],
+    mut stream: S,
+    credential_psk: &[u8; 32],
     id: u64,
     capability: &crate::proto::Capability,
 ) -> Result<(StatelessNoise, Vec<u8>)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let preface = AuthRole::Client.preface(client_selector(credential_psk));
+    stream.write_all(&preface).await?;
+    stream.flush().await?;
     let mut payload = Vec::with_capacity(8 + crate::proto::CAPABILITY_LEN);
     payload.extend_from_slice(&id.to_be_bytes());
     payload.extend_from_slice(capability);
     let mut stream: BoxStream = Box::new(stream);
-    let (keys, reply) = run_initiator(&mut stream, psk, &STATELESS_PROLOGUE, &payload).await?;
+    let (keys, reply) = run_initiator(&mut stream, credential_psk, &preface, &payload).await?;
     Ok((StatelessNoise::from_keys(keys), reply))
 }
 
@@ -943,16 +959,27 @@ where
     Ok((id, StatelessNoise::from_keys(keys)))
 }
 
+/// Responder side of a claim handshake: read the credential-selector preface,
+/// complete the handshake with that client's credential, and return the
+/// authenticated client id with the claimed `id` and capability. The caller
+/// admits the claim only for the client the credential names.
 pub async fn server_handshake_stateless_claim<S>(
-    stream: S,
-    psk: &[u8; 32],
+    mut stream: S,
+    clients: &ClientCredentials,
     reply: &[u8],
-) -> Result<(u64, crate::proto::Capability, StatelessNoise)>
+) -> Result<(String, u64, crate::proto::Capability, StatelessNoise)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let mut preface = [0u8; REMOTE_PREFACE_LEN];
+    stream.read_exact(&mut preface).await?;
+    let (role, selector) = parse_remote_preface(&preface)?;
+    if role != AuthRole::Client {
+        return Err("stateless claims require a client credential".into());
+    }
+    let (client_id, psk) = clients.get(&selector).ok_or("unknown client credential")?;
     let mut stream: BoxStream = Box::new(stream);
-    let (keys, payload) = run_responder(&mut stream, psk, &STATELESS_PROLOGUE, reply).await?;
+    let (keys, payload) = run_responder(&mut stream, psk, &preface, reply).await?;
     if payload.len() != 8 + crate::proto::CAPABILITY_LEN {
         return Err("invalid data capability in handshake payload".into());
     }
@@ -961,7 +988,12 @@ where
     let id = u64::from_be_bytes(id_bytes);
     let mut capability = [0; crate::proto::CAPABILITY_LEN];
     capability.copy_from_slice(&payload[8..]);
-    Ok((id, capability, StatelessNoise::from_keys(keys)))
+    Ok((
+        client_id.clone(),
+        id,
+        capability,
+        StatelessNoise::from_keys(keys),
+    ))
 }
 
 #[cfg(test)]
@@ -1223,6 +1255,92 @@ mod tests {
         let (prior_result, current_result) = tokio::join!(prior_client, current_server);
         assert!(prior_result.is_err());
         assert!(current_result.is_err());
+    }
+
+    // The claim handshake names its credential in the preface: the responder
+    // resolves the client id from it, keys the handshake with that client's
+    // psk, and hands back the claimed id and capability with a live transport.
+    #[tokio::test]
+    async fn stateless_claim_binds_the_claiming_credential() {
+        let a_psk = derive_psk("claim client a");
+        let b_psk = derive_psk("claim client b");
+        let mut clients = credentials("client-a", a_psk);
+        clients.extend(credentials("client-b", b_psk));
+        let capability = [9u8; crate::proto::CAPABILITY_LEN];
+        let (initiator, responder) = tokio::io::duplex(8192);
+
+        let server = crate::spawn(async move {
+            server_handshake_stateless_claim(responder, &clients, b"observed").await
+        });
+        let (cli, reply) =
+            client_handshake_stateless_claim_reply(initiator, &b_psk, 42, &capability)
+                .await
+                .unwrap();
+        assert_eq!(reply, b"observed");
+        let (client_id, id, got_capability, srv) = server.await.unwrap().unwrap();
+        assert_eq!(client_id, "client-b");
+        assert_eq!(id, 42);
+        assert_eq!(got_capability, capability);
+
+        let d = cli.seal(b"up").unwrap();
+        assert_eq!(srv.open(&d).unwrap(), b"up");
+        let d = srv.seal(b"down").unwrap();
+        assert_eq!(cli.open(&d).unwrap(), b"down");
+    }
+
+    #[tokio::test]
+    async fn stateless_claim_unknown_credential_fails_closed() {
+        let clients = credentials("client-a", derive_psk("claim known"));
+        let stranger = derive_psk("claim stranger");
+        let capability = [0u8; crate::proto::CAPABILITY_LEN];
+        let (initiator, responder) = tokio::io::duplex(8192);
+        let client = client_handshake_stateless_claim(initiator, &stranger, 7, &capability);
+        let server = server_handshake_stateless_claim(responder, &clients, &[]);
+        let (client, server) = tokio::join!(client, server);
+        assert!(client.is_err());
+        assert!(server.is_err());
+    }
+
+    // The admin credential opens no stateless claims: the role is refused
+    // before any psk lookup.
+    #[tokio::test]
+    async fn stateless_claim_refuses_the_admin_role() {
+        let psk = derive_psk("claim admin");
+        let clients = credentials("client-a", psk);
+        let (mut initiator, responder) = tokio::io::duplex(8192);
+        // The selector names a registered credential and the handshake is
+        // keyed by it, so the role byte is the only thing left to refuse on.
+        let admin = async {
+            let preface = AuthRole::Admin.preface(client_selector(&psk));
+            initiator.write_all(&preface).await?;
+            let mut stream: BoxStream = Box::new(initiator);
+            run_initiator(&mut stream, &psk, &preface, &7u64.to_be_bytes()).await
+        };
+        let server = server_handshake_stateless_claim(responder, &clients, &[]);
+        let (admin, server) = tokio::join!(admin, server);
+        assert!(admin.is_err());
+        assert!(server.is_err());
+    }
+
+    // A claim handshake without the credential preface (the shape prior
+    // protocol versions sent) authenticates nothing.
+    #[tokio::test]
+    async fn stateless_claim_without_preface_fails_closed() {
+        let psk = derive_psk("claim prefaceless");
+        let clients = credentials("client-a", psk);
+        let capability = [0u8; crate::proto::CAPABILITY_LEN];
+        let (initiator, responder) = tokio::io::duplex(8192);
+        let legacy = async {
+            let mut payload = Vec::with_capacity(8 + crate::proto::CAPABILITY_LEN);
+            payload.extend_from_slice(&7u64.to_be_bytes());
+            payload.extend_from_slice(&capability);
+            let mut stream: BoxStream = Box::new(initiator);
+            run_initiator(&mut stream, &psk, &STATELESS_PROLOGUE, &payload).await
+        };
+        let server = server_handshake_stateless_claim(responder, &clients, &[]);
+        let (legacy, server) = tokio::join!(legacy, server);
+        assert!(legacy.is_err());
+        assert!(server.is_err());
     }
 
     // The responder's message-2 payload reaches the initiator intact, and the
