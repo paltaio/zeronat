@@ -50,6 +50,24 @@ pub enum PathStatus {
     Relay,
 }
 
+/// Why the server refused a `PeerAnnounce`, reported in `PeerAnnounceRefuse`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerRefuseReason {
+    /// The announced identity is not a usable x25519 public key.
+    MalformedIdentity,
+    /// The proof did not demonstrate possession of the announced identity.
+    FailedProof,
+}
+
+impl std::fmt::Display for PeerRefuseReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PeerRefuseReason::MalformedIdentity => "malformed identity",
+            PeerRefuseReason::FailedProof => "failed proof",
+        })
+    }
+}
+
 /// A public port the server is listening on, as reported in a `Snapshot`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Listener {
@@ -156,8 +174,10 @@ pub struct FwdOptionEntry {
 /// one mutation message (`AddListener`/`RemoveListener`/`SetRoute`/`ClearRoute`),
 /// answered by `MutationResult`.
 /// Peer rendezvous (control channel): a peer-capable client sends `PeerAnnounce`
-/// after `ClientHello`; the server replies `PeerAnnounceAck` (an old server never
-/// acks, so an unacked announce means no peer support). A consumer sends
+/// after `ClientHello`; the server answers `PeerChallenge`, the client proves
+/// possession of the announced identity with `PeerProof`, and the server
+/// replies `PeerAnnounceAck` or `PeerAnnounceRefuse` (an old server never
+/// answers, so an unanswered announce means no peer support). A consumer sends
 /// `PeerConnect`, answered by `PeerResult`; on acceptance the server sends
 /// `PeerProbe` and `PeerInfo` to both parties, each party reports its punch
 /// outcome with `PeerPath`, and on fallback the server sends `PeerRelayOpen`
@@ -239,6 +259,21 @@ pub enum Msg {
         /// The control socket's source address as the server observed it.
         /// Diagnostic only; never a punch candidate.
         observed: SocketAddr,
+    },
+    PeerChallenge {
+        /// The server's fresh x25519 ephemeral public key, one per announce.
+        eph_pub: [u8; 32],
+        /// Random per-announce nonce, covered by the proof MAC.
+        nonce: [u8; 32],
+    },
+    PeerProof {
+        /// Keyed BLAKE2s MAC over the challenge and the announce, keyed by the
+        /// x25519 shared secret between the announced identity and the
+        /// challenge ephemeral.
+        mac: [u8; 32],
+    },
+    PeerAnnounceRefuse {
+        reason: PeerRefuseReason,
     },
     PeerConnect {
         /// The provider's public peer identity.
@@ -352,6 +387,21 @@ fn peer_status_from_byte(n: u8) -> Result<PeerStatus> {
         3 => Ok(PeerStatus::NotProvided),
         4 => Ok(PeerStatus::PeerBusy),
         n => Err(format!("unknown peer status byte {n}").into()),
+    }
+}
+
+fn refuse_reason_byte(r: PeerRefuseReason) -> u8 {
+    match r {
+        PeerRefuseReason::MalformedIdentity => 0,
+        PeerRefuseReason::FailedProof => 1,
+    }
+}
+
+fn refuse_reason_from_byte(n: u8) -> Result<PeerRefuseReason> {
+    match n {
+        0 => Ok(PeerRefuseReason::MalformedIdentity),
+        1 => Ok(PeerRefuseReason::FailedProof),
+        n => Err(format!("unknown refuse reason byte {n}").into()),
     }
 }
 
@@ -908,6 +958,20 @@ impl Msg {
                 put_sockaddr(&mut b, *observed);
                 b
             }
+            Msg::PeerChallenge { eph_pub, nonce } => {
+                let mut b = Vec::with_capacity(65);
+                b.push(25);
+                b.extend_from_slice(eph_pub);
+                b.extend_from_slice(nonce);
+                b
+            }
+            Msg::PeerProof { mac } => {
+                let mut b = Vec::with_capacity(33);
+                b.push(26);
+                b.extend_from_slice(mac);
+                b
+            }
+            Msg::PeerAnnounceRefuse { reason } => vec![27, refuse_reason_byte(*reason)],
             Msg::PeerConnect { peer_id, want } => {
                 let mut b = Vec::with_capacity(2 + PEER_IDENTITY_LEN);
                 b.push(18);
@@ -1337,6 +1401,20 @@ impl Msg {
                     bridge_capability,
                 })
             }
+            Some(25) if b.len() == 65 => {
+                let mut at = 1;
+                let eph_pub = take_arr(b, &mut at, "challenge ephemeral")?;
+                let nonce = take_arr(b, &mut at, "challenge nonce")?;
+                Ok(Msg::PeerChallenge { eph_pub, nonce })
+            }
+            Some(26) if b.len() == 33 => {
+                let mut at = 1;
+                let mac = take_arr(b, &mut at, "announce proof")?;
+                Ok(Msg::PeerProof { mac })
+            }
+            Some(27) if b.len() == 2 => Ok(Msg::PeerAnnounceRefuse {
+                reason: refuse_reason_from_byte(b[1])?,
+            }),
             _ => Err(format!("malformed message ({} bytes)", b.len()).into()),
         }
     }
@@ -2108,7 +2186,7 @@ mod tests {
             assert!(Msg::decode(&bad).is_err());
         }
         // The tag after the peer block is still unknown.
-        assert!(Msg::decode(&[24]).is_err());
+        assert!(Msg::decode(&[28]).is_err());
     }
 
     #[test]
@@ -2139,6 +2217,62 @@ mod tests {
         let mut bad_family = good.clone();
         bad_family[1] = 5;
         assert!(Msg::decode(&bad_family).is_err());
+    }
+
+    #[test]
+    fn peer_challenge_roundtrip() {
+        let good = Msg::PeerChallenge {
+            eph_pub: [5; 32],
+            nonce: [6; 32],
+        }
+        .encode();
+        assert_eq!(good.len(), 65);
+        match Msg::decode(&good).unwrap() {
+            Msg::PeerChallenge { eph_pub, nonce } => {
+                assert_eq!(eph_pub, [5; 32]);
+                assert_eq!(nonce, [6; 32]);
+            }
+            other => panic!("expected peer challenge, got {other:?}"),
+        }
+        for cut in 1..good.len() {
+            assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
+        }
+        let mut junk = good.clone();
+        junk.push(0x00);
+        assert!(Msg::decode(&junk).is_err());
+    }
+
+    #[test]
+    fn peer_proof_roundtrip() {
+        let good = Msg::PeerProof { mac: [7; 32] }.encode();
+        assert_eq!(good.len(), 33);
+        match Msg::decode(&good).unwrap() {
+            Msg::PeerProof { mac } => assert_eq!(mac, [7; 32]),
+            other => panic!("expected peer proof, got {other:?}"),
+        }
+        for cut in 1..good.len() {
+            assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
+        }
+        let mut junk = good.clone();
+        junk.push(0x00);
+        assert!(Msg::decode(&junk).is_err());
+    }
+
+    #[test]
+    fn peer_announce_refuse_roundtrip() {
+        for reason in [
+            PeerRefuseReason::MalformedIdentity,
+            PeerRefuseReason::FailedProof,
+        ] {
+            match roundtrip(&Msg::PeerAnnounceRefuse { reason }) {
+                Msg::PeerAnnounceRefuse { reason: got } => assert_eq!(got, reason),
+                other => panic!("expected peer announce refuse, got {other:?}"),
+            }
+        }
+        // Truncated, trailing, and undefined-reason bodies all error.
+        assert!(Msg::decode(&[27]).is_err());
+        assert!(Msg::decode(&[27, 9]).is_err());
+        assert!(Msg::decode(&[27, 0, 0]).is_err());
     }
 
     #[test]

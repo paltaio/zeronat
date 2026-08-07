@@ -4077,12 +4077,42 @@ async fn peer_control_connect(
         Msg::ClientHelloAck { client_id, .. } => assert_eq!(client_id, expected_id),
         other => panic!("expected client hello ack, got {other:?}"),
     }
+    answer_announce_challenge(&mut r, &mut w, client_id, provides).await;
     let frame = r.recv().await.unwrap();
     match Msg::decode(&frame).unwrap() {
         Msg::PeerAnnounceAck { observed } => assert_eq!(observed, local),
         other => panic!("expected announce ack, got {other:?}"),
     }
     (r, w)
+}
+
+/// Answer the announce's `PeerChallenge` with the proof only this peer's
+/// static key can compute.
+async fn answer_announce_challenge(
+    r: &mut zeronat::noise::NoiseReader,
+    w: &mut zeronat::noise::NoiseWriter,
+    client_id: &str,
+    provides: u8,
+) {
+    let frame = r.recv().await.unwrap();
+    let (eph_pub, nonce) = match Msg::decode(&frame).unwrap() {
+        Msg::PeerChallenge { eph_pub, nonce } => (eph_pub, nonce),
+        other => panic!("expected peer challenge, got {other:?}"),
+    };
+    w.send(
+        &Msg::PeerProof {
+            mac: zeronat::noise::announce_proof(
+                &peer_static_of(client_id),
+                &eph_pub,
+                &nonce,
+                provides,
+                client_id,
+            ),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
 }
 
 /// One `PeerConnect` round-trip on an announced control session, asserting the
@@ -4265,6 +4295,7 @@ async fn peer_control_connect_udp(
         Msg::ClientHelloAck { client_id, .. } => assert_eq!(client_id, expected_id),
         other => panic!("expected client hello ack, got {other:?}"),
     }
+    answer_announce_challenge(&mut r, &mut w, client_id, provides).await;
     let frame = r.recv().await.unwrap();
     assert!(
         matches!(Msg::decode(&frame).unwrap(), Msg::PeerAnnounceAck { .. }),

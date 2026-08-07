@@ -22,14 +22,15 @@ use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
 #[cfg(target_os = "linux")]
 use crate::netfilter;
 use crate::noise::{
-    server_handshake_remote, server_handshake_stateless_claim, AuthIdentity, ClientCredentials,
-    Noise, NoiseReader, NoiseWriter, StatelessNoise,
+    server_handshake_remote, server_handshake_stateless_claim, AnnounceChallenge, AuthIdentity,
+    ClientCredentials, Noise, NoiseReader, NoiseWriter, StatelessNoise,
 };
 #[cfg(target_os = "linux")]
 use crate::proto::BridgeEntry;
 use crate::proto::{
     proto_name, Capability, ClientEntry, FwdOptionEntry, Listener, Msg, PairEntry, PathStatus,
-    PeerIdentity, PeerStatus, Proto, RouteEntry, SnapshotBody, Source, PROVIDES_EXIT,
+    PeerIdentity, PeerRefuseReason, PeerStatus, Proto, RouteEntry, SnapshotBody, Source,
+    PROVIDES_EXIT,
 };
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
@@ -170,12 +171,13 @@ struct ClientHandle {
     /// The control socket's source address as observed at registration.
     /// Diagnostic only; never a punch candidate.
     observed: Option<SocketAddr>,
-    /// The capability bitset from this client's `PeerAnnounce`, or `None` while
-    /// it has not announced. The server sends peer tags only to a client whose
-    /// entry holds `Some`, so an old client never sees an undecodable frame.
+    /// The capability bitset from this client's proven `PeerAnnounce`, or
+    /// `None` until a proof completes. Beyond the announce exchange itself,
+    /// the server sends peer tags only to a client whose entry holds `Some`,
+    /// so an old client never sees an undecodable frame.
     peer_provides: Option<u8>,
-    /// The peer identity this client's `PeerAnnounce` asserted. `PeerConnect`
-    /// resolves over these.
+    /// The peer identity this client's announce proved possession of.
+    /// `PeerConnect` resolves over these.
     peer_identity: Option<PeerIdentity>,
     bridge_capability: Option<Capability>,
     cancel: watch::Sender<bool>,
@@ -392,9 +394,9 @@ pub(crate) struct Server {
     pending: Mutex<HashMap<u64, PendingStream>>,
     udp_pending: Mutex<HashMap<u64, UdpPending>>,
     clients: Mutex<HashMap<String, ClientHandle>>,
-    /// Every peer identity an announce has ever asserted on this server, kept
-    /// across disconnects so `PeerConnect` can tell an offline peer from an
-    /// unknown one.
+    /// Every peer identity a completed proof has ever registered on this
+    /// server, kept across disconnects so `PeerConnect` can tell an offline
+    /// peer from an unknown one. An unproven claim is never remembered here.
     known_peer_identities: Mutex<HashSet<PeerIdentity>>,
     /// Accepted rendezvous pairs by `pair_id`.
     pairs: Mutex<HashMap<u64, Pair>>,
@@ -588,9 +590,7 @@ impl Server {
         // comparing the two identities, so equal identities leave both ends
         // responders: neither can send handshake message one, the pair burns
         // its deadline, and an exclusive provider's one slot is held by a
-        // pair that carries nothing. Until announces prove possession, two
-        // sessions can also claim one identity, so the guard refuses the
-        // identity itself, not just the consumer's own registry entry.
+        // pair that carries nothing.
         if consumer.peer_identity.as_ref() == Some(provider) {
             return Some((0, PeerStatus::UnknownPeer));
         }
@@ -599,8 +599,8 @@ impl Server {
             .find(|(_, h)| h.peer_identity.as_ref() == Some(provider));
         let Some((provider_id, handle)) = resolved else {
             drop(clients);
-            // An identity an announce has asserted before but that no live
-            // session holds is offline; one this server has never seen is
+            // An identity a completed proof has registered before but that no
+            // live session holds is offline; one no proof has ever landed is
             // unknown.
             if self
                 .known_peer_identities
@@ -1436,6 +1436,16 @@ async fn handle_incoming(
     serve_stream(srv, role, r, w, ActiveTransport::Tcp, Some(peer)).await
 }
 
+/// One control session's announce mid-exchange: the claim it asserted and the
+/// challenge minted for it. A fresh announce replaces it and the proof takes
+/// it, so at most one exchange is pending per session, and it dies with the
+/// session task that holds it.
+struct PendingAnnounce {
+    provides: u8,
+    identity: PeerIdentity,
+    challenge: AnnounceChallenge,
+}
+
 /// Dispatch a freshly authenticated client or admin stream over either transport.
 /// The first message must match the authenticated role.
 pub(crate) async fn serve_stream(
@@ -1510,6 +1520,7 @@ pub(crate) async fn serve_stream(
             // deadline also keeps resetting. A timeout (no inbound frame for the
             // whole window) or a recv error breaks the loop and tears down: a
             // black-holed link delivers no FIN/RST, so only the deadline catches it.
+            let mut pending_announce: Option<PendingAnnounce> = None;
             loop {
                 let bytes = tokio::select! {
                     _ = session_cancelled(&mut cancelled) => break,
@@ -1556,32 +1567,114 @@ pub(crate) async fn serve_stream(
                         tx.try_send(Msg::FwdOptionsAck.encode()).ok();
                     }
                     Ok(Msg::PeerAnnounce { provides, identity }) => {
-                        // Record peer support and the asserted identity only
+                        // The announce only claims an identity; nothing
+                        // registers until the proof settles. A repeat replaces
+                        // the pending exchange, so the newest challenge is the
+                        // only one a proof can answer.
+                        match AnnounceChallenge::mint(&identity) {
+                            Ok(Some(challenge)) => {
+                                let msg = Msg::PeerChallenge {
+                                    eph_pub: challenge.eph_pub,
+                                    nonce: challenge.nonce,
+                                };
+                                pending_announce = Some(PendingAnnounce {
+                                    provides,
+                                    identity,
+                                    challenge,
+                                });
+                                tx.try_send(msg.encode()).ok();
+                            }
+                            Ok(None) => {
+                                pending_announce = None;
+                                let hex = crate::secret::encode(identity);
+                                crate::elog!(
+                                    "client {client_id}: peer announce for {hex} refused: \
+                                     malformed identity"
+                                );
+                                tx.try_send(
+                                    Msg::PeerAnnounceRefuse {
+                                        reason: PeerRefuseReason::MalformedIdentity,
+                                    }
+                                    .encode(),
+                                )
+                                .ok();
+                            }
+                            Err(e) => {
+                                pending_announce = None;
+                                crate::elog!("client {client_id}: peer challenge failed: {e}");
+                            }
+                        }
+                    }
+                    Ok(Msg::PeerProof { mac }) => {
+                        // A proof with no exchange pending is dropped like any
+                        // unknown frame.
+                        let Some(pending) = pending_announce.take() else {
+                            continue;
+                        };
+                        let hex = crate::secret::encode(pending.identity);
+                        if !pending.challenge.verify(pending.provides, &client_id, &mac) {
+                            crate::elog!(
+                                "client {client_id}: peer announce for {hex} refused: failed proof"
+                            );
+                            tx.try_send(
+                                Msg::PeerAnnounceRefuse {
+                                    reason: PeerRefuseReason::FailedProof,
+                                }
+                                .encode(),
+                            )
+                            .ok();
+                            continue;
+                        }
+                        // Record peer support and the proven identity only
                         // while this session still owns its slot (same guard
                         // as FwdOptions); the recorded entry gates every later
-                        // peer tag to this client.
-                        let recorded = {
+                        // peer tag to this client. Possession defines
+                        // rightful, so the proof also displaces any other live
+                        // session holding the identity: its peer state is
+                        // cleared under the same guard and its pairs are
+                        // invalidated like a superseded control session's.
+                        let (observed, displaced) = {
                             let mut clients = srv.clients.lock().unwrap();
-                            match clients.get_mut(&client_id) {
-                                Some(h) if h.tx.same_channel(&tx) => {
-                                    h.peer_provides = Some(provides);
-                                    h.peer_identity = Some(identity);
-                                    Some(h.observed)
+                            let owned = clients
+                                .get(&client_id)
+                                .is_some_and(|h| h.tx.same_channel(&tx));
+                            if owned {
+                                let mut displaced = Vec::new();
+                                let mut observed = None;
+                                for (id, h) in clients.iter_mut() {
+                                    if *id == client_id {
+                                        h.peer_provides = Some(pending.provides);
+                                        h.peer_identity = Some(pending.identity);
+                                        observed = Some(h.observed);
+                                    } else if h.peer_identity == Some(pending.identity) {
+                                        h.peer_provides = None;
+                                        h.peer_identity = None;
+                                        displaced.push(id.clone());
+                                    }
                                 }
-                                _ => None,
+                                (observed, displaced)
+                            } else {
+                                (None, Vec::new())
                             }
                         };
-                        let observed = match recorded {
-                            Some(observed) => {
-                                srv.known_peer_identities.lock().unwrap().insert(identity);
-                                observed
+                        if observed.is_some() {
+                            srv.known_peer_identities
+                                .lock()
+                                .unwrap()
+                                .insert(pending.identity);
+                            for id in &displaced {
+                                srv.invalidate_pairs(id);
+                                crate::elog!(
+                                    "peer identity {hex} proven by client {client_id}, \
+                                     superseding client {id}; displaced peer state \
+                                     invalidated"
+                                );
                             }
-                            None => None,
-                        };
+                        }
                         // The ack echoes the control address recorded at
                         // registration; like FwdOptionsAck it is only ever sent
                         // in reply.
-                        if let Some(observed) = observed {
+                        if let Some(Some(observed)) = observed {
                             tx.try_send(Msg::PeerAnnounceAck { observed }.encode()).ok();
                         }
                     }
@@ -3629,24 +3722,24 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         assert_ne!(pair_id, 0);
     }
 
-    // PeerAnnounce is acked with the control address recorded at registration,
-    // and the announced bitset lands on the registry entry that gates every
-    // later peer tag.
-    #[tokio::test]
-    async fn peer_announce_acked_with_recorded_address() {
-        let srv = test_server();
+    /// Connect a hand-rolled control session through `serve_stream` and read
+    /// the `ClientHelloAck`, returning the session halves and the server task.
+    async fn connect_control(
+        srv: &Arc<Server>,
+        client_id: &str,
+        observed: SocketAddr,
+    ) -> (NoiseReader, NoiseWriter, tokio::task::JoinHandle<()>) {
         let (client_io, server_io) = tokio::io::duplex(8192);
         let psk = srv.psk;
-        let observed: SocketAddr = "203.0.113.7:4321".parse().unwrap();
-
         let srv2 = srv.clone();
+        let id = client_id.to_string();
         let server = crate::spawn(async move {
             let (r, w) = crate::noise::server_handshake(server_io, &psk)
                 .await
                 .expect("server handshake");
             let _ = serve_stream(
                 srv2,
-                AuthIdentity::Client("prov".into()),
+                AuthIdentity::Client(id),
                 r,
                 w,
                 ActiveTransport::Tcp,
@@ -3654,35 +3747,90 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             )
             .await;
         });
-
         let (mut cr, mut cw) = crate::noise::client_handshake(client_io, &psk)
             .await
             .expect("client handshake");
         cw.send(
             &Msg::ClientHello {
                 version: crate::identity::PROTO_VERSION,
-                client_id: "prov".into(),
+                client_id: client_id.into(),
             }
             .encode(),
         )
         .await
         .unwrap();
-        cr.recv().await.unwrap();
-        cw.send(
-            &Msg::PeerAnnounce {
-                provides: PROVIDES_EXIT,
-                identity: [3; 32],
-            }
-            .encode(),
-        )
-        .await
-        .unwrap();
+        let bytes = cr.recv().await.unwrap();
+        assert!(matches!(
+            Msg::decode(&bytes),
+            Ok(Msg::ClientHelloAck { .. })
+        ));
+        (cr, cw, server)
+    }
 
+    /// Drive the four-message announce exchange, answering the challenge with
+    /// `static_private`, and return the server's verdict frame. A refusal sent
+    /// in place of the challenge is returned as the verdict.
+    async fn announce_exchange(
+        cr: &mut NoiseReader,
+        cw: &mut NoiseWriter,
+        static_private: &[u8; 32],
+        identity: PeerIdentity,
+        provides: u8,
+        client_id: &str,
+    ) -> Msg {
+        cw.send(&Msg::PeerAnnounce { provides, identity }.encode())
+            .await
+            .unwrap();
         let bytes = timeout(Duration::from_secs(10), cr.recv())
             .await
-            .expect("no announce ack")
+            .expect("no challenge")
             .unwrap();
-        match Msg::decode(&bytes).unwrap() {
+        let (eph_pub, nonce) = match Msg::decode(&bytes).unwrap() {
+            Msg::PeerChallenge { eph_pub, nonce } => (eph_pub, nonce),
+            other => return other,
+        };
+        cw.send(
+            &Msg::PeerProof {
+                mac: crate::noise::announce_proof(
+                    static_private,
+                    &eph_pub,
+                    &nonce,
+                    provides,
+                    client_id,
+                ),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        let bytes = timeout(Duration::from_secs(10), cr.recv())
+            .await
+            .expect("no announce verdict")
+            .unwrap();
+        Msg::decode(&bytes).unwrap()
+    }
+
+    // A proven announce is acked with the control address recorded at
+    // registration, and the announced bitset and identity land on the registry
+    // entry that gates every later peer tag.
+    #[tokio::test]
+    async fn peer_announce_acked_with_recorded_address() {
+        let srv = test_server();
+        let observed: SocketAddr = "203.0.113.7:4321".parse().unwrap();
+        let static_private = crate::noise::derive_psk("prov announce static");
+        let identity = crate::noise::public_identity(&static_private);
+        let (mut cr, mut cw, server) = connect_control(&srv, "prov", observed).await;
+
+        match announce_exchange(
+            &mut cr,
+            &mut cw,
+            &static_private,
+            identity,
+            PROVIDES_EXIT,
+            "prov",
+        )
+        .await
+        {
             Msg::PeerAnnounceAck { observed: got } => assert_eq!(got, observed),
             other => panic!("expected announce ack, got {other:?}"),
         }
@@ -3690,9 +3838,239 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             let clients = srv.clients.lock().unwrap();
             let handle = clients.get("prov").unwrap();
             assert_eq!(handle.peer_provides, Some(PROVIDES_EXIT));
-            assert_eq!(handle.peer_identity, Some([3; 32]));
+            assert_eq!(handle.peer_identity, Some(identity));
         }
-        assert!(srv.known_peer_identities.lock().unwrap().contains(&[3; 32]));
+        assert!(srv
+            .known_peer_identities
+            .lock()
+            .unwrap()
+            .contains(&identity));
+        server.abort();
+    }
+
+    // An impostor announcing an identity it cannot prove is refused and
+    // registers nothing, while the key holder still lands the same identity
+    // afterwards. The two verdicts differ inside one test, so a verifier that
+    // accepts everything or refuses everything fails it either way.
+    #[tokio::test]
+    async fn announce_proof_refuses_impostors_and_admits_the_key_holder() {
+        let srv = test_server();
+        let observed: SocketAddr = "203.0.113.7:4321".parse().unwrap();
+        let owner_static = crate::noise::derive_psk("owner announce static");
+        let impostor_static = crate::noise::derive_psk("impostor announce static");
+        let identity = crate::noise::public_identity(&owner_static);
+
+        let (mut ir, mut iw, impostor_task) = connect_control(&srv, "impostor", observed).await;
+        match announce_exchange(
+            &mut ir,
+            &mut iw,
+            &impostor_static,
+            identity,
+            PROVIDES_EXIT,
+            "impostor",
+        )
+        .await
+        {
+            Msg::PeerAnnounceRefuse { reason } => {
+                assert_eq!(reason, PeerRefuseReason::FailedProof);
+            }
+            other => panic!("expected an announce refusal, got {other:?}"),
+        }
+        {
+            let clients = srv.clients.lock().unwrap();
+            let handle = clients.get("impostor").unwrap();
+            assert_eq!(handle.peer_provides, None);
+            assert_eq!(handle.peer_identity, None);
+        }
+        assert!(!srv
+            .known_peer_identities
+            .lock()
+            .unwrap()
+            .contains(&identity));
+
+        let (mut or, mut ow, owner_task) = connect_control(&srv, "owner", observed).await;
+        match announce_exchange(
+            &mut or,
+            &mut ow,
+            &owner_static,
+            identity,
+            PROVIDES_EXIT,
+            "owner",
+        )
+        .await
+        {
+            Msg::PeerAnnounceAck { .. } => {}
+            other => panic!("expected an announce ack, got {other:?}"),
+        }
+        assert_eq!(
+            srv.clients
+                .lock()
+                .unwrap()
+                .get("owner")
+                .unwrap()
+                .peer_identity,
+            Some(identity)
+        );
+        assert!(srv
+            .known_peer_identities
+            .lock()
+            .unwrap()
+            .contains(&identity));
+        impostor_task.abort();
+        owner_task.abort();
+    }
+
+    // A small-order identity is refused at the announce, before any challenge
+    // goes out, and registers nothing.
+    #[tokio::test]
+    async fn announce_refuses_a_malformed_identity() {
+        let srv = test_server();
+        let observed: SocketAddr = "203.0.113.7:4321".parse().unwrap();
+        let (mut cr, mut cw, server) = connect_control(&srv, "prov", observed).await;
+        cw.send(
+            &Msg::PeerAnnounce {
+                provides: PROVIDES_EXIT,
+                identity: [0; 32],
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        let bytes = timeout(Duration::from_secs(10), cr.recv())
+            .await
+            .expect("no refusal")
+            .unwrap();
+        match Msg::decode(&bytes).unwrap() {
+            Msg::PeerAnnounceRefuse { reason } => {
+                assert_eq!(reason, PeerRefuseReason::MalformedIdentity);
+            }
+            other => panic!("expected an announce refusal, got {other:?}"),
+        }
+        let clients = srv.clients.lock().unwrap();
+        assert_eq!(clients.get("prov").unwrap().peer_identity, None);
+        drop(clients);
+        server.abort();
+    }
+
+    // Possession defines rightful: a second session proving the same identity
+    // displaces the first, whose peer state and pairs are invalidated, and a
+    // failed proof afterwards leaves the standing claim untouched.
+    #[tokio::test]
+    async fn proven_claim_supersedes_and_a_failed_proof_does_not() {
+        let srv = test_server();
+        let observed: SocketAddr = "203.0.113.7:4321".parse().unwrap();
+        let static_private = crate::noise::derive_psk("shared announce static");
+        let impostor_static = crate::noise::derive_psk("impostor announce static");
+        let identity = crate::noise::public_identity(&static_private);
+
+        let (mut ar, mut aw, a_task) = connect_control(&srv, "a", observed).await;
+        assert!(matches!(
+            announce_exchange(
+                &mut ar,
+                &mut aw,
+                &static_private,
+                identity,
+                PROVIDES_EXIT,
+                "a"
+            )
+            .await,
+            Msg::PeerAnnounceAck { .. }
+        ));
+        // Pair a consumer against the claim so the displacement has a pair to
+        // invalidate.
+        let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
+        let (_pair_id, status) = srv
+            .peer_connect("c", &c_tx, &identity, PROVIDES_EXIT)
+            .unwrap();
+        assert_eq!(status, PeerStatus::Accepted);
+
+        let (mut br, mut bw, b_task) = connect_control(&srv, "b", observed).await;
+        assert!(matches!(
+            announce_exchange(
+                &mut br,
+                &mut bw,
+                &static_private,
+                identity,
+                PROVIDES_EXIT,
+                "b"
+            )
+            .await,
+            Msg::PeerAnnounceAck { .. }
+        ));
+        {
+            let clients = srv.clients.lock().unwrap();
+            assert_eq!(clients.get("a").unwrap().peer_identity, None);
+            assert_eq!(clients.get("a").unwrap().peer_provides, None);
+            assert_eq!(clients.get("b").unwrap().peer_identity, Some(identity));
+        }
+        assert!(
+            srv.pairs.lock().unwrap().is_empty(),
+            "the displaced claim's pair is invalidated"
+        );
+
+        // An impostor's failed proof leaves the standing claim untouched.
+        let (mut er, mut ew, evil_task) = connect_control(&srv, "evil", observed).await;
+        match announce_exchange(
+            &mut er,
+            &mut ew,
+            &impostor_static,
+            identity,
+            PROVIDES_EXIT,
+            "evil",
+        )
+        .await
+        {
+            Msg::PeerAnnounceRefuse { reason } => {
+                assert_eq!(reason, PeerRefuseReason::FailedProof);
+            }
+            other => panic!("expected an announce refusal, got {other:?}"),
+        }
+        assert_eq!(
+            srv.clients.lock().unwrap().get("b").unwrap().peer_identity,
+            Some(identity)
+        );
+        a_task.abort();
+        b_task.abort();
+        evil_task.abort();
+    }
+
+    // An identity whose proof never arrives registers nothing: to a consumer
+    // it is unknown, not offline, and the known-identity memory stays empty.
+    #[tokio::test]
+    async fn unproven_identity_is_unknown_not_offline() {
+        let srv = test_server();
+        let observed: SocketAddr = "203.0.113.7:4321".parse().unwrap();
+        let static_private = crate::noise::derive_psk("silent announce static");
+        let identity = crate::noise::public_identity(&static_private);
+        let (mut cr, mut cw, server) = connect_control(&srv, "silent", observed).await;
+        cw.send(
+            &Msg::PeerAnnounce {
+                provides: PROVIDES_EXIT,
+                identity,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        let bytes = timeout(Duration::from_secs(10), cr.recv())
+            .await
+            .expect("no challenge")
+            .unwrap();
+        assert!(matches!(
+            Msg::decode(&bytes).unwrap(),
+            Msg::PeerChallenge { .. }
+        ));
+        // The proof never arrives; the claim occupies nothing.
+        let (c_tx, _c_rx) = register_peer_client(&srv, "c", Some(0));
+        assert_eq!(
+            srv.peer_connect("c", &c_tx, &identity, PROVIDES_EXIT),
+            Some((0, PeerStatus::UnknownPeer))
+        );
+        assert!(!srv
+            .known_peer_identities
+            .lock()
+            .unwrap()
+            .contains(&identity));
         server.abort();
     }
 

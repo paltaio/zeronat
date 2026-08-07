@@ -87,6 +87,103 @@ pub fn public_identity(private: &[u8; 32]) -> [u8; 32] {
     x25519(*private, X25519_BASEPOINT_BYTES)
 }
 
+const ANNOUNCE_PROOF_TAG: &[u8] = b"zeronat-peer-announce-proof-v1";
+
+/// The keyed MAC an announce proof carries: a domain tag, the protocol
+/// version, the challenge nonce and ephemeral, the claimed identity, the
+/// announced `provides` byte, and the announcing client's id, keyed by the
+/// x25519 shared secret between the challenge ephemeral and the identity.
+fn announce_mac(
+    shared: &[u8; 32],
+    eph_pub: &[u8; 32],
+    nonce: &[u8; 32],
+    identity: &[u8; 32],
+    provides: u8,
+    client_id: &str,
+) -> SimpleHmac<Blake2s256> {
+    let mut mac =
+        <SimpleHmac<Blake2s256> as Mac>::new_from_slice(shared).expect("hmac accepts any key len");
+    mac.update(ANNOUNCE_PROOF_TAG);
+    mac.update(&[crate::identity::PROTO_VERSION]);
+    mac.update(nonce);
+    mac.update(eph_pub);
+    mac.update(identity);
+    mac.update(&[provides]);
+    mac.update(client_id.as_bytes());
+    mac
+}
+
+/// Answer a `PeerChallenge`: the proof MAC only the announced identity's
+/// static private key can compute.
+pub fn announce_proof(
+    static_private: &[u8; 32],
+    eph_pub: &[u8; 32],
+    nonce: &[u8; 32],
+    provides: u8,
+    client_id: &str,
+) -> [u8; 32] {
+    let shared = x25519(*static_private, *eph_pub);
+    let identity = public_identity(static_private);
+    announce_mac(&shared, eph_pub, nonce, &identity, provides, client_id)
+        .finalize()
+        .into_bytes()
+        .into()
+}
+
+/// One announce's server-side challenge: the ephemeral public key and nonce
+/// sent to the client, and the shared secret held to verify the proof. The
+/// ephemeral private key is dropped at mint, so the challenge is single-use
+/// and dies with the exchange it was minted for.
+pub struct AnnounceChallenge {
+    pub eph_pub: [u8; 32],
+    pub nonce: [u8; 32],
+    identity: [u8; 32],
+    shared: [u8; 32],
+}
+
+impl AnnounceChallenge {
+    /// Mint a challenge for a claimed identity. `Ok(None)` marks a malformed
+    /// identity: a point whose shared secret is all zeros, which would key
+    /// the proof with a value anyone can compute.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the system random source is unavailable.
+    pub fn mint(identity: &[u8; 32]) -> Result<Option<AnnounceChallenge>> {
+        let mut eph_priv = [0u8; 32];
+        getrandom::getrandom(&mut eph_priv)
+            .map_err(|e| -> Error { format!("generating an ephemeral key: {e}").into() })?;
+        let mut nonce = [0u8; 32];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|e| -> Error { format!("generating a challenge nonce: {e}").into() })?;
+        let shared = x25519(eph_priv, *identity);
+        if shared == [0u8; 32] {
+            return Ok(None);
+        }
+        Ok(Some(AnnounceChallenge {
+            eph_pub: public_identity(&eph_priv),
+            nonce,
+            identity: *identity,
+            shared,
+        }))
+    }
+
+    /// Whether `mac` proves possession of the identity this challenge was
+    /// minted for. The comparison runs in constant time.
+    pub fn verify(&self, provides: u8, client_id: &str, mac: &[u8; 32]) -> bool {
+        announce_mac(
+            &self.shared,
+            &self.eph_pub,
+            &self.nonce,
+            &self.identity,
+            provides,
+            client_id,
+        )
+        .verify_slice(mac)
+        .is_ok()
+    }
+}
+
 /// Derive the 32-byte pre-shared key from the user's passphrase.
 pub fn derive_psk(secret: &str) -> [u8; 32] {
     let mut h = Blake2s256::new();
@@ -960,6 +1057,36 @@ mod tests {
         );
         assert!(initiator.seal(b"wrapped").is_err());
         assert!(initiator.seal(b"wrapped again").is_err());
+    }
+
+    // The proof binds every transcript field: only the identity's key holder
+    // can compute it, and changing the provides byte or the client id fails
+    // an otherwise valid MAC.
+    #[test]
+    fn announce_proof_verifies_only_the_key_holder() {
+        let owner = derive_psk("announce owner");
+        let impostor = derive_psk("announce impostor");
+        let identity = public_identity(&owner);
+        let challenge = AnnounceChallenge::mint(&identity).unwrap().unwrap();
+
+        let good = announce_proof(&owner, &challenge.eph_pub, &challenge.nonce, 1, "node-a");
+        assert!(challenge.verify(1, "node-a", &good));
+        assert!(!challenge.verify(2, "node-a", &good));
+        assert!(!challenge.verify(1, "node-b", &good));
+
+        let forged = announce_proof(&impostor, &challenge.eph_pub, &challenge.nonce, 1, "node-a");
+        assert!(!challenge.verify(1, "node-a", &forged));
+
+        // A proof answers only the challenge it was computed for.
+        let fresh = AnnounceChallenge::mint(&identity).unwrap().unwrap();
+        assert!(!fresh.verify(1, "node-a", &good));
+    }
+
+    #[test]
+    fn announce_challenge_refuses_a_small_order_identity() {
+        assert!(AnnounceChallenge::mint(&[0u8; 32]).unwrap().is_none());
+        let identity = public_identity(&derive_psk("valid announce identity"));
+        assert!(AnnounceChallenge::mint(&identity).unwrap().is_some());
     }
 
     #[test]

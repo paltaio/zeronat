@@ -2635,6 +2635,47 @@ async fn control_loop(
                 }
                 None
             }
+            Ok(Msg::PeerChallenge { eph_pub, nonce }) => {
+                // The challenge answers this session's announce; the proof
+                // binds the server-authorized client id, which the ordered
+                // control stream delivers before any challenge.
+                if let (Some(provides), Some(peer_static)) =
+                    (client.peer_announce, &client.peer_static)
+                {
+                    let Some(client_id) = authorized_client_id.as_deref() else {
+                        break Err(
+                            "server challenged the peer announce before client authorization"
+                                .into(),
+                        );
+                    };
+                    tx.try_send(
+                        Msg::PeerProof {
+                            mac: crate::noise::announce_proof(
+                                peer_static,
+                                &eph_pub,
+                                &nonce,
+                                provides,
+                                client_id,
+                            ),
+                        }
+                        .encode(),
+                    )
+                    .ok();
+                }
+                None
+            }
+            Ok(Msg::PeerAnnounceRefuse { reason }) => {
+                // The server answered, so the missing-support watchdog stays
+                // quiet; dropping the guard fails every peer slot for this
+                // control session with the server's reason.
+                peer_ack.store(true, Ordering::Relaxed);
+                peer_live = None;
+                crate::elog!(
+                    "server refused the peer announce: {reason}; no peer session can pair \
+                     over this control session"
+                );
+                None
+            }
             Ok(Msg::PeerAnnounceAck { observed }) => {
                 peer_ack.store(true, Ordering::Relaxed);
                 if peer_live.is_none() {
