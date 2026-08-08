@@ -1040,13 +1040,19 @@ impl App {
         match self.cfg.mode {
             Mode::Client if self.cfg.use_dht => {
                 add("server", "via DHT".to_string(), PLAIN);
-                add("discovery", self.cfg.discovery.clone(), GOOD);
+                add("discovery", "set (hidden)".to_string(), GOOD);
             }
             Mode::Client => add("server", self.cfg.server_addr.clone(), PLAIN),
             Mode::Server if self.cfg.use_dht => add("discovery", "DHT publish".to_string(), PLAIN),
             Mode::Server => add("control", self.cfg.control.clone(), PLAIN),
         }
-        add("secret", self.cfg.secret.clone(), GOOD);
+        // The value itself stays off the screen; the env file holds it.
+        let secret = match self.cfg.secret_mode {
+            SecretMode::Reuse => "reuse existing (hidden)",
+            SecretMode::Generate => "generate new",
+            SecretMode::Enter => "entered (hidden)",
+        };
+        add("secret", secret.to_string(), GOOD);
     }
 
     fn status_line(&self) -> Line {
@@ -1149,5 +1155,24 @@ mod tests {
         app.sel = 0;
         assert!(!app.apply_selection());
         assert!(app.error.as_deref().unwrap().contains("64 hexadecimal"));
+    }
+
+    #[test]
+    fn summary_screen_renders_no_credential() {
+        let mut app = App::new(Config::new(false, false, None), None);
+        app.cfg.mode = Mode::Client;
+        app.cfg.use_dht = true;
+        app.cfg.secret = "a".repeat(64);
+        app.cfg.discovery = "b".repeat(64);
+        app.cfg.admin_secret = "c".repeat(64);
+        app.cfg.secret_mode = SecretMode::Enter;
+        app.step = Step::Summary;
+
+        let mut body = Vec::new();
+        app.summary_rows(80, &mut body);
+        let screen = body.join("\n");
+        assert!(!screen.contains(&app.cfg.secret), "{screen}");
+        assert!(!screen.contains(&app.cfg.discovery), "{screen}");
+        assert!(!screen.contains(&app.cfg.admin_secret), "{screen}");
     }
 }

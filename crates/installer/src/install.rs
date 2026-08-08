@@ -324,10 +324,8 @@ fn console_cmd(cfg: &Config) -> Option<String> {
         // The image is FROM scratch with the binary at /zeronat, and the
         // container receives ZERONAT_ADMIN_SECRET from its env file.
         Method::Docker => format!("docker exec -it zeronat /zeronat admin --server {target}"),
-        Method::Systemd => format!(
-            "zeronat admin --server {target} --secret {}",
-            cfg.admin_secret
-        ),
+        // sudo lets admin read ZERONAT_ADMIN_SECRET from the root-owned env file.
+        Method::Systemd => format!("sudo {BIN_PATH} admin --server {target}"),
     })
 }
 
@@ -335,28 +333,41 @@ fn console_cmd(cfg: &Config) -> Option<String> {
 /// mirroring the shell installer.
 fn peer_steps(cfg: &Config) -> (String, String) {
     let fwd = forward_flag(cfg);
+    // The one-liner lands in scrollback and shell history on the other machine,
+    // so it carries prompt flags instead of the credentials themselves.
+    let names = if cfg.use_dht {
+        "ZERONAT_SECRET and ZERONAT_DISCOVERY_SECRET"
+    } else {
+        "ZERONAT_SECRET"
+    };
+    let entry = if cfg.use_dht {
+        "enter each value at its hidden prompt"
+    } else {
+        "enter it at the hidden prompt"
+    };
     match cfg.mode {
         Mode::Server => {
             let cmd = if cfg.use_dht {
                 format!(
-                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --dht --secret {} --discovery {} {fwd} -y",
-                    cfg.secret, cfg.discovery
+                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --dht --secret-prompt --discovery-prompt {fwd} -y"
                 )
             } else {
                 let host = sys::pub_ip();
                 format!(
-                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --server-addr {host}:{} --secret {} {fwd} -y",
-                    cfg.control, cfg.secret
+                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --server-addr {host}:{} --secret-prompt {fwd} -y",
+                    cfg.control
                 )
             };
             (
-                "Run this on the client (the machine behind CG-NAT):".into(),
+                format!(
+                    "Read {names} from {ENV_FILE} on this server. Run this on the client (the machine behind CG-NAT) and {entry}:"
+                ),
                 cmd,
             )
         }
         Mode::Client => {
             let disc = if cfg.use_dht {
-                format!("--dht --discovery {}", cfg.discovery)
+                "--dht --discovery-prompt".to_string()
             } else {
                 // The server must listen on the port the client dials, which is
                 // the one in the entered address (falling back to the default).
@@ -368,11 +379,12 @@ fn peer_steps(cfg: &Config) -> (String, String) {
                 format!("--control {ctrl}")
             };
             let cmd = format!(
-                "curl -fsSL {INSTALL_URL} | sh -s -- --server {disc} --secret {} {fwd} -y",
-                cfg.secret
+                "curl -fsSL {INSTALL_URL} | sh -s -- --server {disc} --secret-prompt {fwd} -y"
             );
             (
-                "Run this on the server (it must use the same secret):".into(),
+                format!(
+                    "Read {names} from {ENV_FILE} on this machine. Run this on the server and {entry}:"
+                ),
                 cmd,
             )
         }
@@ -1086,8 +1098,8 @@ fn install_systemd_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_forwards, console_cmd, env_file, install_systemd_with, peer_steps, subcmd, Runner,
-        MANIFEST_NAME, SIGNATURE_NAME,
+        check_forwards, console_cmd, env_file, execute, install_systemd_with, peer_steps, subcmd,
+        Runner, MANIFEST_NAME, SIGNATURE_NAME,
     };
     use crate::ui::{Config, Kind, Method, Mode};
     use ed25519_dalek::{Signer, SigningKey};
@@ -1340,7 +1352,7 @@ mod tests {
         c.method = Method::Systemd;
         assert_eq!(
             console_cmd(&c).unwrap(),
-            format!("zeronat admin --server 127.0.0.1:2222 --secret {TEST_ADMIN_SECRET}")
+            "sudo /usr/local/bin/zeronat admin --server 127.0.0.1:2222"
         );
     }
 
@@ -1371,11 +1383,11 @@ mod tests {
         assert!(!client.contains("ZERONAT_ADMIN_SECRET="));
     }
 
-    // A dht install carries the discovery secret in the env file it writes and
-    // in the one-liner for the other machine; a host:port install carries
-    // neither.
+    // A dht install carries the discovery secret in the env file it writes;
+    // the one-liner for the other machine prompts for it instead, and a
+    // host:port install carries neither.
     #[test]
-    fn dht_install_carries_the_discovery_secret() {
+    fn dht_install_keeps_the_discovery_secret_in_the_env_file() {
         let mut c = cfg();
         c.mode = Mode::Server;
         c.use_dht = true;
@@ -1386,10 +1398,8 @@ mod tests {
             "ZERONAT_DISCOVERY_SECRET={TEST_DISCOVERY_SECRET}\n"
         )));
         let (_, cmd) = peer_steps(&c);
-        assert!(
-            cmd.contains(&format!("--discovery {TEST_DISCOVERY_SECRET}")),
-            "{cmd}"
-        );
+        assert!(!cmd.contains(TEST_DISCOVERY_SECRET), "{cmd}");
+        assert!(cmd.contains("--discovery-prompt"), "{cmd}");
 
         c.mode = Mode::Client;
         let env = env_file(&c, "client --server dht");
@@ -1397,10 +1407,8 @@ mod tests {
             "ZERONAT_DISCOVERY_SECRET={TEST_DISCOVERY_SECRET}\n"
         )));
         let (_, cmd) = peer_steps(&c);
-        assert!(
-            cmd.contains(&format!("--discovery {TEST_DISCOVERY_SECRET}")),
-            "{cmd}"
-        );
+        assert!(!cmd.contains(TEST_DISCOVERY_SECRET), "{cmd}");
+        assert!(cmd.contains("--discovery-prompt"), "{cmd}");
 
         c.use_dht = false;
         c.server_addr = "vps.example:9000".into();
@@ -1408,6 +1416,61 @@ mod tests {
         assert!(!env.contains("ZERONAT_DISCOVERY_SECRET"));
         let (_, cmd) = peer_steps(&c);
         assert!(!cmd.contains("--discovery"), "{cmd}");
+    }
+
+    #[test]
+    fn peer_commands_prompt_for_credentials_instead_of_embedding_them() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.use_dht = true;
+        c.discovery = TEST_DISCOVERY_SECRET.into();
+        c.ports = "443/tcp".into();
+        let (intro, cmd) = peer_steps(&c);
+        assert!(!cmd.contains(TEST_SECRET), "{cmd}");
+        assert!(!cmd.contains(TEST_DISCOVERY_SECRET), "{cmd}");
+        assert!(cmd.contains("--secret-prompt"), "{cmd}");
+        assert!(cmd.contains("--discovery-prompt"), "{cmd}");
+        assert!(intro.contains("/etc/zeronat/.env"), "{intro}");
+
+        c.mode = Mode::Client;
+        let (intro, cmd) = peer_steps(&c);
+        assert!(!cmd.contains(TEST_SECRET), "{cmd}");
+        assert!(!cmd.contains(TEST_DISCOVERY_SECRET), "{cmd}");
+        assert!(cmd.contains("--secret-prompt"), "{cmd}");
+        assert!(cmd.contains("--discovery-prompt"), "{cmd}");
+        assert!(intro.contains("/etc/zeronat/.env"), "{intro}");
+    }
+
+    // Everything the installer prints back - the ran/console commands, the note,
+    // and the one-liner for the other machine - stays free of the three
+    // credentials; they belong in the 0600 env file only.
+    #[test]
+    fn no_summary_output_contains_a_credential() {
+        for method in [Method::Systemd, Method::Docker] {
+            let mut c = cfg();
+            c.mode = Mode::Server;
+            c.method = method;
+            c.use_dht = true;
+            c.discovery = TEST_DISCOVERY_SECRET.into();
+            c.ports = "443/tcp".into();
+            let mut r = FakeRunner {
+                cmds: Vec::new(),
+                release: test_release(b"downloaded binary"),
+            };
+            let outcome = execute(&c, true, &mut r).unwrap();
+
+            let mut text: Vec<String> = outcome.cmds.iter().map(|e| e.cmd.clone()).collect();
+            text.push(outcome.headline);
+            text.extend(outcome.note);
+            text.push(outcome.peer_intro);
+            text.push(outcome.peer_cmd);
+            text.extend(r.cmds);
+            let text = text.join("\n");
+
+            assert!(!text.contains(TEST_SECRET), "{method:?}: {text}");
+            assert!(!text.contains(TEST_ADMIN_SECRET), "{method:?}: {text}");
+            assert!(!text.contains(TEST_DISCOVERY_SECRET), "{method:?}: {text}");
+        }
     }
 
     #[test]

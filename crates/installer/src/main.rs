@@ -202,12 +202,14 @@ zeronat installer
   --all                     forward every port plus ICMP; keeps SSH on the server
   --control PORT            tunnel control port (default 2222)
   --secret 64-HEX           32-byte hex secret (default: generated)
+  --secret-prompt           read the secret from the terminal without echo
   --admin-secret 64-HEX     server admin secret (default: generated)
   --server-addr HOST[:PORT] (client only) where the server is reachable
   --dht                     find the server over the DHT (dynamic IP, no fixed address)
   --discovery 64-HEX        (with --dht) credential the DHT record is keyed by
                             (server default: generated; a client passes the
                             value its server's install printed)
+  --discovery-prompt        (with --dht) read the discovery credential without echo
   --announce-ip IP          (server, with --dht) public IPv4 to announce
   --announce-port PORT      (server, with --dht) public port to announce
   --tap NAME                L2 bridge instead of ports: relay raw Ethernet/PPPoE (Linux)
@@ -222,7 +224,7 @@ With no options it runs the interactive wizard. --ports, --tap, and --all are mu
 
 fn real_main() -> i32 {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let parsed = match args::parse(&argv) {
+    let mut parsed = match args::parse(&argv) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {e}");
@@ -232,6 +234,25 @@ fn real_main() -> i32 {
     if parsed.help {
         println!("{USAGE}");
         return 0;
+    }
+
+    if parsed.secret_prompt {
+        match term::read_hidden_line("Secret: ") {
+            Ok(v) => parsed.secret = Some(v),
+            Err(e) => {
+                eprintln!("error: cannot read secret: {e}");
+                return 1;
+            }
+        }
+    }
+    if parsed.discovery_prompt {
+        match term::read_hidden_line("Discovery credential: ") {
+            Ok(v) => parsed.discovery = Some(v),
+            Err(e) => {
+                eprintln!("error: cannot read discovery credential: {e}");
+                return 1;
+            }
+        }
     }
 
     let dry = parsed.dry;

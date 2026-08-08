@@ -16,8 +16,10 @@ pub struct Parsed {
     pub method: Option<String>,
     pub deploy: Option<String>,
     pub secret: Option<String>,
+    pub secret_prompt: bool,
     pub admin_secret: Option<String>,
     pub discovery: Option<String>,
+    pub discovery_prompt: bool,
     pub control: Option<String>,
     pub ports: Option<String>,
     pub server_addr: Option<String>,
@@ -62,8 +64,10 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             "--method" => p.method = Some(take(&mut i, a)?),
             "--deploy" => p.deploy = Some(take(&mut i, a)?),
             "--secret" => p.secret = Some(take(&mut i, a)?),
+            "--secret-prompt" => p.secret_prompt = true,
             "--admin-secret" => p.admin_secret = Some(take(&mut i, a)?),
             "--discovery" => p.discovery = Some(take(&mut i, a)?),
+            "--discovery-prompt" => p.discovery_prompt = true,
             "--control" => p.control = Some(take(&mut i, a)?),
             "--ports" => p.ports = Some(take(&mut i, a)?),
             "--server-addr" | "--addr" => p.server_addr = Some(take(&mut i, a)?),
@@ -81,6 +85,12 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             other => return Err(format!("unknown option: {other} (try --help)")),
         }
         i += 1;
+    }
+    if p.secret_prompt && p.secret.is_some() {
+        return Err("--secret and --secret-prompt are mutually exclusive".into());
+    }
+    if p.discovery_prompt && p.discovery.is_some() {
+        return Err("--discovery and --discovery-prompt are mutually exclusive".into());
     }
     Ok(p)
 }
@@ -347,6 +357,18 @@ mod tests {
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn prompt_flags_exclude_their_value_flags() {
+        let p = parse(&s(&["--client", "--secret-prompt", "--discovery-prompt"])).unwrap();
+        assert!(p.secret_prompt);
+        assert!(p.discovery_prompt);
+        assert!(p.secret.is_none());
+        assert!(p.discovery.is_none());
+
+        assert!(parse(&s(&["--secret-prompt", "--secret", FLAG_SECRET])).is_err());
+        assert!(parse(&s(&["--discovery-prompt", "--discovery", FLAG_SECRET])).is_err());
     }
 
     fn host() -> Host {

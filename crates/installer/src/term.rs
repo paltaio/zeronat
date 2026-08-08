@@ -8,6 +8,82 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use zntui::key::{parse, Key};
 
+/// Read one line from the controlling terminal with echo disabled, for
+/// credentials that must not land on screen or in scrollback. The terminal
+/// stays in canonical mode, so the tty driver handles line editing.
+pub fn read_hidden_line(prompt: &str) -> io::Result<String> {
+    let mut file = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    file.write_all(prompt.as_bytes())?;
+    file.flush()?;
+    read_line_no_echo(&mut file)
+}
+
+fn read_line_no_echo(file: &mut File) -> io::Result<String> {
+    let fd = file.as_raw_fd();
+    // SAFETY: fd is an open terminal descriptor and the termios out-pointer is
+    // valid for the duration of the call.
+    let original = unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut t) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        t
+    };
+    let mut hidden = original;
+    // ISIG goes too: Ctrl-C must arrive as input and cancel the read, not kill
+    // the process before the guard below restores echo.
+    hidden.c_lflag &= !(libc::ECHO | libc::ISIG);
+    // SAFETY: fd is the same open terminal and hidden was initialized from its
+    // current attributes.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    struct RestoreEcho {
+        fd: RawFd,
+        original: libc::termios,
+    }
+    impl Drop for RestoreEcho {
+        fn drop(&mut self) {
+            // SAFETY: fd stays open for this guard's lifetime and original came
+            // from tcgetattr on the same terminal.
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+            }
+        }
+    }
+    let _restore = RestoreEcho { fd, original };
+
+    // A canonical-mode read never returns bytes past the newline, so the line
+    // is complete once the accumulated input ends with one. A zero read is the
+    // terminal closing (or Ctrl-D); return what arrived and let credential
+    // validation reject it.
+    let mut bytes = Vec::new();
+    loop {
+        let mut chunk = [0u8; 256];
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+        if bytes.last() == Some(&b'\n') {
+            break;
+        }
+    }
+    // Enter was not echoed, so move off the prompt line ourselves.
+    file.write_all(b"\n")?;
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    if bytes.contains(&3) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "prompt cancelled",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "input is not UTF-8"))
+}
+
 pub struct Tty {
     file: File,
     fd: RawFd,
@@ -187,5 +263,90 @@ impl Renderer {
         out.push_str(&format!("\x1b[{};1H", lines.len() + 1));
         self.prev = lines;
         tty.write_all(out.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_line_no_echo;
+    use std::fs::File;
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
+
+    fn pty_pair() -> (File, File) {
+        let mut master = 0;
+        let mut slave = 0;
+        // SAFETY: openpty fills the two descriptors; the name, termios, and
+        // winsize out-parameters are allowed to be null.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0);
+        // SAFETY: openpty returned ownership of both descriptors.
+        unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+    }
+
+    fn lflag(fd: RawFd) -> libc::tcflag_t {
+        // SAFETY: fd is an open pty descriptor and the out-pointer is valid.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(fd, &mut t), 0);
+            t.c_lflag
+        }
+    }
+
+    /// Block until the reader has applied the hidden termios, so bytes written
+    /// afterwards are processed under it rather than the pty defaults.
+    fn wait_until_hidden(fd: RawFd) {
+        for _ in 0..1000 {
+            if lflag(fd) & libc::ECHO == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("reader never disabled echo");
+    }
+
+    #[test]
+    fn correcting_an_overtyped_credential_with_backspace_yields_the_corrected_value() {
+        let (mut master, mut slave) = pty_pair();
+
+        let mut typed = vec![b'a'; 64];
+        typed.push(b'b'); // one character too many
+        typed.push(0x7f); // erased by the pty line discipline
+        typed.push(b'\n');
+        let writer = std::thread::spawn(move || {
+            master.write_all(&typed).unwrap();
+            master
+        });
+
+        let line = read_line_no_echo(&mut slave).unwrap();
+        let _master = writer.join().unwrap();
+        assert_eq!(line, "a".repeat(64));
+    }
+
+    #[test]
+    fn ctrl_c_cancels_the_prompt_and_restores_the_terminal() {
+        let (mut master, mut slave) = pty_pair();
+        let master_fd = master.as_raw_fd();
+
+        let writer = std::thread::spawn(move || {
+            wait_until_hidden(master_fd);
+            master.write_all(b"abc\x03\n").unwrap();
+            master
+        });
+
+        let err = read_line_no_echo(&mut slave).unwrap_err();
+        let master = writer.join().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        let restored = lflag(master.as_raw_fd());
+        assert_ne!(restored & libc::ECHO, 0, "echo not restored");
+        assert_ne!(restored & libc::ISIG, 0, "isig not restored");
     }
 }
