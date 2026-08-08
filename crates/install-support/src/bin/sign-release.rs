@@ -1,6 +1,7 @@
 //! Sign a release manifest: reads the manifest from stdin, signs it with the
 //! 64-hex ed25519 seed in `ZERONAT_RELEASE_SIGNING_KEY`, and prints the hex
-//! signature. Refuses to sign a manifest a downloader would reject.
+//! signature. Refuses to sign a manifest a downloader would reject. With
+//! `--pubkey`, prints the seed's public key and exits.
 
 use std::io::Read;
 
@@ -19,6 +20,18 @@ fn run() -> Result<(), String> {
         .map_err(|_| "ZERONAT_RELEASE_SIGNING_KEY is not set".to_string())?;
     let seed = zeronat_secret::decode(key_hex.trim()).map_err(|e| e.to_string())?;
     let signing = SigningKey::from_bytes(&seed);
+
+    match std::env::args().nth(1).as_deref() {
+        Some("--pubkey") => {
+            println!(
+                "{}",
+                zeronat_secret::encode(signing.verifying_key().to_bytes())
+            );
+            return Ok(());
+        }
+        Some(other) => return Err(format!("unknown option: {other}")),
+        None => {}
+    }
 
     let mut manifest = Vec::new();
     std::io::stdin()

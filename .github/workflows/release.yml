@@ -8,7 +8,39 @@ on:
 permissions: {}
 
 jobs:
+  # A workflow_dispatch run is a release rehearsal: it builds and signs
+  # against a keypair generated for the run and publishes nothing - no
+  # release, no tag, no image. The seed is readable in this job's outputs by
+  # anyone who can see the run; it must only ever sign the run's unpublished
+  # artifacts.
+  throwaway-key:
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      pubkey: ${{ steps.gen.outputs.pubkey }}
+      seed: ${{ steps.gen.outputs.seed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+
+      - name: Generate the run's keypair
+        id: gen
+        run: |
+          seed=$(openssl rand -hex 32)
+          pubkey=$(ZERONAT_RELEASE_SIGNING_KEY="$seed" cargo run --locked -p zeronat-install-support --bin sign-release -- --pubkey)
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+          echo "pubkey=$pubkey" >> "$GITHUB_OUTPUT"
+
   binaries:
+    needs: throwaway-key
+    # Tag builds run with the throwaway-key job skipped; a dry run needs it.
+    if: ${{ !cancelled() && (needs.throwaway-key.result == 'success' || needs.throwaway-key.result == 'skipped') }}
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -49,17 +81,16 @@ jobs:
           echo "$v"
           echo "$v" | grep -q 'getrandom v0\.2\.' || { echo "getrandom drifted off 0.2.x; MIPS build will break"; exit 1; }
 
-      - name: Require the release public key on tag builds
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Require a release public key
         env:
-          ZERONAT_RELEASE_PUBKEY: ${{ vars.ZERONAT_RELEASE_PUBKEY }}
+          ZERONAT_RELEASE_PUBKEY: ${{ startsWith(github.ref, 'refs/tags/') && vars.ZERONAT_RELEASE_PUBKEY || needs.throwaway-key.outputs.pubkey }}
         run: |
           printf '%s' "$ZERONAT_RELEASE_PUBKEY" | grep -Eq '^[0-9a-f]{64}$' || { echo "ZERONAT_RELEASE_PUBKEY is not a 64-hex ed25519 public key; a release binary built without it cannot verify upgrades"; exit 1; }
 
       - name: Build
         env:
           RUSTFLAGS: '-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort -Cforce-unwind-tables=no --cfg curve25519_dalek_backend="serial"'
-          ZERONAT_RELEASE_PUBKEY: ${{ vars.ZERONAT_RELEASE_PUBKEY }}
+          ZERONAT_RELEASE_PUBKEY: ${{ startsWith(github.ref, 'refs/tags/') && vars.ZERONAT_RELEASE_PUBKEY || needs.throwaway-key.outputs.pubkey }}
         run: |
           cross build --release --locked \
             -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
@@ -76,6 +107,9 @@ jobs:
           if-no-files-found: error
 
   freebsd:
+    needs: throwaway-key
+    # Tag builds run with the throwaway-key job skipped; a dry run needs it.
+    if: ${{ !cancelled() && (needs.throwaway-key.result == 'success' || needs.throwaway-key.result == 'skipped') }}
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -106,17 +140,16 @@ jobs:
         with:
           tool: cargo-zigbuild
 
-      - name: Require the release public key on tag builds
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Require a release public key
         env:
-          ZERONAT_RELEASE_PUBKEY: ${{ vars.ZERONAT_RELEASE_PUBKEY }}
+          ZERONAT_RELEASE_PUBKEY: ${{ startsWith(github.ref, 'refs/tags/') && vars.ZERONAT_RELEASE_PUBKEY || needs.throwaway-key.outputs.pubkey }}
         run: |
           printf '%s' "$ZERONAT_RELEASE_PUBKEY" | grep -Eq '^[0-9a-f]{64}$' || { echo "ZERONAT_RELEASE_PUBKEY is not a 64-hex ed25519 public key; a release binary built without it cannot verify upgrades"; exit 1; }
 
       - name: Build
         env:
           RUSTFLAGS: '-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort -Cforce-unwind-tables=no --cfg curve25519_dalek_backend="serial"'
-          ZERONAT_RELEASE_PUBKEY: ${{ vars.ZERONAT_RELEASE_PUBKEY }}
+          ZERONAT_RELEASE_PUBKEY: ${{ startsWith(github.ref, 'refs/tags/') && vars.ZERONAT_RELEASE_PUBKEY || needs.throwaway-key.outputs.pubkey }}
         run: |
           cargo zigbuild --release --locked \
             -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
@@ -230,6 +263,59 @@ jobs:
             out/release.manifest
             out/release.manifest.sig
 
+  # Runs the release job's collect-and-sign steps with the run's throwaway
+  # key and publishes nothing.
+  dry-release:
+    needs: [throwaway-key, binaries, freebsd]
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+          pattern: bin-*
+      - name: Collect per-target binaries
+        run: |
+          mkdir -p out
+          for d in artifacts/bin-*; do
+            name="${d#artifacts/bin-}"
+            if [ -f "$d/zeronat.exe" ]; then
+              install -m 0755 "$d/zeronat.exe" "out/zeronat-${name}.exe"
+            else
+              install -m 0755 "$d/zeronat" "out/zeronat-${name}"
+            fi
+          done
+      - name: Write and sign the release manifest
+        env:
+          LC_ALL: C
+          ZERONAT_RELEASE_SIGNING_KEY: ${{ needs.throwaway-key.outputs.seed }}
+        run: |
+          version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          {
+            printf 'zeronat-release-v1 %s\n' "$version"
+            for f in out/zeronat-*; do
+              digest=$(sha256sum "$f")
+              printf '%s %s %s\n' "${digest%% *}" "$(wc -c < "$f" | tr -d ' ')" "${f#out/}"
+            done
+          } > release.manifest
+          cargo run --locked -p zeronat-install-support --bin sign-release \
+            < release.manifest > release.manifest.sig
+      - name: Upload the rehearsal manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dry-release-manifest
+          path: |
+            release.manifest
+            release.manifest.sig
+          if-no-files-found: error
+
   docker:
     needs: binaries
     permissions:
@@ -258,6 +344,7 @@ jobs:
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Log in to ghcr.io
+        if: startsWith(github.ref, 'refs/tags/')
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
@@ -273,14 +360,13 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=ref,event=branch
-            type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      - name: Build and push
+      - name: Build, pushing only for a tag
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
