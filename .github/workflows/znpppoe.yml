@@ -78,6 +78,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Create manifest
+        # latest tracks main; this image has no versioned releases. The
+        # zeronat image's latest instead moves with release tags
+        # (release.yml).
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create -t ${{ env.IMAGE }}:latest \
