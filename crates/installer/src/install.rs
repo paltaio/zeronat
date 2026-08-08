@@ -431,9 +431,36 @@ fn env_file(cfg: &Config, sub: &str) -> String {
         role.push_str(&format!("ZERONAT_DISCOVERY_SECRET={}\n", cfg.discovery));
     }
     if cfg.method == Method::Docker && cfg.deploy == Deploy::Compose {
-        format!("ZERONAT_SECRET={}\n{role}ZERONAT_ARGS={sub}\n", cfg.secret)
+        format!(
+            "ZERONAT_SECRET={}\n{role}ZERONAT_USER={}\nZERONAT_ARGS={sub}\n",
+            cfg.secret,
+            container_user(cfg)
+        )
     } else {
         format!("ZERONAT_SECRET={}\n{role}", cfg.secret)
+    }
+}
+
+/// Container user for docker deploys. Binding a port below 1024 needs
+/// CAP_NET_BIND_SERVICE and tun/tap needs CAP_NET_ADMIN, and capabilities
+/// added to a non-root container user never become effective (docker sets no
+/// ambient set), so those configurations must run as root with everything
+/// else dropped. Only a ports config whose every bound port (forwards, plus
+/// the control port on a server) parses unprivileged runs as the nonroot uid.
+fn container_user(cfg: &Config) -> &'static str {
+    let control_ok =
+        cfg.mode != Mode::Server || cfg.control.parse::<u16>().is_ok_and(|port| port >= 1024);
+    let unprivileged = cfg.kind == Kind::Ports
+        && control_ok
+        && cfg.ports.split_whitespace().all(|tok| {
+            tok.split_once('/')
+                .and_then(|(num, _)| num.parse::<u16>().ok())
+                .is_some_and(|port| port >= 1024)
+        });
+    if unprivileged {
+        "65532:65532"
+    } else {
+        "0:0"
     }
 }
 
@@ -455,6 +482,13 @@ pub fn execute(cfg: &Config, dry: bool, r: &mut dyn Runner) -> Result<Outcome, S
         let out = r.run(true, "mkdir", &["-p", DATA_DIR])?;
         if !ok(&out) {
             return Err(format!("mkdir {DATA_DIR}: {}", errtext(&out)));
+        }
+        // A nonroot container writes its route config into the mounted dir.
+        if cfg.method == Method::Docker && container_user(cfg) != "0:0" {
+            let out = r.run(true, "chown", &[container_user(cfg), DATA_DIR])?;
+            if !ok(&out) {
+                return Err(format!("chown {DATA_DIR}: {}", errtext(&out)));
+            }
         }
     }
 
@@ -770,7 +804,13 @@ fn upgrade_docker(offer: &UpgradeOffer, r: &mut dyn Runner) -> Result<(), String
 /// installer env file, which a docker-run install always wrote.
 fn recreate_container(r: &mut dyn Runner) -> Result<(), String> {
     let cmd = inspect_lines(r, "{{range .Config.Cmd}}{{println .}}{{end}}");
+    let user = inspect_lines(r, "{{.Config.User}}")
+        .into_iter()
+        .next()
+        .unwrap_or_default();
     let caps = inspect_lines(r, "{{range .HostConfig.CapAdd}}{{println .}}{{end}}");
+    let cap_drops = inspect_lines(r, "{{range .HostConfig.CapDrop}}{{println .}}{{end}}");
+    let security_opts = inspect_lines(r, "{{range .HostConfig.SecurityOpt}}{{println .}}{{end}}");
     let devices = inspect_lines(
         r,
         "{{range .HostConfig.Devices}}{{println .PathOnHost}}{{end}}",
@@ -798,6 +838,18 @@ fn recreate_container(r: &mut dyn Runner) -> Result<(), String> {
     if !network.is_empty() {
         args.push("--network".into());
         args.push(network);
+    }
+    if !user.is_empty() {
+        args.push("--user".into());
+        args.push(user);
+    }
+    for c in &cap_drops {
+        args.push("--cap-drop".into());
+        args.push(c.clone());
+    }
+    for s in &security_opts {
+        args.push("--security-opt".into());
+        args.push(s.clone());
     }
     for c in &caps {
         args.push("--cap-add".into());
@@ -966,14 +1018,29 @@ fn install_docker(cfg: &Config, sub: &str, r: &mut dyn Runner) -> Result<Started
             "unless-stopped".into(),
             "--network".into(),
             "host".into(),
+            "--user".into(),
+            container_user(cfg).into(),
+            "--cap-drop".into(),
+            "ALL".into(),
+            "--security-opt".into(),
+            "no-new-privileges".into(),
         ];
         if cfg.kind != Kind::Ports {
+            // NET_RAW keeps the legacy-iptables fallback working when nft is
+            // unusable on the host kernel; NET_BIND_SERVICE covers a
+            // privileged control port.
             args.extend([
                 "--cap-add".into(),
                 "NET_ADMIN".into(),
+                "--cap-add".into(),
+                "NET_RAW".into(),
+                "--cap-add".into(),
+                "NET_BIND_SERVICE".into(),
                 "--device".into(),
                 "/dev/net/tun".into(),
             ]);
+        } else if container_user(cfg) == "0:0" {
+            args.extend(["--cap-add".into(), "NET_BIND_SERVICE".into()]);
         }
         // Persist the route config across container recreation. The data subdir
         // (not the file) is mounted: a not-yet-written file would otherwise make
@@ -1098,10 +1165,10 @@ fn install_systemd_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_forwards, console_cmd, env_file, execute, install_systemd_with, peer_steps, subcmd,
-        Runner, MANIFEST_NAME, SIGNATURE_NAME,
+        check_forwards, console_cmd, container_user, env_file, execute, install_systemd_with,
+        peer_steps, recreate_container, subcmd, Runner, MANIFEST_NAME, SIGNATURE_NAME,
     };
-    use crate::ui::{Config, Kind, Method, Mode};
+    use crate::ui::{Config, Deploy, Kind, Method, Mode};
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
     use std::io::{Read as _, Write as _};
@@ -1479,6 +1546,125 @@ mod tests {
         c.mode = Mode::Client;
         c.use_dht = true;
         assert!(console_cmd(&c).is_none());
+    }
+
+    #[test]
+    fn container_user_is_nonroot_only_when_every_port_is_unprivileged() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.kind = Kind::Ports;
+        c.control = "2222".into();
+        c.ports = "8443/tcp 51820/udp".into();
+        assert_eq!(container_user(&c), "65532:65532");
+
+        c.ports = "443/tcp 8443/tcp".into();
+        assert_eq!(container_user(&c), "0:0");
+
+        // Unparseable ports must not end up nonroot and unable to bind.
+        c.ports = "bogus".into();
+        assert_eq!(container_user(&c), "0:0");
+
+        // The server binds its control port too.
+        c.ports = "8443/tcp".into();
+        c.control = "443".into();
+        assert_eq!(container_user(&c), "0:0");
+        // A client dials the control port instead of binding it.
+        c.mode = Mode::Client;
+        assert_eq!(container_user(&c), "65532:65532");
+
+        c.mode = Mode::Server;
+        c.control = "2222".into();
+        c.kind = Kind::All;
+        assert_eq!(container_user(&c), "0:0");
+        c.kind = Kind::Bridge;
+        assert_eq!(container_user(&c), "0:0");
+    }
+
+    /// Answers `docker inspect` with a hardened container's settings and
+    /// records every command, so the recreate path can be checked to carry
+    /// them over.
+    struct InspectRunner {
+        cmds: Vec<String>,
+    }
+
+    impl Runner for InspectRunner {
+        fn step(&mut self, _: String) {}
+        fn info(&mut self, _: String) {}
+        fn run(&mut self, _: bool, program: &str, args: &[&str]) -> Result<Output, String> {
+            use std::os::unix::process::ExitStatusExt;
+            self.cmds.push(format!("{program} {}", args.join(" ")));
+            let stdout = if program == "docker" && args.first() == Some(&"inspect") {
+                match args[2] {
+                    f if f.contains(".Config.User") => b"65532:65532\n".to_vec(),
+                    f if f.contains("CapDrop") => b"ALL\n".to_vec(),
+                    f if f.contains("SecurityOpt") => b"no-new-privileges\n".to_vec(),
+                    f if f.contains(".Config.Cmd") => {
+                        b"server\n--control\n2222\n--tcp\n8443\n".to_vec()
+                    }
+                    f if f.contains("NetworkMode") => b"host\n".to_vec(),
+                    f if f.contains("RestartPolicy") => b"unless-stopped\n".to_vec(),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+        fn run_with_stdin(
+            &mut self,
+            _: bool,
+            program: &str,
+            args: &[&str],
+            _: &std::fs::File,
+        ) -> Result<Output, String> {
+            self.run(false, program, args)
+        }
+        fn run_with_stdout(
+            &mut self,
+            _: bool,
+            program: &str,
+            args: &[&str],
+            _: &std::fs::File,
+        ) -> Result<Output, String> {
+            self.run(false, program, args)
+        }
+        fn confirm(&mut self, _: &str, _: u32) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn recreated_container_keeps_user_and_capability_flags() {
+        let mut r = InspectRunner { cmds: Vec::new() };
+        recreate_container(&mut r).unwrap();
+        let run = r
+            .cmds
+            .iter()
+            .find(|c| c.starts_with("docker run"))
+            .expect("recreate must run the container");
+        assert!(run.contains("--user 65532:65532"), "{run}");
+        assert!(run.contains("--cap-drop ALL"), "{run}");
+        assert!(run.contains("--security-opt no-new-privileges"), "{run}");
+    }
+
+    #[test]
+    fn compose_env_selects_the_container_user() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.method = Method::Docker;
+        c.deploy = Deploy::Compose;
+        c.kind = Kind::Ports;
+        c.ports = "8443/tcp".into();
+        let env = env_file(&c, "server --control 2222");
+        assert!(env.contains("ZERONAT_USER=65532:65532\n"), "{env}");
+
+        c.ports = "443/tcp".into();
+        let env = env_file(&c, "server --control 2222");
+        assert!(env.contains("ZERONAT_USER=0:0\n"), "{env}");
     }
 
     #[test]

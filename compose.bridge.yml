@@ -5,8 +5,17 @@ services:
     network_mode: host
     restart: unless-stopped
     env_file: .env
+    # tun/tap needs root: capabilities added to a non-root user never become
+    # effective, so the device would silently fail to come up.
+    user: "0:0"
+    cap_drop:
+      - ALL
     cap_add:
       - NET_ADMIN
+      - NET_RAW
+      - NET_BIND_SERVICE
     devices:
       - /dev/net/tun
+    security_opt:
+      - no-new-privileges:true
     command: ${ZERONAT_ARGS}

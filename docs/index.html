@@ -168,11 +168,13 @@ SECRET="$(openssl rand -hex 32)"
 
 <span class="c"># On the public host (VPS):</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
+  --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
   -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat \
   server --control 2222 --tcp 443 --tcp 80 --udp 51820
 
 <span class="c"># On the host behind CG-NAT; with --network host, 127.0.0.1 targets are host services:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
+  --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
   -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat \
   client --server &lt;public-ip&gt;:2222 --tcp 443 --tcp 80 --udp 51820</code></pre>
       <p>Open the control port (2222, both UDP and TCP) on the server's firewall.</p>
@@ -285,6 +287,7 @@ entryPoints:
       <p>Load listeners, routes, and identity from a file with <code>--config</code>:</p>
 <pre class="v-cli"><code>zeronat server --config /etc/zeronat/server.toml</code></pre>
 <pre class="v-docker"><code>docker run -d --name zeronat --restart unless-stopped --network host \
+  --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
   -v /etc/zeronat/data:/etc/zeronat/data --env-file /etc/zeronat/.env \
   ghcr.io/paltaio/zeronat server --config /etc/zeronat/data/server.toml</code></pre>
 <pre><code><span class="c"># server.toml</span>
@@ -434,18 +437,21 @@ ZERONAT_SECRET="$SECRET" zeronat server --control 2222 --tun --except 22
 ZERONAT_SECRET="$SECRET" zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
 <pre class="v-docker"><code><span class="c"># Server (VPS): forward every port to the client, keep SSH on 22:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
-  --cap-add NET_ADMIN --device /dev/net/tun \
+  --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
+  --device /dev/net/tun --security-opt no-new-privileges \
   -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat server --control 2222 --tun --except 22
 
 <span class="c"># Client (behind CG-NAT): local services receive on the same port:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
-  --cap-add NET_ADMIN --device /dev/net/tun \
+  --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
+  --device /dev/net/tun --security-opt no-new-privileges \
   -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
       <p>Forwarded traffic includes the server's own SSH; keep it reachable with
       <code>--except &lt;ssh-port&gt;</code> (repeatable). The client needs no NAT: local services receive
       the traffic on the same port and must listen on <code>0.0.0.0</code> or the tunnel address.</p>
-      <p>Linux only. The server needs root or <code>CAP_NET_ADMIN</code>, <code>/dev/net/tun</code>, and
-      <code>nft</code> or <code>iptables</code> to program the NAT.</p>
+      <p>Linux only. The server needs root or <code>CAP_NET_ADMIN</code> (plus <code>CAP_NET_RAW</code>
+      for the iptables fallback), <code>/dev/net/tun</code>, and <code>nft</code> or
+      <code>iptables</code> to program the NAT.</p>
 
       <h3>Exit mode</h3>
       <p>On top of <code>--tun</code>, the server's <code>--exit</code> makes it a default-route exit:
@@ -470,12 +476,14 @@ ZERONAT_SECRET="$SECRET" zeronat server --control 2222 --tun --except 22 --exit 
 ZERONAT_SECRET="$SECRET" zeronat client --server &lt;public-ip&gt;:2222 --tun --exit --exit-strict</code></pre>
 <pre class="v-docker"><code><span class="c"># Server (VPS): masquerade the client's traffic out eth0:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
-  --cap-add NET_ADMIN --device /dev/net/tun \
+  --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
+  --device /dev/net/tun --security-opt no-new-privileges \
   -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat server --control 2222 --tun --except 22 --exit --exit-iface eth0
 
 <span class="c"># Client: send this host's IPv4 traffic through the server:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
-  --cap-add NET_ADMIN --device /dev/net/tun \
+  --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
+  --device /dev/net/tun --security-opt no-new-privileges \
   -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tun --exit --exit-strict</code></pre>
       <p><code>--exit</code> requires <code>--tun</code> on both ends; <code>--exit-iface</code> and
       <code>--exit-strict</code> require <code>--exit</code>. In the config file,
@@ -496,18 +504,21 @@ ZERONAT_SECRET="$SECRET" zeronat client --server &lt;public-ip&gt;:2222 --tap zn
 pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
 <pre class="v-docker"><code><span class="c"># Near the target segment (e.g. the PPPoE concentrator):</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
-  --cap-add NET_ADMIN --device /dev/net/tun \
+  --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
+  --device /dev/net/tun --security-opt no-new-privileges \
   -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat server --control 2222 --tap zn0 --bridge br0
 
 <span class="c"># Behind CG-NAT; zn0 lands in the host netns, run pppd on the host:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
-  --cap-add NET_ADMIN --device /dev/net/tun \
+  --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
+  --device /dev/net/tun --security-opt no-new-privileges \
   -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tap zn0
 pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
       <p><code>--bridge &lt;name&gt;</code> enslaves the TAP to an existing bridge; <code>--tap-mtu &lt;n&gt;</code>
       sets the MTU (default 1400). Linux only. Needs <code>CAP_NET_ADMIN</code>: root,
       <code>setcap cap_net_admin+ep zeronat</code>, or Docker
-      <code>--cap-add NET_ADMIN --device /dev/net/tun</code> (plus <code>--device /dev/ppp</code> for pppd).</p>
+      <code>--cap-add NET_ADMIN --device /dev/net/tun</code> (plus <code>--device /dev/ppp</code> for pppd,
+      and <code>--cap-add NET_RAW</code> for the iptables fallback).</p>
       <p>The installer can build that bridge on netplan or systemd-networkd hosts: pass
       <code>--bridge-nic &lt;iface&gt;</code> (or pick the interface in the wizard) and it creates the bridge,
       enslaves the NIC, and persists the change. On a single-NIC server, where the uplink itself must join

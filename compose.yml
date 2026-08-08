@@ -5,6 +5,15 @@ services:
     network_mode: host
     restart: unless-stopped
     env_file: .env
+    # The installer sets ZERONAT_USER in .env: 65532 when every forwarded port
+    # is unprivileged, root (kept to NET_BIND_SERVICE) when one is below 1024.
+    user: "${ZERONAT_USER:-0:0}"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - /etc/zeronat/data:/etc/zeronat/data
     command: ${ZERONAT_ARGS}
