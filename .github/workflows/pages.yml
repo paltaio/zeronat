@@ -10,6 +10,7 @@ on:
       - "crates/tui/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
+  workflow_call:
 
 permissions: {}
 
@@ -18,7 +19,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The deploy waits for the release named by Cargo.toml, so a pushed get.sh
+  # or installer never goes live ahead of the release it installs. The
+  # release workflow calls this workflow after publishing.
+  release-exists:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if gh release view "$version" --json tagName --jq .tagName; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "release $version is not published; deploying nothing"
+          fi
+
   installers:
+    needs: release-exists
+    if: needs.release-exists.outputs.exists == 'true'
     permissions:
       contents: read
     runs-on: ubuntu-latest

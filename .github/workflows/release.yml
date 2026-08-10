@@ -316,6 +316,18 @@ jobs:
             release.manifest.sig
           if-no-files-found: error
 
+  # get.sh and the installers go live only after the release they install is
+  # published.
+  pages:
+    needs: release
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+    uses: ./.github/workflows/pages.yml
+
   docker:
     needs: [binaries, release]
     # On a tag the image publishes only after the release exists; a dry run
