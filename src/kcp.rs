@@ -19,6 +19,47 @@ pub const CLASS_DGRAM: u8 = 0x03;
 pub const CLASS_PUNCH: u8 = 0x04;
 pub const KCP_MTU: usize = 1350;
 
+/// Send and receive window a conv opens with, in segments. The effective window
+/// is the smaller of the two ends' values, so raising it needs the same setting
+/// on the server and the client.
+///
+/// This is the throughput ceiling of one forwarded connection over the UDP
+/// transport: the window drains once per round trip, so a conv carries at most
+/// `window * mss` bytes per RTT. With the 1326-byte segments `KCP_MTU` leaves
+/// and a 6.6 ms round trip, 256 segments caps a connection near 110 Mbit/s.
+///
+/// Raising it is not free. `new_kcp` runs KCP without congestion control, so a
+/// window larger than the bottleneck's queue overruns that queue on every flush
+/// and throughput falls instead of rising: on a 400 Mbit/s hop with a 100-packet
+/// queue, 1024 segments carries less than a third of what 256 does.
+pub const DEFAULT_WINDOW: u16 = 256;
+
+/// Accepted range for a configured window. The ceiling bounds the buffering one
+/// conv can hold in each direction; `MAX_CONVS_PER_SESSION` bounds how many
+/// convs a session holds at once.
+pub const MIN_WINDOW: u16 = 32;
+pub const MAX_WINDOW: u16 = 4096;
+
+static WINDOW: AtomicU16 = AtomicU16::new(DEFAULT_WINDOW);
+
+/// Set the window every conv opened after this call uses. Argument parsing calls
+/// it once, before any session exists; convs already open keep the old value.
+pub fn set_window(segments: u16) {
+    WINDOW.store(segments.clamp(MIN_WINDOW, MAX_WINDOW), Ordering::Relaxed);
+}
+
+/// Parse a window in segments, rejecting anything outside [`MIN_WINDOW`,
+/// `MAX_WINDOW`] rather than silently clamping a typo.
+pub fn parse_window(value: &str) -> crate::Result<u16> {
+    let n: u16 = value
+        .parse()
+        .map_err(|_| -> crate::Error { format!("window must be a u16, got '{value}'").into() })?;
+    if !(MIN_WINDOW..=MAX_WINDOW).contains(&n) {
+        return Err(format!("window must be {MIN_WINDOW}-{MAX_WINDOW} segments, got {n}").into());
+    }
+    Ok(n)
+}
+
 /// High bit marking a UDP-forward setup/datagram conv. Auto-allocated stream
 /// convs (control + TCP-forward) come from a counter starting at 1 and stay in
 /// the low half, so setup convs derived from the control id never collide with
@@ -75,7 +116,8 @@ impl Write for ChannelWriter {
 fn new_kcp(conv: u32, tx: mpsc::Sender<Vec<u8>>, class: u8) -> Kcp<ChannelWriter> {
     let mut k = Kcp::new(conv, ChannelWriter { tx, class });
     k.set_nodelay(true, 10, 2, true);
-    k.set_wndsize(256, 256);
+    let window = WINDOW.load(Ordering::Relaxed);
+    k.set_wndsize(window, window);
     let _ = k.set_mtu(KCP_MTU);
     k
 }
@@ -243,7 +285,7 @@ impl AsyncWrite for KcpStream {
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 type ConvMap = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;

@@ -8,6 +8,24 @@ use zeronat::{admin, client, client_admin, server, Result};
 
 const TUN_PREFIX_LEN: u8 = 24;
 
+/// Apply the KCP window from `--kcp-window` or `ZERONAT_KCP_WINDOW`, leaving the
+/// default in place when neither is set. Runs before any session is built, so
+/// every conv this process opens sees the same value.
+fn apply_kcp_window(flag: Option<String>) -> zeronat::Result<()> {
+    let (source, value) = match flag {
+        Some(value) => ("--kcp-window", value),
+        None => match std::env::var("ZERONAT_KCP_WINDOW") {
+            Ok(value) => ("ZERONAT_KCP_WINDOW", value),
+            Err(_) => return Ok(()),
+        },
+    };
+    zeronat::kcp::set_window(
+        zeronat::kcp::parse_window(&value)
+            .map_err(|e| -> zeronat::Error { format!("{source}: {e}").into() })?,
+    );
+    Ok(())
+}
+
 fn runtime_secret(value: String) -> Result<String> {
     zeronat::secret::normalize(&value).map_err(Into::into)
 }
@@ -50,6 +68,10 @@ server options:
   --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
   --tap-mtu <N>       TAP/TUN MTU (default: 1400; alias --tun-mtu)
   --bridge <NAME>     Enslave the TAP to this existing bridge
+  --kcp-window <N>    KCP window in segments for the udp transport (default: 256,
+                      range 32-4096; or env ZERONAT_KCP_WINDOW). Both ends must
+                      set it; raising it lifts the per-connection ceiling on an
+                      uncongested path and lowers throughput on a congested one
   --server dht        Publish this server's address to the DHT for discovery
   --discovery <64-HEX>  Discovery credential the DHT record is keyed by (or env
                       ZERONAT_DISCOVERY_SECRET); required with --server dht
@@ -79,6 +101,10 @@ client options:
   --exit-strict       Strict exit (requires --exit): delete the default routes
                       and send IPv6 to loopback while the routes are up; a
                       crash leaves the host without a default route
+  --kcp-window <N>    KCP window in segments for the udp transport (default: 256,
+                      range 32-4096; or env ZERONAT_KCP_WINDOW). Both ends must
+                      set it; raising it lifts the per-connection ceiling on an
+                      uncongested path and lowers throughput on a congested one
   --transport <MODE>  auto|udp|tcp (default: auto)
   --tap <NAME>        L2 bridge mode (Linux only): create/attach this TAP device
   --tap-mtu <N>       TAP/TUN MTU (default: 1400; alias --tun-mtu)
@@ -635,6 +661,7 @@ fn parse_args() -> Result<Cmd> {
         let mut discovery: Option<String> = None;
         let mut client_credentials = Vec::new();
         let mut admin_secret: Option<String> = None;
+        let mut kcp_window: Option<String> = None;
         let mut server_id: Option<String> = None;
         let mut tcp: Vec<u16> = Vec::new();
         let mut udp: Vec<u16> = Vec::new();
@@ -711,6 +738,9 @@ fn parse_args() -> Result<Cmd> {
                 "--admin-secret" => {
                     admin_secret = Some(iter.next().ok_or("--admin-secret requires a value")?);
                 }
+                "--kcp-window" => {
+                    kcp_window = Some(iter.next().ok_or("--kcp-window requires a value")?);
+                }
                 "--id" => {
                     server_id = Some(iter.next().ok_or("--id requires a value")?);
                 }
@@ -762,6 +792,8 @@ fn parse_args() -> Result<Cmd> {
                 }
             }
         }
+
+        apply_kcp_window(kcp_window)?;
 
         let secret = runtime_secret(
             secret
@@ -829,6 +861,7 @@ fn parse_args() -> Result<Cmd> {
         let mut tcp: Vec<String> = Vec::new();
         let mut udp: Vec<String> = Vec::new();
         let mut proxy = false;
+        let mut kcp_window: Option<String> = None;
         let mut transport: Option<String> = None;
         let mut tap_name: Option<String> = None;
         let mut tap_mtu: Option<usize> = None;
@@ -890,6 +923,9 @@ fn parse_args() -> Result<Cmd> {
                 "--proxy" => {
                     proxy = true;
                 }
+                "--kcp-window" => {
+                    kcp_window = Some(iter.next().ok_or("--kcp-window requires a value")?);
+                }
                 "--transport" => {
                     transport = Some(iter.next().ok_or("--transport requires a value")?);
                 }
@@ -948,6 +984,8 @@ fn parse_args() -> Result<Cmd> {
                 }
             }
         }
+
+        apply_kcp_window(kcp_window)?;
 
         Ok(Cmd::Client {
             server,
