@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "znpppoe"
-version = "0.1.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "base64",

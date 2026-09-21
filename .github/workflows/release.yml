@@ -300,7 +300,9 @@ jobs:
           LC_ALL: C
           ZERONAT_RELEASE_SIGNING_KEY: ${{ needs.throwaway-key.outputs.seed }}
         run: |
-          version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p;}' Cargo.toml)"
+          [ -n "$version" ] || { echo "Cargo.toml has no version under [workspace.package]"; exit 1; }
+          version="v$version"
           {
             printf 'zeronat-release-v1 %s\n' "$version"
             for f in out/zeronat-*; do
@@ -375,8 +377,7 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/zeronat
-          # latest moves with release tags. znpppoe.yml differs on purpose:
-          # its latest tracks main, and it has no versioned releases.
+          # latest moves with release tags.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -393,3 +394,15 @@ jobs:
           push: ${{ startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  # znpppoe links the zeronat crate from this tree, so its image ships under
+  # the same version.
+  znpppoe:
+    needs: release
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/znpppoe.yml
+    with:
+      tag: ${{ github.ref_name }}

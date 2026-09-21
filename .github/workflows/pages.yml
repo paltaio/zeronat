@@ -36,7 +36,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p;}' Cargo.toml)"
+          [ -n "$version" ] || { echo "Cargo.toml has no version under [workspace.package]"; exit 1; }
+          version="v$version"
           if gh release view "$version" --json tagName --jq .tagName; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else

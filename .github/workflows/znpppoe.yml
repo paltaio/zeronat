@@ -2,6 +2,11 @@ name: znpppoe-image
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
   push:
     branches: [main]
     paths:
@@ -65,6 +70,8 @@ jobs:
     permissions:
       packages: write
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -78,11 +85,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Create manifest
-        # latest tracks main; this image has no versioned releases. The
-        # zeronat image's latest instead moves with release tags
-        # (release.yml).
+        # A release tag moves the version tags and latest; a main push moves
+        # only edge.
         working-directory: /tmp/digests
         run: |
-          docker buildx imagetools create -t ${{ env.IMAGE }}:latest \
-            $(for d in *; do echo ${{ env.IMAGE }}@sha256:$d; done)
-      - run: docker buildx imagetools inspect ${{ env.IMAGE }}:latest
+          version="${TAG#v}"
+          if [ -n "$version" ]; then
+            tags=(-t "$IMAGE:$version" -t "$IMAGE:${version%.*}" -t "$IMAGE:latest")
+          else
+            tags=(-t "$IMAGE:edge")
+          fi
+          docker buildx imagetools create "${tags[@]}" \
+            $(for d in *; do echo "$IMAGE@sha256:$d"; done)
+      - name: Inspect manifest
+        run: |
+          version="${TAG#v}"
+          docker buildx imagetools inspect "$IMAGE:${version:-edge}"

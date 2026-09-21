@@ -1,12 +1,17 @@
 [package]
 name = "zeronat"
-version = "0.26.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 
 [workspace]
 members = ["crates/tui", "crates/installer", "crates/install-support", "crates/secret", "crates/znpppoe"]
 default-members = ["."]
+
+# znpppoe links this crate by path and speaks its wire protocol, so the two
+# ship as one version.
+[workspace.package]
+version = "0.26.0"
 
 [features]
 default = ["dht", "tui"]
