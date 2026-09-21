@@ -21,7 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 use crate::netstack::Handle;
-use crate::proxy::{self, Selector};
+use crate::proxy::{self, Refusal, Selector};
 use crate::socks5::resolve_v4;
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -68,9 +68,14 @@ async fn handle(mut sock: TcpStream, selector: &Selector, handles: &[Handle]) ->
         }
     };
 
-    let idx = match req.auth.and_then(|(u, p)| selector.select(&u, &p)) {
-        Some(i) => i,
-        None => {
+    let idx = match req.auth.map(|(u, p)| selector.select(&u, &p)) {
+        Some(Ok(i)) => i,
+        Some(Err(Refusal::Down)) => {
+            sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                .await?;
+            bail!("no live session");
+        }
+        Some(Err(Refusal::Denied)) | None => {
             sock.write_all(
                 b"HTTP/1.1 407 Proxy Authentication Required\r\n\
                   Proxy-Authenticate: Basic\r\nConnection: close\r\n\r\n",

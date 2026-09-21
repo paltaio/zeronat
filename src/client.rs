@@ -11,7 +11,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tokio::time::timeout as tokio_timeout;
-use tokio::time::{interval, sleep};
+use tokio::time::sleep;
 
 use crate::bridge;
 use crate::clientcfg::{CfgPeer, CfgTun, ClientConfig};
@@ -61,6 +61,12 @@ pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// Ping, so no inbound frame for a few ping intervals means the link is a black
 /// hole (no FIN/RST on a NAT rebind, WAN re-dial, or silent firewall drop).
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long a Ping may go unanswered before the client probes again.
+const PONG_WAIT: Duration = Duration::from_secs(5);
+/// Gap between probes once a Ping has gone unanswered.
+const PROBE_INTERVAL: Duration = Duration::from_secs(3);
+/// Consecutive unanswered probes after which the server counts as gone.
+const PROBE_STRIKES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 /// Cap for the reconnect backoff. A server that stays down (especially in DHT
 /// mode, where each cycle runs a full lookup) must not redial every RETRY_DELAY
@@ -372,6 +378,85 @@ pub(crate) struct AbortOnDrop<T = ()>(pub(crate) tokio::task::JoinHandle<T>);
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// Tracks whether the server answers a control channel's Pings. A restarted
+/// server re-binds its UDP port and drops datagrams for sessions it never saw,
+/// so the client gets neither an ICMP error nor a reply: an unanswered Ping is
+/// the only sign before CONTROL_TIMEOUT.
+pub struct PingWatch {
+    interval: Duration,
+    /// A Ping is out and no frame has arrived since.
+    waiting: bool,
+    /// Probes sent since that Ping went unanswered.
+    probes: u32,
+}
+
+impl PingWatch {
+    /// `interval` is the gap between Pings while the server answers them.
+    pub fn new(interval: Duration) -> Self {
+        PingWatch {
+            interval,
+            waiting: false,
+            probes: 0,
+        }
+    }
+
+    /// The ping timer ran out. `Some(wait)`: send a Ping and run the timer for
+    /// `wait`. `None`: PROBE_STRIKES probes in a row went unanswered.
+    pub fn lapse(&mut self) -> Option<Duration> {
+        if !self.waiting {
+            self.waiting = true;
+            return Some(PONG_WAIT);
+        }
+        if self.probes == PROBE_STRIKES {
+            return None;
+        }
+        self.probes += 1;
+        Some(PROBE_INTERVAL)
+    }
+
+    /// A frame arrived. `Some(wait)`: it answers the outstanding Ping, so run
+    /// the ping timer for `wait`. `None`: no Ping was out and the timer stands.
+    pub fn heard(&mut self) -> Option<Duration> {
+        if !self.waiting {
+            return None;
+        }
+        self.waiting = false;
+        self.probes = 0;
+        Some(self.interval)
+    }
+}
+
+/// Ping the server over a control channel that carries nothing else, every
+/// `interval` while it answers. Returns once the channel closes or the server
+/// stops answering.
+pub async fn hold_control(
+    mut r: crate::noise::NoiseReader,
+    mut w: crate::noise::NoiseWriter,
+    interval: Duration,
+) {
+    let mut pings = PingWatch::new(interval);
+    let mut ping_at = tokio::time::Instant::now() + interval;
+    loop {
+        match tokio::time::timeout_at(ping_at, r.recv()).await {
+            Ok(Ok(_)) => {
+                if let Some(wait) = pings.heard() {
+                    ping_at = tokio::time::Instant::now() + wait;
+                }
+            }
+            Ok(Err(_)) => return,
+            Err(_) => {
+                let Some(wait) = pings.lapse() else {
+                    return;
+                };
+                if w.send(&Msg::Ping.encode()).await.is_err() {
+                    return;
+                }
+                ping_at = tokio::time::Instant::now() + wait;
+            }
+        }
     }
 }
 
@@ -1871,10 +1956,13 @@ struct BridgeLease {
     _task: AbortOnDrop,
 }
 
+/// Authorize the bridge client on its control channel and hold the channel
+/// open. `cancel` fires when the server stops answering on it.
 async fn bridge_lease(
     client_id: &str,
     mut r: crate::noise::NoiseReader,
     mut w: crate::noise::NoiseWriter,
+    cancel: &Arc<Notify>,
 ) -> Result<BridgeLease> {
     w.send(
         &Msg::ClientHello {
@@ -1894,16 +1982,11 @@ async fn bridge_lease(
     else {
         return Err("server did not authorize the client session".into());
     };
+    let cancel = cancel.clone();
     let task = AbortOnDrop(crate::spawn(async move {
-        loop {
-            sleep(PING_INTERVAL).await;
-            if w.send(&Msg::Ping.encode()).await.is_err() {
-                return;
-            }
-            if !matches!(tokio_timeout(CONTROL_TIMEOUT, r.recv()).await, Ok(Ok(_))) {
-                return;
-            }
-        }
+        hold_control(r, w, PING_INTERVAL).await;
+        crate::elog!("control channel lost (link dead)");
+        cancel.notify_one();
     }));
     Ok(BridgeLease {
         client_id,
@@ -2002,7 +2085,7 @@ async fn bridge_udp(
         Ok(Err(e)) => return (Err(e), false),
         Err(_) => return (Err("udp control handshake timed out".into()), false),
     };
-    let lease = match bridge_lease(&client.client_id, control_r, control_w).await {
+    let lease = match bridge_lease(&client.client_id, control_r, control_w, &cancel).await {
         Ok(lease) => lease,
         Err(e) => return (Err(e), false),
     };
@@ -2031,8 +2114,9 @@ async fn bridge_udp(
     let rx = DgramRx::new(inbound, noise);
     // Announce this client's label so the server's fleet view names the port.
     let _ = tx.send_name(&lease.client_id).await;
-    // `cancel` fires only when the RX pump sees the peer vanish (server restart),
-    // tearing the bridge down at once instead of stalling until the next reconnect.
+    // `cancel` fires when the RX pump sees the peer vanish or the lease's control
+    // channel goes unanswered (server restart), tearing the bridge down at once
+    // instead of stalling until the next reconnect.
     bridge::tap_dgram(tap, rx, tx, cancel, &lease.client_id).await;
     (Ok(()), true)
 }
@@ -2045,6 +2129,7 @@ async fn bridge_tcp(
     tap: Arc<TapDevice>,
     link: &LinkCell,
 ) -> (Result<()>, bool) {
+    let cancel = Arc::new(Notify::new());
     let ((control_r, control_w), _peer) = match connect_and_handshake(
         &client.server,
         &client.credential_psk,
@@ -2055,7 +2140,7 @@ async fn bridge_tcp(
         Ok(v) => v,
         Err(e) => return (Err(e), false),
     };
-    let lease = match bridge_lease(&client.client_id, control_r, control_w).await {
+    let lease = match bridge_lease(&client.client_id, control_r, control_w, &cancel).await {
         Ok(lease) => lease,
         Err(e) => return (Err(e), false),
     };
@@ -2084,7 +2169,7 @@ async fn bridge_tcp(
     }
     crate::elog!("bridge connected to {} over tcp", client.server);
     link.set(LinkStatus::Connected);
-    bridge::tap_stream(tap, nr, nw, Arc::new(Notify::new())).await;
+    bridge::tap_stream(tap, nr, nw, cancel).await;
     (Ok(()), true)
 }
 
@@ -2282,7 +2367,7 @@ async fn pppoe_udp(
         Ok(Err(e)) => return (Err(e), false),
         Err(_) => return (Err("udp control handshake timed out".into()), false),
     };
-    let lease = match bridge_lease(&client.client_id, control_r, control_w).await {
+    let lease = match bridge_lease(&client.client_id, control_r, control_w, &cancel).await {
         Ok(lease) => lease,
         Err(e) => return (Err(e), false),
     };
@@ -2338,6 +2423,7 @@ async fn pppoe_tcp(
         Ok(dp) => dp,
         Err(e) => return (Err(e), false),
     };
+    let cancel = Arc::new(Notify::new());
     let ((control_r, control_w), _control_peer) = match connect_and_handshake(
         &client.server,
         &client.credential_psk,
@@ -2348,7 +2434,7 @@ async fn pppoe_tcp(
         Ok(v) => v,
         Err(e) => return (Err(e), false),
     };
-    let lease = match bridge_lease(&client.client_id, control_r, control_w).await {
+    let lease = match bridge_lease(&client.client_id, control_r, control_w, &cancel).await {
         Ok(lease) => lease,
         Err(e) => return (Err(e), false),
     };
@@ -2384,7 +2470,7 @@ async fn pppoe_tcp(
         bringup(server_ip, &pp, status),
         nr,
         nw,
-        Arc::new(Notify::new()),
+        cancel,
     )
     .await;
     (result, true)
@@ -2580,18 +2666,6 @@ async fn control_loop(
         }
     }));
 
-    let ping_tx = tx.clone();
-    let _pinger = AbortOnDrop(crate::spawn(async move {
-        let mut tick = interval(PING_INTERVAL);
-        tick.tick().await;
-        loop {
-            tick.tick().await;
-            if ping_tx.try_send(Msg::Ping.encode()).is_err() {
-                break;
-            }
-        }
-    }));
-
     // Fail loud at setup for proxy-enabled forwards: they never fall back to a
     // headerless relay, so a server that does not ack the options (an older
     // release ignores the frame) leaves those ports refusing every connection.
@@ -2646,11 +2720,15 @@ async fn control_loop(
     // teardown aborts black-holed forwards instead of leaking them.
     let mut forwards: Vec<AbortOnDrop> = Vec::new();
 
+    let mut pings = PingWatch::new(PING_INTERVAL);
+    let mut ping_at = tokio::time::Instant::now() + PING_INTERVAL;
+    let mut deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
+
     loop {
         // Any inbound frame (Pong from our ping, or an Open) resets the deadline.
         // No frame for the whole window means the link is a black hole with no
         // FIN/RST; return Err so the outer reconnect loop re-resolves and redials.
-        let recv = tokio_timeout(CONTROL_TIMEOUT, r.recv());
+        let recv = tokio::time::timeout_at(deadline, r.recv());
         let died = async {
             match &cancel {
                 Some(c) => c.notified().await,
@@ -2661,12 +2739,24 @@ async fn control_loop(
             // The RX pump saw the peer vanish (ICMP unreachable on UDP); tear down
             // now rather than waiting out CONTROL_TIMEOUT for the deadline to lapse.
             _ = died => break Err("udp peer unreachable (link dead)".into()),
+            _ = tokio::time::sleep_until(ping_at) => {
+                let Some(wait) = pings.lapse() else {
+                    break Err("server stopped answering pings (link dead)".into());
+                };
+                tx.try_send(Msg::Ping.encode()).ok();
+                ping_at = tokio::time::Instant::now() + wait;
+                continue;
+            }
             res = recv => match res {
                 Ok(Ok(m)) => m,
                 Ok(Err(e)) => break Err(e),
                 Err(_) => break Err("control channel timed out (link dead)".into()),
             },
         };
+        deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
+        if let Some(wait) = pings.heard() {
+            ping_at = tokio::time::Instant::now() + wait;
+        }
         let open = match Msg::decode(&msg) {
             Ok(Msg::Open {
                 proto,
@@ -3861,5 +3951,74 @@ mod tests {
 
         let res = connect_and_handshake(&addr, &[0u8; 32], OPEN_HANDSHAKE_TIMEOUT).await;
         assert!(res.is_err(), "expected timeout error, got Ok");
+    }
+
+    #[test]
+    fn an_answered_ping_keeps_the_normal_cadence() {
+        let mut pings = PingWatch::new(PING_INTERVAL);
+        for _ in 0..3 {
+            assert_eq!(pings.lapse(), Some(PONG_WAIT));
+            assert_eq!(pings.heard(), Some(PING_INTERVAL));
+        }
+        // A frame with no Ping out leaves the timer alone.
+        assert_eq!(pings.heard(), None);
+    }
+
+    #[test]
+    fn a_silent_server_is_dead_after_three_probes() {
+        let mut pings = PingWatch::new(PING_INTERVAL);
+        let mut waited = Duration::ZERO;
+        let mut sent = 0;
+        while let Some(wait) = pings.lapse() {
+            sent += 1;
+            waited += wait;
+        }
+        assert_eq!(sent, 1 + PROBE_STRIKES);
+        assert_eq!(waited, PONG_WAIT + PROBE_INTERVAL * PROBE_STRIKES);
+        assert!(waited <= Duration::from_secs(15));
+    }
+
+    #[test]
+    fn a_late_answer_clears_the_strikes() {
+        let mut pings = PingWatch::new(PING_INTERVAL);
+        assert_eq!(pings.lapse(), Some(PONG_WAIT));
+        assert_eq!(pings.lapse(), Some(PROBE_INTERVAL));
+        assert_eq!(pings.lapse(), Some(PROBE_INTERVAL));
+        assert_eq!(pings.heard(), Some(PING_INTERVAL));
+        let sent = std::iter::from_fn(|| pings.lapse()).count();
+        assert_eq!(sent as u32, 1 + PROBE_STRIKES);
+    }
+
+    // The server answers the first Ping and then reads on without replying, as
+    // a restarted server does to a session it never saw.
+    #[tokio::test(start_paused = true)]
+    async fn hold_control_returns_once_pings_go_unanswered() {
+        let psk = [7u8; 32];
+        let (a, b) = tokio::io::duplex(4096);
+        let (cli, srv) = tokio::join!(
+            crate::noise::client_handshake(a, &psk),
+            crate::noise::server_handshake(b, &psk),
+        );
+        let (r, w) = cli.unwrap();
+        let (mut sr, mut sw) = srv.unwrap();
+        let server = crate::spawn(async move {
+            let mut pings = 0u32;
+            while let Ok(frame) = sr.recv().await {
+                assert!(matches!(Msg::decode(&frame), Ok(Msg::Ping)));
+                if pings == 0 {
+                    sw.send(&Msg::Pong.encode()).await.unwrap();
+                }
+                pings += 1;
+            }
+            pings
+        });
+
+        let start = tokio::time::Instant::now();
+        hold_control(r, w, PING_INTERVAL).await;
+        let silent = PONG_WAIT + PROBE_INTERVAL * PROBE_STRIKES;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= PING_INTERVAL * 2 + silent, "{elapsed:?}");
+        assert!(elapsed < PING_INTERVAL * 2 + silent + Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(server.await.unwrap(), 2 + PROBE_STRIKES);
     }
 }

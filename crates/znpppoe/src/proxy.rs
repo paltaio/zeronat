@@ -23,12 +23,23 @@ const CONNECT_WAIT: Duration = Duration::from_secs(35);
 /// without bound. On overflow the table is cleared; mappings re-establish on use.
 const STICKY_MAX: usize = 4096;
 
+/// Why `Selector::select` picked no session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Wrong password, or a username that names no session.
+    Denied,
+    /// The credentials are good and every session they can use is down.
+    Down,
+}
+
 /// Authenticates a client and resolves its egress session. The proxy password
 /// gates access; the username chooses the session over those currently live, so
-/// rotation never lands on a down session.
+/// no connection is dialed through a down session.
 ///
 /// Username forms (`<user>` is the configured proxy user): `<user>` round-robins,
-/// `<user>_pppoe<K>` pins session K, `<user>_s<token>` is sticky per token.
+/// `<user>_pppoe<K>` pins session K, `<user>_s<token>` is sticky per token. A
+/// sticky token whose session is down moves to the next live session after it
+/// and stays there.
 pub struct Selector {
     user: String,
     pass: String,
@@ -48,39 +59,58 @@ impl Selector {
         }
     }
 
-    pub fn select(&self, user: &[u8], pass: &[u8]) -> Option<usize> {
+    pub fn select(&self, user: &[u8], pass: &[u8]) -> Result<usize, Refusal> {
         if pass != self.pass.as_bytes() {
-            return None;
+            return Err(Refusal::Denied);
         }
-        let rest = std::str::from_utf8(user).ok()?.strip_prefix(&self.user)?;
+        let rest = std::str::from_utf8(user)
+            .ok()
+            .and_then(|user| user.strip_prefix(&self.user))
+            .ok_or(Refusal::Denied)?;
         if rest.is_empty() {
-            self.next_live()
+            self.next_live().ok_or(Refusal::Down)
         } else if let Some(k) = rest.strip_prefix("_pppoe") {
-            let k: usize = k.parse().ok()?;
-            (k < self.live.len()).then_some(k)
+            let k: usize = k.parse().map_err(|_| Refusal::Denied)?;
+            if k >= self.live.len() {
+                return Err(Refusal::Denied);
+            }
+            if self.is_live(k) {
+                Ok(k)
+            } else {
+                Err(Refusal::Down)
+            }
         } else if let Some(token) = rest.strip_prefix("_s") {
-            (!token.is_empty()).then(|| self.sticky(token)).flatten()
+            if token.is_empty() {
+                return Err(Refusal::Denied);
+            }
+            self.sticky(token).ok_or(Refusal::Down)
         } else {
-            None
+            Err(Refusal::Denied)
         }
     }
 
-    fn next_live(&self) -> Option<usize> {
+    /// Whether session `idx` has a negotiated address right now.
+    pub fn is_live(&self, idx: usize) -> bool {
+        self.live[idx].load(Ordering::Relaxed)
+    }
+
+    /// The first live session at or after `start`, wrapping around.
+    fn live_from(&self, start: usize) -> Option<usize> {
         let n = self.live.len();
-        let start = self.rr.fetch_add(1, Ordering::Relaxed);
-        (0..n)
-            .map(|i| (start + i) % n)
-            .find(|&i| self.live[i].load(Ordering::Relaxed))
+        (0..n).map(|i| (start + i) % n).find(|&i| self.is_live(i))
+    }
+
+    fn next_live(&self) -> Option<usize> {
+        self.live_from(self.rr.fetch_add(1, Ordering::Relaxed))
     }
 
     fn sticky(&self, token: &str) -> Option<usize> {
         let mut map = self.sticky.lock().unwrap();
-        if let Some(&i) = map.get(token) {
-            if self.live[i].load(Ordering::Relaxed) {
-                return Some(i);
-            }
-        }
-        let i = self.next_live()?;
+        let i = match map.get(token) {
+            Some(&i) if self.is_live(i) => return Some(i),
+            Some(&i) => self.live_from(i + 1)?,
+            None => self.next_live()?,
+        };
         if map.len() >= STICKY_MAX {
             map.clear();
         }
@@ -189,27 +219,41 @@ mod tests {
 
     #[test]
     fn rejects_wrong_password() {
-        assert_eq!(selector(&[true]).select(b"proxy", b"nope"), None);
+        assert_eq!(
+            selector(&[true]).select(b"proxy", b"nope"),
+            Err(Refusal::Denied)
+        );
     }
 
     #[test]
     fn round_robin_skips_down_sessions() {
         let s = selector(&[false, true, false, true]);
         let picks: Vec<_> = (0..4).map(|_| s.select(b"proxy", b"pw")).collect();
-        assert!(picks.iter().all(|p| matches!(p, Some(1) | Some(3))));
-        assert!(picks.contains(&Some(1)) && picks.contains(&Some(3)));
+        assert!(picks.iter().all(|p| matches!(p, Ok(1) | Ok(3))));
+        assert!(picks.contains(&Ok(1)) && picks.contains(&Ok(3)));
     }
 
     #[test]
     fn round_robin_none_when_all_down() {
-        assert_eq!(selector(&[false, false]).select(b"proxy", b"pw"), None);
+        assert_eq!(
+            selector(&[false, false]).select(b"proxy", b"pw"),
+            Err(Refusal::Down)
+        );
     }
 
     #[test]
     fn pin_selects_exact_session() {
         let s = selector(&[true, true, true]);
-        assert_eq!(s.select(b"proxy_pppoe2", b"pw"), Some(2));
-        assert_eq!(s.select(b"proxy_pppoe9", b"pw"), None);
+        assert_eq!(s.select(b"proxy_pppoe2", b"pw"), Ok(2));
+        assert_eq!(s.select(b"proxy_pppoe9", b"pw"), Err(Refusal::Denied));
+    }
+
+    #[test]
+    fn pin_fails_while_its_session_is_down() {
+        let s = selector(&[true, false, true]);
+        assert_eq!(s.select(b"proxy_pppoe1", b"pw"), Err(Refusal::Down));
+        s.live[1].store(true, Ordering::Relaxed);
+        assert_eq!(s.select(b"proxy_pppoe1", b"pw"), Ok(1));
     }
 
     #[test]
@@ -217,16 +261,38 @@ mod tests {
         let s = selector(&[true, true, true, true]);
         let first = s.select(b"proxy_sjobA", b"pw").unwrap();
         for _ in 0..10 {
-            assert_eq!(s.select(b"proxy_sjobA", b"pw"), Some(first));
+            assert_eq!(s.select(b"proxy_sjobA", b"pw"), Ok(first));
         }
         let other = s.select(b"proxy_sjobB", b"pw").unwrap();
-        assert_eq!(s.select(b"proxy_sjobB", b"pw"), Some(other));
+        assert_eq!(s.select(b"proxy_sjobB", b"pw"), Ok(other));
+    }
+
+    #[test]
+    fn sticky_token_moves_to_the_next_live_session_and_stays() {
+        let s = selector(&[true, true, false, true]);
+        let first = s.select(b"proxy_sjobA", b"pw").unwrap();
+        s.live[first].store(false, Ordering::Relaxed);
+        // The next live session after `first`, skipping session 2.
+        let moved = if first == 1 { 3 } else { (first + 1) % 4 };
+        assert_eq!(s.select(b"proxy_sjobA", b"pw"), Ok(moved));
+        s.live[first].store(true, Ordering::Relaxed);
+        assert_eq!(s.select(b"proxy_sjobA", b"pw"), Ok(moved));
+    }
+
+    #[test]
+    fn sticky_none_when_all_down() {
+        let s = selector(&[true, true]);
+        s.select(b"proxy_sjobA", b"pw").unwrap();
+        for flag in &s.live {
+            flag.store(false, Ordering::Relaxed);
+        }
+        assert_eq!(s.select(b"proxy_sjobA", b"pw"), Err(Refusal::Down));
     }
 
     #[test]
     fn unknown_username_shape_rejected() {
         let s = selector(&[true]);
-        assert_eq!(s.select(b"proxy_bogus", b"pw"), None);
-        assert_eq!(s.select(b"other", b"pw"), None);
+        assert_eq!(s.select(b"proxy_bogus", b"pw"), Err(Refusal::Denied));
+        assert_eq!(s.select(b"other", b"pw"), Err(Refusal::Denied));
     }
 }

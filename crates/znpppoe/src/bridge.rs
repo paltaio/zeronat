@@ -20,6 +20,8 @@ use zeronat::noise::{
 use zeronat::proto::Msg;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Gap between control-channel Pings while the server answers them.
+const PING_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Where the server lives: a fixed address, or a DHT identity resolved at dial
 /// time (and re-resolved on reconnect). The DHT identity is derived from the
@@ -176,18 +178,12 @@ pub async fn connect(addr: SocketAddr, credential: &str, client_id: &str) -> Res
     else {
         return Err(anyhow!("server did not authorize the bridge client"));
     };
-    let control = AbortOnDrop(crate::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            if control_w.send(&Msg::Ping.encode()).await.is_err() {
-                return;
-            }
-            if !matches!(
-                tokio::time::timeout(Duration::from_secs(30), control_r.recv()).await,
-                Ok(Ok(_))
-            ) {
-                return;
-            }
+    let control = AbortOnDrop(crate::spawn({
+        let cancel = cancel.clone();
+        async move {
+            zeronat::client::hold_control(control_r, control_w, PING_INTERVAL).await;
+            eprintln!("znpppoe: the server stopped answering on the control channel");
+            cancel.notify_one();
         }
     }));
 

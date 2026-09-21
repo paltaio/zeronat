@@ -37,7 +37,12 @@ Two front ends, same auth: SOCKS5 (for clients that speak SOCKS) and HTTP CONNEC
 - `proxy` round-robins over the live sessions, one IP per connection.
 - `proxy_pppoe<K>` pins session K (a specific ISP IP).
 - `proxy_s<token>` is sticky: the same token always maps to the same session, so a
-  job's connections share one IP. Vary the token to spread jobs across IPs.
+  job's connections share one IP. Vary the token to spread jobs across IPs. If
+  that session goes down, the token moves to the next live session and stays there.
+
+With no live session to use (every session down, or the pinned one), SOCKS5
+replies `0x03` (network unreachable) and the HTTP proxy replies `502 Bad Gateway`
+at once.
 
 ```
 curl --socks5 proxy:proxypass@127.0.0.1:1080 https://ifconfig.me        # socks, rotates

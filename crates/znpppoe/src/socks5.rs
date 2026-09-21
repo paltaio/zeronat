@@ -12,10 +12,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 use crate::netstack::Handle;
-use crate::proxy::{self, Selector};
+use crate::proxy::{self, Refusal, Selector};
 
 /// Cap the pre-splice handshake so a silent client cannot park a task and fd.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// SOCKS5 reply code 0x03, sent while the chosen session is down.
+const REP_NETWORK_UNREACHABLE: u8 = 0x03;
 
 pub async fn serve(
     listen: SocketAddr,
@@ -57,6 +59,10 @@ async fn handle(mut sock: TcpStream, selector: &Selector, handles: &[Handle]) ->
         Err(_) => bail!("socks5 handshake timed out"),
     };
 
+    let Some(idx) = idx else {
+        reply(&mut sock, REP_NETWORK_UNREACHABLE).await?;
+        bail!("no live session for {target}");
+    };
     match proxy::connect(handles, idx, target).await {
         Ok(conn) => {
             reply(&mut sock, 0x00).await?;
@@ -65,7 +71,12 @@ async fn handle(mut sock: TcpStream, selector: &Selector, handles: &[Handle]) ->
             Ok(())
         }
         Err(e) => {
-            reply(&mut sock, 0x01).await?;
+            let rep = if selector.is_live(idx) {
+                0x01
+            } else {
+                REP_NETWORK_UNREACHABLE
+            };
+            reply(&mut sock, rep).await?;
             Err(e)
         }
     }
@@ -88,8 +99,10 @@ async fn negotiate_auth(sock: &mut TcpStream) -> Result<()> {
 }
 
 /// Read RFC1929 username/password and resolve the egress session through the
-/// selector (password check plus username routing).
-async fn read_userpass(sock: &mut TcpStream, selector: &Selector) -> Result<usize> {
+/// selector (password check plus username routing). `None` means the
+/// credentials are good and no session they can use is up; the request that
+/// follows is answered with `REP_NETWORK_UNREACHABLE`.
+async fn read_userpass(sock: &mut TcpStream, selector: &Selector) -> Result<Option<usize>> {
     let mut head = [0u8; 2];
     sock.read_exact(&mut head).await?;
     if head[0] != 0x01 {
@@ -103,9 +116,13 @@ async fn read_userpass(sock: &mut TcpStream, selector: &Selector) -> Result<usiz
     sock.read_exact(&mut pass).await?;
 
     let idx = selector.select(&user, &pass);
-    sock.write_all(&[0x01, if idx.is_some() { 0x00 } else { 0x01 }])
+    let denied = idx == Err(Refusal::Denied);
+    sock.write_all(&[0x01, if denied { 0x01 } else { 0x00 }])
         .await?;
-    idx.context("bad proxy credentials or no live session")
+    if denied {
+        bail!("bad proxy credentials");
+    }
+    Ok(idx.ok())
 }
 
 async fn read_request(sock: &mut TcpStream) -> Result<SocketAddrV4> {

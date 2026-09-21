@@ -195,12 +195,14 @@ async fn run(
         )
         .await;
 
-        eprintln!("znpppoe: link down; reconnecting");
+        let mut dropped = 0;
         for i in 0..count {
             if state[i].up_since.take().is_some() {
                 est_txs[i].send_replace(None);
+                dropped += 1;
             }
         }
+        eprintln!("znpppoe: link down, {dropped} of {count} session(s) went down; reconnecting");
         sleep(RECONNECT_DELAY).await;
     }
 }
