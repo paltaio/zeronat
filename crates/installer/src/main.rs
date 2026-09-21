@@ -201,14 +201,21 @@ zeronat installer
   --ports \"443/tcp 80/tcp 51820/udp\"
   --all                     forward every port plus ICMP; keeps SSH on the server
   --control PORT            tunnel control port (default 2222)
-  --secret 64-HEX           32-byte hex secret (default: generated)
+  --secret 64-HEX           seed both sides derive their credentials from
+                            (default: generated); the network secret with
+                            --explicit-secrets
   --secret-prompt           read the secret from the terminal without echo
-  --admin-secret 64-HEX     server admin secret (default: generated)
+  --explicit-secrets        write the network, client, admin, and discovery
+                            values themselves instead of one ZERONAT_SEED
+  --admin-secret 64-HEX     server admin secret (default: derived from the
+                            seed; generated with --explicit-secrets)
   --server-addr HOST[:PORT] (client only) where the server is reachable
   --dht                     find the server over the DHT (dynamic IP, no fixed address)
   --discovery 64-HEX        (with --dht) credential the DHT record is keyed by
-                            (server default: generated; a client passes the
-                            value its server's install printed)
+                            (default: derived from the seed; with
+                            --explicit-secrets a server generates one and a
+                            client passes the value its server's install
+                            printed)
   --discovery-prompt        (with --dht) read the discovery credential without echo
   --announce-ip IP          (server, with --dht) public IPv4 to announce
   --announce-port PORT      (server, with --dht) public port to announce
@@ -270,12 +277,14 @@ fn real_main() -> i32 {
     let have_docker = sys::have("docker");
     let have_compose = have_docker && sys::have_compose();
     // Dry-run previews use the stored credentials that installation would reuse.
+    let existing_seed = sys::existing_seed();
     let existing = sys::existing_secret();
     let existing_admin = sys::existing_admin_secret();
     let existing_discovery = sys::existing_discovery_secret();
     let host = Host {
         have_docker,
         have_compose,
+        existing_seed,
         existing_secret: existing,
         existing_admin_secret: existing_admin,
         existing_discovery_secret: existing_discovery,

@@ -13,6 +13,7 @@ use zeronat::client::{
     ActiveTarget, ClientSettings, PeerSlotSession, PeerSlotSpec, ServerTarget, Transport,
 };
 use zeronat::dgram::{DgramRx, DgramTx, Frame};
+use zeronat::identity::ClientId;
 use zeronat::proto::PROVIDES_SEGMENT;
 
 use crate::bridge::{self, AbortOnDrop, Bridge, BridgeHold, Target};
@@ -64,17 +65,16 @@ pub struct PeerId<'a>(pub &'a str);
 /// Pair with `peer`'s L2 segment and hand every session that comes up to the
 /// driver. The client this starts runs no session body of its own: the control
 /// session it dials is what the pairing goes through, and the consumer slot
-/// under it asks again whenever a pair dies. The client derives its id from
-/// `id_prefix`, the same id the bridge path labels its port with, and
-/// authenticates the inner handshake with `peer_secret`, its own x25519
-/// static key.
+/// under it asks again whenever a pair dies. The client goes by `id`, the
+/// same id the bridge path labels its port with, and authenticates the inner
+/// handshake with `peer_secret`, its own x25519 static key.
 pub fn peer(
     server: &str,
     secret: &str,
     credential: &str,
     discovery: Option<&str>,
     peer_secret: &str,
-    id_prefix: &str,
+    id: ClientId,
     peer: PeerId<'_>,
 ) -> Uplink {
     let target = ServerTarget {
@@ -94,7 +94,7 @@ pub fn peer(
         tun: None,
         pppoe: Vec::new(),
         autostart: None,
-        id_prefix: Some(id_prefix.to_string()),
+        id,
         peer_secret: Some(peer_secret.to_string()),
         control: None,
         config: None,

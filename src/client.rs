@@ -23,6 +23,7 @@ use crate::clientproto::{
 use crate::dgram::{DgramRx, DgramTx};
 #[cfg(target_os = "linux")]
 use crate::exitroute::ExitRoutes;
+use crate::identity::ClientId;
 use crate::kcp::{
     route, session as kcp_session, ConvGuard, Session, CLASS_KCP, CLASS_SETUP, SETUP_CONV_BIT,
 };
@@ -1165,7 +1166,7 @@ pub async fn run(
     tap: Option<TapConfig>,
     tun: Option<ClientTun>,
     pppoe: Option<PppoeRunConfig>,
-    id_prefix: Option<String>,
+    id: ClientId,
     control: Option<ControlPath>,
 ) -> Result<()> {
     let target = ServerTarget {
@@ -1192,7 +1193,7 @@ pub async fn run(
             .into_iter()
             .collect(),
         autostart,
-        id_prefix,
+        id,
         peer_secret: None,
         control,
         config: None,
@@ -1223,7 +1224,7 @@ pub struct ClientSettings {
     pub pppoe: Vec<PppoeSession>,
     /// Name of the pppoe session to boot when no forwards are declared.
     pub autostart: Option<String>,
-    pub id_prefix: Option<String>,
+    pub id: ClientId,
     /// The 64-hex static x25519 private key peer sessions authenticate with;
     /// required when `peers` is non-empty.
     pub peer_secret: Option<String>,
@@ -1265,7 +1266,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         tun,
         pppoe,
         autostart,
-        id_prefix,
+        id,
         peer_secret,
         control,
         config,
@@ -1280,7 +1281,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
             target.discovery = Some(crate::secret::normalize(discovery)?);
         }
     }
-    let client_id = crate::identity::derive_client_id(id_prefix.as_deref());
+    let client_id = id.resolve();
     let peer_static = peer_secret
         .as_deref()
         .map(crate::secret::decode)
@@ -3828,7 +3829,7 @@ mod tests {
             tun: None,
             pppoe: vec![],
             autostart: None,
-            id_prefix: Some("t".into()),
+            id: ClientId::Prefix(Some("t".into())),
             peer_secret: Some(crate::secret::encode([3; 32])),
             control: None,
             config: None,

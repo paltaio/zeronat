@@ -18,7 +18,7 @@ frames are demultiplexed back to the right session by destination MAC.
 docker build -f crates/znpppoe/Dockerfile -t znpppoe .
 
 docker run --rm -p 127.0.0.1:1080:1080 -p 127.0.0.1:8081:8081 \
-  -e ZN_SECRET=0000 \
+  -e ZN_SEED=<64-hex-seed> -e ZN_CLIENT_ID=pppoe \
   -e ZN_USER=someuser -e ZN_PASSWORD=somepassword \
   -e ZN_PROXY_USER=proxy -e ZN_PROXY_PASS=proxypass \
   znpppoe --host 192.168.1.100:2222 --connections 50 \
@@ -56,7 +56,15 @@ curl --proxy http://proxy_sjob42:proxypass@127.0.0.1:8081 https://ifconfig.me  #
 - `--sock-rx KIB` per-connection TCP receive buffer (default 256); it sets the advertised window, so raise it for high bandwidth-delay paths. Below 64 disables window scaling.
 - `--sock-tx KIB` per-connection TCP send buffer (default 64).
 - `--max-conns N` ceiling on concurrent proxied connections (default 1024); bounds total buffer memory.
-- `ZN_SECRET` tunnel secret.
+- `ZN_SEED` the seed the zeronat server runs on; it fills `ZN_SECRET`,
+  `ZN_CLIENT_SECRET` (derived for `ZN_CLIENT_ID`, which the server lists as
+  `--client <id>`), `ZN_DISCOVERY_SECRET`, and `ZN_PEER_SECRET`. A value set on
+  its own wins.
+- `ZN_CLIENT_ID` the client id sent to the server; required with `ZN_SEED`.
+- `ZN_SECRET` tunnel secret; `ZN_CLIENT_SECRET` this client's credential
+  (defaults to `ZN_SECRET`).
+- `ZN_DISCOVERY_SECRET` the server's discovery credential, with `--dht`.
+- `ZN_PEER_SECRET` this process's x25519 static key, with `--peer`.
 - `ZN_USER`/`ZN_PASSWORD` PPPoE login; `ZN_SERVICE` optional PPPoE service name.
 - `ZN_PROXY_USER`/`ZN_PROXY_PASS` proxy credentials (separate from the PPPoE
   login).
@@ -65,8 +73,8 @@ curl --proxy http://proxy_sjob42:proxypass@127.0.0.1:8081 https://ifconfig.me  #
 
 - Running N sessions on one credential only works if the ISP permits concurrent
   PPPoE sessions for that login; otherwise give each session its own credential.
-- Pass `--dht` instead of `--host` to find the server by DHT (derived from
-  `ZN_SECRET`, the same identity the server announces under).
+- Pass `--dht` instead of `--host` to find the server by DHT under
+  `ZN_DISCOVERY_SECRET`, the credential the server announces under.
 - Domain targets are resolved with the container's resolver, so the DNS lookup
   does not carry the PPPoE source address (the TCP egress does). The
   `scratch` image carries no `/etc/resolv.conf`, so domain resolution relies on

@@ -18,14 +18,18 @@ Picks Docker or a systemd service, generates the secret, asks what to forward, a
 
 ```bash
 # Generate this once, then copy the same value to both hosts.
-SECRET="$(openssl rand -hex 32)"
+SEED="$(openssl rand -hex 32)"
 
 # On the public host:
-ZERONAT_SECRET="$SECRET" zeronat server --control 2222 --tcp 443 --udp 51820
+ZERONAT_SEED="$SEED" zeronat server --control 2222 --client home --tcp 443 --udp 51820
 
 # Behind CG-NAT:
-ZERONAT_SECRET="$SECRET" zeronat client --server <public-ip>:2222 --tcp 443 --udp 51820
+ZERONAT_SEED="$SEED" zeronat client --server <public-ip>:2222 --id home --tcp 443 --udp 51820
 ```
+
+The seed derives every credential: the network secret, the admin secret, the discovery credential, and one credential per client id, so `--client home` on the server and `--id home` on the client agree with nothing else copied. The server accepts only clients it holds a credential for; `--client <id>` is repeatable and the config file takes `[[clients]]` entries. Ids and credentials must both be unique.
+
+A value set on its own wins over the seed: `ZERONAT_SECRET`, `--client <id>:<64-HEX>` (or `ZERONAT_CLIENT_ID` with `ZERONAT_CLIENT_SECRET`), `ZERONAT_ADMIN_SECRET`, `ZERONAT_DISCOVERY_SECRET`. To keep the seed off a client, run `zeronat derive-client <id>` on the server. It prints `ZERONAT_SECRET` and `ZERONAT_CLIENT_SECRET` lines for that client, and `ZERONAT_DISCOVERY_SECRET` with `--dht`; start the client with those in its environment in place of the seed.
 
 `--tcp 443` maps to `127.0.0.1:443`. Remap with `--tcp 443:10.0.0.5:443`; `--udp` works the same. Specs take `+` modifiers: `--tcp 443+proxy` hands the target the real client address in a PROXY protocol v2 header (`--proxy` enables it on every TCP forward), and `+idle=SECS` tunes the per-forward idle window. Open the control port (2222, UDP and TCP) on the server's firewall.
 

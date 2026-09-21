@@ -267,11 +267,18 @@ fn client_addr(cfg: &Config) -> String {
 }
 
 /// The zeronat subcommand the service runs (without the binary/image prefix).
+/// Under a seed the server authorizes the client id `client` and the client
+/// goes by it; an explicit install names both in its env file.
 pub fn subcmd(cfg: &Config) -> String {
     let a = zn_args(cfg);
+    let id = if cfg.explicit { "" } else { " --id client" };
     match cfg.mode {
         Mode::Server => {
-            let mut s = format!("server --control {}{a}", cfg.control);
+            let mut s = format!("server --control {}", cfg.control);
+            if !cfg.explicit {
+                s.push_str(" --client client");
+            }
+            s.push_str(&a);
             // Keep SSH on the server (it would otherwise route to the client like
             // every other port).
             if cfg.kind == Kind::All && cfg.exclude_ssh {
@@ -293,8 +300,8 @@ pub fn subcmd(cfg: &Config) -> String {
             }
             s
         }
-        Mode::Client if cfg.use_dht => format!("client --server dht{a}"),
-        Mode::Client => format!("client --server {}{a}", client_addr(cfg)),
+        Mode::Client if cfg.use_dht => format!("client --server dht{id}{a}"),
+        Mode::Client => format!("client --server {}{id}{a}", client_addr(cfg)),
     }
 }
 
@@ -322,9 +329,10 @@ fn console_cmd(cfg: &Config) -> Option<String> {
     };
     Some(match cfg.method {
         // The image is FROM scratch with the binary at /zeronat, and the
-        // container receives ZERONAT_ADMIN_SECRET from its env file.
+        // container receives its env file, whose ZERONAT_SEED or
+        // ZERONAT_ADMIN_SECRET admin reads.
         Method::Docker => format!("docker exec -it zeronat /zeronat admin --server {target}"),
-        // sudo lets admin read ZERONAT_ADMIN_SECRET from the root-owned env file.
+        // sudo lets admin read the root-owned env file.
         Method::Systemd => format!("sudo {BIN_PATH} admin --server {target}"),
     })
 }
@@ -334,27 +342,33 @@ fn console_cmd(cfg: &Config) -> Option<String> {
 fn peer_steps(cfg: &Config) -> (String, String) {
     let fwd = forward_flag(cfg);
     // The one-liner lands in scrollback and shell history on the other machine,
-    // so it carries prompt flags instead of the credentials themselves.
-    let names = if cfg.use_dht {
-        "ZERONAT_SECRET and ZERONAT_DISCOVERY_SECRET"
-    } else {
-        "ZERONAT_SECRET"
-    };
-    let entry = if cfg.use_dht {
-        "enter each value at its hidden prompt"
-    } else {
-        "enter it at the hidden prompt"
+    // so it carries prompt flags instead of the credentials themselves. An
+    // explicit install says so, since the other side defaults to a seed.
+    let (names, entry, prompts) = match (cfg.explicit, cfg.use_dht) {
+        (true, true) => (
+            "ZERONAT_SECRET and ZERONAT_DISCOVERY_SECRET",
+            "enter each value at its hidden prompt",
+            "--explicit-secrets --secret-prompt --discovery-prompt",
+        ),
+        (true, false) => (
+            "ZERONAT_SECRET",
+            "enter it at the hidden prompt",
+            "--explicit-secrets --secret-prompt",
+        ),
+        (false, _) => (
+            "ZERONAT_SEED",
+            "enter it at the hidden prompt",
+            "--secret-prompt",
+        ),
     };
     match cfg.mode {
         Mode::Server => {
             let cmd = if cfg.use_dht {
-                format!(
-                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --dht --secret-prompt --discovery-prompt {fwd} -y"
-                )
+                format!("curl -fsSL {INSTALL_URL} | sh -s -- --client --dht {prompts} {fwd} -y")
             } else {
                 let host = sys::pub_ip();
                 format!(
-                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --server-addr {host}:{} --secret-prompt {fwd} -y",
+                    "curl -fsSL {INSTALL_URL} | sh -s -- --client --server-addr {host}:{} {prompts} {fwd} -y",
                     cfg.control
                 )
             };
@@ -367,7 +381,7 @@ fn peer_steps(cfg: &Config) -> (String, String) {
         }
         Mode::Client => {
             let disc = if cfg.use_dht {
-                "--dht --discovery-prompt".to_string()
+                "--dht".to_string()
             } else {
                 // The server must listen on the port the client dials, which is
                 // the one in the entered address (falling back to the default).
@@ -378,9 +392,8 @@ fn peer_steps(cfg: &Config) -> (String, String) {
                     .unwrap_or_else(|| cfg.control.clone());
                 format!("--control {ctrl}")
             };
-            let cmd = format!(
-                "curl -fsSL {INSTALL_URL} | sh -s -- --server {disc} --secret-prompt {fwd} -y"
-            );
+            let cmd =
+                format!("curl -fsSL {INSTALL_URL} | sh -s -- --server {disc} {prompts} {fwd} -y");
             (
                 format!(
                     "Read {names} from {ENV_FILE} on this machine. Run this on the server and {entry}:"
@@ -418,27 +431,38 @@ fn check_forwards(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// The env file: one `ZERONAT_SEED` plus any credential given on its own, or
+/// with `explicit` the network secret, the `client` authorization, and the
+/// admin secret spelled out.
 fn env_file(cfg: &Config, sub: &str) -> String {
-    let mut role = if cfg.mode == Mode::Server {
-        format!(
-            "ZERONAT_CLIENT_ID=client\nZERONAT_CLIENT_SECRET={}\nZERONAT_ADMIN_SECRET={}\n",
-            cfg.secret, cfg.admin_secret
-        )
+    let mut env = if cfg.explicit {
+        let mut env = format!("ZERONAT_SECRET={}\n", cfg.secret);
+        if cfg.mode == Mode::Server {
+            env.push_str(&format!(
+                "ZERONAT_CLIENT_ID=client\nZERONAT_CLIENT_SECRET={}\nZERONAT_ADMIN_SECRET={}\n",
+                cfg.secret, cfg.admin_secret
+            ));
+        } else {
+            env.push_str(&format!("ZERONAT_CLIENT_SECRET={}\n", cfg.secret));
+        }
+        env
     } else {
-        format!("ZERONAT_CLIENT_SECRET={}\n", cfg.secret)
+        let mut env = format!("ZERONAT_SEED={}\n", cfg.secret);
+        if cfg.mode == Mode::Server && !cfg.admin_secret.is_empty() {
+            env.push_str(&format!("ZERONAT_ADMIN_SECRET={}\n", cfg.admin_secret));
+        }
+        env
     };
-    if cfg.use_dht {
-        role.push_str(&format!("ZERONAT_DISCOVERY_SECRET={}\n", cfg.discovery));
+    if cfg.use_dht && !cfg.discovery.is_empty() {
+        env.push_str(&format!("ZERONAT_DISCOVERY_SECRET={}\n", cfg.discovery));
     }
     if cfg.method == Method::Docker && cfg.deploy == Deploy::Compose {
-        format!(
-            "ZERONAT_SECRET={}\n{role}ZERONAT_USER={}\nZERONAT_ARGS={sub}\n",
-            cfg.secret,
+        env.push_str(&format!(
+            "ZERONAT_USER={}\nZERONAT_ARGS={sub}\n",
             container_user(cfg)
-        )
-    } else {
-        format!("ZERONAT_SECRET={}\n{role}", cfg.secret)
+        ));
     }
+    env
 }
 
 /// Container user for docker deploys. Binding a port below 1024 needs
@@ -1432,30 +1456,92 @@ mod tests {
         assert!(console_cmd(&c).is_none());
     }
 
+    // Both sides get the one seed; the server authorizes `client` on the
+    // command line and the client goes by that id. An admin secret given on
+    // its own rides along.
     #[test]
-    fn generated_env_authorizes_the_installed_client() {
+    fn generated_env_is_one_seed() {
         let mut c = cfg();
+        c.mode = Mode::Server;
+        c.admin_secret.clear();
+        assert_eq!(
+            env_file(&c, "server --control 2222"),
+            format!("ZERONAT_SEED={TEST_SECRET}\n")
+        );
+        assert_eq!(
+            subcmd(&c),
+            "server --control 2222 --client client --config /etc/zeronat/data/server.toml"
+        );
+        c.admin_secret = TEST_ADMIN_SECRET.into();
+        assert_eq!(
+            env_file(&c, "server --control 2222"),
+            format!("ZERONAT_SEED={TEST_SECRET}\nZERONAT_ADMIN_SECRET={TEST_ADMIN_SECRET}\n")
+        );
+
+        c.mode = Mode::Client;
+        c.server_addr = "1.2.3.4:2222".into();
+        assert_eq!(
+            env_file(&c, "client --server 1.2.3.4:2222"),
+            format!("ZERONAT_SEED={TEST_SECRET}\n")
+        );
+        assert_eq!(subcmd(&c), "client --server 1.2.3.4:2222 --id client");
+    }
+
+    #[test]
+    fn explicit_env_authorizes_the_installed_client() {
+        let mut c = cfg();
+        c.explicit = true;
         c.mode = Mode::Server;
         let server = env_file(&c, "server --control 2222");
         assert!(server.contains(&format!("ZERONAT_SECRET={TEST_SECRET}\n")));
         assert!(server.contains("ZERONAT_CLIENT_ID=client\n"));
         assert!(server.contains(&format!("ZERONAT_CLIENT_SECRET={TEST_SECRET}\n")));
         assert!(server.contains(&format!("ZERONAT_ADMIN_SECRET={TEST_ADMIN_SECRET}\n")));
+        assert!(!server.contains("ZERONAT_SEED="));
+        assert_eq!(
+            subcmd(&c),
+            "server --control 2222 --config /etc/zeronat/data/server.toml"
+        );
 
         c.mode = Mode::Client;
+        c.server_addr = "1.2.3.4:2222".into();
         let client = env_file(&c, "client --server 127.0.0.1:2222");
         assert!(client.contains(&format!("ZERONAT_SECRET={TEST_SECRET}\n")));
         assert!(client.contains(&format!("ZERONAT_CLIENT_SECRET={TEST_SECRET}\n")));
         assert!(!client.contains("ZERONAT_CLIENT_ID="));
         assert!(!client.contains("ZERONAT_ADMIN_SECRET="));
+        assert!(!client.contains("ZERONAT_SEED="));
+        assert_eq!(subcmd(&c), "client --server 1.2.3.4:2222");
     }
 
-    // A dht install carries the discovery secret in the env file it writes;
-    // the one-liner for the other machine prompts for it instead, and a
-    // host:port install carries neither.
+    // A seeded dht install writes no discovery value and asks the other
+    // machine for the seed only.
+    #[test]
+    fn seeded_dht_install_derives_the_discovery_secret() {
+        let mut c = cfg();
+        c.mode = Mode::Server;
+        c.use_dht = true;
+        c.ports = "80/tcp".into();
+        let env = env_file(&c, "server --control 2222");
+        assert!(!env.contains("ZERONAT_DISCOVERY_SECRET"), "{env}");
+        let (intro, cmd) = peer_steps(&c);
+        assert!(intro.contains("ZERONAT_SEED"), "{intro}");
+        assert!(cmd.contains("--secret-prompt"), "{cmd}");
+        assert!(!cmd.contains("--discovery"), "{cmd}");
+        assert!(!cmd.contains("--explicit-secrets"), "{cmd}");
+
+        c.mode = Mode::Client;
+        let (_, cmd) = peer_steps(&c);
+        assert!(cmd.contains("--server --dht --secret-prompt"), "{cmd}");
+    }
+
+    // An explicit dht install carries the discovery secret in the env file it
+    // writes; the one-liner for the other machine prompts for it instead, and
+    // a host:port install carries neither.
     #[test]
     fn dht_install_keeps_the_discovery_secret_in_the_env_file() {
         let mut c = cfg();
+        c.explicit = true;
         c.mode = Mode::Server;
         c.use_dht = true;
         c.discovery = TEST_DISCOVERY_SECRET.into();
@@ -1488,6 +1574,7 @@ mod tests {
     #[test]
     fn peer_commands_prompt_for_credentials_instead_of_embedding_them() {
         let mut c = cfg();
+        c.explicit = true;
         c.mode = Mode::Server;
         c.use_dht = true;
         c.discovery = TEST_DISCOVERY_SECRET.into();
@@ -1495,6 +1582,7 @@ mod tests {
         let (intro, cmd) = peer_steps(&c);
         assert!(!cmd.contains(TEST_SECRET), "{cmd}");
         assert!(!cmd.contains(TEST_DISCOVERY_SECRET), "{cmd}");
+        assert!(cmd.contains("--explicit-secrets"), "{cmd}");
         assert!(cmd.contains("--secret-prompt"), "{cmd}");
         assert!(cmd.contains("--discovery-prompt"), "{cmd}");
         assert!(intro.contains("/etc/zeronat/.env"), "{intro}");
@@ -1503,6 +1591,7 @@ mod tests {
         let (intro, cmd) = peer_steps(&c);
         assert!(!cmd.contains(TEST_SECRET), "{cmd}");
         assert!(!cmd.contains(TEST_DISCOVERY_SECRET), "{cmd}");
+        assert!(cmd.contains("--explicit-secrets"), "{cmd}");
         assert!(cmd.contains("--secret-prompt"), "{cmd}");
         assert!(cmd.contains("--discovery-prompt"), "{cmd}");
         assert!(intro.contains("/etc/zeronat/.env"), "{intro}");
@@ -1718,7 +1807,7 @@ mod tests {
         c.ports = "443/tcp 51820/udp".into();
         assert_eq!(
             subcmd(&c),
-            "server --control 2222 --tcp 443 --udp 51820 --config /etc/zeronat/data/server.toml"
+            "server --control 2222 --client client --tcp 443 --udp 51820 --config /etc/zeronat/data/server.toml"
         );
     }
 
@@ -1730,7 +1819,7 @@ mod tests {
         c.ports = "80/tcp".into();
         assert_eq!(
             subcmd(&c),
-            "server --control 2222 --tcp 80 --server dht --config /etc/zeronat/data/server.toml"
+            "server --control 2222 --client client --tcp 80 --server dht --config /etc/zeronat/data/server.toml"
         );
     }
 
@@ -1740,7 +1829,7 @@ mod tests {
         c.mode = Mode::Client;
         c.server_addr = "1.2.3.4".into();
         c.ports = "443/tcp".into();
-        assert_eq!(subcmd(&c), "client --server 1.2.3.4:2222 --tcp 443");
+        assert_eq!(subcmd(&c), "client --server 1.2.3.4:2222 --id client --tcp 443");
     }
 
     #[test]
@@ -1749,7 +1838,10 @@ mod tests {
         c.mode = Mode::Client;
         c.server_addr = "host.example:9000".into();
         c.ports = "443/tcp".into();
-        assert_eq!(subcmd(&c), "client --server host.example:9000 --tcp 443");
+        assert_eq!(
+            subcmd(&c),
+            "client --server host.example:9000 --id client --tcp 443"
+        );
     }
 
     #[test]
@@ -1758,7 +1850,7 @@ mod tests {
         c.mode = Mode::Client;
         c.use_dht = true;
         c.ports = "443/tcp".into();
-        assert_eq!(subcmd(&c), "client --server dht --tcp 443");
+        assert_eq!(subcmd(&c), "client --server dht --id client --tcp 443");
     }
 
     #[test]
@@ -1767,7 +1859,7 @@ mod tests {
         c.mode = Mode::Server;
         c.kind = Kind::Bridge;
         c.tap = "zn0".into();
-        assert_eq!(subcmd(&c), "server --control 2222 --tap zn0");
+        assert_eq!(subcmd(&c), "server --control 2222 --client client --tap zn0");
     }
 
     #[test]
@@ -1780,7 +1872,7 @@ mod tests {
         c.tap_mtu = "1400".into();
         assert_eq!(
             subcmd(&c),
-            "server --control 2222 --tap zn0 --bridge br0 --tap-mtu 1400"
+            "server --control 2222 --client client --tap zn0 --bridge br0 --tap-mtu 1400"
         );
     }
 
@@ -1794,7 +1886,7 @@ mod tests {
         c.announce_port = "9000".into();
         assert_eq!(
             subcmd(&c),
-            "server --control 2222 --tcp 443 --server dht --announce-ip 203.0.113.1 --announce-port 9000 --config /etc/zeronat/data/server.toml"
+            "server --control 2222 --client client --tcp 443 --server dht --announce-ip 203.0.113.1 --announce-port 9000 --config /etc/zeronat/data/server.toml"
         );
     }
 
@@ -1804,7 +1896,10 @@ mod tests {
         c.mode = Mode::Server;
         c.kind = Kind::All;
         c.ssh_port = 2200;
-        assert_eq!(subcmd(&c), "server --control 2222 --tun --except 2200");
+        assert_eq!(
+            subcmd(&c),
+            "server --control 2222 --client client --tun --except 2200"
+        );
     }
 
     #[test]
@@ -1813,7 +1908,7 @@ mod tests {
         c.mode = Mode::Server;
         c.kind = Kind::All;
         c.exclude_ssh = false;
-        assert_eq!(subcmd(&c), "server --control 2222 --tun");
+        assert_eq!(subcmd(&c), "server --control 2222 --client client --tun");
     }
 
     #[test]
@@ -1822,7 +1917,7 @@ mod tests {
         c.mode = Mode::Client;
         c.kind = Kind::All;
         c.server_addr = "1.2.3.4".into();
-        assert_eq!(subcmd(&c), "client --server 1.2.3.4:2222 --tun");
+        assert_eq!(subcmd(&c), "client --server 1.2.3.4:2222 --id client --tun");
     }
 
     #[test]

@@ -2,7 +2,9 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use zeronat::client::{DEFAULT_TAP_MTU, DEFAULT_TUN_NAME};
 use zeronat::clientcfg::{CfgForward, CfgPppoe, CfgServer, ClientConfig};
+use zeronat::identity::ClientId;
 use zeronat::proto::{Proto, Source};
+use zeronat::seed::Seed;
 use zeronat::tap::TapConfig;
 use zeronat::{admin, client, client_admin, server, Result};
 
@@ -30,6 +32,13 @@ fn runtime_secret(value: String) -> Result<String> {
     zeronat::secret::normalize(&value).map_err(Into::into)
 }
 
+/// The seed from `--seed` or `ZERONAT_SEED`, if either is set.
+fn seed_from(flag: Option<String>) -> Result<Option<Seed>> {
+    flag.or_else(|| std::env::var("ZERONAT_SEED").ok())
+        .map(|value| Seed::parse(&value))
+        .transpose()
+}
+
 /// The tunnel `/24` for `secret`: `(network base, server .1, client .2)`.
 fn tun_addrs(secret: &str) -> (Ipv4Addr, Ipv4Addr, Ipv4Addr) {
     let base = zeronat::identity::derive_tun_subnet(secret);
@@ -44,16 +53,24 @@ Subcommands:
   server   Run on the public host (VPS)
   client   Run on the host behind CG-NAT
   admin    Inspect and control topology (interactive on a terminal)
+  derive-client <ID>  Print the env lines that start client ID without the seed
   upgrade  Fetch the latest release and restart this host's deployment
 
 server options:
   --bind <ADDR>       Address to bind on (default: 0.0.0.0)
   --control <PORT>    Control port (default: 2222)
-  --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET)
-  --client <ID>:<64-HEX>  Authorize a client id and credential (repeatable; or env
-                      ZERONAT_CLIENT_ID and ZERONAT_CLIENT_SECRET)
+  --seed <64-HEX>     Seed for every credential left unset (or env ZERONAT_SEED):
+                      the network secret, the admin secret, the discovery
+                      credential, and the credential of each --client given as
+                      a bare ID. A credential set on its own always wins
+  --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET, or derived from
+                      the seed)
+  --client <ID>[:<64-HEX>]  Authorize a client id and credential (repeatable; or
+                      env ZERONAT_CLIENT_ID and ZERONAT_CLIENT_SECRET). A bare
+                      ID takes its credential from the seed
   --admin-secret <64-HEX>  Independent remote admin secret (or env
-                      ZERONAT_ADMIN_SECRET; remote admin is disabled when unset)
+                      ZERONAT_ADMIN_SECRET, or derived from the seed; remote
+                      admin is disabled when none is set)
   --id <ID>           Server identity label (default: 0)
   --config <PATH>     Load listeners/routes/identity from a config file
   --tcp <PORT>        Public TCP port to expose (repeatable)
@@ -74,19 +91,28 @@ server options:
                       uncongested path and lowers throughput on a congested one
   --server dht        Publish this server's address to the DHT for discovery
   --discovery <64-HEX>  Discovery credential the DHT record is keyed by (or env
-                      ZERONAT_DISCOVERY_SECRET); required with --server dht
+                      ZERONAT_DISCOVERY_SECRET, or derived from the seed);
+                      required with --server dht
   --announce-ip <IP>  Public IPv4 to announce (default: auto-detected via DHT)
   --announce-port <P> Public port to announce (default: control port)
 
 client options:
   --server <ADDR>     Server control address host:port, or 'dht' to discover via DHT
-  --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET)
-  --credential <64-HEX>  Client credential (or env ZERONAT_CLIENT_SECRET;
-                      defaults to --secret)
+  --seed <64-HEX>     Seed for every credential left unset (or env ZERONAT_SEED):
+                      the network secret, the discovery credential, and this
+                      client's credential for --id. A credential set on its own
+                      always wins
+  --secret <64-HEX>   32-byte hex secret (or env ZERONAT_SECRET, or derived from
+                      the seed)
+  --credential <64-HEX>  Client credential (or env ZERONAT_CLIENT_SECRET, or
+                      derived from the seed for --id; defaults to --secret)
   --discovery <64-HEX>  Discovery credential the server's DHT record is keyed
-                      by (or env ZERONAT_DISCOVERY_SECRET); required with
-                      --server dht
-  --id <PREFIX>       Client id prefix (default: short hostname)
+                      by (or env ZERONAT_DISCOVERY_SECRET, or derived from the
+                      seed); required with --server dht
+  --id <ID>           Client id. With a seed-derived credential it is sent as-is
+                      and must equal the id in the server's --client entry;
+                      otherwise it is a prefix a host suffix is appended to
+                      (default: short hostname)
   --config <PATH>     Load servers/forwards/identity from a config file
   --tcp <SPEC>        Forward TCP: PORT | PORT:LOCALPORT | PORT:HOST:PORT, plus
                       optional +proxy (send a PROXY protocol v2 header to the
@@ -162,8 +188,16 @@ admin options:
                       status and exits when piped or redirected
   show                Print the server's current topology and exit
   --server <ADDR>     Server control address host:port
-  --secret <64-HEX>   32-byte admin secret (or env ZERONAT_ADMIN_SECRET, or the
-                      ZERONAT_ADMIN_SECRET in /etc/zeronat/.env)
+  --secret <64-HEX>   32-byte admin secret (or env ZERONAT_ADMIN_SECRET, or
+                      derived from env ZERONAT_SEED, or either one read from
+                      /etc/zeronat/.env)
+
+derive-client options:
+  <ID>                The client id, as the server lists it under --client.
+                      Prints ZERONAT_SECRET and ZERONAT_CLIENT_SECRET
+  --seed <64-HEX>     The seed (or env ZERONAT_SEED)
+  --dht               Also print ZERONAT_DISCOVERY_SECRET, for a client that
+                      runs with --server dht
 
 upgrade options:
   --check             Report whether a newer release exists, without applying it
@@ -177,9 +211,10 @@ enum Cmd {
     Server {
         bind: Option<Ipv4Addr>,
         control: Option<u16>,
-        secret: String,
+        seed: Option<String>,
+        secret: Option<String>,
         discovery: Option<String>,
-        client_credentials: Vec<server::ClientCredentialSpec>,
+        client_credentials: Vec<zeronat::config::CfgClient>,
         admin_secret: Option<String>,
         server_id: Option<String>,
         tcp: Vec<u16>,
@@ -197,6 +232,7 @@ enum Cmd {
     },
     Client {
         server: Option<String>,
+        seed: Option<String>,
         secret: Option<String>,
         credential: Option<String>,
         discovery: Option<String>,
@@ -233,6 +269,11 @@ enum Cmd {
         server: String,
         secret: String,
         interactive: bool,
+    },
+    DeriveClient {
+        secret: String,
+        credential: String,
+        discovery: Option<String>,
     },
     Upgrade {
         check: bool,
@@ -494,6 +535,7 @@ fn parse_args() -> Result<Cmd> {
         Some("server") => "server",
         Some("client") => "client",
         Some("admin") => "admin",
+        Some("derive-client") => "derive-client",
         Some("upgrade") => "upgrade",
         Some(other) => {
             eprintln!("error: unknown subcommand '{other}'\n{USAGE}");
@@ -657,9 +699,10 @@ fn parse_args() -> Result<Cmd> {
     if subcmd == "server" {
         let mut bind: Option<Ipv4Addr> = None;
         let mut control: Option<u16> = None;
+        let mut seed: Option<String> = None;
         let mut secret: Option<String> = None;
         let mut discovery: Option<String> = None;
-        let mut client_credentials = Vec::new();
+        let mut client_credentials: Vec<zeronat::config::CfgClient> = Vec::new();
         let mut admin_secret: Option<String> = None;
         let mut kcp_window: Option<String> = None;
         let mut server_id: Option<String> = None;
@@ -717,6 +760,9 @@ fn parse_args() -> Result<Cmd> {
                         format!("--control must be a u16, got '{v}'").into()
                     })?);
                 }
+                "--seed" => {
+                    seed = Some(iter.next().ok_or("--seed requires a value")?);
+                }
                 "--secret" => {
                     secret = Some(iter.next().ok_or("--secret requires a value")?);
                 }
@@ -724,15 +770,19 @@ fn parse_args() -> Result<Cmd> {
                     discovery = Some(iter.next().ok_or("--discovery requires a value")?);
                 }
                 "--client" => {
-                    let value = iter.next().ok_or("--client requires ID:64-HEX")?;
-                    let (client_id, secret) =
-                        value.split_once(':').ok_or("--client requires ID:64-HEX")?;
+                    let value = iter.next().ok_or("--client requires ID or ID:64-HEX")?;
+                    let (client_id, secret) = match value.split_once(':') {
+                        Some((client_id, secret)) => {
+                            (client_id, Some(runtime_secret(secret.to_string())?))
+                        }
+                        None => (value.as_str(), None),
+                    };
                     if client_id.is_empty() {
                         return Err("--client id must not be empty".into());
                     }
-                    client_credentials.push(server::ClientCredentialSpec {
-                        client_id: client_id.to_string(),
-                        secret: runtime_secret(secret.to_string())?,
+                    client_credentials.push(zeronat::config::CfgClient {
+                        id: client_id.to_string(),
+                        secret,
                     });
                 }
                 "--admin-secret" => {
@@ -795,33 +845,33 @@ fn parse_args() -> Result<Cmd> {
 
         apply_kcp_window(kcp_window)?;
 
-        let secret = runtime_secret(
-            secret
-                .or_else(|| std::env::var("ZERONAT_SECRET").ok())
-                .ok_or("--secret or ZERONAT_SECRET is required")?,
-        )?;
+        // Credentials the seed may fill stay unresolved here: the config file,
+        // read at run time, may carry the seed.
+        let seed = seed_from(seed)?.map(|seed| seed.to_hex());
+        let secret = secret
+            .or_else(|| std::env::var("ZERONAT_SECRET").ok())
+            .map(runtime_secret)
+            .transpose()?;
         let discovery = discovery.or_else(|| std::env::var("ZERONAT_DISCOVERY_SECRET").ok());
-        if dht && discovery.is_none() {
-            return Err("--server dht requires --discovery or ZERONAT_DISCOVERY_SECRET".into());
-        }
         let admin_secret = admin_secret.or_else(|| std::env::var("ZERONAT_ADMIN_SECRET").ok());
         if client_credentials.is_empty() {
             match (
                 std::env::var("ZERONAT_CLIENT_ID").ok(),
                 std::env::var("ZERONAT_CLIENT_SECRET").ok(),
             ) {
-                (Some(client_id), Some(client_secret)) if !client_id.is_empty() => {
-                    client_credentials.push(server::ClientCredentialSpec {
-                        client_id,
-                        secret: runtime_secret(client_secret)?,
+                (Some(id), secret) => {
+                    if id.is_empty() {
+                        return Err("ZERONAT_CLIENT_ID must not be empty".into());
+                    }
+                    client_credentials.push(zeronat::config::CfgClient {
+                        id,
+                        secret: secret.map(runtime_secret).transpose()?,
                     });
                 }
-                (None, None) => {}
-                _ => {
-                    return Err(
-                        "ZERONAT_CLIENT_ID and ZERONAT_CLIENT_SECRET must be set together".into(),
-                    );
+                (None, Some(_)) => {
+                    return Err("ZERONAT_CLIENT_SECRET is set without ZERONAT_CLIENT_ID".into());
                 }
+                (None, None) => {}
             }
         }
 
@@ -833,6 +883,7 @@ fn parse_args() -> Result<Cmd> {
         Ok(Cmd::Server {
             bind,
             control,
+            seed,
             secret,
             discovery,
             client_credentials,
@@ -854,6 +905,7 @@ fn parse_args() -> Result<Cmd> {
     } else if subcmd == "client" {
         // client
         let mut server: Option<String> = None;
+        let mut seed: Option<String> = None;
         let mut secret: Option<String> = None;
         let mut credential: Option<String> = None;
         let mut discovery: Option<String> = None;
@@ -899,6 +951,9 @@ fn parse_args() -> Result<Cmd> {
                 }
                 "--server" => {
                     server = Some(iter.next().ok_or("--server requires a value")?);
+                }
+                "--seed" => {
+                    seed = Some(iter.next().ok_or("--seed requires a value")?);
                 }
                 "--secret" => {
                     secret = Some(iter.next().ok_or("--secret requires a value")?);
@@ -989,6 +1044,7 @@ fn parse_args() -> Result<Cmd> {
 
         Ok(Cmd::Client {
             server,
+            seed,
             secret,
             credential,
             discovery,
@@ -1015,6 +1071,42 @@ fn parse_args() -> Result<Cmd> {
             pppoe_no_mss_clamp,
             pppoe_dns,
             config,
+        })
+    } else if subcmd == "derive-client" {
+        let mut seed: Option<String> = None;
+        let mut id: Option<String> = None;
+        let mut dht = false;
+        while let Some(flag) = iter.next() {
+            match flag.as_str() {
+                "-h" | "--help" => {
+                    print!("{USAGE}");
+                    std::process::exit(0);
+                }
+                "--seed" => {
+                    seed = Some(iter.next().ok_or("--seed requires a value")?);
+                }
+                "--dht" => dht = true,
+                other if other.starts_with('-') => {
+                    eprintln!("error: unknown flag '{other}'");
+                    std::process::exit(1);
+                }
+                other => {
+                    if id.is_some() {
+                        return Err(format!("unexpected argument '{other}'").into());
+                    }
+                    id = Some(other.to_string());
+                }
+            }
+        }
+        let id = id.ok_or("derive-client requires a client id")?;
+        if id.is_empty() {
+            return Err("client id must not be empty".into());
+        }
+        let seed = seed_from(seed)?.ok_or("--seed or ZERONAT_SEED is required")?;
+        Ok(Cmd::DeriveClient {
+            secret: seed.network(),
+            credential: seed.client(&id),
+            discovery: dht.then(|| seed.discovery()),
         })
     } else if subcmd == "upgrade" {
         let mut check = false;
@@ -1069,12 +1161,16 @@ fn parse_args() -> Result<Cmd> {
         }
 
         let server = server.ok_or("--server is required")?;
-        let secret = runtime_secret(
-            secret
-            .or_else(|| std::env::var("ZERONAT_ADMIN_SECRET").ok())
-            .or_else(zeronat::admin::admin_secret_from_env_file)
-            .ok_or("no admin secret: pass --secret, set ZERONAT_ADMIN_SECRET, or add it to /etc/zeronat/.env")?,
-        )?;
+        let secret = match secret.or_else(|| std::env::var("ZERONAT_ADMIN_SECRET").ok()) {
+            Some(secret) => secret,
+            None => match seed_from(None)? {
+                Some(seed) => seed.admin(),
+                None => zeronat::admin::admin_secret_from_env_file().ok_or(
+                    "no admin secret: pass --secret, set ZERONAT_ADMIN_SECRET or ZERONAT_SEED, or add either to /etc/zeronat/.env",
+                )?,
+            },
+        };
+        let secret = runtime_secret(secret)?;
 
         let interactive = command.is_none() && interactive_default();
         Ok(Cmd::Admin {
@@ -1148,6 +1244,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Server {
             bind,
             control,
+            seed,
             secret,
             discovery,
             client_credentials,
@@ -1197,8 +1294,8 @@ async fn run(cmd: Cmd) -> Result<()> {
 
             // A valid file's identity/control win over the CLI; a present CLI flag
             // that the file overrides is logged so the override is visible.
-            let (cli_id, cli_bind, cli_control, cli_admin_secret) =
-                (server_id, bind, control, admin_secret);
+            let (cli_id, cli_bind, cli_control, cli_seed, cli_admin_secret) =
+                (server_id, bind, control, seed, admin_secret);
             if let (Some(f), Some(c)) = (&file.id, &cli_id) {
                 if f != c {
                     zeronat::elog!("config [server].id '{f}' overrides --server-id '{c}'");
@@ -1232,30 +1329,80 @@ async fn run(cmd: Cmd) -> Result<()> {
             let bind_ip = file_ip.or(cli_bind).unwrap_or(Ipv4Addr::UNSPECIFIED);
             let control_port = file_port.or(cli_control).unwrap_or(2222);
 
+            let file_seed = file
+                .seed
+                .as_deref()
+                .map(|value| {
+                    Seed::parse(value)
+                        .map(|seed| seed.to_hex())
+                        .map_err(|e| -> zeronat::Error { format!("config [server].{e}").into() })
+                })
+                .transpose()?;
+            if let (Some(f), Some(c)) = (&file_seed, &cli_seed) {
+                if f != c {
+                    zeronat::elog!("config [server].seed overrides --seed");
+                }
+            }
+            let seed_hex = file_seed.or(cli_seed);
+            let seed = seed_hex.as_deref().map(Seed::parse).transpose()?;
+
+            // An explicit value always wins; the seed fills what is left.
+            let secret = match secret {
+                Some(secret) => secret,
+                None => seed.as_ref().map(Seed::network).ok_or(
+                    "--secret, ZERONAT_SECRET, or a seed (--seed, ZERONAT_SEED, [server].seed) is required",
+                )?,
+            };
+            let discovery = discovery.or_else(|| seed.as_ref().map(Seed::discovery));
+            if dht && discovery.is_none() {
+                return Err(
+                    "--server dht requires --discovery, ZERONAT_DISCOVERY_SECRET, or a seed".into(),
+                );
+            }
             if file.admin_secret.is_some() && cli_admin_secret.is_some() {
                 zeronat::elog!("config [server].admin_secret overrides --admin-secret");
             }
-            let admin_secret = file
+            let explicit_admin_secret = file
                 .admin_secret
                 .clone()
                 .or(cli_admin_secret)
                 .map(runtime_secret)
                 .transpose()?;
+            let admin_secret = explicit_admin_secret
+                .clone()
+                .or_else(|| seed.as_ref().map(Seed::admin));
 
-            let client_credentials = if file.clients.is_empty() {
-                client_credentials
+            let (client_entries, no_credential) = if file.clients.is_empty() {
+                (
+                    &client_credentials,
+                    "give --client ID:64-HEX or set a seed (--seed or ZERONAT_SEED)",
+                )
             } else {
                 if !client_credentials.is_empty() {
                     zeronat::elog!("config [[clients]] overrides --client");
                 }
-                file.clients
-                    .iter()
-                    .map(|client| server::ClientCredentialSpec {
-                        client_id: client.id.clone(),
-                        secret: client.secret.clone(),
-                    })
-                    .collect()
+                (&file.clients, "add `secret` or set [server].seed")
             };
+            let client_credentials = client_entries
+                .iter()
+                .map(|client| -> Result<server::ClientCredentialSpec> {
+                    let secret = match (&client.secret, &seed) {
+                        (Some(secret), _) => secret.clone(),
+                        (None, Some(seed)) => seed.client(&client.id),
+                        (None, None) => {
+                            return Err(format!(
+                                "client `{}` has no credential: {no_credential}",
+                                client.id
+                            )
+                            .into());
+                        }
+                    };
+                    Ok(server::ClientCredentialSpec {
+                        client_id: client.id.clone(),
+                        secret,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
 
             let (cli_exit, cli_exit_iface) = (exit, exit_iface);
             if file.exit == Some(false) && cli_exit {
@@ -1405,12 +1552,13 @@ async fn run(cmd: Cmd) -> Result<()> {
             // On a self-heal the file lost its [server] table; record the resolved
             // identity so the rewritten file matches the running server and an
             // operator can later drop the CLI flags without a silent change.
-            let (file_id, file_control, file_admin_secret, file_exit, file_exit_iface) =
+            let (file_id, file_control, file_seed, file_admin_secret, file_exit, file_exit_iface) =
                 if self_healed {
                     (
                         Some(server_id.clone()),
                         Some(format!("{bind_ip}:{control_port}")),
-                        admin_secret.clone(),
+                        seed_hex,
+                        explicit_admin_secret,
                         exit.then_some(true),
                         exit_iface,
                     )
@@ -1418,6 +1566,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                     (
                         file.id,
                         file.control,
+                        file.seed,
                         file.admin_secret,
                         file.exit,
                         file.exit_iface,
@@ -1439,6 +1588,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 config_path: config,
                 file_id,
                 file_control,
+                file_seed,
                 file_admin_secret,
                 file_clients: file.clients,
                 file_exit,
@@ -1448,6 +1598,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         }
         Cmd::Client {
             server,
+            seed,
             secret,
             credential,
             discovery,
@@ -1528,6 +1679,9 @@ async fn run(cmd: Cmd) -> Result<()> {
             if declares_shape(&file) {
                 if let Some(v) = &server {
                     zeronat::elog!("config overrides --server '{v}'");
+                }
+                if seed.is_some() {
+                    zeronat::elog!("config overrides --seed");
                 }
                 if secret.is_some() {
                     zeronat::elog!("config overrides --secret");
@@ -1649,6 +1803,12 @@ async fn run(cmd: Cmd) -> Result<()> {
                     onoff(tap.is_some()),
                     onoff(tun.is_some())
                 );
+                // A seeded profile's credential names `[client].id`, so that
+                // id is what the client goes by.
+                let id = match (&file.id, file.servers.iter().any(|s| s.seed.is_some())) {
+                    (Some(id), true) => ClientId::Exact(id.clone()),
+                    _ => ClientId::Prefix(id_prefix),
+                };
                 let settings = client::ClientSettings {
                     servers,
                     tcp,
@@ -1657,7 +1817,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                     tun,
                     pppoe,
                     autostart,
-                    id_prefix,
+                    id,
                     peer_secret: file.peer_secret.as_ref().map(|s| s.0.clone()),
                     control,
                     // The shape came from the file, so admin mutations
@@ -1669,22 +1829,37 @@ async fn run(cmd: Cmd) -> Result<()> {
                 client::run_switchable(client::ActiveTarget::new(target), settings).await
             } else {
                 let server = server.ok_or("--server is required")?;
-                let secret = runtime_secret(
-                    secret
-                        .or_else(|| std::env::var("ZERONAT_SECRET").ok())
-                        .ok_or("--secret or ZERONAT_SECRET is required")?,
-                )?;
-                let credential = runtime_secret(
-                    credential
-                        .or_else(|| std::env::var("ZERONAT_CLIENT_SECRET").ok())
-                        .unwrap_or_else(|| secret.clone()),
-                )?;
-                let discovery =
-                    discovery.or_else(|| std::env::var("ZERONAT_DISCOVERY_SECRET").ok());
+                // An explicit value always wins; the seed fills what is left.
+                let seed = seed_from(seed)?;
+                let secret = match secret.or_else(|| std::env::var("ZERONAT_SECRET").ok()) {
+                    Some(secret) => runtime_secret(secret)?,
+                    None => seed.as_ref().map(Seed::network).ok_or(
+                        "--secret, ZERONAT_SECRET, or a seed (--seed or ZERONAT_SEED) is required",
+                    )?,
+                };
+                let (credential, id) = match (
+                    credential.or_else(|| std::env::var("ZERONAT_CLIENT_SECRET").ok()),
+                    &seed,
+                ) {
+                    (Some(credential), _) => {
+                        (runtime_secret(credential)?, ClientId::Prefix(id_prefix))
+                    }
+                    (None, Some(seed)) => {
+                        let id = id_prefix.ok_or(
+                            "--id is required with a seed: the credential is derived for it, and the server lists the same id under --client",
+                        )?;
+                        (seed.client(&id), ClientId::Exact(id))
+                    }
+                    (None, None) => (secret.clone(), ClientId::Prefix(id_prefix)),
+                };
+                let discovery = discovery
+                    .or_else(|| std::env::var("ZERONAT_DISCOVERY_SECRET").ok())
+                    .or_else(|| seed.as_ref().map(Seed::discovery));
                 let discovery = match (server == "dht", discovery) {
                     (true, None) => {
                         return Err(
-                            "--server dht requires --discovery or ZERONAT_DISCOVERY_SECRET".into(),
+                            "--server dht requires --discovery, ZERONAT_DISCOVERY_SECRET, or a seed"
+                                .into(),
                         );
                     }
                     (_, Some(value)) => Some(runtime_secret(value)?),
@@ -1833,7 +2008,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 }
                 client::run(
                     server, secret, credential, discovery, tcp, udp, transport, tap, tun, pppoe,
-                    id_prefix, control,
+                    id, control,
                 )
                 .await
             }
@@ -1911,6 +2086,18 @@ async fn run(cmd: Cmd) -> Result<()> {
             }
             let _ = interactive;
             admin::show(server, secret).await
+        }
+        Cmd::DeriveClient {
+            secret,
+            credential,
+            discovery,
+        } => {
+            println!("ZERONAT_SECRET={secret}");
+            println!("ZERONAT_CLIENT_SECRET={credential}");
+            if let Some(discovery) = discovery {
+                println!("ZERONAT_DISCOVERY_SECRET={discovery}");
+            }
+            Ok(())
         }
         Cmd::Upgrade { check } => zeronat::upgrade::run(check),
     }
@@ -2052,6 +2239,7 @@ mod tests {
         CfgServer {
             name: name.into(),
             addr: format!("{name}.example:2222"),
+            seed: None,
             secret: zeronat::clientproto::ServerSecret("s".into()),
             credential: zeronat::clientproto::ServerSecret("s".into()),
             discovery: None,

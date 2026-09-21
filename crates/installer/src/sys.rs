@@ -159,6 +159,11 @@ pub fn pub_ip() -> String {
     "YOUR_SERVER_IP".to_string()
 }
 
+/// A seed already on disk, so a re-run keeps every credential it derives.
+pub fn existing_seed() -> Option<String> {
+    existing_env_value("ZERONAT_SEED")
+}
+
 /// A secret already on disk, so a re-run does not rotate it and break clients.
 pub fn existing_secret() -> Option<String> {
     existing_env_value("ZERONAT_SECRET")

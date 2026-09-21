@@ -15,8 +15,10 @@ mod uplink;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::Semaphore;
+use zeronat::identity::ClientId;
+use zeronat::seed::Seed;
 
 /// Spawn a task on the tokio runtime.
 ///
@@ -67,6 +69,9 @@ struct Config {
     peer_secret: Option<String>,
     secret: String,
     credential: String,
+    /// The id sent as-is when `ZN_CLIENT_ID` is set; a seed-derived
+    /// credential is bound to it.
+    client_id: Option<String>,
     username: String,
     password: String,
     service: String,
@@ -122,6 +127,10 @@ fn usage() -> ! {
          (proxy auth) required; ZN_SERVICE optional;\n\
          ZN_DISCOVERY_SECRET (the server's discovery credential) required with --dht\n\
          ZN_PEER_SECRET (this process's x25519 static key) required with --peer\n\
+         ZN_SEED (64-hex) fills ZN_SECRET, ZN_CLIENT_SECRET, ZN_DISCOVERY_SECRET, and\n\
+         ZN_PEER_SECRET when they are unset; the client credential is derived for\n\
+         ZN_CLIENT_ID, which the server lists as a bare --client ID\n\
+         ZN_CLIENT_ID is sent as this client's id whenever set\n\
          SOCKS5 and HTTP CONNECT proxies share auth: password = ZN_PROXY_PASS; username\n\
          <ZN_PROXY_USER> round-robins, _pppoe<K> pins session K, _s<token> is sticky\n\
          listens default to 127.0.0.1:1080 (socks) and 127.0.0.1:8081 (http)"
@@ -241,26 +250,45 @@ fn parse() -> Result<Config> {
     if let Some(peer) = &peer {
         zeronat::secret::decode(peer).context("--peer must be a 64-hex peer identity")?;
     }
-    let secret = runtime_secret(std::env::var("ZN_SECRET").context("ZN_SECRET env is required")?)?;
-    let credential =
-        runtime_secret(std::env::var("ZN_CLIENT_SECRET").unwrap_or_else(|_| secret.clone()))?;
+    // A value set on its own always wins; the seed fills what is left.
+    let seed = std::env::var("ZN_SEED")
+        .ok()
+        .map(|value| Seed::parse(&value).map_err(|e| anyhow!("ZN_SEED: {e}")))
+        .transpose()?;
+    let client_id = std::env::var("ZN_CLIENT_ID").ok();
+    if client_id.as_deref() == Some("") {
+        bail!("ZN_CLIENT_ID must not be empty");
+    }
+    let secret = match std::env::var("ZN_SECRET") {
+        Ok(value) => runtime_secret(value)?,
+        Err(_) => seed
+            .as_ref()
+            .map(Seed::network)
+            .context("ZN_SECRET or ZN_SEED env is required")?,
+    };
+    let credential = match (std::env::var("ZN_CLIENT_SECRET"), &seed) {
+        (Ok(value), _) => runtime_secret(value)?,
+        (Err(_), Some(seed)) => seed.client(client_id.as_deref().context(
+            "ZN_CLIENT_ID env is required with ZN_SEED: the client credential is derived for it, and the server lists the same id under --client",
+        )?),
+        (Err(_), None) => secret.clone(),
+    };
     let peer_secret = peer
         .as_ref()
-        .map(|_| {
-            std::env::var("ZN_PEER_SECRET")
-                .context("ZN_PEER_SECRET env is required with --peer")
-                .and_then(|value| runtime_peer_secret(value, &secret, &credential))
+        .map(|_| match (std::env::var("ZN_PEER_SECRET"), &seed) {
+            (Ok(value), _) => runtime_peer_secret(value, &secret, &credential),
+            (Err(_), Some(seed)) => Ok(seed.peer()),
+            (Err(_), None) => Err(anyhow!("ZN_PEER_SECRET or ZN_SEED env is required with --peer")),
         })
         .transpose()?;
     let discovery = if dht {
-        let value = std::env::var("ZN_DISCOVERY_SECRET")
-            .context("ZN_DISCOVERY_SECRET env is required with --dht")?;
-        Some(runtime_discovery_secret(
-            value,
-            &secret,
-            &credential,
-            peer_secret.as_deref(),
-        )?)
+        Some(match (std::env::var("ZN_DISCOVERY_SECRET"), &seed) {
+            (Ok(value), _) => {
+                runtime_discovery_secret(value, &secret, &credential, peer_secret.as_deref())?
+            }
+            (Err(_), Some(seed)) => seed.discovery(),
+            (Err(_), None) => bail!("ZN_DISCOVERY_SECRET or ZN_SEED env is required with --dht"),
+        })
     } else {
         None
     };
@@ -281,6 +309,7 @@ fn parse() -> Result<Config> {
         peer_secret,
         secret,
         credential,
+        client_id,
         username,
         password,
         service,
@@ -299,10 +328,12 @@ fn parse() -> Result<Config> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = parse()?;
-    // The peer client derives its own id from this prefix, so both paths
-    // announce the one name a fleet view lists the process under.
-    let id_prefix = format!("znpppoe-{}", std::process::id());
-    let client_id = zeronat::identity::derive_client_id(Some(&id_prefix));
+    // Both paths announce the one name a fleet view lists the process under.
+    let id = match cfg.client_id {
+        Some(id) => ClientId::Exact(id),
+        None => ClientId::Prefix(Some(format!("znpppoe-{}", std::process::id()))),
+    };
+    let client_id = id.resolve();
 
     eprintln!(
         "znpppoe: server {} ({} session{})",
@@ -327,7 +358,7 @@ async fn main() -> Result<()> {
                 &cfg.credential,
                 cfg.discovery.as_deref(),
                 cfg.peer_secret.as_deref().expect("validated peer secret"),
-                &id_prefix,
+                id,
                 uplink::PeerId(peer),
             )
         }

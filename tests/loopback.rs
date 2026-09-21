@@ -94,6 +94,7 @@ fn cli_settings(control: u16, tcp: Vec<u16>, udp: Vec<u16>) -> ServerSettings {
         config_path: None,
         file_id: None,
         file_control: None,
+        file_seed: None,
         file_admin_secret: None,
         file_exit: None,
         file_exit_iface: None,
@@ -292,7 +293,7 @@ async fn start_tagged_pair(
             None,
             None,
             None,
-            Some(name.into()),
+            zeronat::identity::ClientId::Prefix(Some(name.into())),
             None,
         ));
     }
@@ -348,7 +349,7 @@ fn start_tunnel(transport: zeronat::client::Transport) -> Tunnel {
         None,
         None,
         None,
-        Some("rpi".into()),
+        zeronat::identity::ClientId::Prefix(Some("rpi".into())),
         None,
     ));
 
@@ -699,7 +700,7 @@ async fn udp_control_answers_on_the_dialed_address() {
         None,
         None,
         None,
-        Some("alias".into()),
+        zeronat::identity::ClientId::Prefix(Some("alias".into())),
         None,
     ));
 
@@ -738,7 +739,7 @@ async fn run_udp_forward_source_test(transport: zeronat::client::Transport) {
         None,
         None,
         None,
-        Some("rpi".into()),
+        zeronat::identity::ClientId::Prefix(Some("rpi".into())),
         None,
     ));
     wait_clients(control, 1).await;
@@ -1691,7 +1692,7 @@ async fn reconnect_same_id_supersede() {
             None,
             None,
             None,
-            Some("dup".into()),
+            zeronat::identity::ClientId::Prefix(Some("dup".into())),
             None,
         ));
         tokio::spawn(zeronat::client::run(
@@ -1705,7 +1706,7 @@ async fn reconnect_same_id_supersede() {
             None,
             None,
             None,
-            Some("dup".into()),
+            zeronat::identity::ClientId::Prefix(Some("dup".into())),
             None,
         ));
 
@@ -1774,7 +1775,7 @@ async fn config_autosave_persists_route() {
             None,
             None,
             None,
-            Some("rpi".into()),
+            zeronat::identity::ClientId::Prefix(Some("rpi".into())),
             None,
         ));
 
@@ -1863,7 +1864,7 @@ async fn cli_listener_remove_refused() {
             None,
             None,
             None,
-            Some("rpi".into()),
+            zeronat::identity::ClientId::Prefix(Some("rpi".into())),
             None,
         ));
         wait_clients(control, 1).await;
@@ -1920,7 +1921,7 @@ async fn runtime_node_does_not_persist() {
             None,
             None,
             None,
-            Some("rpi".into()),
+            zeronat::identity::ClientId::Prefix(Some("rpi".into())),
             None,
         ));
 
@@ -2034,7 +2035,7 @@ async fn run_proxy_header_test(transport: zeronat::client::Transport) {
         None,
         None,
         None,
-        Some("rpi".into()),
+        zeronat::identity::ClientId::Prefix(Some("rpi".into())),
         None,
     ));
 
@@ -2240,7 +2241,7 @@ async fn proxy_forward_refuses_headerless_open() {
             None,
             None,
             None,
-            Some("rpi".into()),
+            zeronat::identity::ClientId::Prefix(Some("rpi".into())),
             None,
         ));
 
@@ -2304,7 +2305,7 @@ fn client_settings(
         tun: None,
         pppoe: vec![],
         autostart: None,
-        id_prefix: Some(id.into()),
+        id: zeronat::identity::ClientId::Prefix(Some(id.into())),
         peer_secret: None,
         control: sock.map(|p| zeronat::clientctl::ControlPath::Explicit(p.to_path_buf())),
         config: None,
@@ -2445,7 +2446,7 @@ async fn dropping_client_future_aborts_session() {
             None,
             None,
             None,
-            Some("drop".into()),
+            zeronat::identity::ClientId::Prefix(Some("drop".into())),
             None,
         ));
 
@@ -2488,7 +2489,7 @@ async fn client_admin_socket_serves_snapshot() {
             None,
             None,
             None,
-            Some("adm".into()),
+            zeronat::identity::ClientId::Prefix(Some("adm".into())),
             Some(zeronat::clientctl::ControlPath::Explicit(sock.clone())),
         ));
 

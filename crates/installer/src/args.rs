@@ -20,6 +20,7 @@ pub struct Parsed {
     pub admin_secret: Option<String>,
     pub discovery: Option<String>,
     pub discovery_prompt: bool,
+    pub explicit: bool,
     pub control: Option<String>,
     pub ports: Option<String>,
     pub server_addr: Option<String>,
@@ -40,6 +41,7 @@ pub struct Parsed {
 pub struct Host {
     pub have_docker: bool,
     pub have_compose: bool,
+    pub existing_seed: Option<String>,
     pub existing_secret: Option<String>,
     pub existing_admin_secret: Option<String>,
     pub existing_discovery_secret: Option<String>,
@@ -68,6 +70,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             "--admin-secret" => p.admin_secret = Some(take(&mut i, a)?),
             "--discovery" => p.discovery = Some(take(&mut i, a)?),
             "--discovery-prompt" => p.discovery_prompt = true,
+            "--explicit-secrets" => p.explicit = true,
             "--control" => p.control = Some(take(&mut i, a)?),
             "--ports" => p.ports = Some(take(&mut i, a)?),
             "--server-addr" | "--addr" => p.server_addr = Some(take(&mut i, a)?),
@@ -129,11 +132,16 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
     if (p.tap.is_some() as u8 + p.ports.is_some() as u8 + p.all as u8) > 1 {
         return Err("--ports, --tap, and --all are mutually exclusive".into());
     }
-    let mut cfg = Config::new(
-        host.have_docker,
-        host.have_compose,
-        host.existing_secret.clone(),
-    );
+    // An install that already holds explicit secrets stays explicit, so the
+    // clients it authorized keep working after a re-run.
+    let explicit = p.explicit || (host.existing_seed.is_none() && host.existing_secret.is_some());
+    let existing = if explicit {
+        host.existing_secret.clone()
+    } else {
+        host.existing_seed.clone()
+    };
+    let mut cfg = Config::new(host.have_docker, host.have_compose, existing);
+    cfg.explicit = explicit;
     cfg.ssh_port = host.ssh_port;
 
     // mode
@@ -266,7 +274,7 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
     // secret: --secret > on-disk > generated.
     let secret = if let Some(s) = &p.secret {
         s.clone()
-    } else if let Some(s) = &host.existing_secret {
+    } else if let Some(s) = &cfg.existing_secret {
         s.clone()
     } else {
         sys::gen_secret()?
@@ -277,19 +285,28 @@ pub fn build(p: &Parsed, host: &Host, headless: bool) -> Result<Config, String> 
     Ok(cfg)
 }
 
-/// Normalize the client secret, resolve the discovery credential, then clear
-/// the admin secret for clients or resolve it for servers. The discovery
-/// precedence is wizard value > --discovery > on-disk; only a server may
-/// generate one, because a client's discovery credential belongs to the server
-/// it joins. With `complete` a dht client missing one is an error; without it
-/// the value is left empty for the wizard to collect.
+/// Normalize the seed or client secret, resolve the discovery credential, then
+/// clear the admin secret for clients or resolve it for servers. The discovery
+/// precedence is wizard value > --discovery > on-disk; a seed derives one that
+/// is otherwise missing, and only an explicit server may generate one, because
+/// a client's discovery credential belongs to the server it joins. With
+/// `complete` an explicit dht client missing one is an error; without it the
+/// value is left empty for the wizard to collect. The admin secret follows the
+/// same shape: --admin-secret > on-disk > generated for an explicit server,
+/// derived from the seed otherwise.
 pub fn finalize_credentials(
     cfg: &mut Config,
     p: &Parsed,
     host: &Host,
     complete: bool,
 ) -> Result<(), String> {
-    cfg.secret = zeronat_secret::normalize(&cfg.secret).map_err(|e| format!("client {e}"))?;
+    cfg.secret = zeronat_secret::normalize(&cfg.secret).map_err(|e| {
+        if cfg.explicit {
+            format!("client {e}")
+        } else {
+            format!("seed: {e}")
+        }
+    })?;
     if cfg.use_dht {
         let discovery = if !cfg.discovery.is_empty() {
             cfg.discovery.clone()
@@ -297,7 +314,7 @@ pub fn finalize_credentials(
             s.clone()
         } else if let Some(s) = &host.existing_discovery_secret {
             s.clone()
-        } else if !complete {
+        } else if !complete || !cfg.explicit {
             String::new()
         } else if cfg.mode == Mode::Server {
             sys::gen_secret()?
@@ -330,12 +347,18 @@ pub fn finalize_credentials(
             s.clone()
         } else if let Some(s) = &host.existing_admin_secret {
             s.clone()
-        } else {
+        } else if cfg.explicit {
             sys::gen_secret()?
+        } else {
+            String::new()
         }
     } else {
         cfg.admin_secret.clone()
     };
+    if admin_secret.is_empty() {
+        cfg.admin_secret.clear();
+        return Ok(());
+    }
     cfg.admin_secret =
         zeronat_secret::normalize(&admin_secret).map_err(|e| format!("admin {e}"))?;
     if cfg.admin_secret == cfg.secret {
@@ -375,6 +398,7 @@ mod tests {
         Host {
             have_docker: false,
             have_compose: false,
+            existing_seed: None,
             existing_secret: None,
             existing_admin_secret: None,
             existing_discovery_secret: None,
@@ -382,14 +406,22 @@ mod tests {
         }
     }
 
-    // A dht setup resolves a discovery secret as --discovery > on-disk, refuses
-    // one that doubles as the client secret, and a host:port setup keeps none.
-    // Only a server may generate one: a dht client with no discovery from any
-    // source errors instead of inventing a credential that names no server.
+    // An explicit dht setup resolves a discovery secret as --discovery >
+    // on-disk, refuses one that doubles as the client secret, and a host:port
+    // setup keeps none. Only a server may generate one: a dht client with no
+    // discovery from any source errors instead of inventing a credential that
+    // names no server.
     #[test]
     fn dht_resolves_a_discovery_secret() {
         let dht = |extra: &[&str]| {
-            let mut args = vec!["-y", "--client", "--dht", "--ports", "443/tcp"];
+            let mut args = vec![
+                "-y",
+                "--client",
+                "--dht",
+                "--explicit-secrets",
+                "--ports",
+                "443/tcp",
+            ];
             args.extend_from_slice(extra);
             parse(&s(&args)).unwrap()
         };
@@ -403,6 +435,7 @@ mod tests {
             "-y",
             "--server",
             "--dht",
+            "--explicit-secrets",
             "--ports",
             "443/tcp",
             "--secret",
@@ -446,7 +479,14 @@ mod tests {
     // entered value otherwise.
     #[test]
     fn wizard_dht_client_defers_the_discovery_credential() {
-        let p = parse(&s(&["--client", "--dht", "--secret", FLAG_SECRET])).unwrap();
+        let p = parse(&s(&[
+            "--client",
+            "--dht",
+            "--explicit-secrets",
+            "--secret",
+            FLAG_SECRET,
+        ]))
+        .unwrap();
         let h = host();
         let mut cfg = build(&p, &h, false).unwrap();
         assert!(cfg.discovery.is_empty());
@@ -457,6 +497,71 @@ mod tests {
         cfg.discovery = DISK_SECRET.into();
         finalize_credentials(&mut cfg, &p, &h, true).unwrap();
         assert_eq!(cfg.discovery, DISK_SECRET);
+    }
+
+    // The default install carries one seed: no admin or discovery value is
+    // generated, an explicit one given is kept, and --explicit-secrets brings
+    // the generated values back.
+    #[test]
+    fn seed_is_the_default_and_derives_the_rest() {
+        let p = parse(&s(&["-y", "--server", "--dht", "--ports", "80/tcp"])).unwrap();
+        let cfg = build(&p, &host(), true).unwrap();
+        assert!(!cfg.explicit);
+        assert_eq!(cfg.secret.len(), 64);
+        assert!(cfg.admin_secret.is_empty());
+        assert!(cfg.discovery.is_empty());
+
+        let p = parse(&s(&["-y", "--client", "--dht", "--ports", "80/tcp"])).unwrap();
+        let cfg = build(&p, &host(), true).unwrap();
+        assert!(cfg.discovery.is_empty());
+
+        let p = parse(&s(&[
+            "-y",
+            "--server",
+            "--dht",
+            "--ports",
+            "80/tcp",
+            "--admin-secret",
+            ADMIN_SECRET,
+            "--discovery",
+            DISK_SECRET,
+        ]))
+        .unwrap();
+        let cfg = build(&p, &host(), true).unwrap();
+        assert_eq!(cfg.admin_secret, ADMIN_SECRET);
+        assert_eq!(cfg.discovery, DISK_SECRET);
+
+        let p = parse(&s(&[
+            "-y",
+            "--server",
+            "--dht",
+            "--explicit-secrets",
+            "--ports",
+            "80/tcp",
+        ]))
+        .unwrap();
+        let cfg = build(&p, &host(), true).unwrap();
+        assert!(cfg.explicit);
+        assert_eq!(cfg.admin_secret.len(), 64);
+        assert_eq!(cfg.discovery.len(), 64);
+    }
+
+    // A re-run follows what is on disk: a seed keeps seed mode and is reused,
+    // an explicit secret without a seed keeps explicit mode.
+    #[test]
+    fn existing_install_decides_the_mode() {
+        let p = parse(&s(&["-y", "--server", "--ports", "80/tcp"])).unwrap();
+        let mut h = host();
+        h.existing_seed = Some(DISK_SECRET.into());
+        let cfg = build(&p, &h, true).unwrap();
+        assert!(!cfg.explicit);
+        assert_eq!(cfg.secret, DISK_SECRET);
+
+        let mut h = host();
+        h.existing_secret = Some(FLAG_SECRET.into());
+        let cfg = build(&p, &h, true).unwrap();
+        assert!(cfg.explicit);
+        assert_eq!(cfg.secret, FLAG_SECRET);
     }
 
     #[test]

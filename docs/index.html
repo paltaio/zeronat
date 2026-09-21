@@ -156,28 +156,46 @@
       <h2>Quick start</h2>
 <pre class="v-cli"><code><span class="c"># On the public host (VPS):</span>
 <span class="c"># Generate this once, then copy the same value to both hosts.</span>
-SECRET="$(openssl rand -hex 32)"
-ZERONAT_SECRET="$SECRET" zeronat server \
-  --control 2222 --tcp 443 --tcp 80 --udp 51820
+SEED="$(openssl rand -hex 32)"
+ZERONAT_SEED="$SEED" zeronat server --control 2222 --client home \
+  --tcp 443 --tcp 80 --udp 51820
 
 <span class="c"># On the host behind CG-NAT:</span>
-ZERONAT_SECRET="$SECRET" zeronat client \
-  --server &lt;public-ip&gt;:2222 --tcp 443 --tcp 80 --udp 51820</code></pre>
+ZERONAT_SEED="$SEED" zeronat client --server &lt;public-ip&gt;:2222 --id home \
+  --tcp 443 --tcp 80 --udp 51820</code></pre>
 <pre class="v-docker"><code><span class="c"># Generate this once, then copy the same value to both hosts.</span>
-SECRET="$(openssl rand -hex 32)"
+SEED="$(openssl rand -hex 32)"
 
 <span class="c"># On the public host (VPS):</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
-  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat \
-  server --control 2222 --tcp 443 --tcp 80 --udp 51820
+  -e ZERONAT_SEED="$SEED" ghcr.io/paltaio/zeronat \
+  server --control 2222 --client home --tcp 443 --tcp 80 --udp 51820
 
 <span class="c"># On the host behind CG-NAT; with --network host, 127.0.0.1 targets are host services:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
-  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat \
-  client --server &lt;public-ip&gt;:2222 --tcp 443 --tcp 80 --udp 51820</code></pre>
+  -e ZERONAT_SEED="$SEED" ghcr.io/paltaio/zeronat \
+  client --server &lt;public-ip&gt;:2222 --id home --tcp 443 --tcp 80 --udp 51820</code></pre>
       <p>Open the control port (2222, both UDP and TCP) on the server's firewall.</p>
+      <p>The seed derives every credential: the network secret, the admin secret, the discovery
+      credential, and one credential per client id, so <code>--client home</code> on the server and
+      <code>--id home</code> on the client agree with nothing else copied. The server accepts only
+      clients it holds a credential for; <code>--client &lt;id&gt;</code> is repeatable and the config
+      file takes <code>[[clients]]</code> entries. Ids and credentials must both be unique.</p>
+      <p>A value set on its own wins over the seed: <code>ZERONAT_SECRET</code>,
+      <code>--client &lt;id&gt;:&lt;64-HEX&gt;</code> (or <code>ZERONAT_CLIENT_ID</code> with
+      <code>ZERONAT_CLIENT_SECRET</code>), <code>ZERONAT_ADMIN_SECRET</code>,
+      <code>ZERONAT_DISCOVERY_SECRET</code>. To keep the seed off a client, run
+      <code>zeronat derive-client &lt;id&gt;</code> on the server and start the client with the lines it
+      prints in its environment in place of the seed:</p>
+<pre><code>ZERONAT_SEED="$SEED" zeronat derive-client home --dht
+<span class="c"># ZERONAT_SECRET=&lt;64-hex&gt;
+# ZERONAT_CLIENT_SECRET=&lt;64-hex&gt;
+# ZERONAT_DISCOVERY_SECRET=&lt;64-hex&gt;</span></code></pre>
+      <p><code>ZERONAT_SECRET</code> is the network secret and <code>ZERONAT_CLIENT_SECRET</code> is that
+      client's credential. <code>--dht</code> adds the discovery credential, which a client needs only
+      with <code>--server dht</code>.</p>
     </section>
 
     <section id="forwarding">
@@ -287,8 +305,9 @@ entryPoints:
       <code>proto</code>, <code>port</code>) to a client id. New connections go to the routed client;
       connections already open on the previous client drain until they close. There is no round-robin,
       health checking, or failover.</p>
-      <p>A client id is the <code>--id</code> prefix (default: short hostname) plus a short derived suffix,
-      for example <code>rpi-2-ab12</code>.</p>
+      <p>A client id is the id in the server's <code>--client</code> entry or its <code>[[clients]]</code>
+      section; the server hands it to the client when the session opens. Under a seed the client's
+      <code>--id</code> is that same id.</p>
       <p>Load listeners, routes, and identity from a file with <code>--config</code>:</p>
 <pre class="v-cli"><code>zeronat server --config /etc/zeronat/server.toml</code></pre>
 <pre class="v-docker"><code>docker run -d --name zeronat --restart unless-stopped --network host \
@@ -299,6 +318,14 @@ entryPoints:
 [server]
 id = "zn01"
 control = "0.0.0.0:2222"
+seed = "&lt;64-hex-seed&gt;"
+
+[[clients]]
+id = "rpi-2"
+
+[[clients]]
+id = "guest"
+secret = "&lt;64-hex-client-credential&gt;"
 
 [[listeners]]
 bind_ip = "0.0.0.0"
@@ -309,7 +336,11 @@ port = 8080
 bind_ip = "0.0.0.0"
 proto = "tcp"
 port = 8080
-client = "rpi-2-ab12"</code></pre>
+client = "rpi-2"</code></pre>
+      <p>A <code>[[clients]]</code> entry without a <code>secret</code> takes its credential from the
+      seed, which <code>[server].seed</code> holds here; <code>--seed</code> or
+      <code>ZERONAT_SEED</code> serves the same purpose. The seed also fills
+      <code>admin_secret</code> when the file leaves it out.</p>
       <p>CLI <code>--tcp</code>/<code>--udp</code> forwards merge with the file's listeners. To change the
       topology, edit the file and restart the server. A malformed config aborts startup.</p>
     </section>
@@ -326,13 +357,14 @@ active = "home"
 [[servers]]
 name = "home"
 addr = "203.0.113.7:2222"
-secret = "&lt;64-hex-secret&gt;"
+seed = "&lt;64-hex-seed&gt;"
 transport = "auto"
 
 [[servers]]
 name = "backup"
 addr = "dht"
-secret = "&lt;different-64-hex-secret&gt;"
+secret = "&lt;64-hex-secret&gt;"
+credential = "&lt;64-hex-client-credential&gt;"
 discovery = "&lt;64-hex-discovery-credential&gt;"
 
 [[forwards]]
@@ -347,8 +379,12 @@ name = "wan"
 username = "user@isp"
 password_file = "/etc/zeronat/wan.pass"</code></pre>
       <p>Replace each secret placeholder with 64 hexadecimal characters encoding 32 bytes.</p>
-      <p>Each <code>[[servers]]</code> entry is a named profile with its own address, secret, and
+      <p>Each <code>[[servers]]</code> entry is a named profile with its own address, credentials, and
       <code>transport</code>; <code>[client].active</code> picks the one to dial (default: the first).
+      A <code>seed</code> fills the entry's <code>secret</code>, <code>discovery</code>, and the
+      <code>credential</code> derived for <code>[client].id</code>, which the server lists as
+      <code>--client &lt;id&gt;</code>; a key set on its own wins. Without a seed,
+      <code>credential</code> defaults to <code>secret</code>.
       <code>[[forwards]]</code> entries take the same options as the CLI specs: <code>proxy</code> is
       TCP-only, <code>idle</code> is whole seconds. <code>enabled = false</code> keeps a forward in the
       config but stops serving it (default true). A <code>[[pppoe]]</code> entry names a session that
@@ -373,9 +409,14 @@ password_file = "/etc/zeronat/wan.pass"</code></pre>
     <section id="admin">
       <h2>Admin</h2>
       <p>Inspect a running server's topology over the control port (read-only):</p>
-<pre class="v-cli"><code>ZERONAT_SECRET=$SECRET zeronat admin --server &lt;public-ip&gt;:2222 show</code></pre>
-<pre class="v-docker"><code><span class="c"># The secret comes from the container's env:</span>
+<pre class="v-cli"><code>ZERONAT_SEED="$SEED" zeronat admin --server &lt;public-ip&gt;:2222 show</code></pre>
+<pre class="v-docker"><code><span class="c"># The seed comes from the container's env:</span>
 docker exec -it zeronat /zeronat admin --server &lt;public-ip&gt;:2222 show</code></pre>
+      <p>Remote admin runs on its own secret, which the seed derives. Without a seed, start the server
+      with <code>--admin-secret</code> or <code>ZERONAT_ADMIN_SECRET</code>, which must differ from the
+      network, client, and discovery credentials, and give <code>admin</code> the same value as
+      <code>--secret</code> or <code>ZERONAT_ADMIN_SECRET</code>. The server refuses remote admin when
+      it has neither.</p>
       <p>It prints the server, its routes, connected clients, and active listeners. Each client lists
       the forwards it announced with non-default options (<code>tcp:443  +proxy+idle=600</code>), and a
       route shows its forward's options in the OPTIONS column.</p>
@@ -436,21 +477,21 @@ docker exec -it zeronat /zeronat client admin spawn-pppoe wan</code></pre>
       Both ends need <code>--tun</code>; it cannot be combined with <code>--tcp</code>/<code>--udp</code> or
       <code>--tap</code>.</p>
 <pre class="v-cli"><code><span class="c"># Server (VPS): forward every port to the client, keep SSH on 22:</span>
-ZERONAT_SECRET="$SECRET" zeronat server --control 2222 --tun --except 22
+ZERONAT_SEED="$SEED" zeronat server --control 2222 --client home --tun --except 22
 
 <span class="c"># Client (behind CG-NAT): local services receive on the same port:</span>
-ZERONAT_SECRET="$SECRET" zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
+ZERONAT_SEED="$SEED" zeronat client --server &lt;public-ip&gt;:2222 --id home --tun</code></pre>
 <pre class="v-docker"><code><span class="c"># Server (VPS): forward every port to the client, keep SSH on 22:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
   --device /dev/net/tun --security-opt no-new-privileges \
-  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat server --control 2222 --tun --except 22
+  -e ZERONAT_SEED="$SEED" ghcr.io/paltaio/zeronat server --control 2222 --client home --tun --except 22
 
 <span class="c"># Client (behind CG-NAT): local services receive on the same port:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
   --device /dev/net/tun --security-opt no-new-privileges \
-  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tun</code></pre>
+  -e ZERONAT_SEED="$SEED" ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --id home --tun</code></pre>
       <p>Forwarded traffic includes the server's own SSH; keep it reachable with
       <code>--except &lt;ssh-port&gt;</code> (repeatable). The client needs no NAT: local services receive
       the traffic on the same port and must listen on <code>0.0.0.0</code> or the tunnel address.</p>
@@ -475,21 +516,24 @@ docker run -d --name zeronat --restart unless-stopped --network host \
       restores the defaults and removes both; a crash skips it and leaves the host without a
       default route.</p>
 <pre class="v-cli"><code><span class="c"># Server (VPS): masquerade the client's traffic out eth0:</span>
-ZERONAT_SECRET="$SECRET" zeronat server --control 2222 --tun --except 22 --exit --exit-iface eth0
+ZERONAT_SEED="$SEED" zeronat server --control 2222 --client home \
+  --tun --except 22 --exit --exit-iface eth0
 
 <span class="c"># Client: send this host's IPv4 traffic through the server:</span>
-ZERONAT_SECRET="$SECRET" zeronat client --server &lt;public-ip&gt;:2222 --tun --exit --exit-strict</code></pre>
+ZERONAT_SEED="$SEED" zeronat client --server &lt;public-ip&gt;:2222 --id home --tun --exit --exit-strict</code></pre>
 <pre class="v-docker"><code><span class="c"># Server (VPS): masquerade the client's traffic out eth0:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
   --device /dev/net/tun --security-opt no-new-privileges \
-  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat server --control 2222 --tun --except 22 --exit --exit-iface eth0
+  -e ZERONAT_SEED="$SEED" ghcr.io/paltaio/zeronat \
+  server --control 2222 --client home --tun --except 22 --exit --exit-iface eth0
 
 <span class="c"># Client: send this host's IPv4 traffic through the server:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
   --device /dev/net/tun --security-opt no-new-privileges \
-  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tun --exit --exit-strict</code></pre>
+  -e ZERONAT_SEED="$SEED" ghcr.io/paltaio/zeronat \
+  client --server &lt;public-ip&gt;:2222 --id home --tun --exit --exit-strict</code></pre>
       <p><code>--exit</code> requires <code>--tun</code> on both ends; <code>--exit-iface</code> and
       <code>--exit-strict</code> require <code>--exit</code>. In the config file,
       <code>[server] exit_iface</code> and <code>[tun] exit_strict</code> carry the same
@@ -502,22 +546,22 @@ docker run -d --name zeronat --restart unless-stopped --network host \
       segment. It carries anything Ethernet, including PPPoE. Both ends need <code>--tap</code>; it cannot be
       combined with <code>--tcp</code>/<code>--udp</code>.</p>
 <pre class="v-cli"><code><span class="c"># Near the target segment (e.g. the PPPoE concentrator):</span>
-ZERONAT_SECRET="$SECRET" zeronat server --control 2222 --tap zn0 --bridge br0
+ZERONAT_SEED="$SEED" zeronat server --control 2222 --client home --tap zn0 --bridge br0
 
 <span class="c"># Behind CG-NAT, then run e.g. pppd on zn0:</span>
-ZERONAT_SECRET="$SECRET" zeronat client --server &lt;public-ip&gt;:2222 --tap zn0
+ZERONAT_SEED="$SEED" zeronat client --server &lt;public-ip&gt;:2222 --id home --tap zn0
 pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
 <pre class="v-docker"><code><span class="c"># Near the target segment (e.g. the PPPoE concentrator):</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
   --device /dev/net/tun --security-opt no-new-privileges \
-  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat server --control 2222 --tap zn0 --bridge br0
+  -e ZERONAT_SEED="$SEED" ghcr.io/paltaio/zeronat server --control 2222 --client home --tap zn0 --bridge br0
 
 <span class="c"># Behind CG-NAT; zn0 lands in the host netns, run pppd on the host:</span>
 docker run -d --name zeronat --restart unless-stopped --network host \
   --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
   --device /dev/net/tun --security-opt no-new-privileges \
-  -e ZERONAT_SECRET="$SECRET" ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --tap zn0
+  -e ZERONAT_SEED="$SEED" ghcr.io/paltaio/zeronat client --server &lt;public-ip&gt;:2222 --id home --tap zn0
 pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
       <p><code>--bridge &lt;name&gt;</code> enslaves the TAP to an existing bridge; <code>--tap-mtu &lt;n&gt;</code>
       sets the MTU (default 1400). Linux only. Needs <code>CAP_NET_ADMIN</code>: root,
@@ -543,9 +587,9 @@ pppd plugin rp-pppoe.so zn0 user &lt;user&gt;</code></pre>
       <p>Peer slots run beside the client's own session with the server and pair while that client
       serves forwards or sits idle. Under a <code>--tun</code>, <code>--tap</code>, or PPPoE session
       the slot is recorded and pairs when the client returns to either.</p>
-      <p>A server started with only <code>--control</code> registers clients and pairs them. It
-      carries no forwards, TAP or tun of its own, so the control port is the only one to open.</p>
-<pre><code>ZERONAT_SECRET="$SECRET" zeronat server --control 2222</code></pre>
+      <p>A server started with a control port and its client credentials registers clients and pairs
+      them. It carries no forwards, TAP or tun of its own, so the control port is the only one to open.</p>
+<pre><code>ZERONAT_SEED="$SEED" zeronat server --control 2222 --client a --client b</code></pre>
 
       <h3>Peer exit</h3>
       <p>The provider sets <code>exit = true</code> under <code>[peer]</code>, with an optional
@@ -605,15 +649,18 @@ zeronat client admin detach-provider exit</code></pre>
       separate from the secret; the published address is signed and encrypted. A holder of the
       discovery credential can find the server but cannot open a session, and the secret alone can
       neither publish nor read the record. Both sides need the same discovery credential, which must
-      differ from every secret.</p>
-<pre><code><span class="c"># Generate once, like the secret, and copy to both hosts:</span>
-DISCOVERY="$(openssl rand -hex 32)"
-
-<span class="c"># Server publishes its address; IP is auto-detected from the DHT:</span>
-ZERONAT_SECRET="$SECRET" ZERONAT_DISCOVERY_SECRET="$DISCOVERY" zeronat server --server dht --tcp 443
+      differ from every secret; the seed derives one.</p>
+<pre><code><span class="c"># Server publishes its address; IP is auto-detected from the DHT:</span>
+ZERONAT_SEED="$SEED" zeronat server --server dht --client home --tcp 443
 
 <span class="c"># Client finds the server through the DHT:</span>
-ZERONAT_SECRET="$SECRET" ZERONAT_DISCOVERY_SECRET="$DISCOVERY" zeronat client --server dht --tcp 443</code></pre>
+ZERONAT_SEED="$SEED" zeronat client --server dht --id home --tcp 443
+
+<span class="c"># Without a seed, generate the credential once and copy it to both hosts:</span>
+DISCOVERY="$(openssl rand -hex 32)"
+ZERONAT_SECRET="$SECRET" ZERONAT_DISCOVERY_SECRET="$DISCOVERY" \
+  ZERONAT_CLIENT_ID=home ZERONAT_CLIENT_SECRET="$SECRET" \
+  zeronat server --server dht --tcp 443</code></pre>
       <p><code>--announce-ip &lt;ip&gt;</code> overrides the detected IP and <code>--announce-port &lt;port&gt;</code>
       the announced port (default: the control port) when the server sits behind a port-forward. The client
       caches the last-known address and re-queries the DHT only when it stops working.</p>
@@ -626,7 +673,7 @@ ZERONAT_SECRET="$SECRET" ZERONAT_DISCOVERY_SECRET="$DISCOVERY" zeronat client --
       privileges. The server is a normal L2 bridge to the PPPoE segment (<code>--tap</code>, see above); the
       proxy credentials are separate from the PPPoE login, and the username selects the egress session.</p>
 <pre><code>docker run -d --name znpppoe -p 127.0.0.1:1080:1080 -p 127.0.0.1:8081:8081 \
-  -e ZN_SECRET="$SECRET" -e ZN_DISCOVERY_SECRET="$DISCOVERY" \
+  -e ZN_SEED="$SEED" -e ZN_CLIENT_ID=pppoe \
   -e ZN_USER=&lt;pppoe-user&gt; -e ZN_PASSWORD=&lt;pppoe-pass&gt; \
   -e ZN_PROXY_USER=proxy -e ZN_PROXY_PASS=&lt;proxy-pass&gt; \
   ghcr.io/paltaio/znpppoe --dht --connections 50 \
@@ -641,6 +688,10 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
       frames ride a peer session between the two. It still names the server with <code>--host</code>
       or <code>--dht</code>, since the server is what pairs them. See
       <a href="#peers">Peer sessions</a>.</p>
+      <p><code>ZN_SEED</code> is the server's seed; it fills <code>ZN_SECRET</code>,
+      <code>ZN_CLIENT_SECRET</code> (derived for <code>ZN_CLIENT_ID</code>, which the server lists as
+      <code>--client pppoe</code>), <code>ZN_DISCOVERY_SECRET</code>, and <code>ZN_PEER_SECRET</code>;
+      a value set on its own wins.</p>
       <p>Use <code>--host &lt;ip:port&gt;</code> instead of <code>--dht</code> for a fixed server. The ISP must
       allow concurrent PPPoE sessions on the login. Linux image, amd64 and arm64.</p>
     </section>
@@ -661,7 +712,10 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
         <tbody>
           <tr><td><code>--bind &lt;ADDR&gt;</code></td><td>Address to bind on (default 0.0.0.0)</td></tr>
           <tr><td><code>--control &lt;PORT&gt;</code></td><td>Control port (default 2222)</td></tr>
-          <tr><td><code>--secret &lt;64-HEX&gt;</code></td><td>32-byte hex secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
+          <tr><td><code>--seed &lt;64-HEX&gt;</code></td><td>Seed for every credential left unset (or env <code>ZERONAT_SEED</code>): the network secret, the admin secret, the discovery credential, and the credential of each <code>--client</code> given as a bare id. A credential set on its own always wins</td></tr>
+          <tr><td><code>--secret &lt;64-HEX&gt;</code></td><td>32-byte hex secret (or env <code>ZERONAT_SECRET</code>, or derived from the seed)</td></tr>
+          <tr><td><code>--client &lt;ID&gt;[:&lt;64-HEX&gt;]</code></td><td>Authorize a client id and credential (repeatable; or env <code>ZERONAT_CLIENT_ID</code> and <code>ZERONAT_CLIENT_SECRET</code>). A bare id takes its credential from the seed</td></tr>
+          <tr><td><code>--admin-secret &lt;64-HEX&gt;</code></td><td>Independent remote admin secret (or env <code>ZERONAT_ADMIN_SECRET</code>, or derived from the seed); remote admin is disabled when none is set</td></tr>
           <tr><td><code>--id &lt;ID&gt;</code></td><td>Server identity label (default 0)</td></tr>
           <tr><td><code>--config &lt;PATH&gt;</code></td><td>Load listeners, routes, and identity from a config file</td></tr>
           <tr><td><code>--tcp &lt;PORT&gt;</code></td><td>Public TCP port to expose (repeatable)</td></tr>
@@ -675,7 +729,7 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
           <tr><td><code>--bridge &lt;NAME&gt;</code></td><td>Enslave the TAP to this existing bridge</td></tr>
           <tr><td><code>--kcp-window &lt;N&gt;</code></td><td>KCP window in segments for the UDP transport (default 256, range 32-4096; or env <code>ZERONAT_KCP_WINDOW</code>)</td></tr>
           <tr><td><code>--server dht</code></td><td>Publish this server's address to the DHT for discovery</td></tr>
-          <tr><td><code>--discovery &lt;64-HEX&gt;</code></td><td>Discovery credential the DHT record is keyed by (or env <code>ZERONAT_DISCOVERY_SECRET</code>); required with <code>--server dht</code></td></tr>
+          <tr><td><code>--discovery &lt;64-HEX&gt;</code></td><td>Discovery credential the DHT record is keyed by (or env <code>ZERONAT_DISCOVERY_SECRET</code>, or derived from the seed); required with <code>--server dht</code></td></tr>
           <tr><td><code>--announce-ip &lt;IP&gt;</code></td><td>Public IPv4 to announce (default: auto-detected via DHT)</td></tr>
           <tr><td><code>--announce-port &lt;P&gt;</code></td><td>Public port to announce (default: control port)</td></tr>
         </tbody>
@@ -685,9 +739,11 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
       <table>
         <tbody>
           <tr><td><code>--server &lt;ADDR&gt;</code></td><td>Server control address <code>host:port</code>, or <code>dht</code> to discover via DHT</td></tr>
-          <tr><td><code>--secret &lt;64-HEX&gt;</code></td><td>32-byte hex secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
-          <tr><td><code>--discovery &lt;64-HEX&gt;</code></td><td>Discovery credential of the server's DHT record (or env <code>ZERONAT_DISCOVERY_SECRET</code>); required with <code>--server dht</code></td></tr>
-          <tr><td><code>--id &lt;PREFIX&gt;</code></td><td>Client id prefix (default: short hostname)</td></tr>
+          <tr><td><code>--seed &lt;64-HEX&gt;</code></td><td>Seed for every credential left unset (or env <code>ZERONAT_SEED</code>): the network secret, the discovery credential, and this client's credential for <code>--id</code>. A credential set on its own always wins</td></tr>
+          <tr><td><code>--secret &lt;64-HEX&gt;</code></td><td>32-byte hex secret (or env <code>ZERONAT_SECRET</code>, or derived from the seed)</td></tr>
+          <tr><td><code>--credential &lt;64-HEX&gt;</code></td><td>Client credential (or env <code>ZERONAT_CLIENT_SECRET</code>, or derived from the seed for <code>--id</code>; defaults to <code>--secret</code>)</td></tr>
+          <tr><td><code>--discovery &lt;64-HEX&gt;</code></td><td>Discovery credential of the server's DHT record (or env <code>ZERONAT_DISCOVERY_SECRET</code>, or derived from the seed); required with <code>--server dht</code></td></tr>
+          <tr><td><code>--id &lt;ID&gt;</code></td><td>Client id. With a seed-derived credential it is sent as-is and must equal the id in the server's <code>--client</code> entry; otherwise it is a prefix a host suffix is appended to (default: short hostname)</td></tr>
           <tr><td><code>--config &lt;PATH&gt;</code></td><td>Load servers, forwards, and identity from a config file</td></tr>
           <tr><td><code>--tcp &lt;SPEC&gt;</code></td><td>Forward TCP: <code>PORT</code> | <code>PORT:LOCALPORT</code> | <code>PORT:HOST:PORT</code>, with optional <code>+proxy</code> and <code>+idle=SECS</code> (repeatable)</td></tr>
           <tr><td><code>--udp &lt;SPEC&gt;</code></td><td>Forward UDP, same spec as <code>--tcp</code>; <code>+idle</code> only, <code>+proxy</code> is TCP-only (repeatable)</td></tr>
@@ -731,7 +787,16 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
         <tbody>
           <tr><td><code>show</code></td><td>Print the server's current topology (default command)</td></tr>
           <tr><td><code>--server &lt;ADDR&gt;</code></td><td>Server control address <code>host:port</code></td></tr>
-          <tr><td><code>--secret &lt;64-HEX&gt;</code></td><td>32-byte hex secret (or env <code>ZERONAT_SECRET</code>)</td></tr>
+          <tr><td><code>--secret &lt;64-HEX&gt;</code></td><td>32-byte admin secret (or env <code>ZERONAT_ADMIN_SECRET</code>, or derived from env <code>ZERONAT_SEED</code>, or either one read from <code>/etc/zeronat/.env</code>)</td></tr>
+        </tbody>
+      </table>
+
+      <h3>zeronat derive-client</h3>
+      <table>
+        <tbody>
+          <tr><td><code>&lt;ID&gt;</code></td><td>The client id, as the server lists it under <code>--client</code>. Prints <code>ZERONAT_SECRET</code> (the network secret) and <code>ZERONAT_CLIENT_SECRET</code> (this client's credential) as <code>KEY=VALUE</code> lines</td></tr>
+          <tr><td><code>--seed &lt;64-HEX&gt;</code></td><td>The seed (or env <code>ZERONAT_SEED</code>)</td></tr>
+          <tr><td><code>--dht</code></td><td>Also print <code>ZERONAT_DISCOVERY_SECRET</code>, for a client that runs with <code>--server dht</code></td></tr>
         </tbody>
       </table>
     </section>

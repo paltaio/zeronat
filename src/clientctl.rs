@@ -478,6 +478,7 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
                 cfg.servers.push(CfgServer {
                     name,
                     addr,
+                    seed: None,
                     credential: secret.clone(),
                     secret,
                     discovery: None,

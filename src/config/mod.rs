@@ -36,13 +36,17 @@ pub struct CfgRoute {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CfgClient {
     pub id: String,
-    pub secret: String,
+    /// Absent when the credential is derived from the seed.
+    pub secret: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ServerConfig {
     pub id: Option<String>,
     pub control: Option<String>,
+    /// Fills the network, admin, and discovery credentials, and the
+    /// credential of any `[[clients]]` entry without a `secret`.
+    pub seed: Option<String>,
     pub admin_secret: Option<String>,
     pub clients: Vec<CfgClient>,
     /// Exit mode: masquerade the tunnel client's outbound traffic.
@@ -142,6 +146,7 @@ pub fn parse(text: &str) -> Result<ServerConfig> {
                 match key {
                     "id" => cfg.id = Some(parse_string(value, n)?),
                     "control" => cfg.control = Some(parse_string(value, n)?),
+                    "seed" => cfg.seed = Some(parse_string(value, n)?),
                     "admin_secret" => cfg.admin_secret = Some(parse_string(value, n)?),
                     "exit" => cfg.exit = Some(parse_bool(value, n)?),
                     "exit_iface" => cfg.exit_iface = Some(parse_string(value, n)?),
@@ -272,11 +277,10 @@ fn close_record(
             if id.is_empty() {
                 return Err(err(n, "client `id` must not be empty"));
             }
-            let secret = record
-                .secret
-                .take()
-                .ok_or_else(|| err(n, "client missing `secret`"))?;
-            cfg.clients.push(CfgClient { id, secret });
+            cfg.clients.push(CfgClient {
+                id,
+                secret: record.secret.take(),
+            });
         }
         Section::None | Section::Server => {}
     }
@@ -304,6 +308,7 @@ pub fn serialize(cfg: &ServerConfig) -> String {
 
     if cfg.id.is_some()
         || cfg.control.is_some()
+        || cfg.seed.is_some()
         || cfg.admin_secret.is_some()
         || cfg.exit.is_some()
         || cfg.exit_iface.is_some()
@@ -314,6 +319,9 @@ pub fn serialize(cfg: &ServerConfig) -> String {
         }
         if let Some(control) = &cfg.control {
             out.push_str(&format!("control = {}\n", quote(control)));
+        }
+        if let Some(seed) = &cfg.seed {
+            out.push_str(&format!("seed = {}\n", quote(seed)));
         }
         if let Some(admin_secret) = &cfg.admin_secret {
             out.push_str(&format!("admin_secret = {}\n", quote(admin_secret)));
@@ -334,7 +342,9 @@ pub fn serialize(cfg: &ServerConfig) -> String {
         }
         out.push_str("[[clients]]\n");
         out.push_str(&format!("id = {}\n", quote(&client.id)));
-        out.push_str(&format!("secret = {}\n", quote(&client.secret)));
+        if let Some(secret) = &client.secret {
+            out.push_str(&format!("secret = {}\n", quote(secret)));
+        }
     }
 
     let mut listeners = cfg.listeners.clone();
@@ -400,11 +410,18 @@ mod tests {
         ServerConfig {
             id: Some("oci".into()),
             control: Some("0.0.0.0:2222".into()),
+            seed: Some("seed".into()),
             admin_secret: Some("admin-secret".into()),
-            clients: vec![CfgClient {
-                id: "rpi-1".into(),
-                secret: "client-secret".into(),
-            }],
+            clients: vec![
+                CfgClient {
+                    id: "rpi-1".into(),
+                    secret: Some("client-secret".into()),
+                },
+                CfgClient {
+                    id: "rpi-2".into(),
+                    secret: None,
+                },
+            ],
             exit: Some(true),
             exit_iface: Some("eth0".into()),
             listeners: vec![
@@ -463,6 +480,7 @@ mod tests {
         let cfg = ServerConfig {
             id: None,
             control: None,
+            seed: None,
             admin_secret: None,
             clients: Vec::new(),
             exit: None,
@@ -516,6 +534,16 @@ mod tests {
         for case in cases {
             assert!(parse(case).is_err(), "expected Err for:\n{case}");
         }
+    }
+
+    #[test]
+    fn client_secret_is_optional() {
+        let text = "[[clients]]\nid = \"a\"\n\n[[clients]]\nid = \"b\"\nsecret = \"s\"\n";
+        let cfg = parse(text).unwrap();
+        assert_eq!(cfg.clients[0].secret, None);
+        assert_eq!(cfg.clients[1].secret.as_deref(), Some("s"));
+        assert_eq!(serialize(&cfg), text);
+        assert!(parse("[[clients]]\nsecret = \"s\"\n").is_err());
     }
 
     #[test]

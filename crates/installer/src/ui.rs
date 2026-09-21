@@ -86,12 +86,18 @@ pub struct Config {
     pub announce_ip: String,
     pub announce_port: String,
     pub server_addr: String,
+    /// The seed both sides derive their credentials from, or the network
+    /// secret when `explicit` is set.
     pub secret: String,
+    /// Empty when the seed derives it.
     pub admin_secret: String,
     /// The credential the DHT record is keyed by; resolved when `use_dht` is
-    /// set, empty otherwise.
+    /// set, empty when unused or when the seed derives it.
     pub discovery: String,
     pub secret_mode: SecretMode,
+    /// Write the network, client, admin, and discovery values themselves
+    /// instead of one `ZERONAT_SEED`.
+    pub explicit: bool,
     pub have_docker: bool,
     pub have_compose: bool,
     pub existing_secret: Option<String>,
@@ -132,6 +138,7 @@ impl Config {
             } else {
                 SecretMode::Generate
             },
+            explicit: false,
             have_docker,
             have_compose,
             existing_secret,
@@ -253,8 +260,10 @@ impl App {
             Step::Discovery => match self.cfg.mode {
                 Mode::Server => Step::Control,
                 // A dht client joins an existing server, so it pastes that
-                // server's discovery credential next.
-                Mode::Client if self.cfg.use_dht => Step::DiscoveryEntry,
+                // server's discovery credential next, unless the seed
+                // derives it.
+                Mode::Client if self.cfg.use_dht && self.cfg.explicit => Step::DiscoveryEntry,
+                Mode::Client if self.cfg.use_dht => Step::Secret,
                 Mode::Client => Step::ServerAddr,
             },
             Step::DiscoveryEntry | Step::ServerAddr => Step::Secret,
@@ -1040,7 +1049,9 @@ impl App {
         match self.cfg.mode {
             Mode::Client if self.cfg.use_dht => {
                 add("server", "via DHT".to_string(), PLAIN);
-                add("discovery", "set (hidden)".to_string(), GOOD);
+                if self.cfg.explicit {
+                    add("discovery", "set (hidden)".to_string(), GOOD);
+                }
             }
             Mode::Client => add("server", self.cfg.server_addr.clone(), PLAIN),
             Mode::Server if self.cfg.use_dht => add("discovery", "DHT publish".to_string(), PLAIN),
@@ -1052,7 +1063,8 @@ impl App {
             SecretMode::Generate => "generate new",
             SecretMode::Enter => "entered (hidden)",
         };
-        add("secret", secret.to_string(), GOOD);
+        let label = if self.cfg.explicit { "secret" } else { "seed" };
+        add(label, secret.to_string(), GOOD);
     }
 
     fn status_line(&self) -> Line {
@@ -1123,6 +1135,7 @@ mod tests {
     fn dht_client_enters_the_discovery_credential() {
         let mut app = App::new(Config::new(false, false, None), None);
         app.cfg.mode = Mode::Client;
+        app.cfg.explicit = true;
         app.cfg.secret = "a".repeat(64);
         app.enter(Step::Discovery);
         app.sel = 1;
@@ -1146,6 +1159,19 @@ mod tests {
         assert!(!app.commit_input());
         app.input = "c".repeat(64);
         assert!(app.commit_input());
+    }
+
+    // With a seed there is no discovery credential to enter: a dht client
+    // goes straight to the secret step.
+    #[test]
+    fn seeded_dht_client_skips_the_discovery_entry() {
+        let mut app = App::new(Config::new(false, false, None), None);
+        app.cfg.mode = Mode::Client;
+        app.enter(Step::Discovery);
+        app.sel = 1;
+        app.on_key(Key::Enter);
+        assert!(app.cfg.use_dht);
+        assert!(app.step == Step::Secret);
     }
 
     #[test]

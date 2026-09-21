@@ -35,6 +35,7 @@ pub mod punch;
 #[cfg(target_os = "linux")]
 pub mod route;
 pub use zeronat_secret as secret;
+pub mod seed;
 pub mod server;
 pub mod tap;
 #[cfg(all(feature = "tui", unix))]

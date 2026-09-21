@@ -29,6 +29,9 @@ pub struct CfgServer {
     pub name: String,
     /// `"dht"` or `host:port`.
     pub addr: String,
+    /// Fills `secret`, `discovery`, and the `credential` derived for
+    /// `[client].id` when the entry leaves them out.
+    pub seed: Option<ServerSecret>,
     pub secret: ServerSecret,
     pub credential: ServerSecret,
     /// The credential the server's DHT record is keyed by; required when
@@ -309,6 +312,7 @@ enum Section {
 struct PartialRecord {
     name: Option<String>,
     addr: Option<String>,
+    seed: Option<String>,
     secret: Option<String>,
     credential: Option<String>,
     discovery: Option<String>,
@@ -355,6 +359,10 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
     let mut client_keys: Vec<&str> = Vec::new();
     let mut record = PartialRecord::default();
     let mut record_keys: Vec<&str> = Vec::new();
+    // Seeded `[[servers]]` entries without a `credential`, by index. Their
+    // credential names `[client].id`, which may be declared after them, so it
+    // is derived once the whole file is read.
+    let mut seeded: Vec<(usize, crate::seed::Seed)> = Vec::new();
 
     for (lineno, raw) in text.lines().enumerate() {
         let line = strip_comment(raw).trim();
@@ -365,7 +373,7 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
 
         if let Some(header) = line.strip_prefix('[') {
             // A table header closes the previous record.
-            close_record(&section, &mut cfg, &mut record, n)?;
+            close_record(&section, &mut cfg, &mut record, &mut seeded, n)?;
             record = PartialRecord::default();
             record_keys.clear();
 
@@ -438,6 +446,7 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
                 match key {
                     "name" => record.name = Some(parse_string(value, n)?),
                     "addr" => record.addr = Some(parse_string(value, n)?),
+                    "seed" => record.seed = Some(parse_string(value, n)?),
                     "secret" => record.secret = Some(parse_string(value, n)?),
                     "credential" => record.credential = Some(parse_string(value, n)?),
                     "discovery" => record.discovery = Some(parse_string(value, n)?),
@@ -524,7 +533,18 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
 
     // Close the final open record at EOF.
     let last = text.lines().count();
-    close_record(&section, &mut cfg, &mut record, last)?;
+    close_record(&section, &mut cfg, &mut record, &mut seeded, last)?;
+    if !seeded.is_empty() {
+        let id = cfg.id.as_deref().ok_or_else(|| {
+            err(
+                last,
+                "a [[servers]] `seed` derives the client credential for [client].id, which is missing",
+            )
+        })?;
+        for (index, seed) in &seeded {
+            cfg.servers[*index].credential = ServerSecret(seed.client(id));
+        }
+    }
     Ok(cfg)
 }
 
@@ -536,6 +556,7 @@ fn close_record(
     section: &Section,
     cfg: &mut ClientConfig,
     record: &mut PartialRecord,
+    seeded: &mut Vec<(usize, crate::seed::Seed)>,
     n: usize,
 ) -> Result<()> {
     match section {
@@ -551,17 +572,41 @@ fn close_record(
                 .addr
                 .take()
                 .ok_or_else(|| err(n, "server missing `addr`"))?;
-            let secret = record
-                .secret
+            let seed = match record.seed.take() {
+                Some(hex) => {
+                    let seed = crate::seed::Seed::parse(&hex)
+                        .map_err(|e| err(n, &format!("server {e}")))?;
+                    Some((hex, seed))
+                }
+                None => None,
+            };
+            let secret = match (record.secret.take(), &seed) {
+                (Some(secret), _) => secret,
+                (None, Some((_, seed))) => seed.network(),
+                (None, None) => return Err(err(n, "server missing `secret` or `seed`")),
+            };
+            let discovery = record
+                .discovery
                 .take()
-                .ok_or_else(|| err(n, "server missing `secret`"))?;
-            let credential = record.credential.take().unwrap_or_else(|| secret.clone());
+                .or_else(|| seed.as_ref().map(|(_, seed)| seed.discovery()));
+            let (seed_hex, seed) = seed.unzip();
+            let credential = match (record.credential.take(), seed) {
+                (Some(credential), _) => credential,
+                // Replaced by the seed's `client <id>` once the whole file is
+                // read; the secret stands in until then.
+                (None, Some(seed)) => {
+                    seeded.push((cfg.servers.len(), seed));
+                    secret.clone()
+                }
+                (None, None) => secret.clone(),
+            };
             cfg.servers.push(CfgServer {
                 name,
                 addr,
+                seed: seed_hex.map(ServerSecret),
                 secret: ServerSecret(secret),
                 credential: ServerSecret(credential),
-                discovery: record.discovery.take().map(ServerSecret),
+                discovery: discovery.map(ServerSecret),
                 transport: record.transport.take().unwrap_or(Transport::Auto),
             });
         }
@@ -740,10 +785,31 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
         table(&mut out, "[[servers]]");
         out.push_str(&format!("name = {}\n", quote(&s.name)));
         out.push_str(&format!("addr = {}\n", quote(&s.addr)));
-        out.push_str(&format!("secret = {}\n", quote(&s.secret.0)));
-        out.push_str(&format!("credential = {}\n", quote(&s.credential.0)));
+        // A value the seed derives is left to the seed, so a later change to
+        // `[client].id` re-derives the credential instead of keeping a stale
+        // copy.
+        let seed = s
+            .seed
+            .as_ref()
+            .and_then(|seed| crate::seed::Seed::parse(&seed.0).ok());
+        let derived = |value: Option<String>, explicit: &str| value.as_deref() == Some(explicit);
+        if let Some(seed) = &s.seed {
+            out.push_str(&format!("seed = {}\n", quote(&seed.0)));
+        }
+        if !derived(seed.as_ref().map(|seed| seed.network()), &s.secret.0) {
+            out.push_str(&format!("secret = {}\n", quote(&s.secret.0)));
+        }
+        let client = seed
+            .as_ref()
+            .zip(cfg.id.as_deref())
+            .map(|(seed, id)| seed.client(id));
+        if !derived(client, &s.credential.0) {
+            out.push_str(&format!("credential = {}\n", quote(&s.credential.0)));
+        }
         if let Some(discovery) = &s.discovery {
-            out.push_str(&format!("discovery = {}\n", quote(&discovery.0)));
+            if !derived(seed.as_ref().map(|seed| seed.discovery()), &discovery.0) {
+                out.push_str(&format!("discovery = {}\n", quote(&discovery.0)));
+            }
         }
         if s.transport != Transport::Auto {
             out.push_str(&format!(
@@ -862,6 +928,7 @@ mod tests {
                 CfgServer {
                     name: "home".into(),
                     addr: "dht".into(),
+                    seed: None,
                     secret: ServerSecret(TEST_SECRET.into()),
                     credential: ServerSecret(TEST_SECRET.into()),
                     discovery: Some(ServerSecret(DISCOVERY_SECRET.into())),
@@ -870,6 +937,7 @@ mod tests {
                 CfgServer {
                     name: "oci".into(),
                     addr: "203.0.113.10:2222".into(),
+                    seed: None,
                     secret: ServerSecret(OTHER_SECRET.into()),
                     credential: ServerSecret(OTHER_SECRET.into()),
                     discovery: None,
@@ -1067,11 +1135,52 @@ mod tests {
     }
 
     #[test]
+    fn seeded_server_derives_what_it_leaves_out() {
+        let seed = crate::seed::Seed::parse(TEST_SECRET).unwrap();
+        // [client] after [[servers]]: the credential still names its id.
+        let text = format!(
+            "[[servers]]\nname = \"home\"\naddr = \"dht\"\nseed = \"{TEST_SECRET}\"\n\n[client]\nid = \"rpi\"\n"
+        );
+        let cfg = parse_client(&text).unwrap();
+        cfg.validate().unwrap();
+        let home = &cfg.servers[0];
+        assert_eq!(home.seed.as_ref().unwrap().0, TEST_SECRET);
+        assert_eq!(home.secret.0, seed.network());
+        assert_eq!(home.credential.0, seed.client("rpi"));
+        assert_eq!(home.discovery.as_ref().unwrap().0, seed.discovery());
+        assert_eq!(parse_client(&serialize_client(&cfg)).unwrap(), cfg);
+        // Derived values stay out of the file; an explicit one is kept.
+        let out = serialize_client(&cfg);
+        assert!(!out.contains("secret ="), "{out}");
+        assert!(!out.contains("credential ="), "{out}");
+        assert!(!out.contains("discovery ="), "{out}");
+        let text = format!(
+            "[client]\nid = \"rpi\"\n\n[[servers]]\nname = \"home\"\naddr = \"dht\"\nseed = \"{TEST_SECRET}\"\ncredential = \"{OTHER_SECRET}\"\n"
+        );
+        let cfg = parse_client(&text).unwrap();
+        assert_eq!(cfg.servers[0].credential.0, OTHER_SECRET);
+        assert_eq!(serialize_client(&cfg), text);
+    }
+
+    #[test]
+    fn seeded_server_needs_a_client_id_and_a_valid_seed() {
+        let text = format!("[[servers]]\nname = \"home\"\naddr = \"dht\"\nseed = \"{TEST_SECRET}\"\n");
+        let error = parse_client(&text).unwrap_err().to_string();
+        assert!(error.contains("[client].id"), "{error}");
+        let text = "[[servers]]\nname = \"home\"\naddr = \"dht\"\nseed = \"short\"\n";
+        assert!(parse_client(text).is_err());
+        let text = "[[servers]]\nname = \"home\"\naddr = \"dht\"\n";
+        let error = parse_client(text).unwrap_err().to_string();
+        assert!(error.contains("`secret` or `seed`"), "{error}");
+    }
+
+    #[test]
     fn roundtrip_devices() {
         let tap = ClientConfig {
             servers: vec![CfgServer {
                 name: "home".into(),
                 addr: "dht".into(),
+                seed: None,
                 secret: ServerSecret(TEST_SECRET.into()),
                 credential: ServerSecret(TEST_SECRET.into()),
                 discovery: Some(ServerSecret(DISCOVERY_SECRET.into())),

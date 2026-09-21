@@ -3,8 +3,8 @@ use crate::Result;
 use tokio::net::TcpStream;
 
 /// Where the installer writes the deployment env file. `admin` reads its
-/// `ZERONAT_ADMIN_SECRET` as the final fallback when neither `--secret` nor the
-/// environment supplies one.
+/// `ZERONAT_ADMIN_SECRET`, or derives one from its `ZERONAT_SEED`, as the
+/// final fallback when neither `--secret` nor the environment supplies one.
 const ENV_FILE: &str = "/etc/zeronat/.env";
 
 /// Best-effort read of the installer env file's administrative secret.
@@ -12,10 +12,20 @@ pub fn admin_secret_from_env_file() -> Option<String> {
     parse_env_admin_secret(&std::fs::read_to_string(ENV_FILE).ok()?)
 }
 
-/// Pull `ZERONAT_ADMIN_SECRET` out of an env-file body (`KEY=VALUE` lines).
+/// The admin secret an env-file body (`KEY=VALUE` lines) yields: its
+/// `ZERONAT_ADMIN_SECRET`, else the one derived from its `ZERONAT_SEED`.
 fn parse_env_admin_secret(body: &str) -> Option<String> {
+    env_value(body, "ZERONAT_ADMIN_SECRET").or_else(|| {
+        crate::seed::Seed::parse(&env_value(body, "ZERONAT_SEED")?)
+            .ok()
+            .map(|seed| seed.admin())
+    })
+}
+
+fn env_value(body: &str, key: &str) -> Option<String> {
     body.lines().find_map(|line| {
-        line.strip_prefix("ZERONAT_ADMIN_SECRET=")
+        line.strip_prefix(key)?
+            .strip_prefix('=')
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(str::to_string)
@@ -531,5 +541,17 @@ mod tests {
         // Missing or empty value yields nothing.
         assert_eq!(parse_env_admin_secret("ZERONAT_ARGS=server\n"), None);
         assert_eq!(parse_env_admin_secret("ZERONAT_ADMIN_SECRET=\n"), None);
+    }
+
+    #[test]
+    fn parse_env_admin_secret_derives_from_the_seed() {
+        let seed = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let derived = crate::seed::Seed::parse(seed).unwrap().admin();
+        let body = format!("ZERONAT_SEED={seed}\nZERONAT_ARGS=server\n");
+        assert_eq!(parse_env_admin_secret(&body).as_deref(), Some(derived.as_str()));
+        // An explicit admin secret wins over the seed.
+        let body = format!("ZERONAT_SEED={seed}\nZERONAT_ADMIN_SECRET=deadbeef\n");
+        assert_eq!(parse_env_admin_secret(&body).as_deref(), Some("deadbeef"));
+        assert_eq!(parse_env_admin_secret("ZERONAT_SEED=short\n"), None);
     }
 }

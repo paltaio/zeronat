@@ -15,6 +15,25 @@ pub fn derive_tun_subnet(secret: &str) -> [u8; 4] {
     [10, out[0], out[1], 0]
 }
 
+/// How a client names itself to the server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientId {
+    /// `PREFIX-XXXX`, see [`derive_client_id`].
+    Prefix(Option<String>),
+    /// Used verbatim. A seed-derived credential is bound to the id it was
+    /// derived for, so that id is sent as-is.
+    Exact(String),
+}
+
+impl ClientId {
+    pub fn resolve(&self) -> String {
+        match self {
+            ClientId::Prefix(prefix) => derive_client_id(prefix.as_deref()),
+            ClientId::Exact(id) => id.clone(),
+        }
+    }
+}
+
 /// Derive a stable client identity label. The prefix is the caller's label when
 /// non-empty, otherwise the short hostname; the suffix disambiguates hosts that
 /// share a prefix and must stay constant across restarts of the same machine.
@@ -128,6 +147,15 @@ mod tests {
         let suffix = machine_suffix();
         assert_eq!(suffix.len(), 4);
         assert!(is_hex_lower(&suffix));
+    }
+
+    #[test]
+    fn exact_id_is_used_verbatim() {
+        assert_eq!(ClientId::Exact("rpi".into()).resolve(), "rpi");
+        assert_eq!(
+            ClientId::Prefix(Some("rpi".into())).resolve(),
+            derive_client_id(Some("rpi"))
+        );
     }
 
     #[test]
