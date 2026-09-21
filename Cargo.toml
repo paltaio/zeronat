@@ -11,7 +11,7 @@ default-members = ["."]
 # znpppoe links this crate by path and speaks its wire protocol, so the two
 # ship as one version.
 [workspace.package]
-version = "0.26.0"
+version = "0.26.1"
 
 [features]
 default = ["dht", "tui"]
