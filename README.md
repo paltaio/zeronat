@@ -33,6 +33,18 @@ What a service behind zeronat sees, and the PROXY protocol cutover, are covered 
 
 Routing, all-ports forwarding, the TAP bridge, DHT discovery, and the full CLI live at https://paltaio.github.io/zeronat/.
 
+## Release
+
+Bump `version` under `[workspace.package]` in `Cargo.toml` and run `cargo test --workspace` so `Cargo.lock` follows. The tag must match that version; the release workflow checks it.
+
+```bash
+git commit Cargo.toml Cargo.lock -m "chore: release v0.27.0"
+git tag v0.27.0
+git push origin main v0.27.0
+```
+
+The tag publishes the release binaries and both images, `ghcr.io/paltaio/zeronat` and `ghcr.io/paltaio/znpppoe`, at `0.27.0`, `0.27`, and `latest`. Pushes to main move `znpppoe:edge`.
+
 ## License
 
 MIT, Copyright (c) 2026 Palta Studios. See [LICENSE](LICENSE).
