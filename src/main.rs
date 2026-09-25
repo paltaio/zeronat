@@ -1154,781 +1154,772 @@ async fn shutdown() {
     }
 }
 
-async fn run(cmd: Cmd) -> Result<()> {
-    match cmd {
-        Cmd::Server(args) => {
-            let ServerArgs {
-                bind,
-                control,
-                seed,
-                secret,
-                discovery,
-                client_credentials,
-                admin_secret,
-                server_id,
-                tcp,
-                udp,
-                tap,
-                tun,
-                mtu,
-                except,
-                exit,
-                exit_iface,
-                dht,
-                announce_ip,
-                announce_port,
-                config,
-            } = *args;
-            // A valid config is authoritative. The recovery for a broken one
-            // depends on why it broke: a missing file is a normal first boot
-            // (default, then self-heal); a malformed file is set aside so its
-            // routes stay recoverable before we rewrite a fresh one, rather than
-            // crash-looping under a restart policy; an unreadable file (permission
-            // or transient IO) is fatal, because falling back here would let the
-            // next mutation overwrite intact state we never managed to read.
-            let mut self_healed = false;
-            let file = match &config {
-                Some(path) => match zeronat::config::load(path) {
-                    Ok(cfg) => cfg,
-                    Err(zeronat::config::LoadError::Malformed(e)) => {
-                        match zeronat::config::quarantine(path) {
-                            Some(b) => zeronat::elog!(
-                                "config: {e}; moved aside to {}; starting from command-line settings and rewriting on the next change",
-                                b.display()
-                            ),
-                            None => zeronat::elog!(
-                                "config: {e}; could not set the file aside; starting from command-line settings and overwriting on the next change"
-                            ),
-                        }
-                        self_healed = true;
-                        zeronat::config::ServerConfig::default()
-                    }
-                    Err(zeronat::config::LoadError::Unreadable(e)) => return Err(e),
-                },
-                None => zeronat::config::ServerConfig::default(),
-            };
-
-            // A valid file's identity/control win over the CLI; a present CLI flag
-            // that the file overrides is logged so the override is visible.
-            let (cli_id, cli_bind, cli_control, cli_seed, cli_admin_secret) =
-                (server_id, bind, control, seed, admin_secret);
-            if let (Some(f), Some(c)) = (&file.id, &cli_id) {
-                if f != c {
-                    zeronat::elog!("config [server].id '{f}' overrides --server-id '{c}'");
-                }
+/// The config at `path`. A missing file is a normal first boot; a malformed
+/// file is set aside so its contents stay recoverable and the client starts
+/// from command-line settings; an unreadable file (permission or transient
+/// IO) is fatal, so a restart retries rather than running with settings we
+/// never managed to read.
+#[inline(never)]
+fn load_client_file(path: &std::path::Path) -> Result<Box<ClientConfig>> {
+    match zeronat::clientcfg::load(path) {
+        Ok(cfg) => Ok(Box::new(cfg)),
+        Err(zeronat::config::LoadError::Malformed(e)) => {
+            match zeronat::config::quarantine(path) {
+                Some(b) => zeronat::elog!(
+                    "config: {e}; moved aside to {}; starting from command-line settings",
+                    b.display()
+                ),
+                None => zeronat::elog!(
+                    "config: {e}; could not set the file aside; starting from command-line settings"
+                ),
             }
-            let server_id = file
-                .id
-                .clone()
-                .or_else(|| cli_id.clone())
-                .unwrap_or_else(|| "0".to_string());
-
-            let (file_ip, file_port) = match &file.control {
-                Some(ctrl) => {
-                    let addr: SocketAddrV4 = ctrl.parse().map_err(|_| -> zeronat::Error {
-                        format!("[server].control must be IPv4:port, got '{ctrl}'").into()
-                    })?;
-                    (Some(*addr.ip()), Some(addr.port()))
-                }
-                None => (None, None),
-            };
-            if let (Some(f), Some(c)) = (file_ip, cli_bind) {
-                if f != c {
-                    zeronat::elog!("config [server].control address {f} overrides --bind {c}");
-                }
-            }
-            if let (Some(f), Some(c)) = (file_port, cli_control) {
-                if f != c {
-                    zeronat::elog!("config [server].control port {f} overrides --control {c}");
-                }
-            }
-            let bind_ip = file_ip.or(cli_bind).unwrap_or(Ipv4Addr::UNSPECIFIED);
-            let control_port = file_port.or(cli_control).unwrap_or(2222);
-
-            let file_seed = file
-                .seed
-                .as_deref()
-                .map(|value| {
-                    Seed::parse(value)
-                        .map(|seed| seed.to_hex())
-                        .map_err(|e| -> zeronat::Error { format!("config [server].{e}").into() })
-                })
-                .transpose()?;
-            if let (Some(f), Some(c)) = (&file_seed, &cli_seed) {
-                if f != c {
-                    zeronat::elog!("config [server].seed overrides --seed");
-                }
-            }
-            let seed_hex = file_seed.or(cli_seed);
-            let seed = seed_hex.as_deref().map(Seed::parse).transpose()?;
-
-            // An explicit value always wins; the seed fills what is left.
-            let secret = match secret {
-                Some(secret) => secret,
-                None => seed.as_ref().map(Seed::network).ok_or(
-                    "--secret, ZERONAT_SECRET, or a seed (--seed, ZERONAT_SEED, [server].seed) is required",
-                )?,
-            };
-            let discovery = discovery.or_else(|| seed.as_ref().map(Seed::discovery));
-            if dht && discovery.is_none() {
-                return Err(
-                    "--server dht requires --discovery, ZERONAT_DISCOVERY_SECRET, or a seed".into(),
-                );
-            }
-            if file.admin_secret.is_some() && cli_admin_secret.is_some() {
-                zeronat::elog!("config [server].admin_secret overrides --admin-secret");
-            }
-            let explicit_admin_secret = file
-                .admin_secret
-                .clone()
-                .or(cli_admin_secret)
-                .map(runtime_secret)
-                .transpose()?;
-            let admin_secret = explicit_admin_secret
-                .clone()
-                .or_else(|| seed.as_ref().map(Seed::admin));
-
-            let (client_entries, no_credential) = if file.clients.is_empty() {
-                (
-                    &client_credentials,
-                    "give --client ID:64-HEX or set a seed (--seed or ZERONAT_SEED)",
-                )
-            } else {
-                if !client_credentials.is_empty() {
-                    zeronat::elog!("config [[clients]] overrides --client");
-                }
-                (&file.clients, "add `secret` or set [server].seed")
-            };
-            let client_credentials = client_entries
-                .iter()
-                .map(|client| -> Result<server::ClientCredentialSpec> {
-                    let secret = match (&client.secret, &seed) {
-                        (Some(secret), _) => secret.clone(),
-                        (None, Some(seed)) => seed.client(&client.id),
-                        (None, None) => {
-                            return Err(format!(
-                                "client `{}` has no credential: {no_credential}",
-                                client.id
-                            )
-                            .into());
-                        }
-                    };
-                    Ok(server::ClientCredentialSpec {
-                        client_id: client.id.clone(),
-                        secret,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            let (cli_exit, cli_exit_iface) = (exit, exit_iface);
-            if file.exit == Some(false) && cli_exit {
-                zeronat::elog!("config [server].exit = false overrides --exit");
-            }
-            let exit = file.exit.unwrap_or(cli_exit);
-            if let (Some(f), Some(c)) = (&file.exit_iface, &cli_exit_iface) {
-                if f != c {
-                    zeronat::elog!("config [server].exit_iface '{f}' overrides --exit-iface '{c}'");
-                }
-            }
-            let exit_iface = file.exit_iface.clone().or(cli_exit_iface);
-
-            // Listeners: start from the file's, then fold in CLI forwards. A CLI
-            // port that matches a file listener locks that file listener (kept as
-            // File so it still persists); a CLI-only port is a locked Cli listener.
-            let mut listeners: Vec<server::ListenerSpec> = file
-                .listeners
-                .iter()
-                .map(|l| server::ListenerSpec {
-                    bind_ip: l.bind_ip,
-                    proto: l.proto,
-                    port: l.port,
-                    source: Source::File,
-                    cli_locked: false,
-                })
-                .collect();
-            let mut add_cli_listener = |proto: Proto, port: u16| {
-                let key = (bind_ip, proto, port);
-                if let Some(spec) = listeners
-                    .iter_mut()
-                    .find(|s| (s.bind_ip, s.proto, s.port) == key)
-                {
-                    spec.cli_locked = true;
-                } else {
-                    listeners.push(server::ListenerSpec {
-                        bind_ip,
-                        proto,
-                        port,
-                        source: Source::Cli,
-                        cli_locked: true,
-                    });
-                }
-            };
-            for port in &tcp {
-                add_cli_listener(Proto::Tcp, *port);
-            }
-            for port in &udp {
-                add_cli_listener(Proto::Udp, *port);
-            }
-
-            let routes: Vec<server::RouteSpec> = file
-                .routes
-                .iter()
-                .map(|r| server::RouteSpec {
-                    bind_ip: r.bind_ip,
-                    proto: r.proto,
-                    port: r.port,
-                    client_id: r.client.clone(),
-                    source: Source::File,
-                })
-                .collect();
-
-            // Validate against the merged set. --tun owns every port and cannot
-            // coexist with --tap or any per-port forward; --tap cannot coexist
-            // with forwards; a config-only server with listeners is valid.
-            if tun {
-                if tap.is_some() {
-                    return Err("--tun cannot be combined with --tap".into());
-                }
-                if !listeners.is_empty() || !routes.is_empty() {
-                    return Err(
-                        "--tun cannot be combined with --tcp/--udp or config listeners/routes"
-                            .into(),
-                    );
-                }
-                // The iptables fallback matches kept ports with the multiport
-                // module, which caps at 15 ports (control port + exclusions).
-                let mut kept: Vec<u16> = except
-                    .iter()
-                    .copied()
-                    .filter(|&p| p != control_port)
-                    .collect();
-                kept.sort_unstable();
-                kept.dedup();
-                if kept.len() + 1 > 15 {
-                    return Err(format!(
-                        "--except has {} distinct ports; at most 14 are allowed besides the control port",
-                        kept.len()
-                    )
-                    .into());
-                }
-            }
-            if !except.is_empty() && !tun {
-                return Err("--except requires --tun".into());
-            }
-            if exit && !tun {
-                return Err("--exit requires --tun".into());
-            }
-            if exit_iface.is_some() && !exit {
-                return Err("--exit-iface requires --exit".into());
-            }
-            if exit_iface.as_deref() == Some(DEFAULT_TUN_NAME) {
-                return Err(
-                    format!("--exit-iface cannot be the tun device {DEFAULT_TUN_NAME}").into(),
-                );
-            }
-            if tap.is_some() && !listeners.is_empty() {
-                return Err("--tap cannot be combined with --tcp/--udp forwards".into());
-            }
-            // A server with no forwards and no device still registers clients,
-            // pairs them, and splices the relays their pairs fall back to.
-
-            let tun = if tun {
-                let (subnet, server_ip, client_ip) = tun_addrs(&secret);
-                Some(server::ServerTun {
-                    device: zeronat::tap::TunConfig {
-                        name: DEFAULT_TUN_NAME.to_string(),
-                        mtu,
-                        addr: server_ip,
-                        prefix_len: TUN_PREFIX_LEN,
-                    },
-                    subnet,
-                    client_ip,
-                    except,
-                    exit,
-                    exit_iface: exit_iface.clone(),
-                })
-            } else {
-                None
-            };
-
-            let dht = dht.then_some(server::DhtAnnounce {
-                ip: announce_ip,
-                port: announce_port,
-            });
-            zeronat::elog!(
-                "zeronat {} server: bind={bind_ip} control={control_port} tcp-forwards={} udp-forwards={} tap={} tun={} exit={} dht={}",
-                env!("CARGO_PKG_VERSION"),
-                listeners.iter().filter(|l| l.proto == Proto::Tcp).count(),
-                listeners.iter().filter(|l| l.proto == Proto::Udp).count(),
-                onoff(tap.is_some()),
-                onoff(tun.is_some()),
-                onoff(exit),
-                onoff(dht.is_some())
-            );
-            // On a self-heal the file lost its [server] table; record the resolved
-            // identity so the rewritten file matches the running server and an
-            // operator can later drop the CLI flags without a silent change.
-            let (file_id, file_control, file_seed, file_admin_secret, file_exit, file_exit_iface) =
-                if self_healed {
-                    (
-                        Some(server_id.clone()),
-                        Some(format!("{bind_ip}:{control_port}")),
-                        seed_hex,
-                        explicit_admin_secret,
-                        exit.then_some(true),
-                        exit_iface,
-                    )
-                } else {
-                    (
-                        file.id,
-                        file.control,
-                        file.seed,
-                        file.admin_secret,
-                        file.exit,
-                        file.exit_iface,
-                    )
-                };
-            server::run(server::ServerSettings {
-                bind: bind_ip,
-                control_port,
-                secret,
-                discovery,
-                client_credentials,
-                admin_secret,
-                server_id,
-                tap,
-                tun,
-                dht,
-                listeners,
-                routes,
-                config_path: config,
-                file_id,
-                file_control,
-                file_seed,
-                file_admin_secret,
-                file_clients: file.clients,
-                file_exit,
-                file_exit_iface,
-            })
-            .await
+            Ok(Box::default())
         }
-        Cmd::Client(args) => {
-            let ClientArgs {
-                server,
-                seed,
-                secret,
-                credential,
-                discovery,
-                id_prefix,
-                tcp,
-                udp,
-                proxy,
-                transport,
-                tap_name,
-                bridge,
-                tun,
-                exit,
-                exit_strict,
-                mtu,
-                pppoe,
-                pppoe_user,
-                pppoe_pass,
-                pppoe_pass_file,
-                pppoe_service,
-                pppoe_ac,
-                pppoe_tun,
-                pppoe_mtu,
-                pppoe_default_route,
-                pppoe_no_mss_clamp,
-                pppoe_dns,
-                config,
-            } = *args;
-            use zeronat::pppoe::cli;
-            // Same recovery split as the server: a missing file is a normal
-            // first boot; a malformed file is set aside so its contents stay
-            // recoverable and the client starts from command-line settings; an
-            // unreadable file (permission or transient IO) is fatal, so a
-            // restart retries rather than running with settings we never
-            // managed to read.
-            let file = match &config {
-                Some(path) => match zeronat::clientcfg::load(path) {
-                    Ok(cfg) => cfg,
-                    Err(zeronat::config::LoadError::Malformed(e)) => {
-                        match zeronat::config::quarantine(path) {
-                            Some(b) => zeronat::elog!(
-                                "config: {e}; moved aside to {}; starting from command-line settings",
-                                b.display()
-                            ),
-                            None => zeronat::elog!(
-                                "config: {e}; could not set the file aside; starting from command-line settings"
-                            ),
-                        }
-                        ClientConfig::default()
-                    }
-                    Err(zeronat::config::LoadError::Unreadable(e)) => return Err(e),
-                },
-                None => ClientConfig::default(),
-            };
-            // A parseable but contradictory file is an operator error to fix
-            // in place, never quarantined.
-            file.validate()?;
+        Err(zeronat::config::LoadError::Unreadable(e)) => Err(e),
+    }
+}
 
-            // Scalars merge field by field; a valid file wins over the CLI and
-            // a present CLI flag it overrides is logged.
-            if let (Some(f), Some(c)) = (&file.id, &id_prefix) {
-                if f != c {
-                    zeronat::elog!("config [client].id '{f}' overrides --id '{c}'");
-                }
-            }
-            let id_prefix = file.id.clone().or(id_prefix);
-
-            // Admin socket path: the file value when set (that path must
-            // work), else the default under /run/zeronat, falling back to
-            // $XDG_RUNTIME_DIR/zeronat and then to no admin socket at all;
-            // the tunnel never depends on it.
-            let control = match &file.control {
-                Some(path) => Some(zeronat::clientctl::ControlPath::Explicit(
-                    std::path::PathBuf::from(path),
-                )),
-                None => zeronat::clientctl::default_control(),
-            };
-
-            if declares_shape(&file) {
-                if let Some(v) = &server {
-                    zeronat::elog!("config overrides --server '{v}'");
-                }
-                if seed.is_some() {
-                    zeronat::elog!("config overrides --seed");
-                }
-                if secret.is_some() {
-                    zeronat::elog!("config overrides --secret");
-                }
-                if credential.is_some() {
-                    zeronat::elog!("config overrides --credential");
-                }
-                if discovery.is_some() {
-                    zeronat::elog!("config overrides --discovery");
-                }
-                if let Some(v) = &transport {
-                    zeronat::elog!("config overrides --transport '{v}'");
-                }
-                for spec in &tcp {
-                    zeronat::elog!("config overrides --tcp '{spec}'");
-                }
-                for spec in &udp {
-                    zeronat::elog!("config overrides --udp '{spec}'");
-                }
-                if proxy {
-                    zeronat::elog!("config overrides --proxy");
-                }
-                if let Some(v) = &tap_name {
-                    zeronat::elog!("config overrides --tap '{v}'");
-                }
-                if tun {
-                    zeronat::elog!("config overrides --tun");
-                }
-                if exit {
-                    zeronat::elog!("config overrides --exit");
-                }
-                if exit_strict {
-                    zeronat::elog!("config overrides --exit-strict");
-                }
-                if let Some(v) = mtu {
-                    zeronat::elog!("config overrides --tap-mtu {v}");
-                }
-                if let Some(v) = &bridge {
-                    zeronat::elog!("config overrides --bridge '{v}'");
-                }
-                if pppoe {
-                    zeronat::elog!("config overrides --pppoe");
-                }
-
-                let srv = active_server(&file)?;
-                let (tcp, udp) = split_forwards(&file.forwards);
-                let tap = file.tap.as_ref().map(|t| TapConfig {
-                    name: t.dev.clone(),
-                    mtu: DEFAULT_TAP_MTU,
-                    bridge: None,
-                });
-                let peers = client::peer_slots(file.tun.as_ref(), file.peer.as_ref())?;
-                // An unpinned [tun] address is derived from the active
-                // server's secret at each bringup, so a server switch moves
-                // the device onto the new server's subnet. A [tun] naming a
-                // peer feeds that consumer slot instead of the server slot.
-                let tun = file
-                    .tun
-                    .as_ref()
-                    .filter(|t| !t.is_peer())
-                    .map(|t| client::ClientTun {
-                        name: t
-                            .dev
-                            .clone()
-                            .unwrap_or_else(|| DEFAULT_TUN_NAME.to_string()),
-                        mtu: DEFAULT_TAP_MTU,
-                        address: t.address,
-                        exit: t.exit,
-                        exit_strict: t.exit_strict,
-                    });
-                // Every [[pppoe]] entry is resolved at boot so the admin can
-                // spawn any of them; run_switchable derives the boot body
-                // (forwards, else the autostart entry, else the device, else
-                // idle with only the admin socket up).
-                let pppoe = file
-                    .pppoe
-                    .iter()
-                    .map(|p| {
-                        Ok(client::PppoeSession {
-                            name: p.name.clone(),
-                            config: pppoe_from_entry(p)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let autostart = file
-                    .pppoe
-                    .iter()
-                    .find(|p| p.autostart)
-                    .map(|p| p.name.clone());
-                let servers: Vec<client::ServerTarget> = file
-                    .servers
-                    .iter()
-                    .map(|s| client::ServerTarget {
-                        name: s.name.clone(),
-                        addr: s.addr.clone(),
-                        secret: s.secret.0.clone(),
-                        credential: s.credential.0.clone(),
-                        discovery: s.discovery.as_ref().map(|d| d.0.clone()),
-                        transport: s.transport,
-                    })
-                    .collect();
-                let target = client::ServerTarget {
-                    name: srv.name.clone(),
-                    addr: srv.addr.clone(),
-                    secret: srv.secret.0.clone(),
-                    credential: srv.credential.0.clone(),
-                    discovery: srv.discovery.as_ref().map(|d| d.0.clone()),
-                    transport: srv.transport,
-                };
-
-                let v = env!("CARGO_PKG_VERSION");
-                zeronat::elog!(
-                    "zeronat {v} client: server={} transport={} tcp-forwards={} udp-forwards={} pppoe-sessions={} tap={} tun={}",
-                    target.addr,
-                    transport_label(target.transport),
-                    tcp.len(),
-                    udp.len(),
-                    pppoe.len(),
-                    onoff(tap.is_some()),
-                    onoff(tun.is_some())
-                );
-                // A seeded profile's credential names `[client].id`, so that
-                // id is what the client goes by.
-                let id = match (&file.id, file.servers.iter().any(|s| s.seed.is_some())) {
-                    (Some(id), true) => ClientId::Exact(id.clone()),
-                    _ => ClientId::Prefix(id_prefix),
-                };
-                let settings = client::ClientSettings {
-                    servers,
-                    tcp,
-                    udp,
-                    tap,
-                    tun,
-                    pppoe,
-                    autostart,
-                    id,
-                    peer_secret: file.peer_secret.as_ref().map(|s| s.0.clone()),
-                    control,
-                    // The shape came from the file, so admin mutations
-                    // persist back to it.
-                    config: config.map(|path| (path, file)),
-                    peers,
-                    peer_sessions: None,
-                };
-                client::run_switchable(client::ActiveTarget::new(target), settings).await
-            } else {
-                let server = server.ok_or("--server is required")?;
-                // An explicit value always wins; the seed fills what is left.
-                let seed = seed_from(seed)?;
-                let secret = match secret.or_else(|| std::env::var("ZERONAT_SECRET").ok()) {
-                    Some(secret) => runtime_secret(secret)?,
-                    None => seed.as_ref().map(Seed::network).ok_or(
-                        "--secret, ZERONAT_SECRET, or a seed (--seed or ZERONAT_SEED) is required",
-                    )?,
-                };
-                let (credential, id) = match (
-                    credential.or_else(|| std::env::var("ZERONAT_CLIENT_SECRET").ok()),
-                    &seed,
-                ) {
-                    (Some(credential), _) => {
-                        (runtime_secret(credential)?, ClientId::Prefix(id_prefix))
-                    }
-                    (None, Some(seed)) => {
-                        let id = id_prefix.ok_or(
-                            "--id is required with a seed: the credential is derived for it, and the server lists the same id under --client",
-                        )?;
-                        (seed.client(&id), ClientId::Exact(id))
-                    }
-                    (None, None) => (secret.clone(), ClientId::Prefix(id_prefix)),
-                };
-                let discovery = discovery
-                    .or_else(|| std::env::var("ZERONAT_DISCOVERY_SECRET").ok())
-                    .or_else(|| seed.as_ref().map(Seed::discovery));
-                let discovery = match (server == "dht", discovery) {
-                    (true, None) => {
-                        return Err(
-                            "--server dht requires --discovery, ZERONAT_DISCOVERY_SECRET, or a seed"
-                                .into(),
-                        );
-                    }
-                    (_, Some(value)) => Some(runtime_secret(value)?),
-                    (false, None) => None,
-                };
-                if discovery.as_deref() == Some(secret.as_str())
-                    || discovery.as_deref() == Some(credential.as_str())
-                {
-                    return Err("--discovery must differ from --secret and --credential".into());
-                }
-                if tun && bridge.is_some() {
-                    return Err("--bridge applies to --tap only, not --tun".into());
-                }
-                let mtu = mtu.unwrap_or(DEFAULT_TAP_MTU);
-                let tap = build_tap(tap_name, mtu, bridge);
-                // --pppoe owns the L2 channel; reject the device/forward flags it
-                // conflicts with. --transport is orthogonal and stays valid.
-                cli::validate_pppoe_exclusions(
-                    pppoe,
-                    tap.is_some(),
-                    tun,
-                    !tcp.is_empty() || !udp.is_empty(),
-                )?;
-                cli::validate_pppoe_netcfg(
-                    pppoe,
-                    pppoe_default_route,
-                    pppoe_no_mss_clamp,
-                    pppoe_dns,
-                )?;
-                if tun {
-                    if tap.is_some() {
-                        return Err("--tun cannot be combined with --tap".into());
-                    }
-                    if !tcp.is_empty() || !udp.is_empty() {
-                        return Err("--tun cannot be combined with --tcp/--udp forwards".into());
-                    }
-                }
-                if exit && !tun {
-                    return Err("--exit requires --tun".into());
-                }
-                if exit_strict && !exit {
-                    return Err("--exit-strict requires --exit".into());
-                }
-                if tap.is_some() && (!tcp.is_empty() || !udp.is_empty()) {
-                    return Err("--tap cannot be combined with --tcp/--udp forwards".into());
-                }
-                if !pppoe && !tun && tap.is_none() && tcp.is_empty() && udp.is_empty() {
-                    return Err(
-                        "nothing to do: pass --pppoe, --tun, --tap, or at least one --tcp/--udp"
-                            .into(),
-                    );
-                }
-                if proxy && tcp.is_empty() {
-                    return Err("--proxy requires at least one --tcp forward".into());
-                }
-
-                // Resolve the PPPoE config: credentials (file > env > flag) and the
-                // effective MTU (capped to the tunnel MTU minus 8, floored). The
-                // password file is read here so the precedence helper stays pure.
-                let pppoe = if pppoe {
-                    let user = cli::resolve_username(
-                        pppoe_user,
-                        std::env::var("ZERONAT_PPPOE_USER").ok(),
-                    )?;
-                    let pass_file = match &pppoe_pass_file {
-                        Some(path) => Some(std::fs::read(path).map_err(|e| -> zeronat::Error {
-                            format!("reading --pppoe-pass-file {}: {e}", path.display()).into()
-                        })?),
-                        None => None,
-                    };
-                    let pass = cli::resolve_password(
-                        pass_file,
-                        std::env::var("ZERONAT_PPPOE_PASS").ok(),
-                        pppoe_pass,
-                    )?;
-                    let pppoe_mtu_u16: u16 =
-                        pppoe_mtu.try_into().map_err(|_| -> zeronat::Error {
-                            format!("--pppoe-mtu {pppoe_mtu} exceeds the 65535 MTU limit").into()
-                        })?;
-                    let tap_mtu_u16: u16 = mtu.try_into().map_err(|_| -> zeronat::Error {
-                        format!("--tap-mtu {mtu} exceeds the 65535 MTU limit").into()
-                    })?;
-                    let resolved = cli::resolve_effective_mtu(pppoe_mtu_u16, tap_mtu_u16)?;
-                    if resolved.capped {
-                        eprintln!(
-                        "pppoe: requested MTU {pppoe_mtu} exceeds what the tunnel carries; using {}",
-                        resolved.effective
-                    );
-                    }
-                    Some(client::PppoeRunConfig {
-                        username: user,
-                        password: pass,
-                        service_name: pppoe_service.map(String::into_bytes).unwrap_or_default(),
-                        ac_name: pppoe_ac.map(String::into_bytes),
-                        tun_name: pppoe_tun,
-                        effective_mtu: resolved.effective,
-                        default_route: pppoe_default_route,
-                        // The MSS clamp rides with --pppoe-default-route unless opted out;
-                        // value is the effective IP MTU minus the IPv4+TCP headers.
-                        clamp_mss: if pppoe_default_route && !pppoe_no_mss_clamp {
-                            Some(resolved.effective.saturating_sub(40).max(536))
-                        } else {
-                            None
-                        },
-                        request_dns: pppoe_dns,
-                    })
-                } else {
-                    None
-                };
-                let tun = if tun {
-                    Some(client::ClientTun {
-                        name: DEFAULT_TUN_NAME.to_string(),
-                        mtu,
-                        address: None,
-                        exit,
-                        exit_strict,
-                    })
-                } else {
-                    None
-                };
-                let mut tcp = tcp
-                    .iter()
-                    .map(|s| parse_forward(s, Proto::Tcp))
-                    .collect::<Result<Vec<_>>>()?;
-                if proxy {
-                    for f in &mut tcp {
-                        f.proxy = true;
-                    }
-                }
-                let udp = udp
-                    .iter()
-                    .map(|s| parse_forward(s, Proto::Udp))
-                    .collect::<Result<Vec<_>>>()?;
-                let transport = parse_transport(transport.as_deref())?;
-                let v = env!("CARGO_PKG_VERSION");
-                let tl = transport_label(transport);
-                match &pppoe {
-                    Some(pp) => zeronat::elog!(
-                        "zeronat {v} client: pppoe server={server} transport={tl} tun={} mtu={} default-route={} mss-clamp={} dns={}",
-                        pp.tun_name, pp.effective_mtu, onoff(pp.default_route), onoff(pp.clamp_mss.is_some()), onoff(pp.request_dns)
+/// Resolve the server command line against its config file into the settings
+/// the server boots from.
+#[inline(never)]
+fn server_boot(args: ServerArgs) -> Result<server::ServerSettings> {
+    let ServerArgs {
+        bind,
+        control,
+        seed,
+        secret,
+        discovery,
+        client_credentials,
+        admin_secret,
+        server_id,
+        tcp,
+        udp,
+        tap,
+        tun,
+        mtu,
+        except,
+        exit,
+        exit_iface,
+        dht,
+        announce_ip,
+        announce_port,
+        config,
+    } = args;
+    // A valid config is authoritative. The recovery for a broken one
+    // depends on why it broke: a missing file is a normal first boot
+    // (default, then self-heal); a malformed file is set aside so its
+    // routes stay recoverable before we rewrite a fresh one, rather than
+    // crash-looping under a restart policy; an unreadable file (permission
+    // or transient IO) is fatal, because falling back here would let the
+    // next mutation overwrite intact state we never managed to read.
+    let mut self_healed = false;
+    let file = match &config {
+        Some(path) => match zeronat::config::load(path) {
+            Ok(cfg) => cfg,
+            Err(zeronat::config::LoadError::Malformed(e)) => {
+                match zeronat::config::quarantine(path) {
+                    Some(b) => zeronat::elog!(
+                        "config: {e}; moved aside to {}; starting from command-line settings and rewriting on the next change",
+                        b.display()
                     ),
                     None => zeronat::elog!(
-                        "zeronat {v} client: server={server} transport={tl} tcp-forwards={} udp-forwards={} tap={} tun={}",
-                        tcp.len(), udp.len(), onoff(tap.is_some()), onoff(tun.is_some())
+                        "config: {e}; could not set the file aside; starting from command-line settings and overwriting on the next change"
                     ),
                 }
-                client::run(
-                    server, secret, credential, discovery, tcp, udp, transport, tap, tun, pppoe,
-                    id, control,
-                )
-                .await
+                self_healed = true;
+                zeronat::config::ServerConfig::default()
             }
+            Err(zeronat::config::LoadError::Unreadable(e)) => return Err(e),
+        },
+        None => zeronat::config::ServerConfig::default(),
+    };
+
+    // A valid file's identity/control win over the CLI; a present CLI flag
+    // that the file overrides is logged so the override is visible.
+    let (cli_id, cli_bind, cli_control, cli_seed, cli_admin_secret) =
+        (server_id, bind, control, seed, admin_secret);
+    if let (Some(f), Some(c)) = (&file.id, &cli_id) {
+        if f != c {
+            zeronat::elog!("config [server].id '{f}' overrides --server-id '{c}'");
+        }
+    }
+    let server_id = file
+        .id
+        .clone()
+        .or_else(|| cli_id.clone())
+        .unwrap_or_else(|| "0".to_string());
+
+    let (file_ip, file_port) = match &file.control {
+        Some(ctrl) => {
+            let addr: SocketAddrV4 = ctrl.parse().map_err(|_| -> zeronat::Error {
+                errf!("[server].control must be IPv4:port, got '{ctrl}'")
+            })?;
+            (Some(*addr.ip()), Some(addr.port()))
+        }
+        None => (None, None),
+    };
+    if let (Some(f), Some(c)) = (file_ip, cli_bind) {
+        if f != c {
+            zeronat::elog!("config [server].control address {f} overrides --bind {c}");
+        }
+    }
+    if let (Some(f), Some(c)) = (file_port, cli_control) {
+        if f != c {
+            zeronat::elog!("config [server].control port {f} overrides --control {c}");
+        }
+    }
+    let bind_ip = file_ip.or(cli_bind).unwrap_or(Ipv4Addr::UNSPECIFIED);
+    let control_port = file_port.or(cli_control).unwrap_or(2222);
+
+    let file_seed = file
+        .seed
+        .as_deref()
+        .map(|value| {
+            Seed::parse(value)
+                .map(|seed| seed.to_hex())
+                .map_err(|e| -> zeronat::Error { errf!("config [server].{e}") })
+        })
+        .transpose()?;
+    if let (Some(f), Some(c)) = (&file_seed, &cli_seed) {
+        if f != c {
+            zeronat::elog!("config [server].seed overrides --seed");
+        }
+    }
+    let seed_hex = file_seed.or(cli_seed);
+    let seed = seed_hex.as_deref().map(Seed::parse).transpose()?;
+
+    // An explicit value always wins; the seed fills what is left.
+    let secret = match secret {
+        Some(secret) => secret,
+        None => seed.as_ref().map(Seed::network).ok_or(
+            "--secret, ZERONAT_SECRET, or a seed (--seed, ZERONAT_SEED, [server].seed) is required",
+        )?,
+    };
+    let discovery = discovery.or_else(|| seed.as_ref().map(Seed::discovery));
+    if dht && discovery.is_none() {
+        return Err(
+            "--server dht requires --discovery, ZERONAT_DISCOVERY_SECRET, or a seed".into(),
+        );
+    }
+    if file.admin_secret.is_some() && cli_admin_secret.is_some() {
+        zeronat::elog!("config [server].admin_secret overrides --admin-secret");
+    }
+    let explicit_admin_secret = file
+        .admin_secret
+        .clone()
+        .or(cli_admin_secret)
+        .map(runtime_secret)
+        .transpose()?;
+    let admin_secret = explicit_admin_secret
+        .clone()
+        .or_else(|| seed.as_ref().map(Seed::admin));
+
+    let (client_entries, no_credential) = if file.clients.is_empty() {
+        (
+            &client_credentials,
+            "give --client ID:64-HEX or set a seed (--seed or ZERONAT_SEED)",
+        )
+    } else {
+        if !client_credentials.is_empty() {
+            zeronat::elog!("config [[clients]] overrides --client");
+        }
+        (&file.clients, "add `secret` or set [server].seed")
+    };
+    let client_credentials = client_entries
+        .iter()
+        .map(|client| -> Result<server::ClientCredentialSpec> {
+            let secret = match (&client.secret, &seed) {
+                (Some(secret), _) => secret.clone(),
+                (None, Some(seed)) => seed.client(&client.id),
+                (None, None) => {
+                    return Err(errf!(
+                        "client `{}` has no credential: {no_credential}",
+                        client.id
+                    ));
+                }
+            };
+            Ok(server::ClientCredentialSpec {
+                client_id: client.id.clone(),
+                secret,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let (cli_exit, cli_exit_iface) = (exit, exit_iface);
+    if file.exit == Some(false) && cli_exit {
+        zeronat::elog!("config [server].exit = false overrides --exit");
+    }
+    let exit = file.exit.unwrap_or(cli_exit);
+    if let (Some(f), Some(c)) = (&file.exit_iface, &cli_exit_iface) {
+        if f != c {
+            zeronat::elog!("config [server].exit_iface '{f}' overrides --exit-iface '{c}'");
+        }
+    }
+    let exit_iface = file.exit_iface.clone().or(cli_exit_iface);
+
+    // Listeners: start from the file's, then fold in CLI forwards. A CLI
+    // port that matches a file listener locks that file listener (kept as
+    // File so it still persists); a CLI-only port is a locked Cli listener.
+    let mut listeners: Vec<server::ListenerSpec> = file
+        .listeners
+        .iter()
+        .map(|l| server::ListenerSpec {
+            bind_ip: l.bind_ip,
+            proto: l.proto,
+            port: l.port,
+            source: Source::File,
+            cli_locked: false,
+        })
+        .collect();
+    let mut add_cli_listener = |proto: Proto, port: u16| {
+        let key = (bind_ip, proto, port);
+        if let Some(spec) = listeners
+            .iter_mut()
+            .find(|s| (s.bind_ip, s.proto, s.port) == key)
+        {
+            spec.cli_locked = true;
+        } else {
+            listeners.push(server::ListenerSpec {
+                bind_ip,
+                proto,
+                port,
+                source: Source::Cli,
+                cli_locked: true,
+            });
+        }
+    };
+    for port in &tcp {
+        add_cli_listener(Proto::Tcp, *port);
+    }
+    for port in &udp {
+        add_cli_listener(Proto::Udp, *port);
+    }
+
+    let routes: Vec<server::RouteSpec> = file
+        .routes
+        .iter()
+        .map(|r| server::RouteSpec {
+            bind_ip: r.bind_ip,
+            proto: r.proto,
+            port: r.port,
+            client_id: r.client.clone(),
+            source: Source::File,
+        })
+        .collect();
+
+    // Validate against the merged set. --tun owns every port and cannot
+    // coexist with --tap or any per-port forward; --tap cannot coexist
+    // with forwards; a config-only server with listeners is valid.
+    if tun {
+        if tap.is_some() {
+            return Err("--tun cannot be combined with --tap".into());
+        }
+        if !listeners.is_empty() || !routes.is_empty() {
+            return Err(
+                "--tun cannot be combined with --tcp/--udp or config listeners/routes".into(),
+            );
+        }
+        // The iptables fallback matches kept ports with the multiport
+        // module, which caps at 15 ports (control port + exclusions).
+        let mut kept: Vec<u16> = except
+            .iter()
+            .copied()
+            .filter(|&p| p != control_port)
+            .collect();
+        kept.sort_unstable();
+        kept.dedup();
+        if kept.len() + 1 > 15 {
+            return Err(errf!(
+                "--except has {} distinct ports; at most 14 are allowed besides the control port",
+                kept.len()
+            ));
+        }
+    }
+    if !except.is_empty() && !tun {
+        return Err("--except requires --tun".into());
+    }
+    if exit && !tun {
+        return Err("--exit requires --tun".into());
+    }
+    if exit_iface.is_some() && !exit {
+        return Err("--exit-iface requires --exit".into());
+    }
+    if exit_iface.as_deref() == Some(DEFAULT_TUN_NAME) {
+        return Err(errf!(
+            "--exit-iface cannot be the tun device {DEFAULT_TUN_NAME}"
+        ));
+    }
+    if tap.is_some() && !listeners.is_empty() {
+        return Err("--tap cannot be combined with --tcp/--udp forwards".into());
+    }
+    // A server with no forwards and no device still registers clients,
+    // pairs them, and splices the relays their pairs fall back to.
+
+    let tun = if tun {
+        let (subnet, server_ip, client_ip) = tun_addrs(&secret);
+        Some(server::ServerTun {
+            device: zeronat::tap::TunConfig {
+                name: DEFAULT_TUN_NAME.to_string(),
+                mtu,
+                addr: server_ip,
+                prefix_len: TUN_PREFIX_LEN,
+            },
+            subnet,
+            client_ip,
+            except,
+            exit,
+            exit_iface: exit_iface.clone(),
+        })
+    } else {
+        None
+    };
+
+    let dht = dht.then_some(server::DhtAnnounce {
+        ip: announce_ip,
+        port: announce_port,
+    });
+    zeronat::elog!(
+        "zeronat {} server: bind={bind_ip} control={control_port} tcp-forwards={} udp-forwards={} tap={} tun={} exit={} dht={}",
+        env!("CARGO_PKG_VERSION"),
+        listeners.iter().filter(|l| l.proto == Proto::Tcp).count(),
+        listeners.iter().filter(|l| l.proto == Proto::Udp).count(),
+        onoff(tap.is_some()),
+        onoff(tun.is_some()),
+        onoff(exit),
+        onoff(dht.is_some())
+    );
+    // On a self-heal the file lost its [server] table; record the resolved
+    // identity so the rewritten file matches the running server and an
+    // operator can later drop the CLI flags without a silent change.
+    let (file_id, file_control, file_seed, file_admin_secret, file_exit, file_exit_iface) =
+        if self_healed {
+            (
+                Some(server_id.clone()),
+                Some(format!("{bind_ip}:{control_port}")),
+                seed_hex,
+                explicit_admin_secret,
+                exit.then_some(true),
+                exit_iface,
+            )
+        } else {
+            (
+                file.id,
+                file.control,
+                file.seed,
+                file.admin_secret,
+                file.exit,
+                file.exit_iface,
+            )
+        };
+    Ok(server::ServerSettings {
+        bind: bind_ip,
+        control_port,
+        secret,
+        discovery,
+        client_credentials,
+        admin_secret,
+        server_id,
+        tap,
+        tun,
+        dht,
+        listeners,
+        routes,
+        config_path: config,
+        file_id,
+        file_control,
+        file_seed,
+        file_admin_secret,
+        file_clients: file.clients,
+        file_exit,
+        file_exit_iface,
+    })
+}
+
+/// Resolve the client settings from the command line and the config file.
+#[inline(never)]
+fn client_boot(
+    mut args: Box<ClientArgs>,
+) -> Result<(client::ActiveTarget, client::ClientSettings)> {
+    let file = match &args.config {
+        Some(path) => load_client_file(path)?,
+        None => Box::default(),
+    };
+    // A parseable but contradictory file is an operator error to fix
+    // in place, never quarantined.
+    file.validate()?;
+
+    // Scalars merge field by field; a valid file wins over the CLI and
+    // a present CLI flag it overrides is logged.
+    if let (Some(f), Some(c)) = (&file.id, &args.id_prefix) {
+        if f != c {
+            zeronat::elog!("config [client].id '{f}' overrides --id '{c}'");
+        }
+    }
+    let id_prefix = file.id.clone().or(args.id_prefix.take());
+
+    // Admin socket path: the file value when set (that path must
+    // work), else the default under /run/zeronat, falling back to
+    // $XDG_RUNTIME_DIR/zeronat and then to no admin socket at all;
+    // the tunnel never depends on it.
+    let control = match &file.control {
+        Some(path) => Some(zeronat::clientctl::ControlPath::Explicit(
+            std::path::PathBuf::from(path),
+        )),
+        None => zeronat::clientctl::default_control(),
+    };
+
+    if declares_shape(&file) {
+        log_overrides(&args);
+        boot_from_file(file, args.config, id_prefix, control)
+    } else {
+        boot_from_cli(args, id_prefix, control)
+    }
+}
+
+#[inline(never)]
+fn overridden(flag: &str, value: &str) {
+    zeronat::elog!("config overrides {flag}{value}");
+}
+
+/// Log every command-line setting the file overrides, in the order the flags
+/// are documented.
+#[inline(never)]
+fn log_overrides(a: &ClientArgs) {
+    let quoted = |flag: &str, v: &str| overridden(flag, &format!(" '{v}'"));
+    let bare = |flag: &str, on: bool| {
+        if on {
+            overridden(flag, "");
+        }
+    };
+    if let Some(v) = &a.server {
+        quoted("--server", v);
+    }
+    bare("--seed", a.seed.is_some());
+    bare("--secret", a.secret.is_some());
+    bare("--credential", a.credential.is_some());
+    bare("--discovery", a.discovery.is_some());
+    if let Some(v) = &a.transport {
+        quoted("--transport", v);
+    }
+    for spec in &a.tcp {
+        quoted("--tcp", spec);
+    }
+    for spec in &a.udp {
+        quoted("--udp", spec);
+    }
+    bare("--proxy", a.proxy);
+    if let Some(v) = &a.tap_name {
+        quoted("--tap", v);
+    }
+    bare("--tun", a.tun);
+    bare("--exit", a.exit);
+    bare("--exit-strict", a.exit_strict);
+    if let Some(v) = a.mtu {
+        overridden("--tap-mtu", &format!(" {v}"));
+    }
+    if let Some(v) = &a.bridge {
+        quoted("--bridge", v);
+    }
+    bare("--pppoe", a.pppoe);
+}
+
+/// The dial target for a `[[servers]]` entry.
+fn server_target(s: &CfgServer) -> client::ServerTarget {
+    client::ServerTarget {
+        name: s.name.clone(),
+        addr: s.addr.clone(),
+        secret: s.secret.0.clone(),
+        credential: s.credential.0.clone(),
+        discovery: s.discovery.as_ref().map(|d| d.0.clone()),
+        transport: s.transport,
+    }
+}
+
+/// The settings of a client whose shape the config file declares.
+#[inline(never)]
+fn boot_from_file(
+    file: Box<ClientConfig>,
+    config: Option<std::path::PathBuf>,
+    id_prefix: Option<String>,
+    control: Option<zeronat::clientctl::ControlPath>,
+) -> Result<(client::ActiveTarget, client::ClientSettings)> {
+    let srv = active_server(&file)?;
+    let (tcp, udp) = split_forwards(&file.forwards);
+    let tap = file.tap.as_ref().map(|t| TapConfig {
+        name: t.dev.clone(),
+        mtu: DEFAULT_TAP_MTU,
+        bridge: None,
+    });
+    let peers = client::peer_slots(file.tun.as_ref(), file.peer.as_ref())?;
+    // An unpinned [tun] address is derived from the active
+    // server's secret at each bringup, so a server switch moves
+    // the device onto the new server's subnet. A [tun] naming a
+    // peer feeds that consumer slot instead of the server slot.
+    let tun = file
+        .tun
+        .as_ref()
+        .filter(|t| !t.is_peer())
+        .map(|t| client::ClientTun {
+            name: t
+                .dev
+                .clone()
+                .unwrap_or_else(|| DEFAULT_TUN_NAME.to_string()),
+            mtu: DEFAULT_TAP_MTU,
+            address: t.address,
+            exit: t.exit,
+            exit_strict: t.exit_strict,
+        });
+    // Every [[pppoe]] entry is resolved at boot so the admin can
+    // spawn any of them; run_switchable derives the boot body
+    // (forwards, else the autostart entry, else the device, else
+    // idle with only the admin socket up).
+    let mut pppoe = Vec::new();
+    for p in &file.pppoe {
+        pppoe.push(client::PppoeSession {
+            name: p.name.clone(),
+            config: pppoe_from_entry(p)?,
+        });
+    }
+    let autostart = file
+        .pppoe
+        .iter()
+        .find(|p| p.autostart)
+        .map(|p| p.name.clone());
+    let servers: Vec<client::ServerTarget> = file.servers.iter().map(server_target).collect();
+    let target = server_target(srv);
+
+    let v = env!("CARGO_PKG_VERSION");
+    zeronat::elog!(
+        "zeronat {v} client: server={} transport={} tcp-forwards={} udp-forwards={} pppoe-sessions={} tap={} tun={}",
+        target.addr,
+        transport_label(target.transport),
+        tcp.len(),
+        udp.len(),
+        pppoe.len(),
+        onoff(tap.is_some()),
+        onoff(tun.is_some())
+    );
+    // A seeded profile's credential names `[client].id`, so that
+    // id is what the client goes by.
+    let id = match (&file.id, file.servers.iter().any(|s| s.seed.is_some())) {
+        (Some(id), true) => ClientId::Exact(id.clone()),
+        _ => ClientId::Prefix(id_prefix),
+    };
+    let settings = client::ClientSettings {
+        servers,
+        tcp,
+        udp,
+        tap,
+        tun,
+        pppoe,
+        autostart,
+        id,
+        peer_secret: file.peer_secret.as_ref().map(|s| s.0.clone()),
+        control,
+        // The shape came from the file, so admin mutations
+        // persist back to it.
+        config: config.map(|path| (path, *file)),
+        peers,
+        peer_sessions: None,
+    };
+    Ok((client::ActiveTarget::new(target), settings))
+}
+
+/// The settings of a client whose shape the command line declares.
+#[inline(never)]
+fn boot_from_cli(
+    mut a: Box<ClientArgs>,
+    id_prefix: Option<String>,
+    control: Option<zeronat::clientctl::ControlPath>,
+) -> Result<(client::ActiveTarget, client::ClientSettings)> {
+    use zeronat::pppoe::cli;
+    let server = a.server.take().ok_or("--server is required")?;
+    // An explicit value always wins; the seed fills what is left.
+    let seed = seed_from(a.seed.take())?;
+    let secret = match a
+        .secret
+        .take()
+        .or_else(|| std::env::var("ZERONAT_SECRET").ok())
+    {
+        Some(secret) => runtime_secret(secret)?,
+        None => seed
+            .as_ref()
+            .map(Seed::network)
+            .ok_or("--secret, ZERONAT_SECRET, or a seed (--seed or ZERONAT_SEED) is required")?,
+    };
+    let (credential, id) = match (
+        a.credential
+            .take()
+            .or_else(|| std::env::var("ZERONAT_CLIENT_SECRET").ok()),
+        &seed,
+    ) {
+        (Some(credential), _) => (runtime_secret(credential)?, ClientId::Prefix(id_prefix)),
+        (None, Some(seed)) => {
+            let id = id_prefix.ok_or(
+                "--id is required with a seed: the credential is derived for it, and the server lists the same id under --client",
+            )?;
+            (seed.client(&id), ClientId::Exact(id))
+        }
+        (None, None) => (secret.clone(), ClientId::Prefix(id_prefix)),
+    };
+    let discovery = a
+        .discovery
+        .take()
+        .or_else(|| std::env::var("ZERONAT_DISCOVERY_SECRET").ok())
+        .or_else(|| seed.as_ref().map(Seed::discovery));
+    let discovery = match (server == "dht", discovery) {
+        (true, None) => {
+            return Err(
+                "--server dht requires --discovery, ZERONAT_DISCOVERY_SECRET, or a seed".into(),
+            );
+        }
+        (_, Some(value)) => Some(runtime_secret(value)?),
+        (false, None) => None,
+    };
+    if discovery.as_deref() == Some(secret.as_str())
+        || discovery.as_deref() == Some(credential.as_str())
+    {
+        return Err("--discovery must differ from --secret and --credential".into());
+    }
+    if a.tun && a.bridge.is_some() {
+        return Err("--bridge applies to --tap only, not --tun".into());
+    }
+    let mtu = a.mtu.unwrap_or(DEFAULT_TAP_MTU);
+    let tap = build_tap(a.tap_name.take(), mtu, a.bridge.take());
+    let forwards = !a.tcp.is_empty() || !a.udp.is_empty();
+    // --pppoe owns the L2 channel; reject the device/forward flags it
+    // conflicts with. --transport is orthogonal and stays valid.
+    cli::validate_pppoe_exclusions(a.pppoe, tap.is_some(), a.tun, forwards)?;
+    cli::validate_pppoe_netcfg(
+        a.pppoe,
+        a.pppoe_default_route,
+        a.pppoe_no_mss_clamp,
+        a.pppoe_dns,
+    )?;
+    if a.tun {
+        if tap.is_some() {
+            return Err("--tun cannot be combined with --tap".into());
+        }
+        if forwards {
+            return Err("--tun cannot be combined with --tcp/--udp forwards".into());
+        }
+    }
+    if a.exit && !a.tun {
+        return Err("--exit requires --tun".into());
+    }
+    if a.exit_strict && !a.exit {
+        return Err("--exit-strict requires --exit".into());
+    }
+    if tap.is_some() && forwards {
+        return Err("--tap cannot be combined with --tcp/--udp forwards".into());
+    }
+    if !a.pppoe && !a.tun && tap.is_none() && !forwards {
+        return Err(
+            "nothing to do: pass --pppoe, --tun, --tap, or at least one --tcp/--udp".into(),
+        );
+    }
+    if a.proxy && a.tcp.is_empty() {
+        return Err("--proxy requires at least one --tcp forward".into());
+    }
+
+    // Resolve the PPPoE config: credentials (file > env > flag) and the
+    // effective MTU (capped to the tunnel MTU minus 8, floored). The
+    // password file is read here so the precedence helper stays pure.
+    let pppoe = if a.pppoe {
+        let user = cli::resolve_username(
+            a.pppoe_user.take(),
+            std::env::var("ZERONAT_PPPOE_USER").ok(),
+        )?;
+        let pass_file = match &a.pppoe_pass_file {
+            Some(path) => Some(std::fs::read(path).map_err(|e| -> zeronat::Error {
+                errf!("reading --pppoe-pass-file {}: {e}", path.display())
+            })?),
+            None => None,
+        };
+        let pass = cli::resolve_password(
+            pass_file,
+            std::env::var("ZERONAT_PPPOE_PASS").ok(),
+            a.pppoe_pass.take(),
+        )?;
+        let pppoe_mtu = a.pppoe_mtu;
+        let pppoe_mtu_u16: u16 = pppoe_mtu.try_into().map_err(|_| -> zeronat::Error {
+            errf!("--pppoe-mtu {pppoe_mtu} exceeds the 65535 MTU limit")
+        })?;
+        let tap_mtu_u16: u16 = mtu.try_into().map_err(|_| -> zeronat::Error {
+            errf!("--tap-mtu {mtu} exceeds the 65535 MTU limit")
+        })?;
+        let resolved = cli::resolve_effective_mtu(pppoe_mtu_u16, tap_mtu_u16)?;
+        if resolved.capped {
+            eprintln!(
+                "pppoe: requested MTU {pppoe_mtu} exceeds what the tunnel carries; using {}",
+                resolved.effective
+            );
+        }
+        Some(client::PppoeRunConfig {
+            username: user,
+            password: pass,
+            service_name: a
+                .pppoe_service
+                .take()
+                .map(String::into_bytes)
+                .unwrap_or_default(),
+            ac_name: a.pppoe_ac.take().map(String::into_bytes),
+            tun_name: std::mem::take(&mut a.pppoe_tun),
+            effective_mtu: resolved.effective,
+            default_route: a.pppoe_default_route,
+            // The MSS clamp rides with --pppoe-default-route unless opted out;
+            // value is the effective IP MTU minus the IPv4+TCP headers.
+            clamp_mss: if a.pppoe_default_route && !a.pppoe_no_mss_clamp {
+                Some(resolved.effective.saturating_sub(40).max(536))
+            } else {
+                None
+            },
+            request_dns: a.pppoe_dns,
+        })
+    } else {
+        None
+    };
+    let tun = a.tun.then(|| client::ClientTun {
+        name: DEFAULT_TUN_NAME.to_string(),
+        mtu,
+        address: None,
+        exit: a.exit,
+        exit_strict: a.exit_strict,
+    });
+    let mut tcp = Vec::new();
+    for s in &a.tcp {
+        let mut f = parse_forward(s, Proto::Tcp)?;
+        f.proxy |= a.proxy;
+        tcp.push(f);
+    }
+    let mut udp = Vec::new();
+    for s in &a.udp {
+        udp.push(parse_forward(s, Proto::Udp)?);
+    }
+    let transport = parse_transport(a.transport.as_deref())?;
+    let v = env!("CARGO_PKG_VERSION");
+    let tl = transport_label(transport);
+    match &pppoe {
+        Some(pp) => zeronat::elog!(
+            "zeronat {v} client: pppoe server={server} transport={tl} tun={} mtu={} default-route={} mss-clamp={} dns={}",
+            pp.tun_name, pp.effective_mtu, onoff(pp.default_route), onoff(pp.clamp_mss.is_some()), onoff(pp.request_dns)
+        ),
+        None => zeronat::elog!(
+            "zeronat {v} client: server={server} transport={tl} tcp-forwards={} udp-forwards={} tap={} tun={}",
+            tcp.len(), udp.len(), onoff(tap.is_some()), onoff(tun.is_some())
+        ),
+    }
+    Ok(client::direct(
+        server, secret, credential, discovery, tcp, udp, transport, tap, tun, pppoe, id, control,
+    ))
+}
+
+async fn run(cmd: Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Server(args) => server::run(server_boot(*args)?).await,
+        Cmd::Client(args) => {
+            let (active, settings) = client_boot(args)?;
+            client::run_switchable(active, settings).await
         }
         Cmd::ClientAdmin {
             command,
