@@ -5,8 +5,7 @@
 //! derived value. The client label ends in the client id; the seed is a fixed
 //! 32 bytes, so the id needs no length prefix to be unambiguous.
 
-use blake2::{Blake2s256, Digest};
-
+use crate::hash::blake2s;
 use crate::Result;
 
 const NETWORK: &[u8] = b"zeronat:v1:network";
@@ -50,11 +49,7 @@ impl Seed {
     }
 
     fn derive(&self, label: &[u8], suffix: &[u8]) -> String {
-        let mut h = Blake2s256::new();
-        h.update(label);
-        h.update(suffix);
-        h.update(self.0);
-        crate::secret::encode(h.finalize().into())
+        crate::secret::encode(blake2s(&[label, suffix, &self.0]))
     }
 }
 

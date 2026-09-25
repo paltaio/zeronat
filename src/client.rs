@@ -371,6 +371,16 @@ struct Client {
     peer_static: Option<[u8; 32]>,
 }
 
+/// Box a future behind a type-erased pointer. The caller's state machine
+/// holds one pointer instead of the future's whole state, and the future is
+/// polled through its vtable.
+#[inline(never)]
+pub(crate) fn boxed<'a, T>(
+    f: impl std::future::Future<Output = T> + Send + 'a,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>> {
+    Box::pin(f)
+}
+
 /// Aborts its task when dropped. Ties a spawned task's lifetime to the scope
 /// that owns this guard, so the task cannot outlive the connection it serves.
 pub(crate) struct AbortOnDrop<T = ()>(pub(crate) tokio::task::JoinHandle<T>);

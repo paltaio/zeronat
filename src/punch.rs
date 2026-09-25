@@ -1,9 +1,8 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::{interval, interval_at, sleep, Instant};
 
 use crate::client::{AbortOnDrop, ProbeSession, PING_INTERVAL};
@@ -119,11 +118,11 @@ pub async fn punch(
     let conv = (pair_id as u32) | SETUP_CONV_BIT;
     let socket = probe.socket.clone();
 
-    let (done_tx, mut done_rx) = mpsc::channel::<(SocketAddr, StatelessNoise)>(MAX_PUNCH_PEERS);
-    let mut sessions: HashMap<SocketAddr, Arc<Session>> = HashMap::new();
+    let finished = Arc::new(Finished::default());
+    let mut sessions: Vec<(SocketAddr, Arc<Session>)> = Vec::new();
     // Responder only: sources whose handshake finished, awaiting the
     // initiator's nominating keepalive.
-    let mut completed: HashMap<SocketAddr, StatelessNoise> = HashMap::new();
+    let mut completed: Vec<(SocketAddr, StatelessNoise)> = Vec::new();
     // Guards for the in-flight handshakes; the losers are aborted when this
     // function returns.
     let mut attempts: Vec<AbortOnDrop> = Vec::new();
@@ -132,12 +131,12 @@ pub async fn punch(
         for &cand in &targets {
             let sess = kcp_session(socket.clone(), cand, 1);
             let stream = sess.open_conv_with(CLASS_SETUP, conv);
-            sessions.insert(cand, sess);
+            sessions.push((cand, sess));
             let psk = *psk;
-            let done = done_tx.clone();
+            let finished = finished.clone();
             attempts.push(AbortOnDrop(crate::spawn(async move {
                 if let Ok(noise) = client_handshake_stateless(stream, &psk, pair_id).await {
-                    done.send((cand, noise)).await.ok();
+                    finished.push(cand, noise);
                 }
             })));
         }
@@ -155,14 +154,19 @@ pub async fn punch(
         tokio::select! {
             biased;
             _ = &mut deadline => break None,
-            done = done_rx.recv() => {
-                let Some((addr, noise)) = done else { break None };
+            _ = finished.wake.notified() => {
+                let done = finished.take();
                 if initiator {
                     // Message two arrived, so this candidate carries traffic
                     // both ways. Nominate it.
-                    break sessions.get(&addr).map(|sess| (addr, sess.clone(), noise));
+                    let Some((addr, noise)) = done.into_iter().next() else {
+                        continue;
+                    };
+                    break lookup(&sessions, addr).map(|sess| (addr, sess.clone(), noise));
                 }
-                completed.insert(addr, noise);
+                for (addr, noise) in done {
+                    store(&mut completed, addr, noise);
+                }
             }
             _ = probes.tick(), if !initiator => {
                 for cand in &targets {
@@ -183,22 +187,21 @@ pub async fn punch(
                 // source's handshake produced.
                 if !initiator {
                     if let Some(body) = dgram_body(&data, conv) {
-                        if let Some(noise) = completed.remove(&src) {
-                            match sessions.get(&src) {
-                                Some(sess) if noise.open(body).is_ok() => {
+                        if let Some(i) = completed.iter().position(|(addr, _)| *addr == src) {
+                            match lookup(&sessions, src) {
+                                Some(sess) if completed[i].1.open(body).is_ok() => {
+                                    let (_, noise) = completed.swap_remove(i);
                                     break Some((src, sess.clone(), noise));
                                 }
                                 // Not the nomination; keep the handshake for a
                                 // later keepalive from the same source.
-                                _ => {
-                                    completed.insert(src, noise);
-                                }
+                                _ => {}
                             }
                         }
                         continue;
                     }
                 }
-                let sess = match sessions.get(&src) {
+                let sess = match lookup(&sessions, src) {
                     Some(sess) => sess.clone(),
                     // The initiator only ever hears back from a candidate it
                     // sent message one to; the responder learns the peer's
@@ -207,7 +210,7 @@ pub async fn punch(
                     None if initiator || sessions.len() >= MAX_PUNCH_PEERS => continue,
                     None => {
                         let sess = kcp_session(socket.clone(), src, 1);
-                        sessions.insert(src, sess.clone());
+                        sessions.push((src, sess.clone()));
                         sess
                     }
                 };
@@ -218,13 +221,13 @@ pub async fn punch(
                         conv: got, stream, ..
                     }) if !initiator && got == conv => {
                         let psk = *psk;
-                        let done = done_tx.clone();
+                        let finished = finished.clone();
                         attempts.push(AbortOnDrop(crate::spawn(async move {
                             if let Ok((id, noise)) =
                                 server_handshake_stateless(stream, &psk, &[]).await
                             {
                                 if id == pair_id {
-                                    done.send((src, noise)).await.ok();
+                                    finished.push(src, noise);
                                 }
                             }
                         })));
@@ -308,6 +311,45 @@ pub async fn punch(
             _pump: pump,
         },
     })
+}
+
+/// The handshakes that completed, in the order they did, and the wakeup the
+/// punch loop takes them on.
+#[derive(Default)]
+struct Finished {
+    queue: Mutex<Vec<(SocketAddr, StatelessNoise)>>,
+    wake: Notify,
+}
+
+impl Finished {
+    fn push(&self, addr: SocketAddr, noise: StatelessNoise) {
+        self.queue.lock().unwrap().push((addr, noise));
+        self.wake.notify_one();
+    }
+
+    fn take(&self) -> Vec<(SocketAddr, StatelessNoise)> {
+        std::mem::take(&mut self.queue.lock().unwrap())
+    }
+}
+
+/// The session bound to `addr`, if the punch holds one.
+fn lookup(sessions: &[(SocketAddr, Arc<Session>)], addr: SocketAddr) -> Option<&Arc<Session>> {
+    sessions
+        .iter()
+        .find(|(a, _)| *a == addr)
+        .map(|(_, sess)| sess)
+}
+
+/// Hold a finished handshake for `addr`, replacing the one held before.
+fn store(
+    completed: &mut Vec<(SocketAddr, StatelessNoise)>,
+    addr: SocketAddr,
+    noise: StatelessNoise,
+) {
+    match completed.iter_mut().find(|(a, _)| *a == addr) {
+        Some(slot) => slot.1 = noise,
+        None => completed.push((addr, noise)),
+    }
 }
 
 /// The sealed body of a datagram-channel frame on `conv`, or `None` when the

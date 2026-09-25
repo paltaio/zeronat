@@ -14,7 +14,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use blake2::{Blake2s256, Digest};
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use ed25519_dalek::SigningKey;
@@ -62,10 +61,7 @@ impl Identity {
 }
 
 fn blake(domain: &[u8], credential: &str) -> [u8; 32] {
-    let mut h = Blake2s256::new();
-    h.update(domain);
-    h.update(credential.as_bytes());
-    h.finalize().into()
+    crate::hash::blake2s(&[domain, credential.as_bytes()])
 }
 
 fn now_unix() -> i64 {
@@ -169,14 +165,19 @@ async fn publish(
 /// Resolve the server's current address from the DHT.
 pub async fn resolve(id: &Identity) -> Result<SocketAddr> {
     let node = Node::new().await?;
-    let mut values = node.lookup(id.target).await?.values;
-    values.sort_by_key(|v| std::cmp::Reverse(v.seq));
-    for val in values {
-        if let Some(addr) = accept(id, &val) {
-            return Ok(addr);
+    let values = node.lookup(id.target).await?.values;
+    // The accepted value with the highest seq; among equals, the first found.
+    let mut best: Option<(i64, SocketAddr)> = None;
+    for val in &values {
+        if best.is_some_and(|(seq, _)| seq >= val.seq) {
+            continue;
+        }
+        if let Some(addr) = accept(id, val) {
+            best = Some((val.seq, addr));
         }
     }
-    Err("no valid DHT record found".into())
+    best.map(|(_, addr)| addr)
+        .ok_or_else(|| "no valid DHT record found".into())
 }
 
 /// Republish the server address forever, refreshing the IP each cycle so a
@@ -256,8 +257,11 @@ pub(super) fn cache_dir() -> Option<PathBuf> {
 }
 
 fn cache_file(id: &Identity) -> Option<PathBuf> {
-    let name: String = id.target.iter().map(|b| format!("{b:02x}")).collect();
-    Some(cache_dir()?.join("zeronat").join(name))
+    Some(
+        cache_dir()?
+            .join("zeronat")
+            .join(crate::secret::hex(&id.target)),
+    )
 }
 
 /// Per-identity seq counter, stored alongside the address cache.

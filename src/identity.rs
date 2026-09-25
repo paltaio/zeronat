@@ -1,4 +1,4 @@
-use blake2::{Blake2s256, Digest};
+use crate::hash::blake2s;
 
 pub const PROTO_VERSION: u8 = 8;
 
@@ -8,10 +8,7 @@ pub const PROTO_VERSION: u8 = 8;
 /// secret hash, so two unrelated deployments are very unlikely to collide. The
 /// returned value is the network base, e.g. `[10, x, y, 0]`.
 pub fn derive_tun_subnet(secret: &str) -> [u8; 4] {
-    let mut h = Blake2s256::new();
-    h.update(b"zeronat-tun-subnet-v1");
-    h.update(secret.as_bytes());
-    let out = h.finalize();
+    let out = blake2s(&[b"zeronat-tun-subnet-v1", secret.as_bytes()]);
     [10, out[0], out[1], 0]
 }
 
@@ -56,10 +53,7 @@ fn machine_suffix() -> String {
             return id[id.len() - 4..].to_ascii_lowercase();
         }
     }
-    let mut h = Blake2s256::new();
-    h.update(b"zeronat-client-suffix-v1");
-    h.update(short_hostname().as_bytes());
-    let out = h.finalize();
+    let out = blake2s(&[b"zeronat-client-suffix-v1", short_hostname().as_bytes()]);
     format!("{:02x}{:02x}", out[0], out[1])
 }
 

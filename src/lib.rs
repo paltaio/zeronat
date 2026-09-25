@@ -29,6 +29,7 @@ pub mod dgram;
 pub mod dht;
 #[cfg(target_os = "linux")]
 pub mod exitroute;
+pub mod hash;
 pub mod identity;
 pub mod kcp;
 pub mod logging;

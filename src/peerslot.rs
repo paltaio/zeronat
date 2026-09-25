@@ -82,12 +82,13 @@ struct Live {
 /// Inbound peer frames by the id they name: `PeerResult` by the peer and
 /// capability its `PeerConnect` asked for, everything else by `pair_id`. A
 /// `pair_id` nothing has claimed belongs to the provider slot the `PeerProbe`
-/// naming it announces for.
-#[derive(Default)]
-struct Routes {
-    results: HashMap<(String, u8), mpsc::Sender<Msg>>,
-    providers: HashMap<u8, mpsc::Sender<Msg>>,
-    pairs: HashMap<u64, mpsc::Sender<Msg>>,
+/// naming it announces for. The queues carry the frames encoded, which is
+/// the one queue type every channel in the process shares.
+type Routes = HashMap<RouteKey, mpsc::Sender<Vec<u8>>>;
+
+/// Drop every pair binding, keeping the slot registrations.
+fn clear_pairs(routes: &mut Routes) {
+    routes.retain(|key, _| !matches!(key, RouteKey::Pair(_)));
 }
 
 struct Inner {
@@ -122,7 +123,7 @@ impl PeerControl {
     /// Dropping the returned guard bumps it again with no session, which is a
     /// cycle failure for every slot that has not settled on a punched path.
     pub fn install(&self, session: ControlSession) -> ControlGuard {
-        self.inner.routes.lock().unwrap().pairs.clear();
+        clear_pairs(&mut self.inner.routes.lock().unwrap());
         self.inner.live.send_modify(|l| {
             l.generation += 1;
             l.session = Some(session);
@@ -185,71 +186,58 @@ impl PeerControl {
                     status,
                 } => {
                     let tx = routes
-                        .results
-                        .get(&(crate::secret::encode(*peer_id), *want))
+                        .get(&RouteKey::Result(crate::secret::encode(*peer_id), *want))
                         .cloned();
                     // Binding the pair here rather than in the slot leaves no
                     // window for the pair's own frames to arrive first.
                     if let Some(tx) = &tx {
                         if *status == PeerStatus::Accepted && *pair_id != 0 {
-                            routes.pairs.insert(*pair_id, tx.clone());
+                            routes.insert(RouteKey::Pair(*pair_id), tx.clone());
                         }
                     }
                     tx
                 }
                 Msg::PeerProbe {
                     pair_id, provides, ..
-                } => match routes.pairs.get(pair_id).cloned() {
+                } => match routes.get(&RouteKey::Pair(*pair_id)).cloned() {
                     Some(tx) => Some(tx),
                     None => {
-                        let tx = routes.providers.get(provides).cloned();
+                        let tx = routes.get(&RouteKey::Provider(*provides)).cloned();
                         if let Some(tx) = &tx {
-                            routes.pairs.insert(*pair_id, tx.clone());
+                            routes.insert(RouteKey::Pair(*pair_id), tx.clone());
                         }
                         tx
                     }
                 },
                 Msg::PeerInfo { pair_id, .. } | Msg::PeerRelayOpen { pair_id, .. } => {
-                    routes.pairs.get(pair_id).cloned()
+                    routes.get(&RouteKey::Pair(*pair_id)).cloned()
                 }
                 _ => None,
             }
         };
         if let Some(tx) = target {
-            tx.try_send(msg).ok();
+            tx.try_send(msg.encode()).ok();
         }
     }
 
-    fn register_consumer(&self, peer_id: &str, want: u8) -> (mpsc::Receiver<Msg>, RouteGuard) {
-        let (tx, rx) = mpsc::channel(SLOT_QUEUE);
-        self.inner
-            .routes
-            .lock()
-            .unwrap()
-            .results
-            .insert((peer_id.to_string(), want), tx);
-        (
-            rx,
-            RouteGuard {
-                control: self.clone(),
-                key: RouteKey::Result(peer_id.to_string(), want),
-            },
-        )
+    fn register_consumer(&self, peer_id: &str, want: u8) -> (mpsc::Receiver<Vec<u8>>, RouteGuard) {
+        self.register(RouteKey::Result(peer_id.to_string(), want))
     }
 
-    fn register_provider(&self, provides: u8) -> (mpsc::Receiver<Msg>, RouteGuard) {
+    fn register_provider(&self, provides: u8) -> (mpsc::Receiver<Vec<u8>>, RouteGuard) {
+        self.register(RouteKey::Provider(provides))
+    }
+
+    /// Route the frames naming `key` to a fresh queue for as long as the
+    /// returned guard lives.
+    fn register(&self, key: RouteKey) -> (mpsc::Receiver<Vec<u8>>, RouteGuard) {
         let (tx, rx) = mpsc::channel(SLOT_QUEUE);
-        self.inner
-            .routes
-            .lock()
-            .unwrap()
-            .providers
-            .insert(provides, tx);
+        self.inner.routes.lock().unwrap().insert(key.clone(), tx);
         (
             rx,
             RouteGuard {
                 control: self.clone(),
-                key: RouteKey::Provider(provides),
+                key,
             },
         )
     }
@@ -271,7 +259,7 @@ pub struct ControlGuard {
 
 impl Drop for ControlGuard {
     fn drop(&mut self) {
-        self.control.inner.routes.lock().unwrap().pairs.clear();
+        clear_pairs(&mut self.control.inner.routes.lock().unwrap());
         self.control.inner.live.send_modify(|l| {
             l.generation += 1;
             l.session = None;
@@ -279,6 +267,7 @@ impl Drop for ControlGuard {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum RouteKey {
     Result(String, u8),
     Provider(u8),
@@ -293,18 +282,7 @@ struct RouteGuard {
 
 impl Drop for RouteGuard {
     fn drop(&mut self) {
-        let mut routes = self.control.inner.routes.lock().unwrap();
-        match &self.key {
-            RouteKey::Result(peer_id, want) => {
-                routes.results.remove(&(peer_id.clone(), *want));
-            }
-            RouteKey::Provider(provides) => {
-                routes.providers.remove(provides);
-            }
-            RouteKey::Pair(pair_id) => {
-                routes.pairs.remove(pair_id);
-            }
-        }
+        self.control.inner.routes.lock().unwrap().remove(&self.key);
     }
 }
 
@@ -688,7 +666,9 @@ async fn consumer_slot(
         let paired = match adapter.as_ref().map(ConsumerAdapter::precheck) {
             Some(Err(e)) => Err(e),
             _ => {
-                let cycle = pair_as_consumer(&peer_id, identity, want, &session, &mut rx, &control);
+                let cycle = crate::client::boxed(pair_as_consumer(
+                    &peer_id, identity, want, &session, &mut rx, &control,
+                ));
                 tokio::select! {
                     _ = control.wait_gone(generation) => Err("the control session ended".into()),
                     r = timeout(CYCLE_DEADLINE, cycle) => match r {
@@ -709,11 +689,15 @@ async fn consumer_slot(
                     // its own, and a profile switch's abort takes them with the
                     // slot. A bringup it cannot do ends the cycle rather than
                     // re-pairing at full speed.
-                    Some(ConsumerAdapter::Exit(via)) => {
-                        consume_exit(peer, via, &secret, path, &session.server)
-                            .await
-                            .err()
-                    }
+                    Some(ConsumerAdapter::Exit(via)) => crate::client::boxed(consume_exit(
+                        peer,
+                        via,
+                        &secret,
+                        path,
+                        &session.server,
+                    ))
+                    .await
+                    .err(),
                     None => {
                         run_session(peer, &peer_id, want, path, &sink).await;
                         None
@@ -745,7 +729,7 @@ async fn pair_as_consumer(
     identity: crate::proto::PeerIdentity,
     want: u8,
     session: &ControlSession,
-    rx: &mut mpsc::Receiver<Msg>,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
     control: &PeerControl,
 ) -> Result<(PeerSession, PairPath)> {
     // A frame the last cycle left behind names a pair the server has already
@@ -858,8 +842,8 @@ async fn provider_slot(
     // a punched pair outlives the server-side state that fast-fails it. A
     // segment serves every pair at once and is never busy.
     let busy = Arc::new(AtomicBool::new(false));
-    let mut pairs: HashMap<u64, mpsc::Sender<Msg>> = HashMap::new();
-    let mut running: Vec<(u64, AbortOnDrop)> = Vec::new();
+    // The live pair tasks by pair id, with the queue each one's frames go to.
+    let mut running: Vec<(u64, AbortOnDrop, mpsc::Sender<Vec<u8>>)> = Vec::new();
     // Where a pair hands its session over once the handshake settles. An
     // exclusive slot sees one at a time: the hold rides along, so a second is
     // refused before it has a session to hand over.
@@ -874,8 +858,8 @@ async fn provider_slot(
     let mut segment = SegmentPorts::default();
     loop {
         let step = tokio::select! {
-            msg = rx.recv() => match msg {
-                Some(msg) => SlotStep::Control(msg),
+            frame = rx.recv() => match frame {
+                Some(frame) => SlotStep::Control(frame),
                 None => break,
             },
             // The sender lives in `owner`, so a slot with no adapter has
@@ -886,12 +870,12 @@ async fn provider_slot(
                 None => break,
             },
             _ = drive(&mut exit_adapter) => SlotStep::AdapterEnded,
-            ended = segment.drive() => ended,
+            ended = std::future::poll_fn(|cx| segment.poll_ended(cx)) => ended,
             // The sender lives in the `PeerControl` this slot holds, so the
             // wait only ends on a real change.
             _ = live.changed() => SlotStep::ControlChanged,
         };
-        let msg = match step {
+        let frame = match step {
             SlotStep::ControlChanged => {
                 status.set(announced(&control), None);
                 continue;
@@ -920,15 +904,12 @@ async fn provider_slot(
                 segment.close();
                 continue;
             }
-            SlotStep::Control(msg) => msg,
+            SlotStep::Control(frame) => frame,
         };
-        running.retain(|(id, task)| {
-            let live = !task.0.is_finished();
-            if !live {
-                pairs.remove(id);
-            }
-            live
-        });
+        running.retain(|(_, task, _)| !task.0.is_finished());
+        let Ok(msg) = Msg::decode(&frame) else {
+            continue;
+        };
         match msg {
             Msg::PeerProbe {
                 pair_id,
@@ -939,39 +920,59 @@ async fn provider_slot(
                 let Some((generation, session)) = control.live() else {
                     continue;
                 };
-                let (tx, pair_rx) = mpsc::channel(SLOT_QUEUE);
-                let task = provider_pair(
-                    PairStart {
-                        pair_id,
-                        peer_id,
-                        provides,
-                        generation,
-                        allow: allow.clone(),
-                    },
-                    session,
-                    pair_rx,
-                    control.pair_guard(pair_id),
-                    control.clone(),
-                    PairOwner {
-                        sink: sink.clone(),
-                        adapter: owner.clone(),
-                    },
-                    busy.clone(),
-                );
-                running.push((pair_id, AbortOnDrop(crate::spawn(task))));
-                // The probe frame starts the pair's own cycle, which binds its
-                // socket and reports the candidates under the id it carries.
-                tx.try_send(msg).ok();
-                pairs.insert(pair_id, tx);
+                let start = PairStart {
+                    pair_id,
+                    peer_id,
+                    provides,
+                    generation,
+                    allow: allow.clone(),
+                };
+                let pair_owner = PairOwner {
+                    sink: sink.clone(),
+                    adapter: owner.clone(),
+                };
+                running.push(start_pair(
+                    start, session, &control, pair_owner, &busy, frame,
+                ));
             }
             Msg::PeerInfo { pair_id, .. } | Msg::PeerRelayOpen { pair_id, .. } => {
-                if let Some(tx) = pairs.get(&pair_id) {
-                    tx.try_send(msg).ok();
+                if let Some((_, _, tx)) = running.iter().rev().find(|(id, _, _)| *id == pair_id) {
+                    tx.try_send(frame).ok();
                 }
             }
             _ => {}
         }
     }
+}
+
+/// Spawn the task serving one pair on a provider slot, with the `PeerProbe`
+/// frame that announced it queued as the task's first frame. Returns the pair
+/// id, the task, and the queue its later frames go to.
+#[inline(never)]
+fn start_pair(
+    start: PairStart,
+    session: ControlSession,
+    control: &PeerControl,
+    owner: PairOwner,
+    busy: &Arc<AtomicBool>,
+    frame: Vec<u8>,
+) -> (u64, AbortOnDrop, mpsc::Sender<Vec<u8>>) {
+    let pair_id = start.pair_id;
+    let (tx, pair_rx) = mpsc::channel(SLOT_QUEUE);
+    let task = provider_pair(
+        start,
+        session,
+        pair_rx,
+        control.pair_guard(pair_id),
+        control.clone(),
+        owner,
+        busy.clone(),
+    );
+    let task = AbortOnDrop(crate::spawn(task));
+    // The probe frame starts the pair's own cycle, which binds its socket and
+    // reports the candidates under the id it carries.
+    tx.try_send(frame).ok();
+    (pair_id, task, tx)
 }
 
 /// A provider slot's link state: connected while the control session its
@@ -985,7 +986,7 @@ fn announced(control: &PeerControl) -> LinkStatus {
 
 /// What moved the provider slot's loop forward.
 enum SlotStep {
-    Control(Msg),
+    Control(Vec<u8>),
     ControlChanged,
     Serve(ServedPair),
     AdapterEnded,
@@ -1005,6 +1006,7 @@ struct ServedPair {
 /// Hand one settled pair to the adapter its slot runs. A segment that cannot
 /// open its device drops the pair and holds the reason against the pairs that
 /// follow, which is what the exit adapter's own bringup failure does.
+#[inline(never)]
 fn serve_pair(
     owner: &AdapterOwner,
     exit_adapter: &mut Option<ExitAdapter>,
@@ -1103,22 +1105,20 @@ impl SegmentPorts {
 
     /// Poll the device reader and every port, yielding whichever ended. A port
     /// that ends is removed and leaves the others running.
-    async fn drive(&mut self) -> SlotStep {
-        std::future::poll_fn(|cx| {
-            if let Some(open) = &mut self.device {
-                if open.reader.as_mut().poll(cx).is_ready() {
-                    return std::task::Poll::Ready(SlotStep::DeviceEnded);
-                }
+    #[inline(never)]
+    fn poll_ended(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<SlotStep> {
+        if let Some(open) = &mut self.device {
+            if open.reader.as_mut().poll(cx).is_ready() {
+                return std::task::Poll::Ready(SlotStep::DeviceEnded);
             }
-            for i in 0..self.ports.len() {
-                if self.ports[i].run.as_mut().poll(cx).is_ready() {
-                    let done = self.ports.swap_remove(i);
-                    return std::task::Poll::Ready(SlotStep::PortEnded(done.peer_id));
-                }
+        }
+        for i in 0..self.ports.len() {
+            if self.ports[i].run.as_mut().poll(cx).is_ready() {
+                let done = self.ports.swap_remove(i);
+                return std::task::Poll::Ready(SlotStep::PortEnded(done.peer_id));
             }
-            std::task::Poll::Pending
-        })
-        .await
+        }
+        std::task::Poll::Pending
     }
 
     /// Drop every port and the device under them.
@@ -1285,7 +1285,7 @@ struct PairStart {
 async fn provider_pair(
     start: PairStart,
     session: ControlSession,
-    mut rx: mpsc::Receiver<Msg>,
+    mut rx: mpsc::Receiver<Vec<u8>>,
     _pair: RouteGuard,
     control: PeerControl,
     owner: PairOwner,
@@ -1301,7 +1301,7 @@ async fn provider_pair(
     let peer_hex = crate::secret::encode(peer_id);
     let exclusive = provides == PROVIDES_EXIT;
     let served: Result<Served> = {
-        let cycle = async {
+        let cycle = crate::client::boxed(async {
             let (settled, challenge) =
                 settle_path(pair_id, &peer_hex, &session.peer_id, &session, &mut rx).await?;
             // The relay-forwarded consumer identity selects the prologue
@@ -1348,7 +1348,7 @@ async fn provider_pair(
                 None => Served::Taken(peer, path, hold),
                 Some(reason) => Served::Refused(reason, peer),
             })
-        };
+        });
         tokio::select! {
             _ = control.wait_gone(generation) => Err("the control session ended".into()),
             r = timeout(CYCLE_DEADLINE, cycle) => match r {
@@ -1429,7 +1429,7 @@ async fn settle_path(
     peer_id: &str,
     local_id: &str,
     session: &ControlSession,
-    rx: &mut mpsc::Receiver<Msg>,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<(SettledPath, [u8; 32])> {
     let mut probe: Option<ProbeSession> = None;
     let mut pair_challenge: Option<[u8; 32]> = None;
@@ -1448,11 +1448,11 @@ async fn settle_path(
                 pair_challenge = Some(challenge);
                 if let Some(server) = udp_server(session)? {
                     probe = Some(
-                        probe_candidates(
+                        crate::client::boxed(probe_candidates(
                             server,
                             &session.credential_psk,
                             (probe_id, probe_capability),
-                        )
+                        ))
                         .await?,
                     );
                 }
@@ -1468,7 +1468,7 @@ async fn settle_path(
 
     let settled = match probe {
         Some(probe) => {
-            let punching = punch(
+            let punching = crate::client::boxed(punch(
                 probe,
                 &candidates,
                 pair_id,
@@ -1476,7 +1476,7 @@ async fn settle_path(
                 peer_id,
                 &session.psk,
                 &session.tx,
-            );
+            ));
             tokio::select! {
                 outcome = punching => Settled::Punched(outcome),
                 id = wait_relay_open(rx, pair_id) => Settled::Relay(id?),
@@ -1538,7 +1538,7 @@ async fn handshake_under_relay_authority(
     pair_id: u64,
     identity: &PairIdentity,
     session: &ControlSession,
-    rx: &mut mpsc::Receiver<Msg>,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<(PeerSession, PairPath)> {
     let (direct, peer) = match settled {
         SettledPath::Relayed(path) => {
@@ -1624,7 +1624,7 @@ fn udp_server(session: &ControlSession) -> Result<Option<SocketAddr>> {
 
 /// The leg id this party's `PeerRelayOpen` carries for `pair_id`.
 async fn wait_relay_open(
-    rx: &mut mpsc::Receiver<Msg>,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
     pair_id: u64,
 ) -> Result<(u64, crate::proto::Capability)> {
     loop {
@@ -1641,10 +1641,12 @@ async fn wait_relay_open(
     }
 }
 
-async fn next_frame(rx: &mut mpsc::Receiver<Msg>) -> Result<Msg> {
-    rx.recv()
+async fn next_frame(rx: &mut mpsc::Receiver<Vec<u8>>) -> Result<Msg> {
+    let frame = rx
+        .recv()
         .await
-        .ok_or_else(|| -> crate::Error { "the slot's control route closed".into() })
+        .ok_or_else(|| -> crate::Error { "the slot's control route closed".into() })?;
+    Msg::decode(&frame)
 }
 
 /// Hold a live session, moving frames to and from whoever owns the slot.
@@ -1860,9 +1862,12 @@ mod tests {
         segment.add_port("b".into(), b_provider).unwrap();
 
         drop(a);
-        let ended = timeout(Duration::from_secs(20), segment.drive())
-            .await
-            .expect("the dead pair's port never ended");
+        let ended = timeout(
+            Duration::from_secs(20),
+            std::future::poll_fn(|cx| segment.poll_ended(cx)),
+        )
+        .await
+        .expect("the dead pair's port never ended");
         assert!(
             matches!(&ended, SlotStep::PortEnded(peer) if peer == "a"),
             "the slot named the wrong port"
@@ -1912,8 +1917,7 @@ mod tests {
             .routes
             .lock()
             .unwrap()
-            .providers
-            .contains_key(&PROVIDES_EXIT));
+            .contains_key(&RouteKey::Provider(PROVIDES_EXIT)));
         drop(slot);
     }
 
@@ -2057,7 +2061,7 @@ mod tests {
                 capability: [0u8; crate::proto::CAPABILITY_LEN],
             },
         ] {
-            pair_tx.try_send(msg).unwrap();
+            pair_tx.try_send(msg.encode()).unwrap();
         }
         let (sock, _) = timeout(Duration::from_secs(20), listener.accept())
             .await

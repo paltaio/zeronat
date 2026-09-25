@@ -3,9 +3,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use blake2::digest::consts::U16;
-use blake2::digest::Mac;
-use blake2::Blake2sMac;
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Instant};
 
@@ -34,8 +31,6 @@ const COOKIE_TTL: Duration = Duration::from_secs(30);
 const HELLO_RESEND: Duration = Duration::from_millis(300);
 const ADMIT_TIMEOUT: Duration = Duration::from_secs(4);
 
-type CookieMac = Blake2sMac<U16>;
-
 /// Server half: issues and verifies source-bound cookies.
 pub struct CookieJar {
     key: [u8; 32],
@@ -52,15 +47,24 @@ impl CookieJar {
         })
     }
 
-    fn mac_for(&self, ts: u64, src: SocketAddr) -> CookieMac {
-        let mut m = <CookieMac as blake2::digest::KeyInit>::new((&self.key).into());
-        m.update(&ts.to_be_bytes());
-        match src.ip() {
-            IpAddr::V4(ip) => m.update(&ip.octets()),
-            IpAddr::V6(ip) => m.update(&ip.octets()),
-        }
-        m.update(&src.port().to_be_bytes());
-        m
+    /// Keyed BLAKE2s over the timestamp and the source tuple, `MAC_LEN` bytes.
+    fn mac_for(&self, ts: u64, src: SocketAddr) -> [u8; MAC_LEN] {
+        let mut msg = [0u8; 26];
+        msg[..8].copy_from_slice(&ts.to_be_bytes());
+        let n = match src.ip() {
+            IpAddr::V4(ip) => {
+                msg[8..12].copy_from_slice(&ip.octets());
+                12
+            }
+            IpAddr::V6(ip) => {
+                msg[8..24].copy_from_slice(&ip.octets());
+                24
+            }
+        };
+        msg[n..n + 2].copy_from_slice(&src.port().to_be_bytes());
+        let mut m = crate::hash::Blake2s::new(MAC_LEN, &self.key);
+        m.update(&msg[..n + 2]);
+        m.finalize()[..MAC_LEN].try_into().unwrap()
     }
 
     /// The challenge datagram answering a hello from `src`.
@@ -69,7 +73,7 @@ impl CookieJar {
         let mut pkt = Vec::with_capacity(CHALLENGE_LEN);
         pkt.push(CLASS_CHALLENGE);
         pkt.extend_from_slice(&ts.to_be_bytes());
-        pkt.extend_from_slice(&self.mac_for(ts, src).finalize().into_bytes());
+        pkt.extend_from_slice(&self.mac_for(ts, src));
         pkt
     }
 
@@ -88,7 +92,9 @@ impl CookieJar {
         if ts > now || now - ts > COOKIE_TTL.as_millis() as u64 {
             return None;
         }
-        self.mac_for(ts, src).verify_slice(mac).ok()?;
+        if !crate::hash::ct_eq(&self.mac_for(ts, src), mac) {
+            return None;
+        }
         let issued_at = self.epoch.checked_add(Duration::from_millis(ts))?;
         Some((ts, issued_at))
     }

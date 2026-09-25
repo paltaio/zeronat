@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::hash::{blake2s, ct_eq, hmac_blake2s};
 use crate::{Error, Result};
-use blake2::{Blake2s256, Digest};
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
-use hmac::{Mac, SimpleHmac};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use x25519_dalek::{x25519, EphemeralSecret, PublicKey, X25519_BASEPOINT_BYTES};
+use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};
 
 const PATTERN: &[u8] = b"Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const XX_PATTERN: &[u8] = b"Noise_XX_25519_ChaChaPoly_BLAKE2s";
@@ -75,10 +74,7 @@ fn parse_remote_preface(
 }
 
 pub fn client_selector(psk: &[u8; 32]) -> [u8; CLIENT_SELECTOR_LEN] {
-    let mut h = Blake2s256::new();
-    h.update(b"zeronat-client-credential-selector-v1");
-    h.update(psk);
-    let digest = h.finalize();
+    let digest = blake2s(&[b"zeronat-client-credential-selector-v1", psk]);
     let mut selector = [0u8; CLIENT_SELECTOR_LEN];
     selector.copy_from_slice(&digest[..CLIENT_SELECTOR_LEN]);
     selector
@@ -116,17 +112,19 @@ fn announce_mac(
     identity: &[u8; 32],
     provides: u8,
     client_id: &str,
-) -> SimpleHmac<Blake2s256> {
-    let mut mac =
-        <SimpleHmac<Blake2s256> as Mac>::new_from_slice(shared).expect("hmac accepts any key len");
-    mac.update(ANNOUNCE_PROOF_TAG);
-    mac.update(&[crate::identity::PROTO_VERSION]);
-    mac.update(nonce);
-    mac.update(eph_pub);
-    mac.update(identity);
-    mac.update(&[provides]);
-    mac.update(client_id.as_bytes());
-    mac
+) -> [u8; 32] {
+    hmac_blake2s(
+        shared,
+        &[
+            ANNOUNCE_PROOF_TAG,
+            &[crate::identity::PROTO_VERSION],
+            nonce,
+            eph_pub,
+            identity,
+            &[provides],
+            client_id.as_bytes(),
+        ],
+    )
 }
 
 /// Answer a `PeerChallenge`: the proof MAC only the announced identity's
@@ -141,9 +139,6 @@ pub fn announce_proof(
     let shared = x25519(*static_private, *eph_pub);
     let identity = public_identity(static_private);
     announce_mac(&shared, eph_pub, nonce, &identity, provides, client_id)
-        .finalize()
-        .into_bytes()
-        .into()
 }
 
 /// One announce's server-side challenge: the ephemeral public key and nonce
@@ -168,10 +163,10 @@ impl AnnounceChallenge {
     pub fn mint(identity: &[u8; 32]) -> Result<Option<AnnounceChallenge>> {
         let mut eph_priv = [0u8; 32];
         getrandom::getrandom(&mut eph_priv)
-            .map_err(|e| -> Error { format!("generating an ephemeral key: {e}").into() })?;
+            .map_err(|e| -> Error { errf!("generating an ephemeral key: {e}") })?;
         let mut nonce = [0u8; 32];
         getrandom::getrandom(&mut nonce)
-            .map_err(|e| -> Error { format!("generating a challenge nonce: {e}").into() })?;
+            .map_err(|e| -> Error { errf!("generating a challenge nonce: {e}") })?;
         let shared = x25519(eph_priv, *identity);
         if shared == [0u8; 32] {
             return Ok(None);
@@ -187,64 +182,34 @@ impl AnnounceChallenge {
     /// Whether `mac` proves possession of the identity this challenge was
     /// minted for. The comparison runs in constant time.
     pub fn verify(&self, provides: u8, client_id: &str, mac: &[u8; 32]) -> bool {
-        announce_mac(
+        let want = announce_mac(
             &self.shared,
             &self.eph_pub,
             &self.nonce,
             &self.identity,
             provides,
             client_id,
-        )
-        .verify_slice(mac)
-        .is_ok()
+        );
+        ct_eq(&want, mac)
     }
 }
 
 /// Derive the 32-byte pre-shared key from the user's passphrase.
 pub fn derive_psk(secret: &str) -> [u8; 32] {
-    let mut h = Blake2s256::new();
-    h.update(b"tunnel-noise-psk-v1");
-    h.update(secret.as_bytes());
-    h.finalize().into()
+    blake2s(&[b"tunnel-noise-psk-v1", secret.as_bytes()])
 }
 
-fn blake2s(data: &[u8]) -> [u8; HASHLEN] {
-    let mut h = Blake2s256::new();
-    h.update(data);
-    h.finalize().into()
-}
-
-/// HMAC-BLAKE2s over `data` with the given key.
-fn hmac(key: &[u8], data: &[u8]) -> [u8; HASHLEN] {
-    let mut mac =
-        <SimpleHmac<Blake2s256> as Mac>::new_from_slice(key).expect("hmac accepts any key len");
-    mac.update(data);
-    mac.finalize().into_bytes().into()
-}
-
-/// Noise HKDF over HMAC-BLAKE2s. Returns two or three 32-byte outputs.
-fn hkdf2(ck: &[u8; HASHLEN], ikm: &[u8]) -> ([u8; HASHLEN], [u8; HASHLEN]) {
-    let temp = hmac(ck, ikm);
-    let o1 = hmac(&temp, &[0x01]);
-    let mut msg2 = [0u8; HASHLEN + 1];
-    msg2[..HASHLEN].copy_from_slice(&o1);
-    msg2[HASHLEN] = 0x02;
-    let o2 = hmac(&temp, &msg2);
-    (o1, o2)
-}
-
-fn hkdf3(ck: &[u8; HASHLEN], ikm: &[u8]) -> ([u8; HASHLEN], [u8; HASHLEN], [u8; HASHLEN]) {
-    let temp = hmac(ck, ikm);
-    let o1 = hmac(&temp, &[0x01]);
-    let mut msg2 = [0u8; HASHLEN + 1];
-    msg2[..HASHLEN].copy_from_slice(&o1);
-    msg2[HASHLEN] = 0x02;
-    let o2 = hmac(&temp, &msg2);
-    let mut msg3 = [0u8; HASHLEN + 1];
-    msg3[..HASHLEN].copy_from_slice(&o2);
-    msg3[HASHLEN] = 0x03;
-    let o3 = hmac(&temp, &msg3);
-    (o1, o2, o3)
+/// Noise HKDF over HMAC-BLAKE2s: the first `n` of three 32-byte outputs.
+#[inline(never)]
+fn hkdf(ck: &[u8; HASHLEN], ikm: &[u8], n: usize) -> [[u8; HASHLEN]; 3] {
+    let temp = hmac_blake2s(ck, &[ikm]);
+    let mut out = [[0u8; HASHLEN]; 3];
+    let mut prev: &[u8] = &[];
+    for (i, o) in out.iter_mut().enumerate().take(n) {
+        *o = hmac_blake2s(&temp, &[prev, &[i as u8 + 1]]);
+        prev = &o[..];
+    }
+    out
 }
 
 /// Encode a Noise 96-bit nonce: 4 zero bytes then the counter in little-endian.
@@ -290,7 +255,7 @@ impl SymmetricState {
             buf[..protocol.len()].copy_from_slice(protocol);
             buf
         } else {
-            blake2s(protocol)
+            blake2s(&[protocol])
         };
         SymmetricState {
             ck: h,
@@ -301,21 +266,18 @@ impl SymmetricState {
     }
 
     fn mix_hash(&mut self, data: &[u8]) {
-        let mut buf = Vec::with_capacity(HASHLEN + data.len());
-        buf.extend_from_slice(&self.h);
-        buf.extend_from_slice(data);
-        self.h = blake2s(&buf);
+        self.h = blake2s(&[&self.h, data]);
     }
 
     fn mix_key(&mut self, ikm: &[u8]) {
-        let (ck, temp_k) = hkdf2(&self.ck, ikm);
+        let [ck, temp_k, _] = hkdf(&self.ck, ikm, 2);
         self.ck = ck;
         self.k = Some(temp_k);
         self.n = 0;
     }
 
     fn mix_key_and_hash(&mut self, ikm: &[u8]) {
-        let (ck, temp_h, temp_k) = hkdf3(&self.ck, ikm);
+        let [ck, temp_h, temp_k] = hkdf(&self.ck, ikm, 3);
         self.ck = ck;
         self.mix_hash(&temp_h);
         self.k = Some(temp_k);
@@ -346,8 +308,21 @@ impl SymmetricState {
         Ok(pt)
     }
 
-    fn split(&self) -> ([u8; 32], [u8; 32]) {
-        hkdf2(&self.ck, &[])
+    /// The transport keys from the handshake split, by role: the initiator
+    /// sends under the first output and receives under the second.
+    fn keys(&self, initiator: bool) -> Keys {
+        let [t1, t2, _] = hkdf(&self.ck, &[], 2);
+        if initiator {
+            Keys {
+                send_key: t1,
+                recv_key: t2,
+            }
+        } else {
+            Keys {
+                send_key: t2,
+                recv_key: t1,
+            }
+        }
     }
 }
 
@@ -384,7 +359,7 @@ impl XxHandshake {
     fn new(initiator: bool, static_private: &[u8; 32], prologue: &[u8]) -> Result<Self> {
         let mut e_priv = [0u8; 32];
         getrandom::getrandom(&mut e_priv)
-            .map_err(|e| -> Error { format!("generating an ephemeral key: {e}").into() })?;
+            .map_err(|e| -> Error { errf!("generating an ephemeral key: {e}") })?;
         let mut ss = SymmetricState::new(XX_PATTERN);
         ss.mix_hash(prologue);
         Ok(XxHandshake {
@@ -478,140 +453,167 @@ impl XxHandshake {
 
     /// Directional datagram state from the handshake split.
     pub fn into_transport(self) -> StatelessNoise {
-        let (t1, t2) = self.ss.split();
-        StatelessNoise::from_keys(if self.initiator {
-            Keys {
-                send_key: t1,
-                recv_key: t2,
-            }
-        } else {
-            Keys {
-                send_key: t2,
-                recv_key: t1,
-            }
-        })
+        StatelessNoise::from_keys(self.ss.keys(self.initiator))
     }
 }
 
-/// Run the NNpsk0 initiator handshake to completion over `stream`, returning
-/// the transport keys and the responder's message-2 payload.
-async fn run_initiator(
-    stream: &mut BoxStream,
-    psk: &[u8; 32],
-    prologue: &[u8],
-    payload1: &[u8],
-) -> Result<(Keys, Vec<u8>)> {
+/// The NNpsk0 symmetric state with the prologue and the psk mixed in.
+fn nn_start(psk: &[u8; 32], prologue: &[u8]) -> SymmetricState {
     let mut ss = SymmetricState::new(PATTERN);
     ss.mix_hash(prologue);
-
-    // Message 1: tokens [psk, e]
     ss.mix_key_and_hash(psk);
-    let e_priv = EphemeralSecret::random();
-    let e_pub = PublicKey::from(&e_priv);
-    ss.mix_hash(e_pub.as_bytes());
-    ss.mix_key(e_pub.as_bytes());
-    let ct1 = ss.encrypt_and_hash(payload1);
-    let mut msg1 = Vec::with_capacity(DHLEN + ct1.len());
-    msg1.extend_from_slice(e_pub.as_bytes());
-    msg1.extend_from_slice(&ct1);
-    write_frame(stream, &msg1).await?;
-
-    // Message 2: tokens [e, ee]
-    let msg2 = read_frame(stream).await?;
-    if msg2.len() < DHLEN {
-        return Err("handshake message 2 too short".into());
-    }
-    let mut re_bytes = [0u8; DHLEN];
-    re_bytes.copy_from_slice(&msg2[..DHLEN]);
-    let re = PublicKey::from(re_bytes);
-    ss.mix_hash(&re_bytes);
-    ss.mix_key(&re_bytes);
-    let dh = e_priv.diffie_hellman(&re);
-    ss.mix_key(dh.as_bytes());
-    let payload2 = ss.decrypt_and_hash(&msg2[DHLEN..])?;
-
-    let (t1, t2) = ss.split();
-    Ok((
-        Keys {
-            send_key: t1,
-            recv_key: t2,
-        },
-        payload2,
-    ))
+    ss
 }
 
-/// Run the NNpsk0 responder handshake, sealing `payload2` into message 2;
-/// returns the keys and the decrypted payload from message 1.
-async fn run_responder(
-    stream: &mut BoxStream,
+/// Write the `e` token and, with `re` given, the `ee` token behind it:
+/// returns the ephemeral private key and the message carrying the ephemeral
+/// public key and the sealed payload.
+#[inline(never)]
+fn nn_write(ss: &mut SymmetricState, re: Option<&[u8; 32]>, payload: &[u8]) -> ([u8; 32], Vec<u8>) {
+    let mut e_priv = [0u8; 32];
+    getrandom::getrandom(&mut e_priv).expect("system randomness");
+    let e_pub = public_identity(&e_priv);
+    ss.mix_hash(&e_pub);
+    ss.mix_key(&e_pub);
+    if let Some(re) = re {
+        ss.mix_key(&x25519(e_priv, *re));
+    }
+    let ct = ss.encrypt_and_hash(payload);
+    let mut msg = Vec::with_capacity(DHLEN + ct.len());
+    msg.extend_from_slice(&e_pub);
+    msg.extend_from_slice(&ct);
+    (e_priv, msg)
+}
+
+/// Read the `e` token and, with `e_priv` given, the `ee` token behind it:
+/// returns the remote ephemeral and the opened payload.
+#[inline(never)]
+fn nn_read(
+    ss: &mut SymmetricState,
+    e_priv: Option<&[u8; 32]>,
+    msg: &[u8],
+    short: &'static str,
+) -> Result<([u8; 32], Vec<u8>)> {
+    if msg.len() < DHLEN {
+        return Err(short.into());
+    }
+    let mut re = [0u8; DHLEN];
+    re.copy_from_slice(&msg[..DHLEN]);
+    ss.mix_hash(&re);
+    ss.mix_key(&re);
+    if let Some(e_priv) = e_priv {
+        ss.mix_key(&x25519(*e_priv, re));
+    }
+    let payload = ss.decrypt_and_hash(&msg[DHLEN..])?;
+    Ok((re, payload))
+}
+
+/// Run the NNpsk0 initiator handshake over `stream`, after writing the remote
+/// preface when there is one: returns the stream, the transport keys and the
+/// responder's message-2 payload.
+async fn initiate(
+    mut stream: BoxStream,
+    psk: &[u8; 32],
+    preface: Option<&[u8; REMOTE_PREFACE_LEN]>,
+    prologue: &[u8],
+    payload1: &[u8],
+) -> Result<(BoxStream, Keys, Vec<u8>)> {
+    if let Some(preface) = preface {
+        stream.write_all(preface).await?;
+        stream.flush().await?;
+    }
+    let mut ss = nn_start(psk, prologue);
+    // Message 1: tokens [psk, e]
+    let (e_priv, msg1) = nn_write(&mut ss, None, payload1);
+    write_frame(&mut stream, &msg1).await?;
+    // Message 2: tokens [e, ee]
+    let msg2 = read_frame(&mut stream).await?;
+    let (_, payload2) = nn_read(
+        &mut ss,
+        Some(&e_priv),
+        &msg2,
+        "handshake message 2 too short",
+    )?;
+    Ok((stream, ss.keys(true), payload2))
+}
+
+/// Run the NNpsk0 responder handshake over `stream`, sealing `payload2` into
+/// message 2: returns the stream, the keys and the payload from message 1.
+async fn respond(
+    mut stream: BoxStream,
     psk: &[u8; 32],
     prologue: &[u8],
     payload2: &[u8],
-) -> Result<(Keys, Vec<u8>)> {
-    let mut ss = SymmetricState::new(PATTERN);
-    ss.mix_hash(prologue);
-
+) -> Result<(BoxStream, Keys, Vec<u8>)> {
+    let mut ss = nn_start(psk, prologue);
     // Message 1: tokens [psk, e]
-    let msg1 = read_frame(stream).await?;
-    if msg1.len() < DHLEN {
-        return Err("handshake message 1 too short".into());
-    }
-    ss.mix_key_and_hash(psk);
-    let mut re_bytes = [0u8; DHLEN];
-    re_bytes.copy_from_slice(&msg1[..DHLEN]);
-    let re = PublicKey::from(re_bytes);
-    ss.mix_hash(&re_bytes);
-    ss.mix_key(&re_bytes);
-    let payload1 = ss.decrypt_and_hash(&msg1[DHLEN..])?;
-
+    let msg1 = read_frame(&mut stream).await?;
+    let (re, payload1) = nn_read(&mut ss, None, &msg1, "handshake message 1 too short")?;
     // Message 2: tokens [e, ee]
-    let e_priv = EphemeralSecret::random();
-    let e_pub = PublicKey::from(&e_priv);
-    ss.mix_hash(e_pub.as_bytes());
-    ss.mix_key(e_pub.as_bytes());
-    let dh = e_priv.diffie_hellman(&re);
-    ss.mix_key(dh.as_bytes());
-    let ct2 = ss.encrypt_and_hash(payload2);
-    let mut msg2 = Vec::with_capacity(DHLEN + ct2.len());
-    msg2.extend_from_slice(e_pub.as_bytes());
-    msg2.extend_from_slice(&ct2);
-    write_frame(stream, &msg2).await?;
+    let (_, msg2) = nn_write(&mut ss, Some(&re), payload2);
+    write_frame(&mut stream, &msg2).await?;
+    Ok((stream, ss.keys(false), payload1))
+}
 
-    let (t1, t2) = ss.split();
-    // Responder: send-cipher = t2, recv-cipher = t1.
-    Ok((
-        Keys {
-            send_key: t2,
-            recv_key: t1,
-        },
-        payload1,
-    ))
+/// Read and parse the remote preface that opens a handshake.
+async fn read_preface(
+    stream: &mut BoxStream,
+) -> Result<(
+    AuthRole,
+    [u8; CLIENT_SELECTOR_LEN],
+    [u8; REMOTE_PREFACE_LEN],
+)> {
+    let mut preface = [0u8; REMOTE_PREFACE_LEN];
+    stream.read_exact(&mut preface).await?;
+    let (role, selector) = parse_remote_preface(&preface)?;
+    Ok((role, selector, preface))
+}
+
+/// The stream initiator handshake, with the remote preface when there is one.
+async fn stream_initiator(
+    stream: BoxStream,
+    psk: &[u8; 32],
+    preface: Option<[u8; REMOTE_PREFACE_LEN]>,
+) -> Result<Noise> {
+    let prologue: &[u8] = preface.as_ref().map_or(&[], |p| p);
+    let (stream, keys, _payload2) = initiate(stream, psk, preface.as_ref(), prologue, &[]).await?;
+    Ok(finish(stream, keys))
+}
+
+async fn stream_responder(stream: BoxStream, psk: &[u8; 32], prologue: &[u8]) -> Result<Noise> {
+    let (stream, keys, _payload) = respond(stream, psk, prologue, &[]).await?;
+    Ok(finish(stream, keys))
+}
+
+/// The stateless initiator handshake: under the remote preface when there is
+/// one, else under the stateless prologue.
+async fn stateless_initiator(
+    stream: BoxStream,
+    psk: &[u8; 32],
+    preface: Option<[u8; REMOTE_PREFACE_LEN]>,
+    payload: &[u8],
+) -> Result<(StatelessNoise, Vec<u8>)> {
+    let prologue: &[u8] = preface.as_ref().map_or(&STATELESS_PROLOGUE, |p| p);
+    let (_, keys, reply) = initiate(stream, psk, preface.as_ref(), prologue, payload).await?;
+    Ok((StatelessNoise::from_keys(keys), reply))
 }
 
 pub async fn client_handshake<S>(stream: S, psk: &[u8; 32]) -> Result<Noise>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut stream: BoxStream = Box::new(stream);
-    let (keys, _payload2) = run_initiator(&mut stream, psk, &[], &[]).await?;
-    Ok(finish(stream, keys))
+    crate::client::boxed(stream_initiator(Box::new(stream), psk, None)).await
 }
 
 pub async fn server_handshake<S>(stream: S, psk: &[u8; 32]) -> Result<Noise>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut stream: BoxStream = Box::new(stream);
-    let (keys, _payload) = run_responder(&mut stream, psk, &[], &[]).await?;
-    Ok(finish(stream, keys))
+    crate::client::boxed(stream_responder(Box::new(stream), psk, &[])).await
 }
 
 /// Run a remote control-port initiator handshake under one credential role.
-pub async fn client_handshake_remote<S>(
-    mut stream: S,
-    psk: &[u8; 32],
-    role: AuthRole,
-) -> Result<Noise>
+pub async fn client_handshake_remote<S>(stream: S, psk: &[u8; 32], role: AuthRole) -> Result<Noise>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -620,25 +622,27 @@ where
         AuthRole::Admin => [0u8; CLIENT_SELECTOR_LEN],
     };
     let preface = role.preface(selector);
-    stream.write_all(&preface).await?;
-    stream.flush().await?;
-    let mut stream: BoxStream = Box::new(stream);
-    let (keys, _payload2) = run_initiator(&mut stream, psk, &preface, &[]).await?;
-    Ok(finish(stream, keys))
+    crate::client::boxed(stream_initiator(Box::new(stream), psk, Some(preface))).await
 }
 
 /// Read the role preface and complete the handshake with that role's configured key.
 pub async fn server_handshake_remote<S>(
-    mut stream: S,
+    stream: S,
     clients: &ClientCredentials,
     admin_psk: Option<&[u8; 32]>,
 ) -> Result<(AuthIdentity, Noise)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut preface = [0u8; REMOTE_PREFACE_LEN];
-    stream.read_exact(&mut preface).await?;
-    let (role, selector) = parse_remote_preface(&preface)?;
+    crate::client::boxed(remote_responder(Box::new(stream), clients, admin_psk)).await
+}
+
+async fn remote_responder(
+    mut stream: BoxStream,
+    clients: &ClientCredentials,
+    admin_psk: Option<&[u8; 32]>,
+) -> Result<(AuthIdentity, Noise)> {
+    let (role, selector, preface) = read_preface(&mut stream).await?;
     let (identity, psk) = match role {
         AuthRole::Client => {
             let (client_id, psk) = clients.get(&selector).ok_or("unknown client credential")?;
@@ -649,9 +653,8 @@ where
             admin_psk.ok_or("remote administration is disabled")?,
         ),
     };
-    let mut stream: BoxStream = Box::new(stream);
-    let (keys, _payload) = run_responder(&mut stream, psk, &preface, &[]).await?;
-    Ok((identity, finish(stream, keys)))
+    let noise = stream_responder(stream, psk, &preface).await?;
+    Ok((identity, noise))
 }
 
 fn finish(stream: BoxStream, keys: Keys) -> Noise {
@@ -904,7 +907,7 @@ where
 /// Like [`client_handshake_stateless_claim`], also returning the responder's
 /// message-2 payload.
 pub async fn client_handshake_stateless_claim_reply<S>(
-    mut stream: S,
+    stream: S,
     credential_psk: &[u8; 32],
     id: u64,
     capability: &crate::proto::Capability,
@@ -913,14 +916,16 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let preface = AuthRole::Client.preface(client_selector(credential_psk));
-    stream.write_all(&preface).await?;
-    stream.flush().await?;
     let mut payload = Vec::with_capacity(8 + crate::proto::CAPABILITY_LEN);
     payload.extend_from_slice(&id.to_be_bytes());
     payload.extend_from_slice(capability);
-    let mut stream: BoxStream = Box::new(stream);
-    let (keys, reply) = run_initiator(&mut stream, credential_psk, &preface, &payload).await?;
-    Ok((StatelessNoise::from_keys(keys), reply))
+    crate::client::boxed(stateless_initiator(
+        Box::new(stream),
+        credential_psk,
+        Some(preface),
+        &payload,
+    ))
+    .await
 }
 
 /// Like [`client_handshake_stateless`], also returning the responder's
@@ -933,10 +938,13 @@ pub async fn client_handshake_stateless_reply<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut stream: BoxStream = Box::new(stream);
-    let (keys, reply) =
-        run_initiator(&mut stream, psk, &STATELESS_PROLOGUE, &id.to_be_bytes()).await?;
-    Ok((StatelessNoise::from_keys(keys), reply))
+    crate::client::boxed(stateless_initiator(
+        Box::new(stream),
+        psk,
+        None,
+        &id.to_be_bytes(),
+    ))
+    .await
 }
 
 /// Responder handshake; returns the peer's `id` and the stateless transport.
@@ -950,8 +958,15 @@ pub async fn server_handshake_stateless<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut stream: BoxStream = Box::new(stream);
-    let (keys, payload) = run_responder(&mut stream, psk, &STATELESS_PROLOGUE, reply).await?;
+    crate::client::boxed(stateless_responder(Box::new(stream), psk, reply)).await
+}
+
+async fn stateless_responder(
+    stream: BoxStream,
+    psk: &[u8; 32],
+    reply: &[u8],
+) -> Result<(u64, StatelessNoise)> {
+    let (_, keys, payload) = respond(stream, psk, &STATELESS_PROLOGUE, reply).await?;
     if payload.len() < 8 {
         return Err("missing stream id in handshake payload".into());
     }
@@ -964,22 +979,27 @@ where
 /// authenticated client id with the claimed `id` and capability. The caller
 /// admits the claim only for the client the credential names.
 pub async fn server_handshake_stateless_claim<S>(
-    mut stream: S,
+    stream: S,
     clients: &ClientCredentials,
     reply: &[u8],
 ) -> Result<(String, u64, crate::proto::Capability, StatelessNoise)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut preface = [0u8; REMOTE_PREFACE_LEN];
-    stream.read_exact(&mut preface).await?;
-    let (role, selector) = parse_remote_preface(&preface)?;
+    crate::client::boxed(claim_responder(Box::new(stream), clients, reply)).await
+}
+
+async fn claim_responder(
+    mut stream: BoxStream,
+    clients: &ClientCredentials,
+    reply: &[u8],
+) -> Result<(String, u64, crate::proto::Capability, StatelessNoise)> {
+    let (role, selector, preface) = read_preface(&mut stream).await?;
     if role != AuthRole::Client {
         return Err("stateless claims require a client credential".into());
     }
     let (client_id, psk) = clients.get(&selector).ok_or("unknown client credential")?;
-    let mut stream: BoxStream = Box::new(stream);
-    let (keys, payload) = run_responder(&mut stream, psk, &preface, reply).await?;
+    let (_, keys, payload) = respond(stream, psk, &preface, reply).await?;
     if payload.len() != 8 + crate::proto::CAPABILITY_LEN {
         return Err("invalid data capability in handshake payload".into());
     }
@@ -1135,8 +1155,8 @@ mod tests {
         let psk = derive_psk("stateless version fixture");
         let (legacy, current) = tokio::io::duplex(8192);
         let legacy_initiator = async {
-            let mut stream: BoxStream = Box::new(legacy);
-            run_initiator(&mut stream, &psk, &[], &7u64.to_be_bytes()).await
+            let stream: BoxStream = Box::new(legacy);
+            initiate(stream, &psk, None, &[], &7u64.to_be_bytes()).await
         };
         let current_responder = server_handshake_stateless(current, &psk, &[]);
         let (legacy_result, current_result) = tokio::join!(legacy_initiator, current_responder);
@@ -1146,8 +1166,8 @@ mod tests {
         let (current, legacy) = tokio::io::duplex(8192);
         let current_initiator = client_handshake_stateless(current, &psk, 7);
         let legacy_responder = async {
-            let mut stream: BoxStream = Box::new(legacy);
-            run_responder(&mut stream, &psk, &[], &[]).await
+            let stream: BoxStream = Box::new(legacy);
+            respond(stream, &psk, &[], &[]).await
         };
         let (current_result, legacy_result) = tokio::join!(current_initiator, legacy_responder);
         assert!(current_result.is_err());
@@ -1248,8 +1268,8 @@ mod tests {
             preface[3] = AuthRole::Client as u8;
             preface[4..].copy_from_slice(&client_selector(&psk));
             prior.write_all(&preface).await?;
-            let mut stream: BoxStream = Box::new(prior);
-            run_initiator(&mut stream, &psk, &preface, &[]).await
+            let stream: BoxStream = Box::new(prior);
+            initiate(stream, &psk, None, &preface, &[]).await
         };
         let current_server = server_handshake_remote(current, &clients, None);
         let (prior_result, current_result) = tokio::join!(prior_client, current_server);
@@ -1313,8 +1333,8 @@ mod tests {
         let admin = async {
             let preface = AuthRole::Admin.preface(client_selector(&psk));
             initiator.write_all(&preface).await?;
-            let mut stream: BoxStream = Box::new(initiator);
-            run_initiator(&mut stream, &psk, &preface, &7u64.to_be_bytes()).await
+            let stream: BoxStream = Box::new(initiator);
+            initiate(stream, &psk, None, &preface, &7u64.to_be_bytes()).await
         };
         let server = server_handshake_stateless_claim(responder, &clients, &[]);
         let (admin, server) = tokio::join!(admin, server);
@@ -1334,8 +1354,8 @@ mod tests {
             let mut payload = Vec::with_capacity(8 + crate::proto::CAPABILITY_LEN);
             payload.extend_from_slice(&7u64.to_be_bytes());
             payload.extend_from_slice(&capability);
-            let mut stream: BoxStream = Box::new(initiator);
-            run_initiator(&mut stream, &psk, &STATELESS_PROLOGUE, &payload).await
+            let stream: BoxStream = Box::new(initiator);
+            initiate(stream, &psk, None, &STATELESS_PROLOGUE, &payload).await
         };
         let server = server_handshake_stateless_claim(responder, &clients, &[]);
         let (legacy, server) = tokio::join!(legacy, server);

@@ -292,7 +292,10 @@ impl PeerSession {
             noise,
             retransmit,
             refused,
-        } = handshake(role, refuse, allow, &mut rx, &mut tx, identity, pair_id).await?;
+        } = crate::client::boxed(handshake(
+            role, refuse, allow, &mut rx, &mut tx, identity, pair_id,
+        ))
+        .await?;
         let noise = Arc::new(noise);
 
         let (out, mut outbox) = mpsc::channel::<Vec<u8>>(SESSION_QUEUE);
@@ -475,12 +478,7 @@ async fn handshake_initiator(
     let mut state = XxHandshake::initiator(&identity.static_private, &prologue)?;
     let frame_one = send_handshake(tx, &state.write_message_one(&[])).await?;
     let mut retry = interval_at(Instant::now() + HANDSHAKE_RETRY, HANDSHAKE_RETRY);
-    let message_two = loop {
-        tokio::select! {
-            _ = retry.tick() => tx.send(&frame_one).await?,
-            message = recv_handshake(rx) => break message?,
-        }
-    };
+    let message_two = exchange(rx, tx, &mut retry, &frame_one, None).await?;
     // Message two's payload carries the refusal a provider can state before
     // it knows who is asking; the verdict repeats it, so only the verdict is
     // acted on.
@@ -500,36 +498,27 @@ async fn handshake_initiator(
     let noise = state.into_transport();
     let mut retry = interval_at(Instant::now() + HANDSHAKE_RETRY, HANDSHAKE_RETRY);
     loop {
-        tokio::select! {
-            _ = retry.tick() => tx.send(&frame_three).await?,
-            message = recv_handshake(rx) => {
-                let message = message?;
-                // A repeat of message two: the provider has not read message
-                // three yet, so send it again.
-                if message == message_two {
-                    tx.send(&frame_three).await?;
-                    continue;
-                }
-                // Anything that is not the sealed verdict is reordered or
-                // stale; the retransmits and the deadline decide the outcome.
-                let Ok(verdict) = noise.open(&message) else {
-                    continue;
-                };
-                return match verdict.split_first() {
-                    Some((&VERDICT_READY, [])) => Ok(Handshaked {
-                        noise,
-                        retransmit: None,
-                        refused: None,
-                    }),
-                    Some((&VERDICT_REFUSED, reason)) => Err(format!(
-                        "the provider refused the pair: {}",
-                        String::from_utf8_lossy(reason)
-                    )
-                    .into()),
-                    _ => Err("invalid peer handshake verdict".into()),
-                };
-            }
-        }
+        // A repeat of message two says the provider has not read message
+        // three yet; anything else that is not the sealed verdict is
+        // reordered or stale, and the retransmits and the deadline decide
+        // the outcome.
+        let message = exchange(rx, tx, &mut retry, &frame_three, Some(&message_two)).await?;
+        let Ok(verdict) = noise.open(&message) else {
+            continue;
+        };
+        return match verdict.split_first() {
+            Some((&VERDICT_READY, [])) => Ok(Handshaked {
+                noise,
+                retransmit: None,
+                refused: None,
+            }),
+            Some((&VERDICT_REFUSED, reason)) => Err(format!(
+                "the provider refused the pair: {}",
+                String::from_utf8_lossy(reason)
+            )
+            .into()),
+            _ => Err("invalid peer handshake verdict".into()),
+        };
     }
 }
 
@@ -563,21 +552,7 @@ async fn handshake_responder(
     }
     let frame_two = send_handshake(tx, &state.write_message_two(refuse)).await?;
     let mut retry = interval_at(Instant::now() + HANDSHAKE_RETRY, HANDSHAKE_RETRY);
-    let message_three = loop {
-        tokio::select! {
-            _ = retry.tick() => tx.send(&frame_two).await?,
-            message = recv_handshake(rx) => {
-                let message = message?;
-                // A repeat of message one: message two was lost on the way,
-                // so send it again.
-                if message == message_one {
-                    tx.send(&frame_two).await?;
-                    continue;
-                }
-                break message;
-            }
-        }
-    };
+    let message_three = exchange(rx, tx, &mut retry, &frame_two, Some(&message_one)).await?;
     if !state.read_message_three(&message_three)?.is_empty() {
         return Err("unexpected payload in peer handshake message three".into());
     }
@@ -622,6 +597,31 @@ async fn handshake_responder(
         }),
         refused: (!refuse.is_empty()).then(|| String::from_utf8_lossy(&refuse).into_owned()),
     })
+}
+
+/// The peer's next handshake message. `frame` goes out again on every
+/// `retry` tick, and whenever the peer repeats `answered`, the message this
+/// frame answers, which says the frame was lost on the way.
+async fn exchange(
+    rx: &mut PathRx,
+    tx: &mut PathTx,
+    retry: &mut tokio::time::Interval,
+    frame: &[u8],
+    answered: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    loop {
+        tokio::select! {
+            _ = retry.tick() => tx.send(frame).await?,
+            message = recv_handshake(rx) => {
+                let message = message?;
+                if Some(message.as_slice()) == answered {
+                    tx.send(frame).await?;
+                    continue;
+                }
+                return Ok(message);
+            }
+        }
+    }
 }
 
 /// The next handshake-class frame the path delivers, stripped of its frame
