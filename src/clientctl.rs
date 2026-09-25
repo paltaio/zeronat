@@ -105,7 +105,7 @@ fn resolve_control_dir(primary: &Path, runtime_dir: Option<&Path>) -> Result<Pat
     };
     let dir = base.join(RUNTIME_SUBDIR);
     create_dir_0700(&dir)
-        .map_err(|e| -> crate::Error { format!("creating {}: {e}", dir.display()).into() })?;
+        .map_err(|e| -> crate::Error { errf!("creating {}: {e}", dir.display()) })?;
     Ok(dir)
 }
 
@@ -215,27 +215,18 @@ impl ControlListener {
                     )
                     .into());
                 }
-                std::fs::remove_file(&path).map_err(|e| -> crate::Error {
-                    format!("removing stale control socket {}: {e}", path.display()).into()
-                })?;
+                std::fs::remove_file(&path)
+                    .map_err(|e| socket_err("removing stale control socket", &path, e))?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(
-                    format!("inspecting control socket path {}: {e}", path.display()).into(),
-                )
-            }
+            Err(e) => return Err(socket_err("inspecting control socket path", &path, e)),
         }
-        let listener = UnixListener::bind(&path).map_err(|e| -> crate::Error {
-            format!("binding control socket {}: {e}", path.display()).into()
-        })?;
+        let listener = UnixListener::bind(&path)
+            .map_err(|e| socket_err("binding control socket", &path, e))?;
         let bound = ControlListener { listener, path };
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bound.path, std::fs::Permissions::from_mode(0o600)).map_err(
-            |e| -> crate::Error {
-                format!("restricting control socket {}: {e}", bound.path.display()).into()
-            },
-        )?;
+        std::fs::set_permissions(&bound.path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| socket_err("restricting control socket", &bound.path, e))?;
         Ok(bound)
     }
 
@@ -266,6 +257,12 @@ impl ControlListener {
     }
 }
 
+/// A `bind` error about the socket at `path`.
+#[inline(never)]
+fn socket_err(what: &str, path: &Path, e: std::io::Error) -> crate::Error {
+    errf!("{what} {}: {e}", path.display())
+}
+
 impl Drop for ControlListener {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -279,7 +276,7 @@ async fn handle(stream: UnixStream, state: &ControlState) -> Result<()> {
     let frame = r.recv().await?;
     let mode = match ClientMsg::decode(&frame)? {
         ClientMsg::ClientAdminHello { version: _, mode } => mode,
-        other => return Err(format!("expected client admin hello, got {other:?}").into()),
+        other => return Err(errf!("expected client admin hello, got {other:?}")),
     };
     match mode {
         0 => {
@@ -292,11 +289,12 @@ async fn handle(stream: UnixStream, state: &ControlState) -> Result<()> {
             w.send(&ClientMsg::MutationResult { ok, msg }.encode())
                 .await?;
         }
-        n => return Err(format!("unknown admin hello mode {n}").into()),
+        n => return Err(errf!("unknown admin hello mode {n}")),
     }
     Ok(())
 }
 
+#[inline(never)]
 fn snapshot(state: &ControlState) -> ClientSnapshotBody {
     let (active, mode, session) = state.active.admin_view();
     ClientSnapshotBody {
@@ -320,231 +318,92 @@ fn snapshot(state: &ControlState) -> ClientSnapshotBody {
 /// though the mutation already applied in memory, so a scripted admin detects
 /// that the on-disk config did not change.
 async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
-    match msg {
-        ClientMsg::SelectServer { name } => {
-            let Some(target) = state.servers.get(&name) else {
-                return (false, format!("no configured server named `{name}`"));
-            };
-            if let Some(msg) = undialable(&target, cfg!(feature = "dht")) {
-                return (false, msg);
-            }
-            // One call updates the target and fires the cancel; the session
-            // body is preserved and comes back up against the new server. An
-            // offline client just re-parks retargeted, nothing is dialed.
-            state.active.switch(target);
-            persist(state, move |cfg| cfg.active = Some(name)).await
+    let after = match apply(state, msg) {
+        Ok(after) => after,
+        Err(reply) => return reply,
+    };
+    let saved = save(state).await;
+    match after {
+        After::Nothing => saved,
+        After::KickIfForwards => {
+            state.active.kick_if_forwards();
+            saved
         }
+        After::ServeForwards => {
+            state.active.serve_forwards();
+            saved
+        }
+        After::PairsLater => match saved {
+            (true, _) => (
+                true,
+                "recorded; peer slots pair while this client runs forwards or sits idle".into(),
+            ),
+            other => other,
+        },
+    }
+}
+
+/// What a mutation does once its config edit is on disk.
+enum After {
+    Nothing,
+    KickIfForwards,
+    ServeForwards,
+    /// The attach is recorded but the slot pairs only under a later body.
+    PairsLater,
+}
+
+/// The parsed config of a file-sourced client, locked for one edit; `None` on
+/// a runtime-only client, whose mutations stay in memory.
+#[inline(never)]
+fn config(state: &ControlState) -> Option<std::sync::MutexGuard<'_, ClientConfig>> {
+    state.persist.as_ref().map(|p| p.cfg.lock().unwrap())
+}
+
+/// The reply a finished, refused or runtime-only mutation answers with, or
+/// what follows the save.
+type Applied = std::result::Result<After, (bool, String)>;
+
+/// Validate one mutation and apply it to the shared state and the parsed
+/// config. `Err` carries the reply of a mutation that is finished, refused or
+/// runtime-only; `Ok` names what follows the save.
+#[inline(never)]
+fn apply(state: &ControlState, msg: ClientMsg) -> Applied {
+    match msg {
+        ClientMsg::SelectServer { name } => select_server(state, name),
         ClientMsg::SetForwardOptions {
             proto,
             port,
             enabled,
             proxy,
             idle_secs,
-        } => {
-            // Mirror the config parser's per-entry rules, so what is applied
-            // here is exactly what the persisted file will parse back.
-            if proxy && proto == Proto::Udp {
-                return (false, "`proxy` is not supported on udp forwards".into());
-            }
-            // Wire 0 clears the idle override; the config value is therefore
-            // never Some(0), which the parser would reject.
-            let idle = if idle_secs == 0 {
-                None
-            } else {
-                Some(Duration::from_secs(u64::from(idle_secs)))
-            };
-            if !state
-                .forwards
-                .set_options(proto, port, enabled, proxy, idle)
-            {
-                return (
-                    false,
-                    format!("no {} forward on port {port}", proto_name(proto)),
-                );
-            }
-            let saved = persist(state, move |cfg| {
-                if let Some(f) = cfg
-                    .forwards
-                    .iter_mut()
-                    .find(|f| f.proto == proto && f.port == port)
-                {
-                    f.enabled = enabled;
-                    f.proxy = proxy;
-                    f.idle = if idle_secs == 0 {
-                        None
-                    } else {
-                        Some(idle_secs)
-                    };
-                }
-            })
-            .await;
-            state.active.kick_if_forwards();
-            saved
-        }
-        ClientMsg::SpawnPppoe { name } => {
-            let Some((_, config)) = state.pppoe.iter().find(|(n, _)| *n == name) else {
-                return (false, format!("no configured pppoe session named `{name}`"));
-            };
-            // Runtime-only: which session runs is never written back.
-            let spawned = state.active.set_mode(RunMode::Pppoe {
-                name,
-                config: config.clone(),
-            });
-            match spawned {
-                Ok(()) => (true, String::new()),
-                Err(e) => (false, e),
-            }
-        }
+        } => set_forward_options(state, proto, port, enabled, proxy, idle_secs),
+        ClientMsg::SpawnPppoe { name } => spawn_pppoe(state, name),
         ClientMsg::StopSession { name } => {
             // Runtime-only, valid only against the running pppoe body; the
             // loop falls back to the derived base mode.
-            if state.active.stop_pppoe(&name, state.base_mode()) {
+            Err(if state.active.stop_pppoe(&name, state.base_mode()) {
                 (true, String::new())
             } else {
                 (false, format!("no active pppoe session named `{name}`"))
-            }
+            })
         }
         ClientMsg::AddServer {
             name,
             addr,
             secret,
             transport,
-        } => {
-            // Mirror the parser and validate plus the checks boot hits at
-            // dial time, so the accepted entry is exactly what the persisted
-            // file parses back to and what the dial loop can use.
-            if name.is_empty() {
-                return (false, "server `name` must not be empty".into());
-            }
-            // The config lexer rejects control characters in strings, so a
-            // value carrying one could never be saved and read back.
-            for (field, value) in [
-                ("name", name.as_str()),
-                ("addr", addr.as_str()),
-                ("secret", secret.0.as_str()),
-            ] {
-                if value.chars().any(char::is_control) {
-                    return (
-                        false,
-                        format!("server `{field}` must not contain control characters"),
-                    );
-                }
-            }
-            let secret = match crate::secret::normalize(&secret.0) {
-                Ok(secret) => ServerSecret(secret),
-                Err(e) => return (false, format!("server {e}")),
-            };
-            if addr == "dht" {
-                // The admin message carries no discovery credential, so a dht
-                // profile added here could never resolve.
-                return (
-                    false,
-                    "a dht profile needs a `discovery` credential; declare it in the config file"
-                        .into(),
-                );
-            }
-            if !valid_host_port(&addr) {
-                return (false, format!("addr must be host:port, got `{addr}`"));
-            }
-            // The boot validation rejects a file where any secret doubles as a
-            // `discovery` credential; a profile persisted past that rule would
-            // keep the daemon down on the next start.
-            match crate::secret::decode(&secret.0) {
-                Ok(key) => {
-                    if let Some(owner) = state.servers.discovery_owner(&key) {
-                        return (
-                            false,
-                            format!(
-                                "secret matches the `discovery` credential of server `{owner}`"
-                            ),
-                        );
-                    }
-                }
-                Err(e) => return (false, format!("server {e}")),
-            }
-            let target = ServerTarget {
-                name: name.clone(),
-                addr: addr.clone(),
-                secret: secret.0.clone(),
-                credential: secret.0.clone(),
-                discovery: None,
-                transport,
-            };
-            // Name uniqueness also protects the empty-name `Connect` sentinel.
-            if !state.servers.add(target) {
-                return (false, format!("a server named `{name}` already exists"));
-            }
-            persist(state, move |cfg| {
-                cfg.servers.push(CfgServer {
-                    name,
-                    addr,
-                    seed: None,
-                    credential: secret.clone(),
-                    secret,
-                    discovery: None,
-                    transport,
-                })
-            })
-            .await
-        }
-        ClientMsg::RemoveServer { name } => {
-            // The active profile is the one the loop is running or about to
-            // dial (offline included); removing it would strand the runtime
-            // target and, on a file-sourced client, save a config whose
-            // `active` names no entry.
-            if state.active.admin_view().0 == name {
-                return (
-                    false,
-                    format!("`{name}` is the active server; select another first"),
-                );
-            }
-            if !state.servers.remove(&name) {
-                return (false, format!("no configured server named `{name}`"));
-            }
-            persist(state, move |cfg| cfg.servers.retain(|s| s.name != name)).await
-        }
-        ClientMsg::Connect { name } => {
-            // An empty name means the current active target, resolved before
-            // any server-list lookup; a named connect must name a profile.
-            let target = if name.is_empty() {
-                None
-            } else {
-                match state.servers.get(&name) {
-                    Some(t) => Some(t),
-                    None => return (false, format!("no configured server named `{name}`")),
-                }
-            };
-            if let Some(t) = &target {
-                if let Some(msg) = undialable(t, cfg!(feature = "dht")) {
-                    return (false, msg);
-                }
-            }
-            let named = target.is_some();
-            match state.active.connect(target, state.boot_mode()) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return (
-                        false,
-                        "a session is already up; select-server retargets a running client".into(),
-                    )
-                }
-                Err(e) => return (false, e),
-            }
-            if named {
-                persist(state, move |cfg| cfg.active = Some(name)).await
-            } else {
-                (true, String::new())
-            }
-        }
+        } => add_server(state, name, addr, secret, transport),
+        ClientMsg::RemoveServer { name } => remove_server(state, name),
+        ClientMsg::Connect { name } => connect(state, name),
         ClientMsg::Disconnect => {
             // Runtime-only, like SpawnPppoe: the offline park is never
             // persisted, so a reboot comes back serving what the file
             // declares.
-            if state.active.disconnect() {
+            Err(if state.active.disconnect() {
                 (true, String::new())
             } else {
                 (false, "already offline".into())
-            }
+            })
         }
         ClientMsg::AddForward {
             proto,
@@ -553,87 +412,8 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
             proxy,
             idle_secs,
             enabled,
-        } => {
-            // The empty target is the wire's config-default sentinel; resolve
-            // it before validation and persistence, exactly as the config
-            // parser fills a missing `target` key.
-            let target = if target.is_empty() {
-                format!("127.0.0.1:{port}")
-            } else {
-                target
-            };
-            // Mirror the parser and validate, so the applied entry is exactly
-            // what the persisted file parses back to.
-            if proxy && proto == Proto::Udp {
-                return (false, "`proxy` is not supported on udp forwards".into());
-            }
-            if !valid_host_port(&target) {
-                return (false, format!("target must be host:port, got `{target}`"));
-            }
-            // The config lexer rejects control characters in strings, so a
-            // value carrying one could never be saved and read back.
-            if target.chars().any(char::is_control) {
-                return (
-                    false,
-                    "forward `target` must not contain control characters".into(),
-                );
-            }
-            // A device-bound client cannot serve forwards, and validate
-            // refuses the combination, so persisting it would save a file
-            // boot rejects.
-            if matches!(state.fallback_mode, RunMode::Device(_)) {
-                return (false, "[tap]/[tun] cannot be combined with forwards".into());
-            }
-            // Wire 0 means no idle override; the config value is therefore
-            // never Some(0), which the parser would reject.
-            let idle = (idle_secs != 0).then(|| Duration::from_secs(u64::from(idle_secs)));
-            let fwd = Forward {
-                port,
-                target: target.clone(),
-                proxy,
-                idle,
-                enabled,
-            };
-            if !state.forwards.add(proto, fwd) {
-                return (
-                    false,
-                    format!(
-                        "a {} forward on port {port} already exists",
-                        proto_name(proto)
-                    ),
-                );
-            }
-            let saved = persist(state, move |cfg| {
-                cfg.forwards.push(CfgForward {
-                    proto,
-                    port,
-                    target,
-                    proxy,
-                    idle: (idle_secs != 0).then_some(idle_secs),
-                    enabled,
-                })
-            })
-            .await;
-            state.active.serve_forwards();
-            saved
-        }
-        ClientMsg::RemoveForward { proto, port } => {
-            if !state.forwards.remove(proto, port) {
-                return (
-                    false,
-                    format!("no {} forward on port {port}", proto_name(proto)),
-                );
-            }
-            let saved = persist(state, move |cfg| {
-                cfg.forwards
-                    .retain(|f| !(f.proto == proto && f.port == port))
-            })
-            .await;
-            // Never demotes the mode: removing the last forward leaves a live
-            // forwards body running as the bare control session.
-            state.active.kick_if_forwards();
-            saved
-        }
+        } => add_forward(state, proto, port, target, proxy, idle_secs, enabled),
+        ClientMsg::RemoveForward { proto, port } => remove_forward(state, proto, port),
         ClientMsg::AttachPeer {
             peer_id,
             want,
@@ -641,160 +421,482 @@ async fn mutate(state: &ControlState, msg: ClientMsg) -> (bool, String) {
             exit,
             exit_strict,
             iface,
-        } => {
-            // The config lexer rejects control characters in strings, so a
-            // value carrying one could never be saved and read back.
-            for (field, value) in [
-                ("peer", peer_id.as_str()),
-                ("dev", dev.as_str()),
-                ("iface", iface.as_str()),
-            ] {
-                if value.chars().any(char::is_control) {
-                    return (
-                        false,
-                        format!("peer `{field}` must not contain control characters"),
-                    );
-                }
-            }
-            // A slot cannot handshake without the static key, and persisting
-            // one would save a file boot rejects.
-            if !state.has_peer_secret {
-                return (
-                    false,
-                    "[client] peer_secret is required before a peer slot can attach".into(),
-                );
-            }
-            let consumer = !peer_id.is_empty();
-            // One `[tun]` table describes one L3 adapter, so a client whose
-            // device body is a tun has no table left for a consumer slot and
-            // persisting one would save a file boot rejects.
-            if consumer && matches!(state.fallback_mode, RunMode::Device(DeviceConfig::Tun(_))) {
-                return (
-                    false,
-                    "[tun] feeds this client's server slot, so it has no table left for a consumer"
-                        .into(),
-                );
-            }
-            if let Err(msg) = attach_fields(&peer_id, want, &dev, exit, exit_strict, &iface) {
-                return (false, msg);
-            }
-            // The slot is derived from the records this attach saves, so the
-            // file it writes parses back to the slot it attached.
-            let (tun, peer) = if consumer {
-                (
-                    Some(CfgTun {
-                        dev: (!dev.is_empty()).then_some(dev),
-                        address: None,
-                        exit,
-                        exit_strict,
-                        exit_via: Some(peer_id),
-                    }),
-                    None,
-                )
-            } else {
-                let mut record = CfgPeer::default();
-                // The allowlist is operator config, not an attach field: the
-                // slot takes it from the saved `[peer]` table, and a provider
-                // no consumer may use is refused here as boot refuses it.
-                if let Some(p) = &state.persist {
-                    let cfg = p.cfg.lock().unwrap();
-                    if let Some(saved) = &cfg.peer {
-                        record.allow = saved.allow.clone();
-                    }
-                }
-                // The key a provider's capability writes, matched exhaustively
-                // so no undefined bit is filed under a defined one.
-                match want {
-                    PROVIDES_EXIT => {
-                        record.exit = true;
-                        record.exit_iface = (!iface.is_empty()).then_some(iface);
-                    }
-                    PROVIDES_SEGMENT => record.segment = Some(iface),
-                    n => return (false, format!("unknown peer capability byte {n}")),
-                }
-                (None, Some(record))
-            };
-            let slots = match crate::client::peer_slots(tun.as_ref(), peer.as_ref()) {
-                Ok(slots) => slots,
-                Err(e) => return (false, e.to_string()),
-            };
-            // One record declares one slot.
-            let Ok([spec]) = <[_; 1]>::try_from(slots) else {
-                return (false, "an attach declares exactly one slot".into());
-            };
-            // Admission runs under the lock that swaps the session body, so a
-            // slot contending with what is running is answered as a refusal and
-            // nothing is torn down. It is admitted against the boot body too:
-            // that one claims its device at the next start whatever runs now.
-            if let Err(msg) = state.active.attach_peer(spec, &state.boot_mode()) {
-                return (false, msg);
-            }
-            // Slots pair under a forwards or idle body; under any other one the
-            // attach is a record that takes effect when such a body runs.
-            let pairs = matches!(
-                state.active.admin_view().1,
-                SessionMode::Forwards | SessionMode::Idle
-            );
-            let saved = persist(state, move |cfg| {
-                if let Some(tun) = tun {
-                    cfg.tun = Some(tun);
-                }
-                if let Some(peer) = peer {
-                    let saved = cfg.peer.get_or_insert_with(CfgPeer::default);
-                    if peer.exit {
-                        saved.exit = true;
-                        saved.exit_iface = peer.exit_iface;
-                    }
-                    if peer.segment.is_some() {
-                        saved.segment = peer.segment;
-                    }
-                }
-            })
-            .await;
-            match saved {
-                (true, _) if !pairs => (
-                    true,
-                    "recorded; peer slots pair while this client runs forwards or sits idle".into(),
-                ),
-                other => other,
-            }
-        }
-        ClientMsg::DetachPeer { peer_id, want } => {
-            // The key a provider's capability clears, matched exhaustively so
-            // no undefined bit clears a defined one's record.
-            let clear: fn(&mut CfgPeer) = match want {
-                PROVIDES_EXIT => |peer| {
-                    peer.exit = false;
-                    peer.exit_iface = None;
-                },
-                PROVIDES_SEGMENT => |peer| peer.segment = None,
-                n => return (false, format!("unknown peer capability byte {n}")),
-            };
-            if !state.active.detach_peer(&peer_id, want) {
-                return (
-                    false,
-                    format!(
-                        "no attached {}",
-                        crate::peerslot::slot_label(&peer_id, want)
-                    ),
-                );
-            }
-            persist(state, move |cfg| {
-                if peer_id.is_empty() {
-                    let Some(peer) = &mut cfg.peer else { return };
-                    clear(peer);
-                    // A `[peer]` table declaring no provider declares nothing.
-                    if *peer == CfgPeer::default() {
-                        cfg.peer = None;
-                    }
-                } else {
-                    cfg.tun = None;
-                }
-            })
-            .await
-        }
-        other => (false, format!("expected a mutation, got {other:?}")),
+        } => attach_peer(state, peer_id, want, dev, exit, exit_strict, iface),
+        ClientMsg::DetachPeer { peer_id, want } => detach_peer(state, peer_id, want),
+        other => Err((false, format!("expected a mutation, got {other:?}"))),
     }
+}
+
+#[inline(never)]
+fn select_server(state: &ControlState, name: String) -> Applied {
+    let Some(target) = state.servers.get(&name) else {
+        return Err((false, format!("no configured server named `{name}`")));
+    };
+    if let Some(msg) = undialable(&target, cfg!(feature = "dht")) {
+        return Err((false, msg));
+    }
+    // One call updates the target and fires the cancel; the session
+    // body is preserved and comes back up against the new server. An
+    // offline client just re-parks retargeted, nothing is dialed.
+    state.active.switch(target);
+    if let Some(mut cfg) = config(state) {
+        cfg.active = Some(name);
+    }
+    Ok(After::Nothing)
+}
+
+#[inline(never)]
+fn set_forward_options(
+    state: &ControlState,
+    proto: Proto,
+    port: u16,
+    enabled: bool,
+    proxy: bool,
+    idle_secs: u32,
+) -> Applied {
+    // Mirror the config parser's per-entry rules, so what is applied
+    // here is exactly what the persisted file will parse back.
+    if proxy && proto == Proto::Udp {
+        return Err((false, "`proxy` is not supported on udp forwards".into()));
+    }
+    // Wire 0 clears the idle override; the config value is therefore
+    // never Some(0), which the parser would reject.
+    let idle = if idle_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(u64::from(idle_secs)))
+    };
+    if !state
+        .forwards
+        .set_options(proto, port, enabled, proxy, idle)
+    {
+        return Err((
+            false,
+            format!("no {} forward on port {port}", proto_name(proto)),
+        ));
+    }
+    if let Some(mut cfg) = config(state) {
+        if let Some(f) = cfg
+            .forwards
+            .iter_mut()
+            .find(|f| f.proto == proto && f.port == port)
+        {
+            f.enabled = enabled;
+            f.proxy = proxy;
+            f.idle = if idle_secs == 0 {
+                None
+            } else {
+                Some(idle_secs)
+            };
+        }
+    }
+    Ok(After::KickIfForwards)
+}
+
+#[inline(never)]
+fn spawn_pppoe(state: &ControlState, name: String) -> Applied {
+    let Some((_, config)) = state.pppoe.iter().find(|(n, _)| *n == name) else {
+        return Err((false, format!("no configured pppoe session named `{name}`")));
+    };
+    // Runtime-only: which session runs is never written back.
+    let spawned = state.active.set_mode(RunMode::Pppoe {
+        name,
+        config: config.clone(),
+    });
+    Err(match spawned {
+        Ok(()) => (true, String::new()),
+        Err(e) => (false, e),
+    })
+}
+
+#[inline(never)]
+fn add_server(
+    state: &ControlState,
+    name: String,
+    addr: String,
+    secret: ServerSecret,
+    transport: crate::client::Transport,
+) -> Applied {
+    // Mirror the parser and validate plus the checks boot hits at
+    // dial time, so the accepted entry is exactly what the persisted
+    // file parses back to and what the dial loop can use.
+    if name.is_empty() {
+        return Err((false, "server `name` must not be empty".into()));
+    }
+    // The config lexer rejects control characters in strings, so a
+    // value carrying one could never be saved and read back.
+    for (field, value) in [
+        ("name", name.as_str()),
+        ("addr", addr.as_str()),
+        ("secret", secret.0.as_str()),
+    ] {
+        if value.chars().any(char::is_control) {
+            return Err((
+                false,
+                format!("server `{field}` must not contain control characters"),
+            ));
+        }
+    }
+    let secret = match crate::secret::normalize(&secret.0) {
+        Ok(secret) => ServerSecret(secret),
+        Err(e) => return Err((false, format!("server {e}"))),
+    };
+    if addr == "dht" {
+        // The admin message carries no discovery credential, so a dht
+        // profile added here could never resolve.
+        return Err((
+            false,
+            "a dht profile needs a `discovery` credential; declare it in the config file".into(),
+        ));
+    }
+    if !valid_host_port(&addr) {
+        return Err((false, format!("addr must be host:port, got `{addr}`")));
+    }
+    // The boot validation rejects a file where any secret doubles as a
+    // `discovery` credential; a profile persisted past that rule would
+    // keep the daemon down on the next start.
+    match crate::secret::decode(&secret.0) {
+        Ok(key) => {
+            if let Some(owner) = state.servers.discovery_owner(&key) {
+                return Err((
+                    false,
+                    format!("secret matches the `discovery` credential of server `{owner}`"),
+                ));
+            }
+        }
+        Err(e) => return Err((false, format!("server {e}"))),
+    }
+    let target = ServerTarget {
+        name: name.clone(),
+        addr: addr.clone(),
+        secret: secret.0.clone(),
+        credential: secret.0.clone(),
+        discovery: None,
+        transport,
+    };
+    // Name uniqueness also protects the empty-name `Connect` sentinel.
+    if !state.servers.add(target) {
+        return Err((false, format!("a server named `{name}` already exists")));
+    }
+    if let Some(mut cfg) = config(state) {
+        cfg.servers.push(CfgServer {
+            name,
+            addr,
+            seed: None,
+            credential: secret.clone(),
+            secret,
+            discovery: None,
+            transport,
+        });
+    }
+    Ok(After::Nothing)
+}
+
+#[inline(never)]
+fn remove_server(state: &ControlState, name: String) -> Applied {
+    // The active profile is the one the loop is running or about to
+    // dial (offline included); removing it would strand the runtime
+    // target and, on a file-sourced client, save a config whose
+    // `active` names no entry.
+    if state.active.admin_view().0 == name {
+        return Err((
+            false,
+            format!("`{name}` is the active server; select another first"),
+        ));
+    }
+    if !state.servers.remove(&name) {
+        return Err((false, format!("no configured server named `{name}`")));
+    }
+    if let Some(mut cfg) = config(state) {
+        cfg.servers.retain(|s| s.name != name);
+    }
+    Ok(After::Nothing)
+}
+
+#[inline(never)]
+fn connect(state: &ControlState, name: String) -> Applied {
+    // An empty name means the current active target, resolved before
+    // any server-list lookup; a named connect must name a profile.
+    let target = if name.is_empty() {
+        None
+    } else {
+        match state.servers.get(&name) {
+            Some(t) => Some(t),
+            None => return Err((false, format!("no configured server named `{name}`"))),
+        }
+    };
+    if let Some(t) = &target {
+        if let Some(msg) = undialable(t, cfg!(feature = "dht")) {
+            return Err((false, msg));
+        }
+    }
+    let named = target.is_some();
+    match state.active.connect(target, state.boot_mode()) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err((
+                false,
+                "a session is already up; select-server retargets a running client".into(),
+            ))
+        }
+        Err(e) => return Err((false, e)),
+    }
+    if !named {
+        return Err((true, String::new()));
+    }
+    if let Some(mut cfg) = config(state) {
+        cfg.active = Some(name);
+    }
+    Ok(After::Nothing)
+}
+
+#[inline(never)]
+fn add_forward(
+    state: &ControlState,
+    proto: Proto,
+    port: u16,
+    target: String,
+    proxy: bool,
+    idle_secs: u32,
+    enabled: bool,
+) -> Applied {
+    // The empty target is the wire's config-default sentinel; resolve
+    // it before validation and persistence, exactly as the config
+    // parser fills a missing `target` key.
+    let target = if target.is_empty() {
+        format!("127.0.0.1:{port}")
+    } else {
+        target
+    };
+    // Mirror the parser and validate, so the applied entry is exactly
+    // what the persisted file parses back to.
+    if proxy && proto == Proto::Udp {
+        return Err((false, "`proxy` is not supported on udp forwards".into()));
+    }
+    if !valid_host_port(&target) {
+        return Err((false, format!("target must be host:port, got `{target}`")));
+    }
+    // The config lexer rejects control characters in strings, so a
+    // value carrying one could never be saved and read back.
+    if target.chars().any(char::is_control) {
+        return Err((
+            false,
+            "forward `target` must not contain control characters".into(),
+        ));
+    }
+    // A device-bound client cannot serve forwards, and validate
+    // refuses the combination, so persisting it would save a file
+    // boot rejects.
+    if matches!(state.fallback_mode, RunMode::Device(_)) {
+        return Err((false, "[tap]/[tun] cannot be combined with forwards".into()));
+    }
+    // Wire 0 means no idle override; the config value is therefore
+    // never Some(0), which the parser would reject.
+    let idle = (idle_secs != 0).then(|| Duration::from_secs(u64::from(idle_secs)));
+    let fwd = Forward {
+        port,
+        target: target.clone(),
+        proxy,
+        idle,
+        enabled,
+    };
+    if !state.forwards.add(proto, fwd) {
+        return Err((
+            false,
+            format!(
+                "a {} forward on port {port} already exists",
+                proto_name(proto)
+            ),
+        ));
+    }
+    if let Some(mut cfg) = config(state) {
+        cfg.forwards.push(CfgForward {
+            proto,
+            port,
+            target,
+            proxy,
+            idle: (idle_secs != 0).then_some(idle_secs),
+            enabled,
+        });
+    }
+    Ok(After::ServeForwards)
+}
+
+#[inline(never)]
+fn remove_forward(state: &ControlState, proto: Proto, port: u16) -> Applied {
+    if !state.forwards.remove(proto, port) {
+        return Err((
+            false,
+            format!("no {} forward on port {port}", proto_name(proto)),
+        ));
+    }
+    if let Some(mut cfg) = config(state) {
+        cfg.forwards
+            .retain(|f| !(f.proto == proto && f.port == port));
+    }
+    // Never demotes the mode: removing the last forward leaves a live
+    // forwards body running as the bare control session.
+    Ok(After::KickIfForwards)
+}
+
+#[inline(never)]
+fn attach_peer(
+    state: &ControlState,
+    peer_id: String,
+    want: u8,
+    dev: String,
+    exit: bool,
+    exit_strict: bool,
+    iface: String,
+) -> Applied {
+    // The config lexer rejects control characters in strings, so a
+    // value carrying one could never be saved and read back.
+    for (field, value) in [
+        ("peer", peer_id.as_str()),
+        ("dev", dev.as_str()),
+        ("iface", iface.as_str()),
+    ] {
+        if value.chars().any(char::is_control) {
+            return Err((
+                false,
+                format!("peer `{field}` must not contain control characters"),
+            ));
+        }
+    }
+    // A slot cannot handshake without the static key, and persisting
+    // one would save a file boot rejects.
+    if !state.has_peer_secret {
+        return Err((
+            false,
+            "[client] peer_secret is required before a peer slot can attach".into(),
+        ));
+    }
+    let consumer = !peer_id.is_empty();
+    // One `[tun]` table describes one L3 adapter, so a client whose
+    // device body is a tun has no table left for a consumer slot and
+    // persisting one would save a file boot rejects.
+    if consumer && matches!(state.fallback_mode, RunMode::Device(DeviceConfig::Tun(_))) {
+        return Err((
+            false,
+            "[tun] feeds this client's server slot, so it has no table left for a consumer".into(),
+        ));
+    }
+    if let Err(msg) = attach_fields(&peer_id, want, &dev, exit, exit_strict, &iface) {
+        return Err((false, msg));
+    }
+    // The slot is derived from the records this attach saves, so the
+    // file it writes parses back to the slot it attached.
+    let (tun, peer) = if consumer {
+        (
+            Some(CfgTun {
+                dev: (!dev.is_empty()).then_some(dev),
+                address: None,
+                exit,
+                exit_strict,
+                exit_via: Some(peer_id),
+            }),
+            None,
+        )
+    } else {
+        let mut record = CfgPeer::default();
+        // The allowlist is operator config, not an attach field: the
+        // slot takes it from the saved `[peer]` table, and a provider
+        // no consumer may use is refused here as boot refuses it.
+        if let Some(cfg) = config(state) {
+            if let Some(saved) = &cfg.peer {
+                record.allow = saved.allow.clone();
+            }
+        }
+        // The key a provider's capability writes, matched exhaustively
+        // so no undefined bit is filed under a defined one.
+        match want {
+            PROVIDES_EXIT => {
+                record.exit = true;
+                record.exit_iface = (!iface.is_empty()).then_some(iface);
+            }
+            PROVIDES_SEGMENT => record.segment = Some(iface),
+            n => return Err((false, format!("unknown peer capability byte {n}"))),
+        }
+        (None, Some(record))
+    };
+    let slots = match crate::client::peer_slots(tun.as_ref(), peer.as_ref()) {
+        Ok(slots) => slots,
+        Err(e) => return Err((false, e.to_string())),
+    };
+    // One record declares one slot.
+    let Ok([spec]) = <[_; 1]>::try_from(slots) else {
+        return Err((false, "an attach declares exactly one slot".into()));
+    };
+    // Admission runs under the lock that swaps the session body, so a
+    // slot contending with what is running is answered as a refusal and
+    // nothing is torn down. It is admitted against the boot body too:
+    // that one claims its device at the next start whatever runs now.
+    if let Err(msg) = state.active.attach_peer(spec, &state.boot_mode()) {
+        return Err((false, msg));
+    }
+    // Slots pair under a forwards or idle body; under any other one the
+    // attach is a record that takes effect when such a body runs.
+    let pairs = matches!(
+        state.active.admin_view().1,
+        SessionMode::Forwards | SessionMode::Idle
+    );
+    if let Some(mut cfg) = config(state) {
+        if let Some(tun) = tun {
+            cfg.tun = Some(tun);
+        }
+        if let Some(peer) = peer {
+            let saved = cfg.peer.get_or_insert_with(CfgPeer::default);
+            if peer.exit {
+                saved.exit = true;
+                saved.exit_iface = peer.exit_iface;
+            }
+            if peer.segment.is_some() {
+                saved.segment = peer.segment;
+            }
+        }
+    }
+    Ok(if pairs {
+        After::Nothing
+    } else {
+        After::PairsLater
+    })
+}
+
+#[inline(never)]
+fn detach_peer(state: &ControlState, peer_id: String, want: u8) -> Applied {
+    // The key a provider's capability clears, matched exhaustively so
+    // no undefined bit clears a defined one's record.
+    let clear: fn(&mut CfgPeer) = match want {
+        PROVIDES_EXIT => |peer| {
+            peer.exit = false;
+            peer.exit_iface = None;
+        },
+        PROVIDES_SEGMENT => |peer| peer.segment = None,
+        n => return Err((false, format!("unknown peer capability byte {n}"))),
+    };
+    if !state.active.detach_peer(&peer_id, want) {
+        return Err((
+            false,
+            format!(
+                "no attached {}",
+                crate::peerslot::slot_label(&peer_id, want)
+            ),
+        ));
+    }
+    if let Some(mut cfg) = config(state) {
+        if peer_id.is_empty() {
+            if let Some(peer) = &mut cfg.peer {
+                clear(peer);
+                // A `[peer]` table declaring no provider declares nothing.
+                if *peer == CfgPeer::default() {
+                    cfg.peer = None;
+                }
+            }
+        } else {
+            cfg.tun = None;
+        }
+    }
+    Ok(After::Nothing)
 }
 
 /// The fields an `AttachPeer` may carry for the role it names. Keys that
@@ -876,19 +978,15 @@ fn valid_host_port(addr: &str) -> bool {
     }
 }
 
-/// Persist an applied mutation on a file-sourced client: edit the parsed
-/// config, then rewrite the file crash-safely off the runtime threads. The
-/// blocking task serializes under the write gate, so a save that outlives its
-/// exchange can neither reorder renames nor write a stale config. A
-/// runtime-only client returns success without touching any file.
-async fn persist(state: &ControlState, edit: impl FnOnce(&mut ClientConfig)) -> (bool, String) {
+/// Rewrite the config file of a file-sourced client crash-safely off the
+/// runtime threads. The blocking task serializes under the write gate, so a
+/// save that outlives its exchange can neither reorder renames nor write a
+/// stale config. A runtime-only client returns success without touching any
+/// file.
+async fn save(state: &ControlState) -> (bool, String) {
     let Some(p) = &state.persist else {
         return (true, String::new());
     };
-    {
-        let mut cfg = p.cfg.lock().unwrap();
-        edit(&mut cfg);
-    }
     let path = p.path.clone();
     let cfg = p.cfg.clone();
     let write = p.write.clone();

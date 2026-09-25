@@ -350,7 +350,9 @@ impl SharedForwards {
                 });
             }
         }
-        out.sort_by_key(|e| (e.proto == Proto::Udp, e.port));
+        let key = |e: &ClientForwardEntry| (e.proto == Proto::Udp, e.port);
+        let idx = crate::admin::order(out.len(), &mut |a, b| key(&out[a]) < key(&out[b]));
+        crate::admin::permute(&idx, &mut |i, j| out.swap(i, j));
         out
     }
 }
@@ -515,14 +517,12 @@ impl Discovery {
             Discovery::Static(s) => Ok(s.clone()),
             #[cfg(feature = "dht")]
             Discovery::Dht(id) => {
-                if let Some(addr) = crate::dht::read_cache(id) {
-                    return Ok(addr.to_string());
+                if let Some(addr) = cached_addr(id) {
+                    return Ok(addr);
                 }
                 crate::elog!("resolving server address via dht...");
                 let addr = crate::dht::resolve(id).await?;
-                crate::elog!("dht: resolved server to {addr}");
-                crate::dht::write_cache(id, addr);
-                Ok(addr.to_string())
+                Ok(remember_addr(id, addr))
             }
         }
     }
@@ -535,6 +535,22 @@ impl Discovery {
             crate::dht::clear_cache(id);
         }
     }
+}
+
+/// The cached address of a dht profile, as a dial target.
+#[cfg(feature = "dht")]
+#[inline(never)]
+fn cached_addr(id: &crate::dht::Identity) -> Option<String> {
+    crate::dht::read_cache(id).map(|addr| addr.to_string())
+}
+
+/// Cache a resolved dht address and return it as a dial target.
+#[cfg(feature = "dht")]
+#[inline(never)]
+fn remember_addr(id: &crate::dht::Identity, addr: SocketAddr) -> String {
+    crate::elog!("dht: resolved server to {addr}");
+    crate::dht::write_cache(id, addr);
+    addr.to_string()
 }
 
 /// One dialable server profile: address (`"dht"` or `host:port`), the secrets
@@ -658,6 +674,7 @@ struct DialMemo(HashMap<(String, String, String, String, Option<String>), DialSt
 impl DialMemo {
     /// Drop entries whose profile is gone, keeping the active target's, so
     /// remove/add cycles cannot grow the memo past the configured set.
+    #[inline(never)]
     fn prune(&mut self, servers: &SharedServers, active: &ServerTarget) {
         self.0
             .retain(|(name, addr, secret, credential, discovery), _| {
@@ -670,6 +687,7 @@ impl DialMemo {
             });
     }
 
+    #[inline(never)]
     fn state(&mut self, target: &ServerTarget) -> Result<&mut DialState> {
         let key = (
             target.name.clone(),
@@ -713,6 +731,7 @@ pub struct ClientTun {
 impl ClientTun {
     /// The concrete device config for a bringup against `secret`'s server.
     #[cfg(any(test, target_os = "linux"))]
+    #[inline(never)]
     fn resolve(&self, secret: &str) -> crate::tap::TunConfig {
         let (addr, prefix_len) = self.address.unwrap_or_else(|| {
             let base = crate::identity::derive_tun_subnet(secret);
@@ -756,6 +775,7 @@ pub enum RunMode {
 /// forward is declared (enabled or not), else `fallback`. Boot, `Connect`,
 /// and `StopSession` all derive through here at use, so the body each
 /// installs tracks runtime forward edits.
+#[inline(never)]
 pub(crate) fn derive_mode(forwards: &SharedForwards, fallback: &RunMode) -> RunMode {
     if forwards.any_declared() {
         RunMode::Forwards
@@ -1004,6 +1024,7 @@ struct ActiveState {
 }
 
 impl ActiveTarget {
+    #[inline(never)]
     pub fn new(target: ServerTarget) -> Self {
         ActiveTarget {
             state: Arc::new(std::sync::Mutex::new(ActiveState {
@@ -1058,6 +1079,7 @@ impl ActiveTarget {
     /// forwards body claims nothing while the boot one still opens its device
     /// at the next start, and an accepted attach is persisted. A refused attach
     /// changes nothing.
+    #[inline(never)]
     pub fn attach_peer(
         &self,
         spec: PeerSlotSpec,
@@ -1100,6 +1122,7 @@ impl ActiveTarget {
 
     /// Remove the peer slot `peer_id` and `want` name, firing the cancel that
     /// tears it down; `false` (and no cancel) when no slot answers to them.
+    #[inline(never)]
     pub fn detach_peer(&self, peer_id: &str, want: u8) -> bool {
         let mut s = self.state.lock().unwrap();
         let before = s.peers.len();
@@ -1118,6 +1141,7 @@ impl ActiveTarget {
     /// in-flight session task, awaits its teardown, and brings the same body up
     /// against the new target; the brief link drop is inherent to the
     /// teardown-then-bringup.
+    #[inline(never)]
     pub fn switch(&self, target: ServerTarget) {
         let mut s = self.state.lock().unwrap();
         s.target = target;
@@ -1128,6 +1152,7 @@ impl ActiveTarget {
     /// running body down and brings the new one up against the same target. A
     /// body whose device or default route a peer slot holds is refused and
     /// nothing is torn down.
+    #[inline(never)]
     pub fn set_mode(&self, mode: RunMode) -> std::result::Result<(), String> {
         let mut s = self.state.lock().unwrap();
         s.claims.admit(&mode.claims())?;
@@ -1139,6 +1164,7 @@ impl ActiveTarget {
     /// Park the client offline: replace the session body with the offline
     /// park and fire the cancel so the loop tears the running body down.
     /// `false` (and no cancel) when already offline.
+    #[inline(never)]
     pub fn disconnect(&self) -> bool {
         let mut s = self.state.lock().unwrap();
         if matches!(s.mode, RunMode::Offline) {
@@ -1152,6 +1178,7 @@ impl ActiveTarget {
     /// Leave the park and install `boot`, retargeting first when `target` is
     /// set. `Ok(false)` (and no change) while a session body is up: connecting
     /// is the park's exit, never a retarget of a live session.
+    #[inline(never)]
     pub fn connect(
         &self,
         target: Option<ServerTarget>,
@@ -1172,6 +1199,7 @@ impl ActiveTarget {
 
     /// Stop the named pppoe session, falling back to `base`. Fires the cancel
     /// only when that session is the active body; returns whether it did.
+    #[inline(never)]
     pub fn stop_pppoe(&self, name: &str, base: RunMode) -> bool {
         let mut s = self.state.lock().unwrap();
         match &s.mode {
@@ -1191,6 +1219,7 @@ impl ActiveTarget {
     /// the redial re-announces the new entry. Any other body, the offline
     /// park included, is left untouched; the forward lands at the next
     /// forwards bringup.
+    #[inline(never)]
     pub fn serve_forwards(&self) {
         let mut s = self.state.lock().unwrap();
         match s.mode {
@@ -1207,6 +1236,7 @@ impl ActiveTarget {
     /// options. A no-op in any other mode: an option edit must not drop an
     /// unrelated pppoe or device body, and the next forwards bringup reads the
     /// updated set anyway.
+    #[inline(never)]
     pub fn kick_if_forwards(&self) {
         let s = self.state.lock().unwrap();
         if matches!(s.mode, RunMode::Forwards) {
@@ -1217,6 +1247,7 @@ impl ActiveTarget {
     /// Snapshot the target, body, and peer slots to bring up and install a
     /// fresh cancel scoped to them. A mutation racing this call lands its
     /// permit on the fresh cancel, so a switch is never lost between profiles.
+    #[inline(never)]
     fn begin(&self) -> (ServerTarget, RunMode, Arc<Notify>, Vec<PeerSlot>) {
         let mut s = self.state.lock().unwrap();
         s.cancel = Arc::new(Notify::new());
@@ -1232,6 +1263,7 @@ impl ActiveTarget {
     /// up), its session mode, and the live pppoe session's name (empty in any
     /// other mode). Read-only: takes the lock briefly and never touches the
     /// cancel.
+    #[inline(never)]
     pub fn admin_view(&self) -> (String, SessionMode, String) {
         let s = self.state.lock().unwrap();
         let session = match &s.mode {
@@ -1243,6 +1275,7 @@ impl ActiveTarget {
 
     /// The configured peer slots as the admin snapshot reports them, each with
     /// what its own loop last wrote. Read-only, like `admin_view`.
+    #[inline(never)]
     pub fn peer_view(&self) -> Vec<ClientPeerSlotEntry> {
         let s = self.state.lock().unwrap();
         s.peers.iter().map(PeerSlot::entry).collect()
@@ -1264,6 +1297,29 @@ pub async fn run(
     id: ClientId,
     control: Option<ControlPath>,
 ) -> Result<()> {
+    let (active, settings) = direct(
+        server, secret, credential, discovery, tcp, udp, transport, tap, tun, pppoe, id, control,
+    );
+    run_switchable(active, settings).await
+}
+
+/// The active target and settings a command-line client runs from.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub fn direct(
+    server: String,
+    secret: String,
+    credential: String,
+    discovery: Option<String>,
+    tcp: Vec<Forward>,
+    udp: Vec<Forward>,
+    transport: Transport,
+    tap: Option<TapConfig>,
+    tun: Option<ClientTun>,
+    pppoe: Option<PppoeRunConfig>,
+    id: ClientId,
+    control: Option<ControlPath>,
+) -> (ActiveTarget, ClientSettings) {
     let target = ServerTarget {
         name: server.clone(),
         addr: server,
@@ -1295,7 +1351,7 @@ pub async fn run(
         peers: Vec::new(),
         peer_sessions: None,
     };
-    run_switchable(ActiveTarget::new(target), settings).await
+    (ActiveTarget::new(target), settings)
 }
 
 /// One named pppoe session the admin can spawn at runtime.
@@ -1352,39 +1408,50 @@ enum Body {
 /// `settings.control` is set and its path binds (see [`ControlPath::bind`] for
 /// the failure policy), an admin socket serves snapshots and mutations for as
 /// long as this future runs.
-pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> Result<()> {
-    let ClientSettings {
-        mut servers,
-        tcp,
-        udp,
-        tap,
-        tun,
-        pppoe,
-        autostart,
-        id,
-        peer_secret,
-        control,
-        config,
-        peers,
-        peer_sessions,
-    } = settings;
+/// The reconnect loop, boxed: the caller holds one pointer instead of the
+/// loop's whole state.
+#[inline(never)]
+pub fn run_switchable(
+    active: ActiveTarget,
+    settings: ClientSettings,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+    boxed(switchable(active, settings))
+}
+
+/// What the reconnect loop runs from, resolved before the first dial.
+struct Loop {
+    client_id: String,
+    peer_static: Option<[u8; 32]>,
+    forwards: SharedForwards,
+    peer_control: PeerControl,
+    ppp: PppStatus,
+    link: LinkCell,
+    servers: SharedServers,
+    peer_sessions: SessionSink,
+    /// The admin socket's accept loop, aborted when the reconnect loop ends.
+    _control: Option<AbortOnDrop>,
+}
+
+#[inline(never)]
+fn prepare(active: &ActiveTarget, mut settings: ClientSettings) -> Result<Loop> {
     active.normalize_secret()?;
-    for target in &mut servers {
+    for target in &mut settings.servers {
         target.secret = crate::secret::normalize(&target.secret)?;
         target.credential = crate::secret::normalize(&target.credential)?;
         if let Some(discovery) = &target.discovery {
             target.discovery = Some(crate::secret::normalize(discovery)?);
         }
     }
-    let client_id = id.resolve();
-    let peer_static = peer_secret
+    let client_id = settings.id.resolve();
+    let peer_static = settings
+        .peer_secret
         .as_deref()
         .map(crate::secret::decode)
         .transpose()
         .map_err(|_| -> crate::Error {
             "client peer_secret must be 64 hexadecimal characters".into()
         })?;
-    if !peers.is_empty() && peer_static.is_none() {
+    if !settings.peers.is_empty() && peer_static.is_none() {
         return Err("[client] peer_secret is required when peer sessions are configured".into());
     }
     if let Some(peer_static) = &peer_static {
@@ -1396,7 +1463,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                     .as_deref()
                     .is_some_and(|d| crate::secret::decode(d).is_ok_and(|v| v == *peer_static))
         };
-        if known(&active.state.lock().unwrap().target) || servers.iter().any(known) {
+        if known(&active.state.lock().unwrap().target) || settings.servers.iter().any(known) {
             return Err(
                 "client peer_secret must differ from every server secret and credential".into(),
             );
@@ -1407,15 +1474,15 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         );
     }
     #[cfg(not(target_os = "linux"))]
-    if tap.is_some() || tun.is_some() {
+    if settings.tap.is_some() || settings.tun.is_some() {
         return Err("L2/L3 tunnel modes (--tap/--tun) are only supported on Linux".into());
     }
     #[cfg(not(target_os = "linux"))]
-    if !pppoe.is_empty() {
+    if !settings.pppoe.is_empty() {
         return Err("pppoe is only supported on Linux".into());
     }
     #[cfg(not(target_os = "linux"))]
-    if let Some(spec) = peers.iter().find(|s| !s.devices().is_empty()) {
+    if let Some(spec) = settings.peers.iter().find(|s| !s.devices().is_empty()) {
         return Err(format!(
             "{} opens a network device, which is only supported on Linux",
             spec.label()
@@ -1423,6 +1490,20 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         .into());
     }
 
+    let ClientSettings {
+        servers,
+        tcp,
+        udp,
+        tap,
+        tun,
+        pppoe,
+        autostart,
+        control,
+        config,
+        peers,
+        peer_sessions,
+        ..
+    } = settings;
     let forwards = SharedForwards::new(tcp, udp);
     // Held for the loop's lifetime: a pppoe attempt's datapath borrows the
     // credential bytes across the await, so every session's config must
@@ -1447,7 +1528,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
             .find(|(n, _)| *n == name)
             .map(|(_, c)| c.clone())
             .ok_or_else(|| -> crate::Error {
-                format!("autostart pppoe `{name}` is not a configured session").into()
+                errf!("autostart pppoe `{name}` is not a configured session")
             })?;
         RunMode::Pppoe { name, config }
     } else if let Some(device) = device {
@@ -1471,7 +1552,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         Some(ctl) => ctl.bind()?,
         None => None,
     };
-    let _control = match listener {
+    let control = match listener {
         Some(listener) => {
             crate::elog!("admin socket at {}", listener.path().display());
             let state = ControlState {
@@ -1489,7 +1570,31 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
         }
         None => None,
     };
+    Ok(Loop {
+        client_id,
+        peer_static,
+        forwards,
+        peer_control,
+        ppp,
+        link,
+        servers,
+        peer_sessions,
+        _control: control,
+    })
+}
 
+async fn switchable(active: ActiveTarget, settings: ClientSettings) -> Result<()> {
+    let Loop {
+        client_id,
+        peer_static,
+        forwards,
+        peer_control,
+        ppp,
+        link,
+        servers,
+        peer_sessions,
+        _control,
+    } = prepare(&active, settings)?;
     let mut dial = DialMemo::default();
 
     // One iteration per active profile/body; only a mutation moves to the
@@ -1578,7 +1683,7 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
             link.set(LinkStatus::Dialing);
             let resolved = tokio::select! {
                 _ = cancel.notified() => break,
-                r = state.discovery.resolve() => r,
+                r = boxed(state.discovery.resolve()) => r,
             };
             let addr = match resolved {
                 Ok(a) => {
@@ -1593,9 +1698,8 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                     None => {
                         crate::elog!("server discovery failed: {e}");
                         link.set(LinkStatus::Backoff);
-                        tokio::select! {
-                            _ = cancel.notified() => break,
-                            _ = sleep(backoff.delay()) => {}
+                        if pause(&cancel, backoff.delay()).await {
+                            break;
                         }
                         backoff.fail();
                         continue;
@@ -1608,14 +1712,20 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
             #[cfg(target_os = "linux")]
             let addr = match &exit_tun {
                 Some((tun_name, strict)) => {
-                    match ensure_exit_routes(&mut exit_routes, &addr, tun_name, *strict).await {
+                    match boxed(ensure_exit_routes(
+                        &mut exit_routes,
+                        &addr,
+                        tun_name,
+                        *strict,
+                    ))
+                    .await
+                    {
                         Ok(target) => target,
                         Err(e) => {
                             crate::elog!("exit routes for {addr}: {e}");
                             link.set(LinkStatus::Backoff);
-                            tokio::select! {
-                                _ = cancel.notified() => break,
-                                _ = sleep(backoff.delay()) => {}
+                            if pause(&cancel, backoff.delay()).await {
+                                break;
                             }
                             backoff.fail();
                             continue;
@@ -1649,17 +1759,21 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
             // default route and rewritten resolv.conf applied).
             #[cfg(target_os = "linux")]
             let mut session_task = {
-                let body = body.clone();
-                let ppp = ppp.clone();
                 let link = link.clone();
-                let peer_control = peer_control.clone();
-                AbortOnDrop(crate::spawn(async move {
-                    match body {
-                        Body::Device(tap) => bridge_session(client, tap, try_udp, link).await,
-                        Body::Pppoe(pp) => pppoe_session(client, pp, ppp, try_udp, link).await,
-                        Body::Forwards => session(client, try_udp, link, peer_control).await,
+                AbortOnDrop(match body.clone() {
+                    Body::Device(tap) => {
+                        crate::spawn(l2_session(client, L2::Device(tap), try_udp, link))
                     }
-                }))
+                    Body::Pppoe(pp) => crate::spawn(l2_session(
+                        client,
+                        L2::Pppoe(pp, ppp.clone()),
+                        try_udp,
+                        link,
+                    )),
+                    Body::Forwards => {
+                        crate::spawn(session(client, try_udp, link, peer_control.clone()))
+                    }
+                })
             };
             #[cfg(not(target_os = "linux"))]
             let mut session_task = AbortOnDrop(crate::spawn(session(
@@ -1719,9 +1833,8 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
                 backoff.fail();
             }
             link.set(LinkStatus::Backoff);
-            tokio::select! {
-                _ = cancel.notified() => break,
-                _ = sleep(backoff.delay()) => {}
+            if pause(&cancel, backoff.delay()).await {
+                break;
             }
         }
         // A profile switch is a barrier: the incoming set claims what the
@@ -1734,24 +1847,52 @@ pub async fn run_switchable(active: ActiveTarget, settings: ClientSettings) -> R
     }
 }
 
-/// Bring up the L2 bridge: UDP first for Auto/Udp, TCP otherwise or as fallback.
-/// Mirrors `session`: returns the UDP verdict so the reconnect loop can damp
-/// flapping in Auto mode. `bridge_udp` runs the data loop inline, so its return
-/// timing is the session lifetime used to judge health.
+/// Sleep for `delay` unless `cancel` fires first; true when it did.
+async fn pause(cancel: &Notify, delay: Duration) -> bool {
+    tokio::select! {
+        _ = cancel.notified() => true,
+        _ = sleep(delay) => false,
+    }
+}
+
+/// What rides an L2 channel once it is up: the bridge device, or the
+/// in-process PPPoE client with the phase cell its datapath reports to.
 #[cfg(target_os = "linux")]
-async fn bridge_session(
+enum L2 {
+    Device(Arc<TapDevice>),
+    Pppoe(Arc<PppoeRunConfig>, PppStatus),
+}
+
+#[cfg(target_os = "linux")]
+impl L2 {
+    fn label(&self) -> &'static str {
+        match self {
+            L2::Device(_) => "bridge",
+            L2::Pppoe(..) => "pppoe",
+        }
+    }
+}
+
+/// Bring up an L2 body: UDP first for Auto/Udp, TCP otherwise or as fallback.
+/// Mirrors `session`: returns the UDP verdict so the reconnect loop can damp
+/// flapping in Auto mode. `l2_udp` runs the data loop inline, so its return
+/// timing is the session lifetime used to judge health. The bridge body always
+/// ends `Ok(())`; the pppoe body returns the datapath's result (a TUN open
+/// failure or discovery death).
+#[cfg(target_os = "linux")]
+async fn l2_session(
     client: Arc<Client>,
-    tap: Arc<TapDevice>,
+    l2: L2,
     try_udp: bool,
     link: LinkCell,
 ) -> (Result<()>, UdpOutcome, bool) {
     let mode = client.transport;
     if mode == Transport::Tcp || (mode == Transport::Auto && !try_udp) {
-        let (result, established) = bridge_tcp(client, tap, &link).await;
+        let (result, established) = l2_tcp(&client, &l2, &link).await;
         return (result, UdpOutcome::Skipped, established);
     }
     let started = Instant::now();
-    match bridge_udp(client.clone(), tap.clone(), &link).await {
+    match l2_udp(&client, &l2, &link).await {
         (Ok(()), established) => {
             let healthy = started.elapsed() >= UDP_MIN_HEALTHY;
             let outcome = if healthy {
@@ -1765,10 +1906,10 @@ async fn bridge_session(
             if mode == Transport::Udp {
                 return (Err(e), UdpOutcome::Skipped, established);
             }
-            // A short-lived bridge_udp returns Err with the handshake never even
+            // A short-lived l2_udp returns Err with the handshake never even
             // reached on some paths; treat any UDP failure here as a flap signal.
             crate::elog!("udp transport unavailable ({e}); falling back to tcp");
-            let (result, tcp_established) = bridge_tcp(client, tap, &link).await;
+            let (result, tcp_established) = l2_tcp(&client, &l2, &link).await;
             (
                 result,
                 UdpOutcome::Unhealthy,
@@ -2023,13 +2164,43 @@ pub async fn relay_leg_stream(
     id: u64,
     capability: crate::proto::Capability,
 ) -> Result<crate::noise::Noise> {
+    claim_stream(
+        server,
+        None,
+        psk,
+        id,
+        capability,
+        "relay leg connect+handshake timed out",
+    )
+    .await
+}
+
+/// A data channel to the server claiming `id`: a fresh tcp connection, or a
+/// kcp conv on `sess` when the control session runs over udp. The handshake
+/// is bounded by `OPEN_HANDSHAKE_TIMEOUT` and `timed_out` names the failure.
+async fn claim_stream(
+    server: &str,
+    sess: Option<&Session>,
+    psk: &[u8; 32],
+    id: u64,
+    capability: crate::proto::Capability,
+    timed_out: &'static str,
+) -> Result<crate::noise::Noise> {
     let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
-        let sock = TcpStream::connect(server).await?;
-        sock.set_nodelay(true).ok();
-        client_handshake_remote(sock, psk, AuthRole::Client).await
+        match sess {
+            Some(sess) => {
+                let (_conv, stream) = sess.open_conv(CLASS_KCP);
+                client_handshake_remote(stream, psk, AuthRole::Client).await
+            }
+            None => {
+                let sock = TcpStream::connect(server).await?;
+                sock.set_nodelay(true).ok();
+                client_handshake_remote(sock, psk, AuthRole::Client).await
+            }
+        }
     })
     .await
-    .map_err(|_| -> crate::Error { "relay leg connect+handshake timed out".into() })??;
+    .map_err(|_| -> crate::Error { timed_out.into() })??;
     nw.send(
         &Msg::Data {
             version: crate::identity::PROTO_VERSION,
@@ -2052,6 +2223,26 @@ pub async fn relay_leg_dgram(
     id: u64,
     capability: crate::proto::Capability,
 ) -> Result<RelayDgramLeg> {
+    claim_dgram(
+        sess,
+        credential_psk,
+        id,
+        capability,
+        "relay leg handshake timed out",
+    )
+    .await
+}
+
+/// The datagram channel on `sess` claiming `id`: a setup conv carrying the
+/// claim, then the channel under the matching tag. `timed_out` names a
+/// handshake past `OPEN_HANDSHAKE_TIMEOUT`.
+async fn claim_dgram(
+    sess: &Session,
+    credential_psk: &[u8; 32],
+    id: u64,
+    capability: crate::proto::Capability,
+    timed_out: &'static str,
+) -> Result<RelayDgramLeg> {
     let conv = (id as u32) | SETUP_CONV_BIT;
     let stream = sess.open_conv_with(CLASS_SETUP, conv);
     let noise = Arc::new(
@@ -2060,7 +2251,7 @@ pub async fn relay_leg_dgram(
             client_handshake_stateless_claim(stream, credential_psk, id, &capability),
         )
         .await
-        .map_err(|_| -> crate::Error { "relay leg handshake timed out".into() })??,
+        .map_err(|_| -> crate::Error { timed_out.into() })??,
     );
     let (inbound, guard) = sess.register_dgram(conv);
     let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
@@ -2068,39 +2259,37 @@ pub async fn relay_leg_dgram(
     Ok(RelayDgramLeg { rx, tx, guard })
 }
 
-/// L2 bridge over the UDP transport: frames ride the unreliable datagram channel.
-/// The bool is whether the handshake established before the bridge ran or failed,
-/// so the reconnect loop can tell a failed connect from an established-then-dead
-/// session.
+/// An L2 channel up over the UDP transport, everything but the data loop.
 #[cfg(target_os = "linux")]
-async fn bridge_udp(
-    client: Arc<Client>,
-    tap: Arc<TapDevice>,
-    link: &LinkCell,
-) -> (Result<()>, bool) {
-    // `_pump` aborts the session RX pump when this scope ends (handshake failure
-    // or bridge teardown), so a reconnect cannot leave the old pump running.
-    let (sess, _pump, cancel) = match udp_connect(&client).await {
-        Ok(v) => v,
-        Err(e) => return (Err(e), false),
-    };
+struct UdpL2 {
+    rx: DgramRx,
+    tx: DgramTx,
+    cancel: Arc<Notify>,
+    lease: BridgeLease,
+    _guard: ConvGuard,
+    _pump: AbortOnDrop,
+    _sess: Arc<Session>,
+}
+
+/// Connect the UDP transport, authorize the control channel, and claim the
+/// bridge datagram channel. `cancel` fires when the RX pump sees the peer
+/// vanish or the lease's control channel goes unanswered (server restart), so
+/// the data loop tears down at once instead of stalling until the next
+/// reconnect. The pump is aborted when the value drops (handshake failure or
+/// teardown), so a reconnect cannot leave the old pump running.
+#[cfg(target_os = "linux")]
+async fn udp_l2(client: &Client, label: &str, link: &LinkCell) -> Result<UdpL2> {
+    let (sess, pump, cancel) = udp_connect(client).await?;
     let (_control_conv, control_stream) = sess.open_conv(CLASS_KCP);
-    let (control_r, control_w) = match tokio_timeout(
+    let (control_r, control_w) = tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
         client_handshake_remote(control_stream, &client.credential_psk, AuthRole::Client),
     )
     .await
-    {
-        Ok(Ok(noise)) => noise,
-        Ok(Err(e)) => return (Err(e), false),
-        Err(_) => return (Err("udp control handshake timed out".into()), false),
-    };
-    let lease = match bridge_lease(&client.client_id, control_r, control_w, &cancel).await {
-        Ok(lease) => lease,
-        Err(e) => return (Err(e), false),
-    };
+    .map_err(|_| -> crate::Error { "udp control handshake timed out".into() })??;
+    let lease = bridge_lease(&client.client_id, control_r, control_w, &cancel).await?;
     let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
-    let noise = match tokio_timeout(
+    let noise = tokio_timeout(
         UDP_HANDSHAKE_TIMEOUT,
         client_handshake_stateless_claim(
             stream,
@@ -2110,77 +2299,168 @@ async fn bridge_udp(
         ),
     )
     .await
-    {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => return (Err(e), false),
-        Err(_) => return (Err("udp handshake timed out".into()), false),
-    };
-    crate::elog!("bridge connected to {} over udp", client.server);
+    .map_err(|_| -> crate::Error { "udp handshake timed out".into() })??;
+    crate::elog!("{label} connected to {} over udp", client.server);
     link.set(LinkStatus::Connected);
 
     let noise = Arc::new(noise);
-    let (inbound, _guard) = sess.register_dgram(BRIDGE_CONV);
+    let (inbound, guard) = sess.register_dgram(BRIDGE_CONV);
     let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
     let rx = DgramRx::new(inbound, noise);
     // Announce this client's label so the server's fleet view names the port.
     let _ = tx.send_name(&lease.client_id).await;
-    // `cancel` fires when the RX pump sees the peer vanish or the lease's control
-    // channel goes unanswered (server restart), tearing the bridge down at once
-    // instead of stalling until the next reconnect.
-    bridge::tap_dgram(tap, rx, tx, cancel, &lease.client_id).await;
-    (Ok(()), true)
+    Ok(UdpL2 {
+        rx,
+        tx,
+        cancel,
+        lease,
+        _guard: guard,
+        _pump: pump,
+        _sess: sess,
+    })
 }
 
-/// L2 bridge over the TCP fallback: frames ride a reliable Noise stream. The bool
-/// is whether the handshake established before the bridge ran or failed.
+/// An L2 body over the UDP transport: frames ride the unreliable datagram
+/// channel. The bool is whether the handshake established before the data loop
+/// ran or failed, so the reconnect loop can tell a failed connect from an
+/// established-then-dead session.
 #[cfg(target_os = "linux")]
-async fn bridge_tcp(
-    client: Arc<Client>,
-    tap: Arc<TapDevice>,
-    link: &LinkCell,
-) -> (Result<()>, bool) {
-    let cancel = Arc::new(Notify::new());
-    let ((control_r, control_w), _peer) = match connect_and_handshake(
-        &client.server,
-        &client.credential_psk,
-        OPEN_HANDSHAKE_TIMEOUT,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => return (Err(e), false),
-    };
-    let lease = match bridge_lease(&client.client_id, control_r, control_w, &cancel).await {
-        Ok(lease) => lease,
-        Err(e) => return (Err(e), false),
-    };
-    let ((nr, mut nw), _peer) = match connect_and_handshake(
-        &client.server,
-        &client.credential_psk,
-        OPEN_HANDSHAKE_TIMEOUT,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => return (Err(e), false),
-    };
-    if let Err(e) = nw
-        .send(
-            &Msg::Data {
-                version: crate::identity::PROTO_VERSION,
-                id: BRIDGE_ID,
-                capability: lease.capability,
-            }
-            .encode(),
-        )
-        .await
-    {
-        return (Err(e), true);
+async fn l2_udp(client: &Client, l2: &L2, link: &LinkCell) -> (Result<()>, bool) {
+    match l2 {
+        L2::Device(tap) => {
+            let up = match udp_l2(client, l2.label(), link).await {
+                Ok(up) => up,
+                Err(e) => return (Err(e), false),
+            };
+            boxed(bridge::tap_dgram(
+                tap.clone(),
+                up.rx,
+                up.tx,
+                up.cancel,
+                &up.lease.client_id,
+            ))
+            .await;
+            (Ok(()), true)
+        }
+        L2::Pppoe(pp, status) => {
+            let dp = match build_datapath(pp) {
+                Ok(dp) => dp,
+                Err(e) => return (Err(e), false),
+            };
+            let up = match udp_l2(client, l2.label(), link).await {
+                Ok(up) => up,
+                Err(e) => return (Err(e), false),
+            };
+            // UDP requires a literal ip:port, so the configured server is the real peer.
+            let server_ip = server_v4(&client.server);
+            let result = crate::pppoe::tunnel::run_dgram(
+                dp,
+                bringup(server_ip, pp, status.clone()),
+                up.rx,
+                up.tx,
+                up.cancel,
+                &up.lease.client_id,
+            )
+            .await;
+            (result, true)
+        }
     }
-    crate::elog!("bridge connected to {} over tcp", client.server);
+}
+
+/// An L2 channel up over the TCP fallback, everything but the data loop.
+#[cfg(target_os = "linux")]
+struct TcpL2 {
+    nr: crate::noise::NoiseReader,
+    nw: crate::noise::NoiseWriter,
+    cancel: Arc<Notify>,
+    /// The address the data connection reached.
+    peer: Option<SocketAddr>,
+    _lease: BridgeLease,
+}
+
+/// Connect the control and data connections over TCP and authorize the
+/// client. The bool of the error is whether the data connection was up before
+/// it failed.
+#[cfg(target_os = "linux")]
+async fn tcp_l2(
+    client: &Client,
+    label: &str,
+    link: &LinkCell,
+) -> std::result::Result<TcpL2, (crate::Error, bool)> {
+    let cancel = Arc::new(Notify::new());
+    let ((control_r, control_w), _peer) = connect_and_handshake(
+        &client.server,
+        &client.credential_psk,
+        OPEN_HANDSHAKE_TIMEOUT,
+    )
+    .await
+    .map_err(|e| (e, false))?;
+    let lease = bridge_lease(&client.client_id, control_r, control_w, &cancel)
+        .await
+        .map_err(|e| (e, false))?;
+    let ((nr, mut nw), peer) = connect_and_handshake(
+        &client.server,
+        &client.credential_psk,
+        OPEN_HANDSHAKE_TIMEOUT,
+    )
+    .await
+    .map_err(|e| (e, false))?;
+    nw.send(
+        &Msg::Data {
+            version: crate::identity::PROTO_VERSION,
+            id: BRIDGE_ID,
+            capability: lease.capability,
+        }
+        .encode(),
+    )
+    .await
+    .map_err(|e| (e, true))?;
+    crate::elog!("{label} connected to {} over tcp", client.server);
     link.set(LinkStatus::Connected);
-    bridge::tap_stream(tap, nr, nw, cancel).await;
-    (Ok(()), true)
+    Ok(TcpL2 {
+        nr,
+        nw,
+        cancel,
+        peer,
+        _lease: lease,
+    })
+}
+
+/// An L2 body over the TCP fallback: frames ride a reliable Noise stream. The
+/// bool is whether the handshake established before the data loop ran.
+#[cfg(target_os = "linux")]
+async fn l2_tcp(client: &Client, l2: &L2, link: &LinkCell) -> (Result<()>, bool) {
+    match l2 {
+        L2::Device(tap) => {
+            let up = match tcp_l2(client, l2.label(), link).await {
+                Ok(up) => up,
+                Err((e, established)) => return (Err(e), established),
+            };
+            boxed(bridge::tap_stream(tap.clone(), up.nr, up.nw, up.cancel)).await;
+            (Ok(()), true)
+        }
+        L2::Pppoe(pp, status) => {
+            let dp = match build_datapath(pp) {
+                Ok(dp) => dp,
+                Err(e) => return (Err(e), false),
+            };
+            let up = match tcp_l2(client, l2.label(), link).await {
+                Ok(up) => up,
+                Err((e, established)) => return (Err(e), established),
+            };
+            // Pin the IP the tunnel actually connected to (handles a hostname --server).
+            let server_ip = up.peer.and_then(peer_v4);
+            let result = crate::pppoe::tunnel::run_stream(
+                dp,
+                bringup(server_ip, pp, status.clone()),
+                up.nr,
+                up.nw,
+                up.cancel,
+            )
+            .await;
+            (result, true)
+        }
+    }
 }
 
 /// Discovery resend budget for the in-process PPPoE client, expressed in
@@ -2190,49 +2470,6 @@ async fn bridge_tcp(
 const PPPOE_RETRANSMIT_TICKS: u32 = 3;
 #[cfg(target_os = "linux")]
 const PPPOE_MAX_ATTEMPTS: u32 = 5;
-
-/// Bring up the in-process PPPoE client: UDP first for Auto/Udp, TCP otherwise or
-/// as fallback. Mirrors `bridge_session`'s reconnect contract; the only structural
-/// delta is that `pppoe_udp`/`pppoe_tcp` return the datapath's `Result<()>` (a TUN
-/// open failure or discovery death) instead of always `Ok(())`.
-#[cfg(target_os = "linux")]
-async fn pppoe_session(
-    client: Arc<Client>,
-    pp: Arc<PppoeRunConfig>,
-    status: PppStatus,
-    try_udp: bool,
-    link: LinkCell,
-) -> (Result<()>, UdpOutcome, bool) {
-    let mode = client.transport;
-    if mode == Transport::Tcp || (mode == Transport::Auto && !try_udp) {
-        let (result, established) = pppoe_tcp(client, pp, status, &link).await;
-        return (result, UdpOutcome::Skipped, established);
-    }
-    let started = Instant::now();
-    match pppoe_udp(client.clone(), pp.clone(), status.clone(), &link).await {
-        (Ok(()), established) => {
-            let healthy = started.elapsed() >= UDP_MIN_HEALTHY;
-            let outcome = if healthy {
-                UdpOutcome::Healthy
-            } else {
-                UdpOutcome::Unhealthy
-            };
-            (Ok(()), outcome, established)
-        }
-        (Err(e), established) => {
-            if mode == Transport::Udp {
-                return (Err(e), UdpOutcome::Skipped, established);
-            }
-            crate::elog!("udp transport unavailable ({e}); falling back to tcp");
-            let (result, tcp_established) = pppoe_tcp(client, pp, status, &link).await;
-            (
-                result,
-                UdpOutcome::Unhealthy,
-                established || tcp_established,
-            )
-        }
-    }
-}
 
 /// Build a `PppoeDatapath` borrowing `pp`'s credential bytes. The caller holds
 /// `pp` (an `Arc`) across the whole datapath run, so the borrow stays valid.
@@ -2283,10 +2520,10 @@ pub(crate) async fn exit_server_v4(addr: &str) -> Result<Ipv4Addr> {
     }
     let mut addrs = tokio::net::lookup_host(addr)
         .await
-        .map_err(|e| -> crate::Error { format!("resolving {addr}: {e}").into() })?;
+        .map_err(|e| -> crate::Error { errf!("resolving {addr}: {e}") })?;
     addrs
         .find_map(peer_v4)
-        .ok_or_else(|| format!("exit mode needs an IPv4 server address; {addr} has none").into())
+        .ok_or_else(|| errf!("exit mode needs an IPv4 server address; {addr} has none"))
 }
 
 /// Program or refresh the exit routes ahead of a dial against `addr`, and
@@ -2308,7 +2545,7 @@ async fn ensure_exit_routes(
         Some(g) => g.assert_pin(server)?,
         None => {
             let table = std::fs::read_to_string("/proc/net/route")
-                .map_err(|e| -> crate::Error { format!("reading /proc/net/route: {e}").into() })?;
+                .map_err(|e| -> crate::Error { errf!("reading /proc/net/route: {e}") })?;
             *guard = Some(ExitRoutes::bring_up_from_table(
                 &table, tun_name, server, strict,
             )?);
@@ -2325,7 +2562,7 @@ async fn ensure_exit_routes(
 fn exit_dial_target(server: Ipv4Addr, addr: &str) -> Result<String> {
     let (_, port) = addr
         .rsplit_once(':')
-        .ok_or_else(|| -> crate::Error { format!("no port in server address {addr}").into() })?;
+        .ok_or_else(|| -> crate::Error { errf!("no port in server address {addr}") })?;
     Ok(format!("{server}:{port}"))
 }
 
@@ -2346,138 +2583,6 @@ fn bringup<'a>(
         server_ip,
         status,
     }
-}
-
-/// In-process PPPoE over the UDP transport: PPPoE frames ride the unreliable
-/// datagram channel. The bool is whether the handshake established before the
-/// datapath ran or failed.
-#[cfg(target_os = "linux")]
-async fn pppoe_udp(
-    client: Arc<Client>,
-    pp: Arc<PppoeRunConfig>,
-    status: PppStatus,
-    link: &LinkCell,
-) -> (Result<()>, bool) {
-    let dp = match build_datapath(&pp) {
-        Ok(dp) => dp,
-        Err(e) => return (Err(e), false),
-    };
-    let (sess, _pump, cancel) = match udp_connect(&client).await {
-        Ok(v) => v,
-        Err(e) => return (Err(e), false),
-    };
-    let (_control_conv, control_stream) = sess.open_conv(CLASS_KCP);
-    let (control_r, control_w) = match tokio_timeout(
-        UDP_HANDSHAKE_TIMEOUT,
-        client_handshake_remote(control_stream, &client.credential_psk, AuthRole::Client),
-    )
-    .await
-    {
-        Ok(Ok(noise)) => noise,
-        Ok(Err(e)) => return (Err(e), false),
-        Err(_) => return (Err("udp control handshake timed out".into()), false),
-    };
-    let lease = match bridge_lease(&client.client_id, control_r, control_w, &cancel).await {
-        Ok(lease) => lease,
-        Err(e) => return (Err(e), false),
-    };
-    let stream = sess.open_conv_with(CLASS_SETUP, BRIDGE_CONV);
-    let noise = match tokio_timeout(
-        UDP_HANDSHAKE_TIMEOUT,
-        client_handshake_stateless_claim(
-            stream,
-            &client.credential_psk,
-            BRIDGE_ID,
-            &lease.capability,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => return (Err(e), false),
-        Err(_) => return (Err("udp handshake timed out".into()), false),
-    };
-    crate::elog!("pppoe connected to {} over udp", client.server);
-    link.set(LinkStatus::Connected);
-
-    let noise = Arc::new(noise);
-    let (inbound, _guard) = sess.register_dgram(BRIDGE_CONV);
-    let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
-    let rx = DgramRx::new(inbound, noise);
-    // Announce this client's label so the server's fleet view names the port.
-    let _ = tx.send_name(&lease.client_id).await;
-    // UDP requires a literal ip:port, so the configured server is the real peer.
-    let server_ip = server_v4(&client.server);
-    let result = crate::pppoe::tunnel::run_dgram(
-        dp,
-        bringup(server_ip, &pp, status),
-        rx,
-        tx,
-        cancel,
-        &lease.client_id,
-    )
-    .await;
-    (result, true)
-}
-
-/// In-process PPPoE over the TCP fallback: PPPoE frames ride a reliable Noise
-/// stream. The bool is whether the handshake established before the datapath ran.
-#[cfg(target_os = "linux")]
-async fn pppoe_tcp(
-    client: Arc<Client>,
-    pp: Arc<PppoeRunConfig>,
-    status: PppStatus,
-    link: &LinkCell,
-) -> (Result<()>, bool) {
-    let dp = match build_datapath(&pp) {
-        Ok(dp) => dp,
-        Err(e) => return (Err(e), false),
-    };
-    let cancel = Arc::new(Notify::new());
-    let ((control_r, control_w), _control_peer) = match connect_and_handshake(
-        &client.server,
-        &client.credential_psk,
-        OPEN_HANDSHAKE_TIMEOUT,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => return (Err(e), false),
-    };
-    let lease = match bridge_lease(&client.client_id, control_r, control_w, &cancel).await {
-        Ok(lease) => lease,
-        Err(e) => return (Err(e), false),
-    };
-    let ((nr, mut nw), peer) = match connect_and_handshake(
-        &client.server,
-        &client.credential_psk,
-        OPEN_HANDSHAKE_TIMEOUT,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => return (Err(e), false),
-    };
-    if let Err(e) = nw
-        .send(
-            &Msg::Data {
-                version: crate::identity::PROTO_VERSION,
-                id: BRIDGE_ID,
-                capability: lease.capability,
-            }
-            .encode(),
-        )
-        .await
-    {
-        return (Err(e), true);
-    }
-    crate::elog!("pppoe connected to {} over tcp", client.server);
-    link.set(LinkStatus::Connected);
-    // Pin the IP the tunnel actually connected to (handles a hostname --server).
-    let server_ip = peer.and_then(peer_v4);
-    let result =
-        crate::pppoe::tunnel::run_stream(dp, bringup(server_ip, &pp, status), nr, nw, cancel).await;
-    (result, true)
 }
 
 /// Establish the control channel over UDP/KCP. Returns the session and the
@@ -2515,12 +2620,22 @@ async fn session(
     // Try UDP first for Auto/Udp (unless cooldown skipped it); fall back to TCP
     // for Auto/Tcp.
     let probe_udp = mode != Transport::Tcp && (mode == Transport::Udp || try_udp);
-    let (via, r, w, started) = if probe_udp {
-        match udp_session(client.clone()).await {
+    let mut udp = UdpOutcome::Skipped;
+    if probe_udp {
+        match boxed(udp_session(client.clone())).await {
             Ok((sess, pump, cancel, (r, w))) => {
                 crate::elog!("connected to {} over udp", client.server);
                 link.set(LinkStatus::Connected);
-                (Link::Udp(sess, pump, cancel), r, w, Some(Instant::now()))
+                let started = Instant::now();
+                let result = control_loop(client, Link::Udp(sess, pump, cancel), r, w, peer).await;
+                // Health is measured from when the UDP control channel came up
+                // to when it returned; a short-lived UDP session is a flap.
+                let outcome = if started.elapsed() >= UDP_MIN_HEALTHY {
+                    UdpOutcome::Healthy
+                } else {
+                    UdpOutcome::Unhealthy
+                };
+                return (result, outcome, true);
             }
             Err(e) => {
                 if mode == Transport::Udp {
@@ -2530,39 +2645,17 @@ async fn session(
                 // A failed UDP connect is itself a flap signal for the cooldown,
                 // independent of how the TCP fallback session fares afterwards.
                 crate::elog!("udp transport unavailable ({e}); falling back to tcp");
-                match tcp_control(client.clone()).await {
-                    Ok((r, w)) => {
-                        link.set(LinkStatus::Connected);
-                        return (
-                            control_loop(client, Link::Tcp, r, w, peer).await,
-                            UdpOutcome::Unhealthy,
-                            true,
-                        );
-                    }
-                    Err(e) => return (Err(e), UdpOutcome::Unhealthy, false),
-                }
+                udp = UdpOutcome::Unhealthy;
             }
         }
-    } else {
-        match tcp_control(client.clone()).await {
-            Ok((r, w)) => {
-                link.set(LinkStatus::Connected);
-                (Link::Tcp, r, w, None)
-            }
-            Err(e) => return (Err(e), UdpOutcome::Skipped, false),
+    }
+    match tcp_control(client.clone()).await {
+        Ok((r, w)) => {
+            link.set(LinkStatus::Connected);
+            (control_loop(client, Link::Tcp, r, w, peer).await, udp, true)
         }
-    };
-
-    let result = control_loop(client, via, r, w, peer).await;
-    // Health is measured from when the UDP control channel came up to when it
-    // returned; a short-lived UDP session is a flap. TCP-fallback paths report
-    // their UDP verdict above, so `started` here is always the UDP case.
-    let outcome = match started {
-        Some(t) if t.elapsed() >= UDP_MIN_HEALTHY => UdpOutcome::Healthy,
-        Some(_) => UdpOutcome::Unhealthy,
-        None => UdpOutcome::Skipped,
-    };
-    (result, outcome, true)
+        Err(e) => (Err(e), udp, false),
+    }
 }
 
 /// Dial `addr`, disable Nagle, run the Noise handshake, and report the connected
@@ -2583,14 +2676,14 @@ async fn connect_and_handshake(
     tokio_timeout(timeout, async {
         let sock = TcpStream::connect(addr)
             .await
-            .map_err(|e| -> crate::Error { format!("connecting to {addr}: {e}").into() })?;
+            .map_err(|e| -> crate::Error { errf!("connecting to {addr}: {e}") })?;
         sock.set_nodelay(true).ok();
         let peer = sock.peer_addr().ok();
         let noise = client_handshake_remote(sock, psk, AuthRole::Client).await?;
         Ok((noise, peer))
     })
     .await
-    .map_err(|_| -> crate::Error { format!("tcp handshake to {addr} timed out").into() })?
+    .map_err(|_| -> crate::Error { errf!("tcp handshake to {addr} timed out") })?
 }
 
 /// Dial the TCP control connection and run the Noise handshake.
@@ -2605,21 +2698,20 @@ async fn tcp_control(client: Arc<Client>) -> Result<crate::noise::Noise> {
     Ok(noise)
 }
 
-/// Run the control loop over an established Noise control channel, dispatching
-/// `Open` requests via `link` until the channel drops.
-async fn control_loop(
-    client: Arc<Client>,
-    link: Link,
-    mut r: crate::noise::NoiseReader,
-    w: crate::noise::NoiseWriter,
-    peer: PeerControl,
-) -> Result<()> {
-    let link = Arc::new(link);
-    let cancel = match link.as_ref() {
-        Link::Udp(_, _, cancel) => Some(cancel.clone()),
-        Link::Tcp => None,
-    };
+/// A control session's outbound side: the frame queue with the hello and
+/// announces already on it, the ack flags, and the tasks that drain the
+/// queue and report a missing ack.
+struct ControlSetup {
+    tx: mpsc::Sender<Vec<u8>>,
+    ack: Arc<AtomicBool>,
+    peer_ack: Arc<AtomicBool>,
+    _writer: AbortOnDrop,
+    _watchdog: Option<AbortOnDrop>,
+    _peer_watchdog: Option<AbortOnDrop>,
+}
 
+#[inline(never)]
+fn control_setup(client: &Client, mut w: crate::noise::NoiseWriter) -> ControlSetup {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
     tx.try_send(
         Msg::ClientHello {
@@ -2632,7 +2724,7 @@ async fn control_loop(
     // Announce per-forward options right after the hello, but only when at
     // least one forward carries a non-default option: an all-default client
     // stays byte-identical on the wire to older releases.
-    let options = fwd_options(&client);
+    let options = fwd_options(client);
     let ack = Arc::new(AtomicBool::new(false));
     if !options.is_empty() {
         tx.try_send(Msg::FwdOptions { entries: options }.encode())
@@ -2652,17 +2744,10 @@ async fn control_loop(
         )
         .ok();
     }
-    // Filled when the ack arrives; dropping it at teardown bumps the
-    // generation, which fails every peer cycle that has not settled on a
-    // punched path.
-    let mut peer_live: Option<crate::peerslot::ControlGuard> = None;
-    let mut authorized_client_id: Option<String> = None;
-
     // Every task this session spawns is held through an AbortOnDrop guard, so
     // both a normal teardown and a server switch aborting the whole session
     // task reap them instead of leaving them running against a dead server.
-    let mut w = w;
-    let _writer = AbortOnDrop(crate::spawn(async move {
+    let writer = AbortOnDrop(crate::spawn(async move {
         while let Some(bytes) = rx.recv().await {
             if w.send(&bytes).await.is_err() {
                 break;
@@ -2674,7 +2759,7 @@ async fn control_loop(
     // headerless relay, so a server that does not ack the options (an older
     // release ignores the frame) leaves those ports refusing every connection.
     // Say so once, loudly, instead of letting each open fail quietly.
-    let _watchdog = {
+    let watchdog = {
         let mut proxied: Vec<u16> = client
             .tcp
             .iter()
@@ -2690,35 +2775,66 @@ async fn control_loop(
                 .map(|p| format!(":{p}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let ack = ack.clone();
-            Some(AbortOnDrop(crate::spawn(async move {
-                sleep(FWD_OPTIONS_ACK_TIMEOUT).await;
-                if !ack.load(Ordering::Relaxed) {
-                    crate::elog!(
-                        "server did not acknowledge PROXY protocol support; tcp forward(s) {ports} \
-                         will refuse connections rather than relay without the header; upgrade the \
-                         server to a release that supports +proxy"
-                    );
-                }
-            })))
+            Some(ack_watchdog(
+                ack.clone(),
+                format!(
+                    "server did not acknowledge PROXY protocol support; tcp forward(s) {ports} \
+                     will refuse connections rather than relay without the header; upgrade the \
+                     server to a release that supports +proxy"
+                ),
+            ))
         }
     };
 
     // A server that does not answer the announce has no peer support, which
     // fails every peer slot for this control session. The next one announces
     // again and re-decides, so the verdict never outlives a server upgrade.
-    let _peer_watchdog = client.peer_announce.map(|_| {
-        let acked = peer_ack.clone();
-        AbortOnDrop(crate::spawn(async move {
-            sleep(FWD_OPTIONS_ACK_TIMEOUT).await;
-            if !acked.load(Ordering::Relaxed) {
-                crate::elog!(
-                    "server did not acknowledge peer support; no peer session can pair over \
-                     this control session; upgrade the server to a release that supports peers"
-                );
-            }
-        }))
+    let peer_watchdog = client.peer_announce.map(|_| {
+        ack_watchdog(
+            peer_ack.clone(),
+            "server did not acknowledge peer support; no peer session can pair over \
+             this control session; upgrade the server to a release that supports peers"
+                .into(),
+        )
     });
+
+    ControlSetup {
+        tx,
+        ack,
+        peer_ack,
+        _writer: writer,
+        _watchdog: watchdog,
+        _peer_watchdog: peer_watchdog,
+    }
+}
+
+/// Run the control loop over an established Noise control channel, dispatching
+/// `Open` requests via `link` until the channel drops.
+async fn control_loop(
+    client: Arc<Client>,
+    link: Link,
+    mut r: crate::noise::NoiseReader,
+    w: crate::noise::NoiseWriter,
+    peer: PeerControl,
+) -> Result<()> {
+    let link = Arc::new(link);
+    let cancel = match link.as_ref() {
+        Link::Udp(_, _, cancel) => Some(cancel.clone()),
+        Link::Tcp => None,
+    };
+    let ControlSetup {
+        tx,
+        ack,
+        peer_ack,
+        _writer,
+        _watchdog,
+        _peer_watchdog,
+    } = control_setup(&client, w);
+    // Filled when the ack arrives; dropping it at teardown bumps the
+    // generation, which fails every peer cycle that has not settled on a
+    // punched path.
+    let mut peer_live: Option<crate::peerslot::ControlGuard> = None;
+    let mut authorized_client_id: Option<String> = None;
 
     // Guards for in-flight forward tasks spawned for this control session, so a
     // teardown aborts black-holed forwards instead of leaking them.
@@ -2885,6 +3001,16 @@ async fn control_loop(
     }
 }
 
+/// Log `message` once `FWD_OPTIONS_ACK_TIMEOUT` passes without `acked` set.
+fn ack_watchdog(acked: Arc<AtomicBool>, message: String) -> AbortOnDrop {
+    AbortOnDrop(crate::spawn(async move {
+        sleep(FWD_OPTIONS_ACK_TIMEOUT).await;
+        if !acked.load(Ordering::Relaxed) {
+            crate::elog!("{message}");
+        }
+    }))
+}
+
 /// Wire entries for every forward carrying a non-default option; empty when the
 /// whole config is default, in which case no `FwdOptions` frame is sent.
 fn fwd_options(client: &Client) -> Vec<FwdOptionEntry> {
@@ -2913,12 +3039,26 @@ async fn connect_local_tcp(
 ) -> Result<TcpStream> {
     let mut local = TcpStream::connect(target)
         .await
-        .map_err(|e| -> crate::Error { format!("connecting to local {target}: {e}").into() })?;
+        .map_err(|e| -> crate::Error { errf!("connecting to local {target}: {e}") })?;
     if let Some((peer, listener)) = proxy_addrs {
-        local
-            .write_all(&crate::proxyproto::encode_v2(peer, listener))
-            .await?;
+        local.write_all(&proxy_header(peer, listener)).await?;
     }
+    Ok(local)
+}
+
+/// The PROXY v2 header for a proxied open.
+#[inline(never)]
+fn proxy_header(peer: SocketAddr, listener: SocketAddr) -> Vec<u8> {
+    crate::proxyproto::encode_v2(peer, listener)
+}
+
+/// A local udp socket connected to `target`.
+async fn connect_local_udp(target: &str) -> Result<UdpSocket> {
+    let local = UdpSocket::bind("0.0.0.0:0").await?;
+    local
+        .connect(target)
+        .await
+        .map_err(|e| -> crate::Error { errf!("connecting to local {target}: {e}") })?;
     Ok(local)
 }
 
@@ -2940,9 +3080,7 @@ async fn handle_open(
         Proto::Tcp => client.tcp.get(&port),
         Proto::Udp => client.udp.get(&port),
     }
-    .ok_or_else(|| -> crate::Error {
-        format!("no local target configured for {proto:?} :{port}").into()
-    })?
+    .ok_or_else(|| -> crate::Error { errf!("no local target configured for {proto:?} :{port}") })?
     .clone();
     if fwd.proxy && proxy_addrs.is_none() {
         return Err(format!(
@@ -2952,7 +3090,7 @@ async fn handle_open(
         .into());
     }
     if !fwd.proxy && proxy_addrs.is_some() {
-        return Err(format!("unexpected proxy open for {proto:?} :{port}").into());
+        return Err(errf!("unexpected proxy open for {proto:?} :{port}"));
     }
     let target = fwd.target;
     let idle = fwd.idle.unwrap_or(match proto {
@@ -2960,95 +3098,42 @@ async fn handle_open(
         Proto::Udp => bridge::UDP_IDLE,
     });
 
-    match (link.as_ref(), proto) {
-        // --- TCP transport (unchanged behavior) ---
-        (Link::Tcp, Proto::Tcp) => {
-            let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
-                let sock = TcpStream::connect(&client.server).await?;
-                sock.set_nodelay(true).ok();
-                client_handshake_remote(sock, &client.credential_psk, AuthRole::Client).await
-            })
-            .await
-            .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
-            nw.send(
-                &Msg::Data {
-                    version: crate::identity::PROTO_VERSION,
-                    id,
-                    capability,
-                }
-                .encode(),
+    const TIMED_OUT: &str = "forward connect+handshake timed out";
+    let sess = match link.as_ref() {
+        Link::Tcp => None,
+        Link::Udp(sess, _, _) => Some(sess.as_ref()),
+    };
+    match (sess, proto) {
+        (sess, Proto::Tcp) => {
+            let (nr, nw) = claim_stream(
+                &client.server,
+                sess,
+                &client.credential_psk,
+                id,
+                capability,
+                TIMED_OUT,
             )
             .await?;
             let local = connect_local_tcp(&target, proxy_addrs).await?;
             bridge::tcp(local, nr, nw, idle).await;
         }
-        (Link::Tcp, Proto::Udp) => {
-            let (nr, mut nw) = tokio_timeout(OPEN_HANDSHAKE_TIMEOUT, async {
-                let sock = TcpStream::connect(&client.server).await?;
-                sock.set_nodelay(true).ok();
-                client_handshake_remote(sock, &client.credential_psk, AuthRole::Client).await
-            })
-            .await
-            .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
-            nw.send(
-                &Msg::Data {
-                    version: crate::identity::PROTO_VERSION,
-                    id,
-                    capability,
-                }
-                .encode(),
+        (None, Proto::Udp) => {
+            let (nr, nw) = claim_stream(
+                &client.server,
+                None,
+                &client.credential_psk,
+                id,
+                capability,
+                TIMED_OUT,
             )
             .await?;
-            let local = UdpSocket::bind("0.0.0.0:0").await?;
-            local.connect(&target).await.map_err(|e| -> crate::Error {
-                format!("connecting to local {target}: {e}").into()
-            })?;
+            let local = connect_local_udp(&target).await?;
             bridge::udp_client(local, nr, nw, idle).await;
         }
-        // --- UDP transport ---
-        (Link::Udp(sess, _, _), Proto::Tcp) => {
-            let (_conv, stream) = sess.open_conv(CLASS_KCP);
-            let (nr, mut nw) = tokio_timeout(
-                OPEN_HANDSHAKE_TIMEOUT,
-                client_handshake_remote(stream, &client.credential_psk, AuthRole::Client),
-            )
-            .await
-            .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??;
-            nw.send(
-                &Msg::Data {
-                    version: crate::identity::PROTO_VERSION,
-                    id,
-                    capability,
-                }
-                .encode(),
-            )
-            .await?;
-            let local = connect_local_tcp(&target, proxy_addrs).await?;
-            bridge::tcp(local, nr, nw, idle).await;
-        }
-        (Link::Udp(sess, _, _), Proto::Udp) => {
-            let conv = (id as u32) | SETUP_CONV_BIT;
-            let stream = sess.open_conv_with(CLASS_SETUP, conv);
-            let noise = Arc::new(
-                tokio_timeout(
-                    OPEN_HANDSHAKE_TIMEOUT,
-                    client_handshake_stateless_claim(
-                        stream,
-                        &client.credential_psk,
-                        id,
-                        &capability,
-                    ),
-                )
-                .await
-                .map_err(|_| -> crate::Error { "forward connect+handshake timed out".into() })??,
-            );
-            let local = UdpSocket::bind("0.0.0.0:0").await?;
-            local.connect(&target).await.map_err(|e| -> crate::Error {
-                format!("connecting to local {target}: {e}").into()
-            })?;
-            let (inbound, _guard) = sess.register_dgram(conv);
-            let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
-            let rx = DgramRx::new(inbound, noise);
+        (Some(sess), Proto::Udp) => {
+            let leg = claim_dgram(sess, &client.credential_psk, id, capability, TIMED_OUT).await?;
+            let local = connect_local_udp(&target).await?;
+            let (tx, rx, _guard) = leg.split();
             bridge::udp_client_stateless(local, rx, tx, idle).await;
         }
     }
