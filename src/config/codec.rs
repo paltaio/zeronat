@@ -9,9 +9,13 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::client::Transport;
+use crate::proto::Proto;
 use crate::Result;
 
 /// Unique-per-attempt suffix for atomic-save temp files, so concurrent saves in
@@ -162,18 +166,22 @@ pub(crate) fn parse_string_list(value: &str, n: usize) -> Result<Vec<String>> {
     Ok(out)
 }
 
-pub(crate) fn parse_int(value: &str, n: usize) -> Result<u16> {
+/// A bare integer no larger than `max`.
+#[inline(never)]
+fn parse_bounded(value: &str, n: usize, max: u64) -> Result<u64> {
     match lex_scalar(value, n)? {
-        Scalar::Int(v) => u16::try_from(v).map_err(|_| err(n, &format!("invalid integer `{v}`"))),
+        Scalar::Int(v) if v <= max => Ok(v),
+        Scalar::Int(v) => Err(err(n, &format!("invalid integer `{v}`"))),
         Scalar::Str(_) | Scalar::Bool(_) => Err(err(n, "expected an integer value")),
     }
 }
 
+pub(crate) fn parse_int(value: &str, n: usize) -> Result<u16> {
+    Ok(parse_bounded(value, n, u16::MAX.into())? as u16)
+}
+
 pub(crate) fn parse_u32(value: &str, n: usize) -> Result<u32> {
-    match lex_scalar(value, n)? {
-        Scalar::Int(v) => u32::try_from(v).map_err(|_| err(n, &format!("invalid integer `{v}`"))),
-        Scalar::Str(_) | Scalar::Bool(_) => Err(err(n, "expected an integer value")),
-    }
+    Ok(parse_bounded(value, n, u32::MAX.into())? as u32)
 }
 
 pub(crate) fn parse_bool(value: &str, n: usize) -> Result<bool> {
@@ -184,12 +192,19 @@ pub(crate) fn parse_bool(value: &str, n: usize) -> Result<bool> {
 }
 
 pub(crate) fn err(line: usize, msg: &str) -> crate::Error {
-    format!("config line {line}: {msg}").into()
+    errf!("config line {line}: {msg}")
 }
 
 /// Double-quote a string, escaping `"` and `\`.
 pub(crate) fn quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    let mut out = String::new();
+    quote_into(&mut out, s);
+    out
+}
+
+/// Append `s` double-quoted, escaping `"` and `\`.
+#[inline(never)]
+pub(crate) fn quote_into(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -199,7 +214,233 @@ pub(crate) fn quote(s: &str) -> String {
         }
     }
     out.push('"');
-    out
+}
+
+/// Append `key = value` with the value as written.
+#[inline(never)]
+pub(crate) fn kv_raw(out: &mut String, key: &str, value: &str) {
+    out.push_str(key);
+    out.push_str(" = ");
+    out.push_str(value);
+    out.push('\n');
+}
+
+/// Append `key = "value"`.
+#[inline(never)]
+pub(crate) fn kv_quoted(out: &mut String, key: &str, value: &str) {
+    out.push_str(key);
+    out.push_str(" = ");
+    quote_into(out, value);
+    out.push('\n');
+}
+
+/// Append `key = n`.
+#[inline(never)]
+pub(crate) fn kv_num(out: &mut String, key: &str, n: u64) {
+    kv_raw(out, key, &n.to_string());
+}
+
+/// Append `key = true` or `key = false`.
+#[inline(never)]
+pub(crate) fn kv_bool(out: &mut String, key: &str, b: bool) {
+    kv_raw(out, key, if b { "true" } else { "false" });
+}
+
+/// Start a table: a blank line after any previous content, then the header.
+#[inline(never)]
+pub(crate) fn table(out: &mut String, header: &str) {
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(header);
+    out.push('\n');
+}
+
+/// The position of `name` in the space-separated `names`.
+#[inline(never)]
+pub(crate) fn lookup(names: &'static str, name: &str) -> Option<usize> {
+    names.split(' ').position(|n| n == name)
+}
+
+pub(crate) fn parse_proto(value: &str, n: usize) -> Result<Proto> {
+    let s = parse_string(value, n)?;
+    match s.as_str() {
+        "tcp" => Ok(Proto::Tcp),
+        "udp" => Ok(Proto::Udp),
+        "tap" => Err(err(n, "proto `tap` is not supported in this version")),
+        other => Err(err(n, &format!("unknown proto `{other}`"))),
+    }
+}
+
+fn parse_ip(value: &str, n: usize) -> Result<Ipv4Addr> {
+    let s = parse_string(value, n)?;
+    Ipv4Addr::from_str(&s).map_err(|_| err(n, &format!("invalid IPv4 address `{s}`")))
+}
+
+fn parse_transport(value: &str, n: usize) -> Result<Transport> {
+    let s = parse_string(value, n)?;
+    match s.as_str() {
+        "auto" => Ok(Transport::Auto),
+        "udp" => Ok(Transport::Udp),
+        "tcp" => Ok(Transport::Tcp),
+        other => Err(err(n, &format!("unknown transport `{other}`"))),
+    }
+}
+
+fn parse_cidr(value: &str, n: usize) -> Result<(Ipv4Addr, u8)> {
+    let s = parse_string(value, n)?;
+    let invalid = || err(n, &format!("invalid address `{s}` (expected A.B.C.D/N)"));
+    let (ip, len) = s.split_once('/').ok_or_else(invalid)?;
+    let ip = Ipv4Addr::from_str(ip).map_err(|_| invalid())?;
+    let len: u8 = len.parse().map_err(|_| invalid())?;
+    if len > 32 {
+        return Err(invalid());
+    }
+    Ok((ip, len))
+}
+
+/// How a key's value is parsed and where the record keeps it.
+#[derive(Clone, Copy)]
+pub(crate) enum Key {
+    Str(u8),
+    Bool(u8),
+    Int(u8),
+    /// A relay idle window in whole seconds, at least 1.
+    Idle,
+    Proto,
+    Transport,
+    Ip,
+    Cidr,
+    StrList,
+}
+
+/// One in-progress table: a superset of the fields of every table in both
+/// grammars. Fields are filled as keys are seen and validated for
+/// completeness when the table closes.
+#[derive(Default)]
+pub(crate) struct Record {
+    pub(crate) strs: [Option<String>; 6],
+    pub(crate) bools: [Option<bool>; 4],
+    pub(crate) ints: [Option<u16>; 1],
+    pub(crate) idle: Option<u32>,
+    pub(crate) proto: Option<Proto>,
+    pub(crate) transport: Option<Transport>,
+    pub(crate) ip: Option<Ipv4Addr>,
+    pub(crate) address: Option<(Ipv4Addr, u8)>,
+    pub(crate) allow: Option<Vec<String>>,
+}
+
+impl Record {
+    #[inline(never)]
+    fn set(&mut self, key: Key, value: &str, n: usize) -> Result<()> {
+        match key {
+            Key::Str(i) => self.strs[i as usize] = Some(parse_string(value, n)?),
+            Key::Bool(i) => self.bools[i as usize] = Some(parse_bool(value, n)?),
+            Key::Int(i) => self.ints[i as usize] = Some(parse_int(value, n)?),
+            Key::Idle => {
+                let secs = parse_u32(value, n)?;
+                if secs == 0 {
+                    return Err(err(n, "`idle` must be at least 1 second"));
+                }
+                self.idle = Some(secs);
+            }
+            Key::Proto => self.proto = Some(parse_proto(value, n)?),
+            Key::Transport => self.transport = Some(parse_transport(value, n)?),
+            Key::Ip => self.ip = Some(parse_ip(value, n)?),
+            Key::Cidr => self.address = Some(parse_cidr(value, n)?),
+            Key::StrList => self.allow = Some(parse_string_list(value, n)?),
+        }
+        Ok(())
+    }
+
+    /// The string at `i`, which the table requires; `missing` is the error.
+    #[inline(never)]
+    pub(crate) fn required(&mut self, i: usize, n: usize, missing: &str) -> Result<String> {
+        self.strs[i].take().ok_or_else(|| err(n, missing))
+    }
+}
+
+/// One table of a grammar.
+pub(crate) struct TableDef {
+    /// The header as printed in errors: `[client]`, `[[servers]]`.
+    pub(crate) label: &'static str,
+    /// Whether the table may appear once only.
+    pub(crate) single: bool,
+    /// Space-separated key names, each with the kind at the same position.
+    pub(crate) keys: &'static str,
+    pub(crate) kinds: &'static [Key],
+}
+
+/// A config grammar: table headers as written inside the brackets
+/// (`client`, `[servers]`), each with its definition at the same position.
+pub(crate) struct Grammar {
+    pub(crate) headers: &'static str,
+    pub(crate) tables: &'static [TableDef],
+}
+
+/// Walk `text` against `grammar`, calling `close` with each table's index and
+/// record when the next header or the end of the file closes it.
+pub(crate) fn parse_tables(
+    text: &str,
+    grammar: &Grammar,
+    close: &mut dyn FnMut(usize, &mut Record, usize) -> Result<()>,
+) -> Result<()> {
+    let mut section: Option<usize> = None;
+    let mut seen = [false; 8];
+    let mut record = Record::default();
+    let mut record_keys: Vec<&str> = Vec::new();
+
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let n = lineno + 1;
+
+        if let Some(header) = line.strip_prefix('[') {
+            // A table header closes the previous table.
+            if let Some(s) = section {
+                close(s, &mut record, n)?;
+            }
+            record = Record::default();
+            record_keys.clear();
+
+            let header = header
+                .strip_suffix(']')
+                .ok_or_else(|| err(n, "unterminated table header"))?;
+            let idx = lookup(grammar.headers, header)
+                .ok_or_else(|| err(n, &format!("unknown table header [{header}]")))?;
+            let table = &grammar.tables[idx];
+            if table.single {
+                if seen[idx] {
+                    return Err(err(n, &format!("duplicate {} table", table.label)));
+                }
+                seen[idx] = true;
+            }
+            section = Some(idx);
+            continue;
+        }
+
+        let (key, value) = split_kv(line).ok_or_else(|| err(n, "expected key = value"))?;
+        if key.is_empty() || key.contains(|c: char| c.is_whitespace()) {
+            return Err(err(n, "invalid key"));
+        }
+        let Some(idx) = section else {
+            return Err(err(n, &format!("key `{key}` before any table header")));
+        };
+        let table = &grammar.tables[idx];
+        reject_dup(&mut record_keys, key, n)?;
+        let Some(k) = lookup(table.keys, key) else {
+            return Err(err(n, &format!("unknown key `{key}` in {}", table.label)));
+        };
+        record.set(table.kinds[k], value, n)?;
+    }
+
+    // Close the final open table at EOF.
+    if let Some(s) = section {
+        close(s, &mut record, text.lines().count())?;
+    }
+    Ok(())
 }
 
 /// Why a config could not be loaded, kept distinct because the safe recovery
@@ -220,16 +461,25 @@ pub(crate) fn load<T: Default>(
     path: &Path,
     parse: impl FnOnce(&str) -> Result<T>,
 ) -> std::result::Result<T, LoadError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
-        Err(e) => {
-            return Err(LoadError::Unreadable(
-                format!("read {}: {e}", path.display()).into(),
-            ))
-        }
-    };
-    parse(&text).map_err(|e| LoadError::Malformed(format!("parse {}: {e}", path.display()).into()))
+    match read(path)? {
+        Some(text) => parse(&text).map_err(|e| malformed(path, e)),
+        None => Ok(T::default()),
+    }
+}
+
+/// The file's text, or `None` when there is no file.
+#[inline(never)]
+fn read(path: &Path) -> std::result::Result<Option<String>, LoadError> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(LoadError::Unreadable(errf!("read {}: {e}", path.display()))),
+    }
+}
+
+#[inline(never)]
+fn malformed(path: &Path, e: crate::Error) -> LoadError {
+    LoadError::Malformed(errf!("parse {}: {e}", path.display()))
 }
 
 /// Best-effort move of an unparseable config aside (`<name>.corrupt-<unixsecs>`)
@@ -259,9 +509,7 @@ pub fn save_atomic(path: &Path, text: &str) -> Result<()> {
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| -> crate::Error {
-            format!("invalid config path {}", path.display()).into()
-        })?;
+        .ok_or_else(|| -> crate::Error { errf!("invalid config path {}", path.display()) })?;
     let tmp = dir.join(format!(
         ".{}.{}.{}.tmp",
         file_name,
@@ -289,7 +537,7 @@ pub fn save_atomic(path: &Path, text: &str) -> Result<()> {
 
     if let Err(e) = write() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("save {}: {e}", path.display()).into());
+        return Err(errf!("save {}: {e}", path.display()));
     }
 
     // Fsync the directory so the rename is durable across a crash. Best-effort:

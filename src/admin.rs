@@ -409,6 +409,19 @@ pub(crate) fn fwd_opts(proxy: bool, idle_secs: u32) -> String {
     s
 }
 
+/// Stable ascending order of `n` items under `less`, as source indices.
+pub(crate) fn order(n: usize, less: &mut dyn FnMut(usize, usize) -> bool) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..n).collect();
+    for i in 1..n {
+        let mut j = i;
+        while j > 0 && less(idx[j], idx[j - 1]) {
+            idx.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    idx
+}
+
 /// Compact duration for the fleet view, e.g. "45s", "4m12s", "1h03m".
 pub(crate) fn fmt_dur(secs: u32) -> String {
     let s = secs % 60;

@@ -7,18 +7,15 @@
 //! [`ClientConfig::validate`] so that a parseable but contradictory file is a
 //! fatal boot error the operator can fix in place, never quarantined.
 
-use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::str::FromStr;
 
 use crate::client::Transport;
 use crate::clientproto::ServerSecret;
 use crate::config::codec::{
-    err, parse_bool, parse_int, parse_string, parse_string_list, parse_u32, quote, reject_dup,
-    split_kv, strip_comment,
+    err, kv_bool, kv_num, kv_quoted, parse_tables, quote, quote_into, table, Grammar, Key, Record,
+    TableDef,
 };
-use crate::config::parse_proto;
 use crate::config::LoadError;
 use crate::proto::{proto_name, Proto};
 use crate::Result;
@@ -122,7 +119,7 @@ impl CfgPeer {
         let mut allow = Vec::with_capacity(self.allow.len());
         for entry in &self.allow {
             allow.push(crate::secret::decode(entry).map_err(|_| -> crate::Error {
-                format!("[peer] allow entry `{entry}` must be a 64-hex peer identity").into()
+                errf!("[peer] allow entry `{entry}` must be a 64-hex peer identity")
             })?);
         }
         if (self.exit || self.segment.is_some()) && allow.is_empty() {
@@ -167,13 +164,14 @@ impl ClientConfig {
     /// reference, name and forward-key uniqueness, the single-autostart rule,
     /// and device exclusivity. A violation here is a fatal boot error, kept
     /// out of `parse_client` so the file is never quarantined for it.
+    #[inline(never)]
     pub fn validate(&self) -> Result<()> {
         let peer_secret = self
             .peer_secret
             .as_ref()
             .map(|secret| crate::secret::decode(&secret.0))
             .transpose()
-            .map_err(|e| -> crate::Error { format!("[client] peer_secret {e}").into() })?;
+            .map_err(|e| -> crate::Error { errf!("[client] peer_secret {e}") })?;
         let has_peer_slots = self.tun.as_ref().is_some_and(CfgTun::is_peer)
             || self
                 .peer
@@ -192,15 +190,13 @@ impl ClientConfig {
         if let Some(peer) = &self.peer {
             peer.allow_identities()?;
         }
-        let mut names: HashSet<&str> = HashSet::new();
+        let mut names: Vec<&str> = Vec::new();
         let mut session_keys: Vec<[u8; 32]> = Vec::new();
         for s in &self.servers {
             let secret = crate::secret::decode(&s.secret.0)
-                .map_err(|e| -> crate::Error { format!("server `{}` {e}", s.name).into() })?;
-            let credential =
-                crate::secret::decode(&s.credential.0).map_err(|e| -> crate::Error {
-                    format!("server `{}` client credential {e}", s.name).into()
-                })?;
+                .map_err(|e| server_err(&s.name, &e.to_string()))?;
+            let credential = crate::secret::decode(&s.credential.0)
+                .map_err(|e| server_err(&s.name, &format!("client credential {e}")))?;
             if peer_secret.is_some_and(|peer| peer == secret || peer == credential) {
                 return Err(format!(
                     "[client] peer_secret must differ from the secret and credential for server `{}`",
@@ -208,9 +204,10 @@ impl ClientConfig {
                 )
                 .into());
             }
-            if !names.insert(&s.name) {
-                return Err(format!("duplicate server name `{}`", s.name).into());
+            if names.contains(&s.name.as_str()) {
+                return Err(errf!("duplicate server name `{}`", s.name));
             }
+            names.push(&s.name);
             session_keys.push(secret);
             session_keys.push(credential);
         }
@@ -223,45 +220,48 @@ impl ClientConfig {
                 .as_ref()
                 .map(|d| crate::secret::decode(&d.0))
                 .transpose()
-                .map_err(|e| -> crate::Error {
-                    format!("server `{}` `discovery` {e}", s.name).into()
-                })?;
+                .map_err(|e| server_err(&s.name, &format!("`discovery` {e}")))?;
             let Some(discovery) = discovery else {
                 if s.addr == "dht" {
-                    return Err(format!(
-                        "server `{}` uses addr = \"dht\" and needs a `discovery` credential",
-                        s.name
-                    )
-                    .into());
+                    return Err(server_err(
+                        &s.name,
+                        "uses addr = \"dht\" and needs a `discovery` credential",
+                    ));
                 }
                 continue;
             };
             if session_keys.contains(&discovery) || peer_secret == Some(discovery) {
-                return Err(format!(
-                    "server `{}` `discovery` must differ from every secret and credential in the file",
-                    s.name
-                )
-                .into());
+                return Err(server_err(
+                    &s.name,
+                    "`discovery` must differ from every secret and credential in the file",
+                ));
             }
         }
         if let Some(active) = &self.active {
             if !self.servers.iter().any(|s| &s.name == active) {
-                return Err(
-                    format!("active = {} names no [[servers]] entry", quote(active)).into(),
-                );
+                return Err(errf!(
+                    "active = {} names no [[servers]] entry",
+                    quote(active)
+                ));
             }
         }
-        let mut fwd: HashSet<(Proto, u16)> = HashSet::new();
+        let mut fwd: Vec<(Proto, u16)> = Vec::new();
         for f in &self.forwards {
-            if !fwd.insert((f.proto, f.port)) {
-                return Err(format!("duplicate forward {} {}", proto_name(f.proto), f.port).into());
+            if fwd.contains(&(f.proto, f.port)) {
+                return Err(errf!(
+                    "duplicate forward {} {}",
+                    proto_name(f.proto),
+                    f.port
+                ));
             }
+            fwd.push((f.proto, f.port));
         }
-        let mut sessions: HashSet<&str> = HashSet::new();
+        let mut sessions: Vec<&str> = Vec::new();
         for p in &self.pppoe {
-            if !sessions.insert(&p.name) {
-                return Err(format!("duplicate pppoe name `{}`", p.name).into());
+            if sessions.contains(&p.name.as_str()) {
+                return Err(errf!("duplicate pppoe name `{}`", p.name));
             }
+            sessions.push(&p.name);
         }
         if self.pppoe.iter().filter(|p| p.autostart).count() > 1 {
             return Err("more than one [[pppoe]] entry sets autostart = true".into());
@@ -293,54 +293,92 @@ impl ClientConfig {
     }
 }
 
-/// Which table the parser is currently filling.
-enum Section {
-    None,
-    Client,
-    Server,
-    Forward,
-    Pppoe,
-    Tap,
-    Tun,
-    Peer,
+/// A `validate` error about the `[[servers]]` entry `name`.
+#[inline(never)]
+fn server_err(name: &str, what: &str) -> crate::Error {
+    errf!("server `{name}` {what}")
 }
 
-/// One in-progress record; a superset of the fields of every table. Fields are
-/// filled as keys are seen and validated for completeness when the record
-/// closes.
-#[derive(Default)]
-struct PartialRecord {
-    name: Option<String>,
-    addr: Option<String>,
-    seed: Option<String>,
-    secret: Option<String>,
-    credential: Option<String>,
-    discovery: Option<String>,
-    transport: Option<Transport>,
-    proto: Option<Proto>,
-    port: Option<u16>,
-    target: Option<String>,
-    proxy: Option<bool>,
-    idle: Option<u32>,
-    enabled: Option<bool>,
-    autostart: Option<bool>,
-    username: Option<String>,
-    password: Option<String>,
-    password_file: Option<String>,
-    service: Option<String>,
-    mtu: Option<u16>,
-    default_route: Option<bool>,
-    clamp_mss: Option<bool>,
-    request_dns: Option<bool>,
-    dev: Option<String>,
-    address: Option<(Ipv4Addr, u8)>,
-    exit: Option<bool>,
-    exit_strict: Option<bool>,
-    exit_via: Option<String>,
-    exit_iface: Option<String>,
-    segment: Option<String>,
-    allow: Option<Vec<String>>,
-}
+const GRAMMAR: Grammar = Grammar {
+    headers: "client [servers] [forwards] [pppoe] tap tun peer",
+    tables: &[
+        TableDef {
+            label: "[client]",
+            single: true,
+            keys: "id peer_secret active control",
+            kinds: &[Key::Str(0), Key::Str(1), Key::Str(2), Key::Str(3)],
+        },
+        TableDef {
+            label: "[[servers]]",
+            single: false,
+            keys: "name addr seed secret credential discovery transport",
+            kinds: &[
+                Key::Str(0),
+                Key::Str(1),
+                Key::Str(2),
+                Key::Str(3),
+                Key::Str(4),
+                Key::Str(5),
+                Key::Transport,
+            ],
+        },
+        TableDef {
+            label: "[[forwards]]",
+            single: false,
+            keys: "proto port target proxy idle enabled",
+            kinds: &[
+                Key::Proto,
+                Key::Int(0),
+                Key::Str(0),
+                Key::Bool(0),
+                Key::Idle,
+                Key::Bool(1),
+            ],
+        },
+        TableDef {
+            label: "[[pppoe]]",
+            single: false,
+            keys: "name autostart username password password_file service mtu default_route \
+                   clamp_mss request_dns",
+            kinds: &[
+                Key::Str(0),
+                Key::Bool(0),
+                Key::Str(1),
+                Key::Str(2),
+                Key::Str(3),
+                Key::Str(4),
+                Key::Int(0),
+                Key::Bool(1),
+                Key::Bool(2),
+                Key::Bool(3),
+            ],
+        },
+        TableDef {
+            label: "[tap]",
+            single: true,
+            keys: "dev",
+            kinds: &[Key::Str(0)],
+        },
+        TableDef {
+            label: "[tun]",
+            single: true,
+            keys: "dev address exit exit_strict exit_via",
+            kinds: &[
+                Key::Str(0),
+                Key::Cidr,
+                Key::Bool(0),
+                Key::Bool(1),
+                Key::Str(1),
+            ],
+        },
+        TableDef {
+            label: "[peer]",
+            single: true,
+            keys: "exit exit_iface segment allow",
+            kinds: &[Key::Bool(0), Key::Str(0), Key::Str(1), Key::StrList],
+        },
+    ],
+};
 
 /// Load a client config. A missing file yields the default (empty) config so a
 /// first boot with `--config` pointing at a not-yet-written path is not an
@@ -349,195 +387,22 @@ pub fn load(path: &Path) -> std::result::Result<ClientConfig, LoadError> {
     crate::config::codec::load(path, parse_client)
 }
 
+#[inline(never)]
 pub fn parse_client(text: &str) -> Result<ClientConfig> {
     let mut cfg = ClientConfig::default();
-    let mut section = Section::None;
-    let mut seen_client = false;
-    let mut seen_tap = false;
-    let mut seen_tun = false;
-    let mut seen_peer = false;
-    let mut client_keys: Vec<&str> = Vec::new();
-    let mut record = PartialRecord::default();
-    let mut record_keys: Vec<&str> = Vec::new();
     // Seeded `[[servers]]` entries without a `credential`, by index. Their
     // credential names `[client].id`, which may be declared after them, so it
     // is derived once the whole file is read.
     let mut seeded: Vec<(usize, crate::seed::Seed)> = Vec::new();
 
-    for (lineno, raw) in text.lines().enumerate() {
-        let line = strip_comment(raw).trim();
-        if line.is_empty() {
-            continue;
-        }
-        let n = lineno + 1;
+    parse_tables(text, &GRAMMAR, &mut |table, record, n| {
+        close_record(table, &mut cfg, record, &mut seeded, n)
+    })?;
 
-        if let Some(header) = line.strip_prefix('[') {
-            // A table header closes the previous record.
-            close_record(&section, &mut cfg, &mut record, &mut seeded, n)?;
-            record = PartialRecord::default();
-            record_keys.clear();
-
-            let header = header
-                .strip_suffix(']')
-                .ok_or_else(|| err(n, "unterminated table header"))?;
-            match header {
-                "client" => {
-                    if seen_client {
-                        return Err(err(n, "duplicate [client] table"));
-                    }
-                    seen_client = true;
-                    client_keys.clear();
-                    section = Section::Client;
-                }
-                "[servers]" => section = Section::Server,
-                "[forwards]" => section = Section::Forward,
-                "[pppoe]" => section = Section::Pppoe,
-                "tap" => {
-                    if seen_tap {
-                        return Err(err(n, "duplicate [tap] table"));
-                    }
-                    seen_tap = true;
-                    section = Section::Tap;
-                }
-                "tun" => {
-                    if seen_tun {
-                        return Err(err(n, "duplicate [tun] table"));
-                    }
-                    seen_tun = true;
-                    section = Section::Tun;
-                }
-                "peer" => {
-                    if seen_peer {
-                        return Err(err(n, "duplicate [peer] table"));
-                    }
-                    seen_peer = true;
-                    section = Section::Peer;
-                }
-                other => {
-                    return Err(err(n, &format!("unknown table header [{other}]")));
-                }
-            }
-            continue;
-        }
-
-        let (key, value) = split_kv(line).ok_or_else(|| err(n, "expected key = value"))?;
-        if key.is_empty() || key.contains(|c: char| c.is_whitespace()) {
-            return Err(err(n, "invalid key"));
-        }
-
-        match section {
-            Section::None => {
-                return Err(err(n, &format!("key `{key}` before any table header")));
-            }
-            Section::Client => {
-                reject_dup(&mut client_keys, key, n)?;
-                match key {
-                    "id" => cfg.id = Some(parse_string(value, n)?),
-                    "peer_secret" => cfg.peer_secret = Some(ServerSecret(parse_string(value, n)?)),
-                    "active" => cfg.active = Some(parse_string(value, n)?),
-                    "control" => cfg.control = Some(parse_string(value, n)?),
-                    other => {
-                        return Err(err(n, &format!("unknown key `{other}` in [client]")));
-                    }
-                }
-            }
-            Section::Server => {
-                reject_dup(&mut record_keys, key, n)?;
-                match key {
-                    "name" => record.name = Some(parse_string(value, n)?),
-                    "addr" => record.addr = Some(parse_string(value, n)?),
-                    "seed" => record.seed = Some(parse_string(value, n)?),
-                    "secret" => record.secret = Some(parse_string(value, n)?),
-                    "credential" => record.credential = Some(parse_string(value, n)?),
-                    "discovery" => record.discovery = Some(parse_string(value, n)?),
-                    "transport" => record.transport = Some(parse_transport(value, n)?),
-                    other => {
-                        return Err(err(n, &format!("unknown key `{other}` in [[servers]]")));
-                    }
-                }
-            }
-            Section::Forward => {
-                reject_dup(&mut record_keys, key, n)?;
-                match key {
-                    "proto" => record.proto = Some(parse_proto(value, n)?),
-                    "port" => record.port = Some(parse_int(value, n)?),
-                    "target" => record.target = Some(parse_string(value, n)?),
-                    "proxy" => record.proxy = Some(parse_bool(value, n)?),
-                    "idle" => {
-                        let secs = parse_u32(value, n)?;
-                        if secs == 0 {
-                            return Err(err(n, "`idle` must be at least 1 second"));
-                        }
-                        record.idle = Some(secs);
-                    }
-                    "enabled" => record.enabled = Some(parse_bool(value, n)?),
-                    other => {
-                        return Err(err(n, &format!("unknown key `{other}` in [[forwards]]")));
-                    }
-                }
-            }
-            Section::Pppoe => {
-                reject_dup(&mut record_keys, key, n)?;
-                match key {
-                    "name" => record.name = Some(parse_string(value, n)?),
-                    "autostart" => record.autostart = Some(parse_bool(value, n)?),
-                    "username" => record.username = Some(parse_string(value, n)?),
-                    "password" => record.password = Some(parse_string(value, n)?),
-                    "password_file" => record.password_file = Some(parse_string(value, n)?),
-                    "service" => record.service = Some(parse_string(value, n)?),
-                    "mtu" => record.mtu = Some(parse_int(value, n)?),
-                    "default_route" => record.default_route = Some(parse_bool(value, n)?),
-                    "clamp_mss" => record.clamp_mss = Some(parse_bool(value, n)?),
-                    "request_dns" => record.request_dns = Some(parse_bool(value, n)?),
-                    other => {
-                        return Err(err(n, &format!("unknown key `{other}` in [[pppoe]]")));
-                    }
-                }
-            }
-            Section::Tap => {
-                reject_dup(&mut record_keys, key, n)?;
-                match key {
-                    "dev" => record.dev = Some(parse_string(value, n)?),
-                    other => {
-                        return Err(err(n, &format!("unknown key `{other}` in [tap]")));
-                    }
-                }
-            }
-            Section::Tun => {
-                reject_dup(&mut record_keys, key, n)?;
-                match key {
-                    "dev" => record.dev = Some(parse_string(value, n)?),
-                    "address" => record.address = Some(parse_cidr(value, n)?),
-                    "exit" => record.exit = Some(parse_bool(value, n)?),
-                    "exit_strict" => record.exit_strict = Some(parse_bool(value, n)?),
-                    "exit_via" => record.exit_via = Some(parse_string(value, n)?),
-                    other => {
-                        return Err(err(n, &format!("unknown key `{other}` in [tun]")));
-                    }
-                }
-            }
-            Section::Peer => {
-                reject_dup(&mut record_keys, key, n)?;
-                match key {
-                    "exit" => record.exit = Some(parse_bool(value, n)?),
-                    "exit_iface" => record.exit_iface = Some(parse_string(value, n)?),
-                    "segment" => record.segment = Some(parse_string(value, n)?),
-                    "allow" => record.allow = Some(parse_string_list(value, n)?),
-                    other => {
-                        return Err(err(n, &format!("unknown key `{other}` in [peer]")));
-                    }
-                }
-            }
-        }
-    }
-
-    // Close the final open record at EOF.
-    let last = text.lines().count();
-    close_record(&section, &mut cfg, &mut record, &mut seeded, last)?;
     if !seeded.is_empty() {
         let id = cfg.id.as_deref().ok_or_else(|| {
             err(
-                last,
+                text.lines().count(),
                 "a [[servers]] `seed` derives the client credential for [client].id, which is missing",
             )
         })?;
@@ -548,31 +413,32 @@ pub fn parse_client(text: &str) -> Result<ClientConfig> {
     Ok(cfg)
 }
 
-/// Validate and commit the in-progress record, if any. Required keys and
+/// Validate and commit the in-progress record. Required keys and
 /// combinations that depend on more than one key of the same entry (`proxy`
 /// against `proto`, `clamp_mss` against `default_route`) are checked here,
 /// where the whole entry is known.
+#[inline(never)]
 fn close_record(
-    section: &Section,
+    table: usize,
     cfg: &mut ClientConfig,
-    record: &mut PartialRecord,
+    record: &mut Record,
     seeded: &mut Vec<(usize, crate::seed::Seed)>,
     n: usize,
 ) -> Result<()> {
-    match section {
-        Section::Server => {
-            let name = record
-                .name
-                .take()
-                .ok_or_else(|| err(n, "server missing `name`"))?;
+    match table {
+        0 => {
+            cfg.id = record.strs[0].take();
+            cfg.peer_secret = record.strs[1].take().map(ServerSecret);
+            cfg.active = record.strs[2].take();
+            cfg.control = record.strs[3].take();
+        }
+        1 => {
+            let name = record.required(0, n, "server missing `name`")?;
             if name.is_empty() {
                 return Err(err(n, "server `name` must not be empty"));
             }
-            let addr = record
-                .addr
-                .take()
-                .ok_or_else(|| err(n, "server missing `addr`"))?;
-            let seed = match record.seed.take() {
+            let addr = record.required(1, n, "server missing `addr`")?;
+            let seed = match record.strs[2].take() {
                 Some(hex) => {
                     let seed = crate::seed::Seed::parse(&hex)
                         .map_err(|e| err(n, &format!("server {e}")))?;
@@ -580,17 +446,16 @@ fn close_record(
                 }
                 None => None,
             };
-            let secret = match (record.secret.take(), &seed) {
+            let secret = match (record.strs[3].take(), &seed) {
                 (Some(secret), _) => secret,
                 (None, Some((_, seed))) => seed.network(),
                 (None, None) => return Err(err(n, "server missing `secret` or `seed`")),
             };
-            let discovery = record
-                .discovery
+            let discovery = record.strs[5]
                 .take()
                 .or_else(|| seed.as_ref().map(|(_, seed)| seed.discovery()));
             let (seed_hex, seed) = seed.unzip();
-            let credential = match (record.credential.take(), seed) {
+            let credential = match (record.strs[4].take(), seed) {
                 (Some(credential), _) => credential,
                 // Replaced by the seed's `client <id>` once the whole file is
                 // read; the secret stands in until then.
@@ -610,42 +475,33 @@ fn close_record(
                 transport: record.transport.take().unwrap_or(Transport::Auto),
             });
         }
-        Section::Forward => {
+        2 => {
             let proto = record
                 .proto
                 .ok_or_else(|| err(n, "forward missing `proto`"))?;
-            let port = record
-                .port
-                .ok_or_else(|| err(n, "forward missing `port`"))?;
-            if record.proxy.is_some() && proto == Proto::Udp {
+            let port = record.ints[0].ok_or_else(|| err(n, "forward missing `port`"))?;
+            if record.bools[0].is_some() && proto == Proto::Udp {
                 return Err(err(n, "`proxy` is not supported on udp forwards"));
             }
             cfg.forwards.push(CfgForward {
                 proto,
                 port,
-                target: record
-                    .target
+                target: record.strs[0]
                     .take()
                     .unwrap_or_else(|| format!("127.0.0.1:{port}")),
-                proxy: record.proxy.take().unwrap_or(false),
+                proxy: record.bools[0].unwrap_or(false),
                 idle: record.idle.take(),
-                enabled: record.enabled.take().unwrap_or(true),
+                enabled: record.bools[1].unwrap_or(true),
             });
         }
-        Section::Pppoe => {
-            let name = record
-                .name
-                .take()
-                .ok_or_else(|| err(n, "pppoe missing `name`"))?;
+        3 => {
+            let name = record.required(0, n, "pppoe missing `name`")?;
             if name.is_empty() {
                 return Err(err(n, "pppoe `name` must not be empty"));
             }
-            let username = record
-                .username
-                .take()
-                .ok_or_else(|| err(n, "pppoe missing `username`"))?;
-            let default_route = record.default_route.take().unwrap_or(false);
-            if record.clamp_mss == Some(false) && !default_route {
+            let username = record.required(1, n, "pppoe missing `username`")?;
+            let default_route = record.bools[1].unwrap_or(false);
+            if record.bools[2] == Some(false) && !default_route {
                 return Err(err(
                     n,
                     "`clamp_mss = false` requires `default_route = true`",
@@ -653,90 +509,61 @@ fn close_record(
             }
             cfg.pppoe.push(CfgPppoe {
                 name,
-                autostart: record.autostart.take().unwrap_or(false),
+                autostart: record.bools[0].unwrap_or(false),
                 username,
-                password: record.password.take(),
-                password_file: record.password_file.take(),
-                service: record.service.take().unwrap_or_default(),
-                mtu: record.mtu.take().unwrap_or(1492),
+                password: record.strs[2].take(),
+                password_file: record.strs[3].take(),
+                service: record.strs[4].take().unwrap_or_default(),
+                mtu: record.ints[0].unwrap_or(1492),
                 default_route,
-                clamp_mss: record.clamp_mss.take().unwrap_or(true),
-                request_dns: record.request_dns.take().unwrap_or(false),
+                clamp_mss: record.bools[2].unwrap_or(true),
+                request_dns: record.bools[3].unwrap_or(false),
             });
         }
-        Section::Tap => {
-            let dev = record
-                .dev
-                .take()
-                .ok_or_else(|| err(n, "tap missing `dev`"))?;
+        4 => {
+            let dev = record.required(0, n, "tap missing `dev`")?;
             if dev.is_empty() {
                 return Err(err(n, "tap `dev` must not be empty"));
             }
             cfg.tap = Some(CfgTap { dev });
         }
-        Section::Tun => {
-            let exit = record.exit.take().unwrap_or(false);
-            let exit_strict = record.exit_strict.take().unwrap_or(false);
+        5 => {
+            let exit = record.bools[0].unwrap_or(false);
+            let exit_strict = record.bools[1].unwrap_or(false);
             if exit_strict && !exit {
                 return Err(err(n, "`exit_strict = true` requires `exit = true`"));
             }
-            let exit_via = record.exit_via.take();
-            if exit_via.as_ref().is_some_and(|p| p.is_empty()) {
+            if record.strs[1].as_deref() == Some("") {
                 return Err(err(n, "tun `exit_via` must name a peer"));
             }
             cfg.tun = Some(CfgTun {
-                dev: record.dev.take(),
+                dev: record.strs[0].take(),
                 address: record.address.take(),
                 exit,
                 exit_strict,
-                exit_via,
+                exit_via: record.strs[1].take(),
             });
         }
-        Section::Peer => {
-            let segment = record.segment.take();
-            if segment.as_ref().is_some_and(|s| s.is_empty()) {
+        _ => {
+            if record.strs[1].as_deref() == Some("") {
                 return Err(err(n, "peer `segment` must name an interface"));
             }
-            let exit = record.exit.take().unwrap_or(false);
-            let exit_iface = record.exit_iface.take();
-            if exit_iface.as_ref().is_some_and(|i| i.is_empty()) {
+            let exit = record.bools[0].unwrap_or(false);
+            if record.strs[0].as_deref() == Some("") {
                 return Err(err(n, "peer `exit_iface` must name an interface"));
             }
-            if exit_iface.is_some() && !exit {
+            if record.strs[0].is_some() && !exit {
                 return Err(err(n, "`exit_iface` requires `exit = true`"));
             }
             cfg.peer = Some(CfgPeer {
                 exit,
-                exit_iface,
-                segment,
+                exit_iface: record.strs[0].take(),
+                segment: record.strs[1].take(),
                 allow: record.allow.take().unwrap_or_default(),
             });
         }
-        Section::None | Section::Client => {}
     }
     Ok(())
-}
-
-fn parse_transport(value: &str, n: usize) -> Result<Transport> {
-    let s = parse_string(value, n)?;
-    match s.as_str() {
-        "auto" => Ok(Transport::Auto),
-        "udp" => Ok(Transport::Udp),
-        "tcp" => Ok(Transport::Tcp),
-        other => Err(err(n, &format!("unknown transport `{other}`"))),
-    }
-}
-
-fn parse_cidr(value: &str, n: usize) -> Result<(Ipv4Addr, u8)> {
-    let s = parse_string(value, n)?;
-    let invalid = || err(n, &format!("invalid address `{s}` (expected A.B.C.D/N)"));
-    let (ip, len) = s.split_once('/').ok_or_else(invalid)?;
-    let ip = Ipv4Addr::from_str(ip).map_err(|_| invalid())?;
-    let len: u8 = len.parse().map_err(|_| invalid())?;
-    if len > 32 {
-        return Err(invalid());
-    }
-    Ok((ip, len))
 }
 
 fn transport_str(t: Transport) -> &'static str {
@@ -750,6 +577,7 @@ fn transport_str(t: Transport) -> &'static str {
 /// Emit a deterministic, comment-free rendering of `cfg`. Entries keep their
 /// declaration order (the first `[[servers]]` entry is the boot default when
 /// `active` is unset) and default-valued keys are omitted.
+#[inline(never)]
 pub fn serialize_client(cfg: &ClientConfig) -> String {
     let mut out = String::new();
 
@@ -760,31 +588,23 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
     {
         out.push_str("[client]\n");
         if let Some(id) = &cfg.id {
-            out.push_str(&format!("id = {}\n", quote(id)));
+            kv_quoted(&mut out, "id", id);
         }
         if let Some(secret) = &cfg.peer_secret {
-            out.push_str(&format!("peer_secret = {}\n", quote(&secret.0)));
+            kv_quoted(&mut out, "peer_secret", &secret.0);
         }
         if let Some(active) = &cfg.active {
-            out.push_str(&format!("active = {}\n", quote(active)));
+            kv_quoted(&mut out, "active", active);
         }
         if let Some(control) = &cfg.control {
-            out.push_str(&format!("control = {}\n", quote(control)));
+            kv_quoted(&mut out, "control", control);
         }
     }
 
-    let table = |out: &mut String, header: &str| {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(header);
-        out.push('\n');
-    };
-
     for s in &cfg.servers {
         table(&mut out, "[[servers]]");
-        out.push_str(&format!("name = {}\n", quote(&s.name)));
-        out.push_str(&format!("addr = {}\n", quote(&s.addr)));
+        kv_quoted(&mut out, "name", &s.name);
+        kv_quoted(&mut out, "addr", &s.addr);
         // A value the seed derives is left to the seed, so a later change to
         // `[client].id` re-derives the credential instead of keeping a stale
         // copy.
@@ -794,115 +614,118 @@ pub fn serialize_client(cfg: &ClientConfig) -> String {
             .and_then(|seed| crate::seed::Seed::parse(&seed.0).ok());
         let derived = |value: Option<String>, explicit: &str| value.as_deref() == Some(explicit);
         if let Some(seed) = &s.seed {
-            out.push_str(&format!("seed = {}\n", quote(&seed.0)));
+            kv_quoted(&mut out, "seed", &seed.0);
         }
         if !derived(seed.as_ref().map(|seed| seed.network()), &s.secret.0) {
-            out.push_str(&format!("secret = {}\n", quote(&s.secret.0)));
+            kv_quoted(&mut out, "secret", &s.secret.0);
         }
         let client = seed
             .as_ref()
             .zip(cfg.id.as_deref())
             .map(|(seed, id)| seed.client(id));
         if !derived(client, &s.credential.0) {
-            out.push_str(&format!("credential = {}\n", quote(&s.credential.0)));
+            kv_quoted(&mut out, "credential", &s.credential.0);
         }
         if let Some(discovery) = &s.discovery {
             if !derived(seed.as_ref().map(|seed| seed.discovery()), &discovery.0) {
-                out.push_str(&format!("discovery = {}\n", quote(&discovery.0)));
+                kv_quoted(&mut out, "discovery", &discovery.0);
             }
         }
         if s.transport != Transport::Auto {
-            out.push_str(&format!(
-                "transport = {}\n",
-                quote(transport_str(s.transport))
-            ));
+            kv_quoted(&mut out, "transport", transport_str(s.transport));
         }
     }
 
     for f in &cfg.forwards {
         table(&mut out, "[[forwards]]");
-        out.push_str(&format!("proto = {}\n", quote(proto_name(f.proto))));
-        out.push_str(&format!("port = {}\n", f.port));
-        out.push_str(&format!("target = {}\n", quote(&f.target)));
+        kv_quoted(&mut out, "proto", proto_name(f.proto));
+        kv_num(&mut out, "port", f.port.into());
+        kv_quoted(&mut out, "target", &f.target);
         if !f.enabled {
-            out.push_str("enabled = false\n");
+            kv_bool(&mut out, "enabled", false);
         }
         if f.proxy {
-            out.push_str("proxy = true\n");
+            kv_bool(&mut out, "proxy", true);
         }
         if let Some(secs) = f.idle {
-            out.push_str(&format!("idle = {secs}\n"));
+            kv_num(&mut out, "idle", secs.into());
         }
     }
 
     for p in &cfg.pppoe {
         table(&mut out, "[[pppoe]]");
-        out.push_str(&format!("name = {}\n", quote(&p.name)));
+        kv_quoted(&mut out, "name", &p.name);
         if p.autostart {
-            out.push_str("autostart = true\n");
+            kv_bool(&mut out, "autostart", true);
         }
-        out.push_str(&format!("username = {}\n", quote(&p.username)));
+        kv_quoted(&mut out, "username", &p.username);
         if let Some(password) = &p.password {
-            out.push_str(&format!("password = {}\n", quote(password)));
+            kv_quoted(&mut out, "password", password);
         }
         if let Some(path) = &p.password_file {
-            out.push_str(&format!("password_file = {}\n", quote(path)));
+            kv_quoted(&mut out, "password_file", path);
         }
         if !p.service.is_empty() {
-            out.push_str(&format!("service = {}\n", quote(&p.service)));
+            kv_quoted(&mut out, "service", &p.service);
         }
         if p.mtu != 1492 {
-            out.push_str(&format!("mtu = {}\n", p.mtu));
+            kv_num(&mut out, "mtu", p.mtu.into());
         }
         if p.default_route {
-            out.push_str("default_route = true\n");
+            kv_bool(&mut out, "default_route", true);
         }
         if !p.clamp_mss {
-            out.push_str("clamp_mss = false\n");
+            kv_bool(&mut out, "clamp_mss", false);
         }
         if p.request_dns {
-            out.push_str("request_dns = true\n");
+            kv_bool(&mut out, "request_dns", true);
         }
     }
 
     if let Some(tap) = &cfg.tap {
         table(&mut out, "[tap]");
-        out.push_str(&format!("dev = {}\n", quote(&tap.dev)));
+        kv_quoted(&mut out, "dev", &tap.dev);
     }
 
     if let Some(tun) = &cfg.tun {
         table(&mut out, "[tun]");
         if let Some(dev) = &tun.dev {
-            out.push_str(&format!("dev = {}\n", quote(dev)));
+            kv_quoted(&mut out, "dev", dev);
         }
         if let Some((ip, len)) = tun.address {
-            out.push_str(&format!("address = {}\n", quote(&format!("{ip}/{len}"))));
+            kv_quoted(&mut out, "address", &format!("{ip}/{len}"));
         }
         if tun.exit {
-            out.push_str("exit = true\n");
+            kv_bool(&mut out, "exit", true);
         }
         if tun.exit_strict {
-            out.push_str("exit_strict = true\n");
+            kv_bool(&mut out, "exit_strict", true);
         }
         if let Some(peer) = &tun.exit_via {
-            out.push_str(&format!("exit_via = {}\n", quote(peer)));
+            kv_quoted(&mut out, "exit_via", peer);
         }
     }
 
     if let Some(peer) = &cfg.peer {
         table(&mut out, "[peer]");
         if peer.exit {
-            out.push_str("exit = true\n");
+            kv_bool(&mut out, "exit", true);
         }
         if let Some(iface) = &peer.exit_iface {
-            out.push_str(&format!("exit_iface = {}\n", quote(iface)));
+            kv_quoted(&mut out, "exit_iface", iface);
         }
         if let Some(bridge) = &peer.segment {
-            out.push_str(&format!("segment = {}\n", quote(bridge)));
+            kv_quoted(&mut out, "segment", bridge);
         }
         if !peer.allow.is_empty() {
-            let entries: Vec<String> = peer.allow.iter().map(|id| quote(id)).collect();
-            out.push_str(&format!("allow = [{}]\n", entries.join(", ")));
+            out.push_str("allow = [");
+            for (i, id) in peer.allow.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                quote_into(&mut out, id);
+            }
+            out.push_str("]\n");
         }
     }
 

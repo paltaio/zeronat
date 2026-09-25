@@ -7,14 +7,13 @@
 
 pub(crate) mod codec;
 
-use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::str::FromStr;
 
-use codec::{err, parse_bool, parse_int, parse_string, quote, reject_dup, split_kv, strip_comment};
+use codec::{err, kv_bool, kv_num, kv_quoted, parse_tables, table, Grammar, Key, Record, TableDef};
 pub use codec::{quarantine, save_atomic, LoadError};
 
+use crate::admin::order;
 use crate::proto::Proto;
 use crate::Result;
 
@@ -57,211 +56,114 @@ pub struct ServerConfig {
     pub routes: Vec<CfgRoute>,
 }
 
-/// Which table the parser is currently filling.
-enum Section {
-    None,
-    Server,
-    Listener,
-    Route,
-    Client,
-}
+const GRAMMAR: Grammar = Grammar {
+    headers: "server [listeners] [routes] [clients]",
+    tables: &[
+        TableDef {
+            label: "[server]",
+            single: true,
+            keys: "id control seed admin_secret exit exit_iface",
+            kinds: &[
+                Key::Str(0),
+                Key::Str(1),
+                Key::Str(2),
+                Key::Str(3),
+                Key::Bool(0),
+                Key::Str(4),
+            ],
+        },
+        TableDef {
+            label: "[[listeners]]",
+            single: false,
+            keys: "bind_ip proto port",
+            kinds: &[Key::Ip, Key::Proto, Key::Int(0)],
+        },
+        TableDef {
+            label: "[[routes]]",
+            single: false,
+            keys: "bind_ip proto port client",
+            kinds: &[Key::Ip, Key::Proto, Key::Int(0), Key::Str(0)],
+        },
+        TableDef {
+            label: "[[clients]]",
+            single: false,
+            keys: "id secret",
+            kinds: &[Key::Str(0), Key::Str(1)],
+        },
+    ],
+};
 
-/// One in-progress array-of-tables record. Fields are filled as keys are seen
-/// and validated for completeness when the record closes.
-#[derive(Default)]
-struct PartialRecord {
-    bind_ip: Option<Ipv4Addr>,
-    proto: Option<Proto>,
-    port: Option<u16>,
-    client: Option<String>,
-    id: Option<String>,
-    secret: Option<String>,
-}
-
+#[inline(never)]
 pub fn parse(text: &str) -> Result<ServerConfig> {
     let mut cfg = ServerConfig::default();
-    let mut section = Section::None;
-    let mut seen_server = false;
-    let mut server_keys: Vec<&str> = Vec::new();
-    let mut record = PartialRecord::default();
-    let mut record_keys: Vec<&str> = Vec::new();
     // A listener and a route may share a (bind_ip, proto, port) key (a route
     // targets a listener), but two listeners or two routes may not.
-    let mut seen_listeners: HashSet<(Ipv4Addr, Proto, u16)> = HashSet::new();
-    let mut seen_routes: HashSet<(Ipv4Addr, Proto, u16)> = HashSet::new();
-
-    for (lineno, raw) in text.lines().enumerate() {
-        let line = strip_comment(raw).trim();
-        if line.is_empty() {
-            continue;
-        }
-        let n = lineno + 1;
-
-        if let Some(header) = line.strip_prefix('[') {
-            // A table header closes the previous array-of-tables record.
-            close_record(
-                &section,
-                &mut cfg,
-                &mut record,
-                &mut seen_listeners,
-                &mut seen_routes,
-                n,
-            )?;
-            record = PartialRecord::default();
-            record_keys.clear();
-
-            let header = header
-                .strip_suffix(']')
-                .ok_or_else(|| err(n, "unterminated table header"))?;
-            match header {
-                "server" => {
-                    if seen_server {
-                        return Err(err(n, "duplicate [server] table"));
-                    }
-                    seen_server = true;
-                    server_keys.clear();
-                    section = Section::Server;
-                }
-                "[listeners]" => section = Section::Listener,
-                "[routes]" => section = Section::Route,
-                "[clients]" => section = Section::Client,
-                other => {
-                    return Err(err(n, &format!("unknown table header [{other}]")));
-                }
-            }
-            continue;
-        }
-
-        let (key, value) = split_kv(line).ok_or_else(|| err(n, "expected key = value"))?;
-        if key.is_empty() || key.contains(|c: char| c.is_whitespace()) {
-            return Err(err(n, "invalid key"));
-        }
-
-        match section {
-            Section::None => {
-                return Err(err(n, &format!("key `{key}` before any table header")));
-            }
-            Section::Server => {
-                reject_dup(&mut server_keys, key, n)?;
-                match key {
-                    "id" => cfg.id = Some(parse_string(value, n)?),
-                    "control" => cfg.control = Some(parse_string(value, n)?),
-                    "seed" => cfg.seed = Some(parse_string(value, n)?),
-                    "admin_secret" => cfg.admin_secret = Some(parse_string(value, n)?),
-                    "exit" => cfg.exit = Some(parse_bool(value, n)?),
-                    "exit_iface" => cfg.exit_iface = Some(parse_string(value, n)?),
-                    other => {
-                        return Err(err(n, &format!("unknown key `{other}` in [server]")));
-                    }
-                }
-            }
-            Section::Listener => {
-                reject_dup(&mut record_keys, key, n)?;
-                match key {
-                    "bind_ip" => record.bind_ip = Some(parse_ip(value, n)?),
-                    "proto" => record.proto = Some(parse_proto(value, n)?),
-                    "port" => record.port = Some(parse_int(value, n)?),
-                    other => {
-                        return Err(err(n, &format!("unknown key `{other}` in [[listeners]]")));
-                    }
-                }
-            }
-            Section::Route => {
-                reject_dup(&mut record_keys, key, n)?;
-                match key {
-                    "bind_ip" => record.bind_ip = Some(parse_ip(value, n)?),
-                    "proto" => record.proto = Some(parse_proto(value, n)?),
-                    "port" => record.port = Some(parse_int(value, n)?),
-                    "client" => record.client = Some(parse_string(value, n)?),
-                    other => {
-                        return Err(err(n, &format!("unknown key `{other}` in [[routes]]")));
-                    }
-                }
-            }
-            Section::Client => {
-                reject_dup(&mut record_keys, key, n)?;
-                match key {
-                    "id" => record.id = Some(parse_string(value, n)?),
-                    "secret" => record.secret = Some(parse_string(value, n)?),
-                    other => {
-                        return Err(err(n, &format!("unknown key `{other}` in [[clients]]")));
-                    }
-                }
-            }
-        }
-    }
-
-    // Close the final open record at EOF.
-    let last = text.lines().count();
-    close_record(
-        &section,
-        &mut cfg,
-        &mut record,
-        &mut seen_listeners,
-        &mut seen_routes,
-        last,
-    )?;
+    let mut seen_listeners: Vec<(Ipv4Addr, Proto, u16)> = Vec::new();
+    let mut seen_routes: Vec<(Ipv4Addr, Proto, u16)> = Vec::new();
+    parse_tables(text, &GRAMMAR, &mut |table, record, n| {
+        close_record(
+            table,
+            &mut cfg,
+            record,
+            &mut seen_listeners,
+            &mut seen_routes,
+            n,
+        )
+    })?;
     Ok(cfg)
+}
+
+/// The `(bind_ip, proto, port)` key of a listener or route table, each part
+/// required; `what` names the table in the errors.
+#[inline(never)]
+fn target(record: &Record, what: &str, n: usize) -> Result<(Ipv4Addr, Proto, u16)> {
+    let missing = |key: &str| err(n, &format!("{what} missing `{key}`"));
+    let bind_ip = record.ip.ok_or_else(|| missing("bind_ip"))?;
+    let proto = record.proto.ok_or_else(|| missing("proto"))?;
+    let port = record.ints[0].ok_or_else(|| missing("port"))?;
+    Ok((bind_ip, proto, port))
 }
 
 /// Validate and commit the in-progress array-of-tables record, if any. Rejects a
 /// listener or route whose `(bind_ip, proto, port)` key already appeared, since
 /// each such key maps to exactly one listener and at most one route.
+#[inline(never)]
 fn close_record(
-    section: &Section,
+    table: usize,
     cfg: &mut ServerConfig,
-    record: &mut PartialRecord,
-    seen_listeners: &mut HashSet<(Ipv4Addr, Proto, u16)>,
-    seen_routes: &mut HashSet<(Ipv4Addr, Proto, u16)>,
+    record: &mut Record,
+    seen_listeners: &mut Vec<(Ipv4Addr, Proto, u16)>,
+    seen_routes: &mut Vec<(Ipv4Addr, Proto, u16)>,
     n: usize,
 ) -> Result<()> {
-    match section {
-        Section::Listener => {
-            let bind_ip = record
-                .bind_ip
-                .ok_or_else(|| err(n, "listener missing `bind_ip`"))?;
-            let proto = record
-                .proto
-                .ok_or_else(|| err(n, "listener missing `proto`"))?;
-            let port = record
-                .port
-                .ok_or_else(|| err(n, "listener missing `port`"))?;
-            if !seen_listeners.insert((bind_ip, proto, port)) {
-                return Err(err(
-                    n,
-                    &format!(
-                        "duplicate listener {bind_ip} {} {port}",
-                        crate::proto::proto_name(proto)
-                    ),
-                ));
+    match table {
+        0 => {
+            cfg.id = record.strs[0].take();
+            cfg.control = record.strs[1].take();
+            cfg.seed = record.strs[2].take();
+            cfg.admin_secret = record.strs[3].take();
+            cfg.exit = record.bools[0];
+            cfg.exit_iface = record.strs[4].take();
+        }
+        1 => {
+            let (bind_ip, proto, port) = target(record, "listener", n)?;
+            if seen_listeners.contains(&(bind_ip, proto, port)) {
+                return Err(duplicate("listener", bind_ip, proto, port, n));
             }
+            seen_listeners.push((bind_ip, proto, port));
             cfg.listeners.push(CfgListener {
                 bind_ip,
                 proto,
                 port,
             });
         }
-        Section::Route => {
-            let bind_ip = record
-                .bind_ip
-                .ok_or_else(|| err(n, "route missing `bind_ip`"))?;
-            let proto = record
-                .proto
-                .ok_or_else(|| err(n, "route missing `proto`"))?;
-            let port = record.port.ok_or_else(|| err(n, "route missing `port`"))?;
-            let client = record
-                .client
-                .take()
-                .ok_or_else(|| err(n, "route missing `client`"))?;
-            if !seen_routes.insert((bind_ip, proto, port)) {
-                return Err(err(
-                    n,
-                    &format!(
-                        "duplicate route {bind_ip} {} {port}",
-                        crate::proto::proto_name(proto)
-                    ),
-                ));
+        2 => {
+            let (bind_ip, proto, port) = target(record, "route", n)?;
+            let client = record.required(0, n, "route missing `client`")?;
+            if seen_routes.contains(&(bind_ip, proto, port)) {
+                return Err(duplicate("route", bind_ip, proto, port, n));
             }
+            seen_routes.push((bind_ip, proto, port));
             cfg.routes.push(CfgRoute {
                 bind_ip,
                 proto,
@@ -269,40 +171,33 @@ fn close_record(
                 client,
             });
         }
-        Section::Client => {
-            let id = record
-                .id
-                .take()
-                .ok_or_else(|| err(n, "client missing `id`"))?;
+        _ => {
+            let id = record.required(0, n, "client missing `id`")?;
             if id.is_empty() {
                 return Err(err(n, "client `id` must not be empty"));
             }
             cfg.clients.push(CfgClient {
                 id,
-                secret: record.secret.take(),
+                secret: record.strs[1].take(),
             });
         }
-        Section::None | Section::Server => {}
     }
     Ok(())
 }
 
-pub(crate) fn parse_proto(value: &str, n: usize) -> Result<Proto> {
-    let s = parse_string(value, n)?;
-    match s.as_str() {
-        "tcp" => Ok(Proto::Tcp),
-        "udp" => Ok(Proto::Udp),
-        "tap" => Err(err(n, "proto `tap` is not supported in this version")),
-        other => Err(err(n, &format!("unknown proto `{other}`"))),
-    }
-}
-
-fn parse_ip(value: &str, n: usize) -> Result<Ipv4Addr> {
-    let s = parse_string(value, n)?;
-    Ipv4Addr::from_str(&s).map_err(|_| err(n, &format!("invalid IPv4 address `{s}`")))
+#[inline(never)]
+fn duplicate(what: &str, bind_ip: Ipv4Addr, proto: Proto, port: u16, n: usize) -> crate::Error {
+    err(
+        n,
+        &format!(
+            "duplicate {what} {bind_ip} {} {port}",
+            crate::proto::proto_name(proto)
+        ),
+    )
 }
 
 /// Emit a deterministic, sorted, comment-free rendering of `cfg`.
+#[inline(never)]
 pub fn serialize(cfg: &ServerConfig) -> String {
     let mut out = String::new();
 
@@ -315,68 +210,63 @@ pub fn serialize(cfg: &ServerConfig) -> String {
     {
         out.push_str("[server]\n");
         if let Some(id) = &cfg.id {
-            out.push_str(&format!("id = {}\n", quote(id)));
+            kv_quoted(&mut out, "id", id);
         }
         if let Some(control) = &cfg.control {
-            out.push_str(&format!("control = {}\n", quote(control)));
+            kv_quoted(&mut out, "control", control);
         }
         if let Some(seed) = &cfg.seed {
-            out.push_str(&format!("seed = {}\n", quote(seed)));
+            kv_quoted(&mut out, "seed", seed);
         }
         if let Some(admin_secret) = &cfg.admin_secret {
-            out.push_str(&format!("admin_secret = {}\n", quote(admin_secret)));
+            kv_quoted(&mut out, "admin_secret", admin_secret);
         }
         if let Some(exit) = cfg.exit {
-            out.push_str(&format!("exit = {exit}\n"));
+            kv_bool(&mut out, "exit", exit);
         }
         if let Some(iface) = &cfg.exit_iface {
-            out.push_str(&format!("exit_iface = {}\n", quote(iface)));
+            kv_quoted(&mut out, "exit_iface", iface);
         }
     }
 
-    let mut clients = cfg.clients.clone();
-    clients.sort_by(|a, b| a.id.cmp(&b.id));
-    for client in &clients {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("[[clients]]\n");
-        out.push_str(&format!("id = {}\n", quote(&client.id)));
+    let clients = &cfg.clients;
+    for &i in &order(clients.len(), &mut |a, b| clients[a].id < clients[b].id) {
+        let client = &clients[i];
+        table(&mut out, "[[clients]]");
+        kv_quoted(&mut out, "id", &client.id);
         if let Some(secret) = &client.secret {
-            out.push_str(&format!("secret = {}\n", quote(secret)));
+            kv_quoted(&mut out, "secret", secret);
         }
     }
 
-    let mut listeners = cfg.listeners.clone();
-    listeners.sort_by(|a, b| {
-        (a.bind_ip, proto_rank(a.proto), a.port).cmp(&(b.bind_ip, proto_rank(b.proto), b.port))
-    });
-    for l in &listeners {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("[[listeners]]\n");
-        out.push_str(&format!("bind_ip = {}\n", quote(&l.bind_ip.to_string())));
-        out.push_str(&format!("proto = {}\n", quote(proto_str(l.proto))));
-        out.push_str(&format!("port = {}\n", l.port));
+    let listeners = &cfg.listeners;
+    let key = |l: &CfgListener| (l.bind_ip, proto_rank(l.proto), l.port);
+    for &i in &order(listeners.len(), &mut |a, b| {
+        key(&listeners[a]) < key(&listeners[b])
+    }) {
+        let l = &listeners[i];
+        table(&mut out, "[[listeners]]");
+        put_target(&mut out, l.bind_ip, l.proto, l.port);
     }
 
-    let mut routes = cfg.routes.clone();
-    routes.sort_by(|a, b| {
-        (a.bind_ip, proto_rank(a.proto), a.port).cmp(&(b.bind_ip, proto_rank(b.proto), b.port))
-    });
-    for r in &routes {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("[[routes]]\n");
-        out.push_str(&format!("bind_ip = {}\n", quote(&r.bind_ip.to_string())));
-        out.push_str(&format!("proto = {}\n", quote(proto_str(r.proto))));
-        out.push_str(&format!("port = {}\n", r.port));
-        out.push_str(&format!("client = {}\n", quote(&r.client)));
+    let routes = &cfg.routes;
+    let key = |r: &CfgRoute| (r.bind_ip, proto_rank(r.proto), r.port);
+    for &i in &order(routes.len(), &mut |a, b| key(&routes[a]) < key(&routes[b])) {
+        let r = &routes[i];
+        table(&mut out, "[[routes]]");
+        put_target(&mut out, r.bind_ip, r.proto, r.port);
+        kv_quoted(&mut out, "client", &r.client);
     }
 
     out
+}
+
+/// The `bind_ip`, `proto`, `port` keys of a listener or route.
+#[inline(never)]
+fn put_target(out: &mut String, bind_ip: Ipv4Addr, proto: Proto, port: u16) {
+    kv_quoted(out, "bind_ip", &bind_ip.to_string());
+    kv_quoted(out, "proto", proto_str(proto));
+    kv_num(out, "port", port.into());
 }
 
 fn proto_str(p: Proto) -> &'static str {
