@@ -339,45 +339,12 @@ pub(crate) fn proto_byte(p: Proto) -> u8 {
     }
 }
 
-pub(crate) fn proto_from_byte(n: u8) -> Result<Proto> {
-    match n {
-        1 => Ok(Proto::Tcp),
-        2 => Ok(Proto::Udp),
-        n => Err(format!("unknown proto byte {n}").into()),
-    }
-}
-
 pub(crate) fn source_byte(s: Source) -> u8 {
     match s {
         Source::File => 0,
         Source::Cli => 1,
         Source::Runtime => 2,
     }
-}
-
-fn source_from_byte(n: u8) -> Result<Source> {
-    match n {
-        0 => Ok(Source::File),
-        1 => Ok(Source::Cli),
-        2 => Ok(Source::Runtime),
-        n => Err(format!("unknown source byte {n}").into()),
-    }
-}
-
-/// Validate a `provides` bitset: any bit outside the defined set is rejected.
-fn provides_from_byte(n: u8) -> Result<u8> {
-    if n & !PROVIDES_MASK != 0 {
-        return Err(format!("unknown provides byte {n}").into());
-    }
-    Ok(n)
-}
-
-/// Validate a requested capability: exactly one defined provides bit.
-fn want_from_byte(n: u8) -> Result<u8> {
-    if n & !PROVIDES_MASK != 0 || n.count_ones() != 1 {
-        return Err(format!("invalid want byte {n}").into());
-    }
-    Ok(n)
 }
 
 fn peer_status_byte(s: PeerStatus) -> u8 {
@@ -391,18 +358,6 @@ fn peer_status_byte(s: PeerStatus) -> u8 {
     }
 }
 
-fn peer_status_from_byte(n: u8) -> Result<PeerStatus> {
-    match n {
-        0 => Ok(PeerStatus::Accepted),
-        1 => Ok(PeerStatus::UnknownPeer),
-        2 => Ok(PeerStatus::PeerOffline),
-        3 => Ok(PeerStatus::NotProvided),
-        4 => Ok(PeerStatus::PeerBusy),
-        5 => Ok(PeerStatus::ServerFailure),
-        n => Err(format!("unknown peer status byte {n}").into()),
-    }
-}
-
 fn refuse_reason_byte(r: PeerRefuseReason) -> u8 {
     match r {
         PeerRefuseReason::MalformedIdentity => 0,
@@ -412,28 +367,10 @@ fn refuse_reason_byte(r: PeerRefuseReason) -> u8 {
     }
 }
 
-fn refuse_reason_from_byte(n: u8) -> Result<PeerRefuseReason> {
-    match n {
-        0 => Ok(PeerRefuseReason::MalformedIdentity),
-        1 => Ok(PeerRefuseReason::FailedProof),
-        2 => Ok(PeerRefuseReason::ChallengeFailed),
-        3 => Ok(PeerRefuseReason::IdentityClaimed),
-        n => Err(format!("unknown refuse reason byte {n}").into()),
-    }
-}
-
 fn path_status_byte(s: PathStatus) -> u8 {
     match s {
         PathStatus::Direct => 0,
         PathStatus::Relay => 1,
-    }
-}
-
-fn path_status_from_byte(n: u8) -> Result<PathStatus> {
-    match n {
-        0 => Ok(PathStatus::Direct),
-        1 => Ok(PathStatus::Relay),
-        n => Err(format!("unknown path status byte {n}").into()),
     }
 }
 
@@ -456,12 +393,10 @@ pub fn path_name(p: PathStatus) -> &'static str {
 }
 
 pub fn settled_path_from_byte(n: u8) -> Result<Option<PathStatus>> {
-    match n {
-        0 => Ok(None),
-        1 => Ok(Some(PathStatus::Direct)),
-        2 => Ok(Some(PathStatus::Relay)),
-        n => Err(format!("unknown settled path byte {n}").into()),
-    }
+    SETTLED_PATHS
+        .get(n as usize)
+        .copied()
+        .ok_or_else(|| bad_byte("unknown settled path", n))
 }
 
 /// Lowercase `PeerStatus` name for logs and refusals.
@@ -493,118 +428,324 @@ pub(crate) fn proto_name(p: Proto) -> &'static str {
     }
 }
 
+/// The decode error for a byte that names nothing: `"<what> byte <n>"`.
+#[inline(never)]
+pub(crate) fn bad_byte(what: &str, n: u8) -> crate::Error {
+    errf!("{what} byte {n}")
+}
+
+/// Append one byte.
+#[inline(never)]
+pub(crate) fn put_u8(b: &mut Vec<u8>, v: u8) {
+    b.push(v);
+}
+
+/// Append a big-endian u16.
+#[inline(never)]
+pub(crate) fn put_u16(b: &mut Vec<u8>, v: u16) {
+    b.extend_from_slice(&v.to_be_bytes());
+}
+
+/// Append a big-endian u32.
+#[inline(never)]
+pub(crate) fn put_u32(b: &mut Vec<u8>, v: u32) {
+    b.extend_from_slice(&v.to_be_bytes());
+}
+
+/// Append a big-endian u64.
+#[inline(never)]
+pub(crate) fn put_u64(b: &mut Vec<u8>, v: u64) {
+    b.extend_from_slice(&v.to_be_bytes());
+}
+
+/// Append raw bytes.
+#[inline(never)]
+pub(crate) fn put_bytes(b: &mut Vec<u8>, s: &[u8]) {
+    b.extend_from_slice(s);
+}
+
+/// A fresh body starting with its tag byte.
+#[inline(never)]
+pub(crate) fn tagged(tag: u8) -> Vec<u8> {
+    vec![tag]
+}
+
+/// A u16 list count, capped so the count and the encoded entries never
+/// disagree; returns the number of entries to encode.
+#[inline(never)]
+pub(crate) fn put_count(b: &mut Vec<u8>, len: usize) -> usize {
+    let count = len.min(u16::MAX as usize);
+    put_u16(b, count as u16);
+    count
+}
+
 /// Append a u16-length-prefixed UTF-8 string. Ids are short, well under
 /// u16::MAX; the debug assert guards against a future caller violating that.
+#[inline(never)]
 pub(crate) fn put_str(b: &mut Vec<u8>, s: &str) {
     debug_assert!(s.len() <= u16::MAX as usize);
-    b.extend_from_slice(&(s.len() as u16).to_be_bytes());
+    put_u16(b, s.len() as u16);
     b.extend_from_slice(s.as_bytes());
 }
 
-/// Read a u16-length-prefixed UTF-8 string at `*at`, advancing the cursor.
-/// Bounds-checks both the length prefix and the body, and validates UTF-8.
-pub(crate) fn take_str(b: &[u8], at: &mut usize) -> Result<String> {
-    if *at + 2 > b.len() {
-        return Err("truncated string length".into());
-    }
-    let len = u16::from_be_bytes([b[*at], b[*at + 1]]) as usize;
-    *at += 2;
-    if *at + len > b.len() {
-        return Err("truncated string body".into());
-    }
-    let s = String::from_utf8(b[*at..*at + len].to_vec())
-        .map_err(|_| -> crate::Error { "invalid utf-8 in string".into() })?;
-    *at += len;
-    Ok(s)
+/// Read cursor over an untrusted body. The first failure is kept in `err`
+/// and every later read yields a zero value without advancing, so a decoder
+/// runs straight through its fields and reports the first error at the end.
+/// Multi-byte reads are preceded by a `need` check naming the field in the
+/// truncation error.
+pub(crate) struct Rd<'a> {
+    pub(crate) b: &'a [u8],
+    pub(crate) at: usize,
+    err: Option<crate::Error>,
 }
 
-/// Read `N` bytes at `*at`, advancing the cursor. `what` names the field in
-/// the truncation error.
-fn take_arr<const N: usize>(b: &[u8], at: &mut usize, what: &str) -> Result<[u8; N]> {
-    if *at + N > b.len() {
-        return Err(format!("truncated {what}").into());
+impl<'a> Rd<'a> {
+    pub(crate) fn new(b: &'a [u8], at: usize) -> Self {
+        Rd { b, at, err: None }
     }
-    let mut arr = [0; N];
-    arr.copy_from_slice(&b[*at..*at + N]);
-    *at += N;
-    Ok(arr)
+
+    /// Whether no read has failed yet.
+    #[inline(never)]
+    pub(crate) fn ok(&self) -> bool {
+        self.err.is_none()
+    }
+
+    /// Record the first failure.
+    #[inline(never)]
+    pub(crate) fn fail(&mut self, e: crate::Error) {
+        if self.err.is_none() {
+            self.err = Some(e);
+        }
+    }
+
+    /// Record the first failure, given as its message.
+    #[inline(never)]
+    pub(crate) fn fail_msg(&mut self, what: &'static str) {
+        if self.err.is_none() {
+            self.err = Some(what.into());
+        }
+    }
+
+    /// The first failure, if any.
+    pub(crate) fn end(&mut self) -> Result<()> {
+        match self.err.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// `n` more bytes must be present, else `what` is the error.
+    #[inline(never)]
+    pub(crate) fn need(&mut self, n: usize, what: &'static str) {
+        if self.err.is_none() && self.at + n > self.b.len() {
+            self.err = Some(what.into());
+        }
+    }
+
+    /// The body must end here, else `what` is the error.
+    #[inline(never)]
+    pub(crate) fn done(&mut self, what: &'static str) {
+        if self.err.is_none() && self.at != self.b.len() {
+            self.err = Some(what.into());
+        }
+    }
+
+    /// The next `n` bytes, or an empty slice after a failure. The caller has
+    /// checked they are present.
+    #[inline(never)]
+    fn take(&mut self, n: usize) -> &'a [u8] {
+        if self.err.is_some() || self.at + n > self.b.len() {
+            return &[];
+        }
+        let s = &self.b[self.at..self.at + n];
+        self.at += n;
+        s
+    }
+
+    #[inline(never)]
+    pub(crate) fn u8(&mut self) -> u8 {
+        self.take(1).first().copied().unwrap_or(0)
+    }
+
+    #[inline(never)]
+    pub(crate) fn u16(&mut self) -> u16 {
+        match self.take(2) {
+            [a, b] => u16::from_be_bytes([*a, *b]),
+            _ => 0,
+        }
+    }
+
+    #[inline(never)]
+    pub(crate) fn u32(&mut self) -> u32 {
+        match self.take(4).try_into() {
+            Ok(a) => u32::from_be_bytes(a),
+            Err(_) => 0,
+        }
+    }
+
+    #[inline(never)]
+    pub(crate) fn u64(&mut self) -> u64 {
+        match self.take(8).try_into() {
+            Ok(a) => u64::from_be_bytes(a),
+            Err(_) => 0,
+        }
+    }
+
+    /// A u16 count preceding a list; `what` names the count in the truncation
+    /// error.
+    #[inline(never)]
+    pub(crate) fn count(&mut self, what: &'static str) -> usize {
+        self.need(2, what);
+        self.u16() as usize
+    }
+
+    /// A flag byte: 0 or 1, anything else fails with `bad_byte(what, n)`.
+    #[inline(never)]
+    pub(crate) fn flag(&mut self, what: &'static str) -> bool {
+        match self.u8() {
+            0 => false,
+            1 => true,
+            n => {
+                self.fail(bad_byte(what, n));
+                false
+            }
+        }
+    }
+
+    /// A byte that must be one of two values, else fails with
+    /// `bad_byte(what, n)`.
+    #[inline(never)]
+    pub(crate) fn one_of(&mut self, a: u8, b: u8, what: &'static str) -> u8 {
+        let n = self.u8();
+        if n != a && n != b {
+            self.fail(bad_byte(what, n));
+        }
+        n
+    }
+
+    /// A byte below `limit`, else fails with `bad_byte(what, n)`; the enum
+    /// decoders index their variant tables with it.
+    #[inline(never)]
+    pub(crate) fn index(&mut self, limit: u8, what: &'static str) -> usize {
+        let n = self.u8();
+        if n >= limit {
+            self.fail(bad_byte(what, n));
+            return 0;
+        }
+        n as usize
+    }
+
+    #[inline(never)]
+    pub(crate) fn proto(&mut self) -> Proto {
+        match self.one_of(1, 2, "unknown proto") {
+            1 => Proto::Tcp,
+            _ => Proto::Udp,
+        }
+    }
+
+    #[inline(never)]
+    pub(crate) fn settled_path(&mut self) -> Option<PathStatus> {
+        SETTLED_PATHS[self.index(3, "unknown settled path")]
+    }
+
+    /// Read a u16-length-prefixed UTF-8 string. Bounds-checks both the length
+    /// prefix and the body, and validates UTF-8.
+    #[inline(never)]
+    pub(crate) fn str(&mut self) -> String {
+        self.need(2, "truncated string length");
+        let len = self.u16() as usize;
+        self.need(len, "truncated string body");
+        match std::str::from_utf8(self.take(len)) {
+            Ok(s) => s.to_owned(),
+            Err(_) => {
+                self.fail_msg("invalid utf-8 in string");
+                String::new()
+            }
+        }
+    }
+
+    /// Read 32 bytes. `what` names the field in the truncation error.
+    #[inline(never)]
+    fn arr32(&mut self, what: &str) -> [u8; 32] {
+        if self.err.is_none() && self.at + 32 > self.b.len() {
+            self.err = Some(errf!("truncated {what}"));
+        }
+        self.take(32).try_into().unwrap_or([0; 32])
+    }
+
+    /// Read 4 octets as an IPv4 address.
+    #[inline(never)]
+    fn ip(&mut self) -> Ipv4Addr {
+        self.need(4, "truncated ipv4 address");
+        Ipv4Addr::from(self.u32())
+    }
+
+    /// Read a socket address. Rejects any family byte other than 4 or 6 and
+    /// length-guards the octets and port.
+    #[inline(never)]
+    fn sockaddr(&mut self) -> SocketAddr {
+        self.need(1, "truncated address family");
+        let ip: IpAddr = match self.u8() {
+            4 => {
+                self.need(4, "truncated ipv4 socket address");
+                IpAddr::from(Ipv4Addr::from(self.u32()))
+            }
+            6 => {
+                self.need(16, "truncated ipv6 socket address");
+                let o: [u8; 16] = self.take(16).try_into().unwrap_or([0; 16]);
+                IpAddr::from(o)
+            }
+            n => {
+                self.fail(bad_byte("unknown address family", n));
+                IpAddr::from([0; 4])
+            }
+        };
+        self.need(2, "truncated socket address port");
+        let port = self.u16();
+        SocketAddr::new(ip, port)
+    }
 }
 
-fn take_identity(b: &[u8], at: &mut usize) -> Result<PeerIdentity> {
-    take_arr(b, at, "peer identity")
-}
-
-fn take_capability(b: &[u8], at: &mut usize) -> Result<Capability> {
-    take_arr(b, at, "capability")
-}
+const SETTLED_PATHS: [Option<PathStatus>; 3] =
+    [None, Some(PathStatus::Direct), Some(PathStatus::Relay)];
+const SOURCES: [Source; 3] = [Source::File, Source::Cli, Source::Runtime];
+const PEER_STATUSES: [PeerStatus; 6] = [
+    PeerStatus::Accepted,
+    PeerStatus::UnknownPeer,
+    PeerStatus::PeerOffline,
+    PeerStatus::NotProvided,
+    PeerStatus::PeerBusy,
+    PeerStatus::ServerFailure,
+];
+const REFUSE_REASONS: [PeerRefuseReason; 4] = [
+    PeerRefuseReason::MalformedIdentity,
+    PeerRefuseReason::FailedProof,
+    PeerRefuseReason::ChallengeFailed,
+    PeerRefuseReason::IdentityClaimed,
+];
+const PATH_STATUSES: [PathStatus; 2] = [PathStatus::Direct, PathStatus::Relay];
 
 /// Append the 4 octets of an IPv4 address.
 fn put_ip(b: &mut Vec<u8>, ip: Ipv4Addr) {
-    b.extend_from_slice(&ip.octets());
-}
-
-/// Read 4 octets at `*at` as an IPv4 address, advancing the cursor.
-fn take_ip(b: &[u8], at: &mut usize) -> Result<Ipv4Addr> {
-    if *at + 4 > b.len() {
-        return Err("truncated ipv4 address".into());
-    }
-    let ip = Ipv4Addr::new(b[*at], b[*at + 1], b[*at + 2], b[*at + 3]);
-    *at += 4;
-    Ok(ip)
+    put_u32(b, ip.into());
 }
 
 /// Append a socket address: a family byte (4 or 6), the raw ip octets, then the
 /// port. Addresses are carried verbatim; collapsing an IPv4-mapped IPv6 address
 /// is the consumer's concern, not the codec's.
+#[inline(never)]
 fn put_sockaddr(b: &mut Vec<u8>, a: SocketAddr) {
     match a.ip() {
         IpAddr::V4(ip) => {
-            b.push(4);
-            b.extend_from_slice(&ip.octets());
+            put_u8(b, 4);
+            put_ip(b, ip);
         }
         IpAddr::V6(ip) => {
-            b.push(6);
-            b.extend_from_slice(&ip.octets());
+            put_u8(b, 6);
+            put_bytes(b, &ip.octets());
         }
     }
-    b.extend_from_slice(&a.port().to_be_bytes());
-}
-
-/// Read a socket address at `*at`, advancing the cursor. Rejects any family byte
-/// other than 4 or 6 and length-guards the octets and port.
-fn take_sockaddr(b: &[u8], at: &mut usize) -> Result<SocketAddr> {
-    if *at >= b.len() {
-        return Err("truncated address family".into());
-    }
-    let fam = b[*at];
-    *at += 1;
-    let ip: IpAddr = match fam {
-        4 => {
-            if *at + 4 > b.len() {
-                return Err("truncated ipv4 socket address".into());
-            }
-            let mut o = [0u8; 4];
-            o.copy_from_slice(&b[*at..*at + 4]);
-            *at += 4;
-            IpAddr::from(o)
-        }
-        6 => {
-            if *at + 16 > b.len() {
-                return Err("truncated ipv6 socket address".into());
-            }
-            let mut o = [0u8; 16];
-            o.copy_from_slice(&b[*at..*at + 16]);
-            *at += 16;
-            IpAddr::from(o)
-        }
-        n => return Err(format!("unknown address family byte {n}").into()),
-    };
-    if *at + 2 > b.len() {
-        return Err("truncated socket address port".into());
-    }
-    let port = u16::from_be_bytes([b[*at], b[*at + 1]]);
-    *at += 2;
-    Ok(SocketAddr::new(ip, port))
+    put_u16(b, a.port());
 }
 
 /// Encode a socket address as a standalone body: a family byte, the raw ip
@@ -612,7 +753,7 @@ fn take_sockaddr(b: &[u8], at: &mut usize) -> Result<SocketAddr> {
 /// (the server-observed public mapping) and in the probe session's first
 /// frame (the party's local candidate).
 pub fn encode_sockaddr(a: SocketAddr) -> Vec<u8> {
-    let mut b = Vec::with_capacity(19);
+    let mut b = Vec::new();
     put_sockaddr(&mut b, a);
     b
 }
@@ -620,11 +761,10 @@ pub fn encode_sockaddr(a: SocketAddr) -> Vec<u8> {
 /// Decode a standalone socket address body written by [`encode_sockaddr`],
 /// rejecting trailing bytes.
 pub fn decode_sockaddr(b: &[u8]) -> Result<SocketAddr> {
-    let mut at = 0;
-    let a = take_sockaddr(b, &mut at)?;
-    if at != b.len() {
-        return Err("trailing bytes in socket address".into());
-    }
+    let mut r = Rd::new(b, 0);
+    let a = r.sockaddr();
+    r.done("trailing bytes in socket address");
+    r.end()?;
     Ok(a)
 }
 
@@ -632,17 +772,17 @@ pub fn decode_sockaddr(b: &[u8]) -> Result<SocketAddr> {
 /// Shared by the `FwdOptions` body and each snapshot client's announced list;
 /// the count is a u16 on the wire, so the encoded entries are capped to match
 /// and the count and body never disagree.
+#[inline(never)]
 fn put_fwd_entries(b: &mut Vec<u8>, entries: &[FwdOptionEntry]) {
     debug_assert!(entries.len() <= u16::MAX as usize);
-    let entries = &entries[..entries.len().min(u16::MAX as usize)];
-    b.extend_from_slice(&(entries.len() as u16).to_be_bytes());
-    for e in entries {
-        b.push(proto_byte(e.proto));
-        b.extend_from_slice(&e.port.to_be_bytes());
+    let count = put_count(b, entries.len());
+    for e in &entries[..count] {
+        put_u8(b, proto_byte(e.proto));
+        put_u16(b, e.port);
         // Flags byte: bit0 = proxy; the remaining bits are reserved and must
         // stay zero (the decoder rejects them).
-        b.push(u8::from(e.proxy));
-        b.extend_from_slice(&e.idle_secs.to_be_bytes());
+        put_u8(b, u8::from(e.proxy));
+        put_u32(b, e.idle_secs);
     }
 }
 
@@ -650,26 +790,19 @@ fn put_fwd_entries(b: &mut Vec<u8>, entries: &[FwdOptionEntry]) {
 /// length-guarded and the list is grown without preallocating from the
 /// untrusted count, so a malformed or truncated body errors rather than
 /// panicking or over-allocating.
-fn take_fwd_entries(b: &[u8], at: &mut usize) -> Result<Vec<FwdOptionEntry>> {
-    if *at + 2 > b.len() {
-        return Err("truncated forward options count".into());
-    }
-    let count = u16::from_be_bytes([b[*at], b[*at + 1]]) as usize;
-    *at += 2;
+#[inline(never)]
+fn take_fwd_entries(r: &mut Rd) -> Vec<FwdOptionEntry> {
+    let count = r.count("truncated forward options count");
     let mut entries = Vec::new();
     for _ in 0..count {
-        if *at + 8 > b.len() {
-            return Err("truncated forward option entry".into());
+        if !r.ok() {
+            break;
         }
-        let proto = proto_from_byte(b[*at])?;
-        let port = u16::from_be_bytes([b[*at + 1], b[*at + 2]]);
-        let proxy = match b[*at + 3] {
-            0 => false,
-            1 => true,
-            n => return Err(format!("unknown forward option flags byte {n}").into()),
-        };
-        let idle_secs = u32::from_be_bytes(b[*at + 4..*at + 8].try_into().unwrap());
-        *at += 8;
+        r.need(8, "truncated forward option entry");
+        let proto = r.proto();
+        let port = r.u16();
+        let proxy = r.flag("unknown forward option flags");
+        let idle_secs = r.u32();
         entries.push(FwdOptionEntry {
             proto,
             port,
@@ -677,7 +810,7 @@ fn take_fwd_entries(b: &[u8], at: &mut usize) -> Result<Vec<FwdOptionEntry>> {
             idle_secs,
         });
     }
-    Ok(entries)
+    entries
 }
 
 /// Decode the bridge-client trailer that follows the routes in a snapshot: a u16
@@ -685,63 +818,37 @@ fn take_fwd_entries(b: &[u8], at: &mut usize) -> Result<Vec<FwdOptionEntry>> {
 /// first, the count is u16-bounded, and the list is grown without preallocating
 /// from the untrusted count, so a malformed or truncated body errors rather than
 /// panicking or over-allocating. The caller still rejects any bytes left over.
-fn decode_bridge_clients(b: &[u8], at: &mut usize) -> Result<Vec<BridgeEntry>> {
-    if *at + 2 > b.len() {
-        return Err("truncated bridge count".into());
-    }
-    let count = u16::from_be_bytes([b[*at], b[*at + 1]]) as usize;
-    *at += 2;
+#[inline(never)]
+fn decode_bridge_clients(r: &mut Rd) -> Vec<BridgeEntry> {
+    let count = r.count("truncated bridge count");
     let mut out = Vec::new();
     for _ in 0..count {
-        let label = take_str(b, at)?;
-        if *at >= b.len() {
-            return Err("truncated bridge named flag".into());
+        if !r.ok() {
+            break;
         }
-        let named = match b[*at] {
-            0 => false,
-            1 => true,
-            n => return Err(format!("unknown bridge named byte {n}").into()),
-        };
-        *at += 1;
-        if *at >= b.len() {
-            return Err("truncated bridge transport".into());
-        }
-        let transport = b[*at];
-        *at += 1;
-        if transport != 1 && transport != 2 {
-            return Err(format!("unknown transport byte {transport}").into());
-        }
-        let peer = take_str(b, at)?;
-        if *at + 2 > b.len() {
-            return Err("truncated bridge mac count".into());
-        }
-        let mac_count = u16::from_be_bytes([b[*at], b[*at + 1]]) as usize;
-        *at += 2;
+        let label = r.str();
+        r.need(1, "truncated bridge named flag");
+        let named = r.flag("unknown bridge named");
+        r.need(1, "truncated bridge transport");
+        let transport = r.one_of(1, 2, "unknown transport");
+        let peer = r.str();
+        let mac_count = r.count("truncated bridge mac count");
         let mut macs = Vec::new();
         for _ in 0..mac_count {
-            if *at + 6 > b.len() {
-                return Err("truncated bridge mac".into());
+            if !r.ok() {
+                break;
             }
-            let mut m = [0u8; 6];
-            m.copy_from_slice(&b[*at..*at + 6]);
-            *at += 6;
+            r.need(6, "truncated bridge mac");
+            let m: [u8; 6] = r.take(6).try_into().unwrap_or([0; 6]);
             macs.push(m);
         }
-        if *at + 40 > b.len() {
-            return Err("truncated bridge counters".into());
-        }
-        let rx_bytes = u64::from_be_bytes(b[*at..*at + 8].try_into().unwrap());
-        *at += 8;
-        let rx_frames = u64::from_be_bytes(b[*at..*at + 8].try_into().unwrap());
-        *at += 8;
-        let tx_bytes = u64::from_be_bytes(b[*at..*at + 8].try_into().unwrap());
-        *at += 8;
-        let tx_frames = u64::from_be_bytes(b[*at..*at + 8].try_into().unwrap());
-        *at += 8;
-        let uptime_secs = u32::from_be_bytes(b[*at..*at + 4].try_into().unwrap());
-        *at += 4;
-        let idle_secs = u32::from_be_bytes(b[*at..*at + 4].try_into().unwrap());
-        *at += 4;
+        r.need(40, "truncated bridge counters");
+        let rx_bytes = r.u64();
+        let rx_frames = r.u64();
+        let tx_bytes = r.u64();
+        let tx_frames = r.u64();
+        let uptime_secs = r.u32();
+        let idle_secs = r.u32();
         out.push(BridgeEntry {
             label,
             named,
@@ -756,31 +863,27 @@ fn decode_bridge_clients(b: &[u8], at: &mut usize) -> Result<Vec<BridgeEntry>> {
             idle_secs,
         });
     }
-    Ok(out)
+    out
 }
 
 /// Decode the pair trailer that follows the bridge clients in a snapshot: a
 /// u16 count then that many entries. Length-guarded like the bridge trailer,
 /// with the capability and the settled path validated at decode; the caller
 /// still rejects any bytes left over.
-fn decode_pairs(b: &[u8], at: &mut usize) -> Result<Vec<PairEntry>> {
-    if *at + 2 > b.len() {
-        return Err(
-            "truncated pair count: the admin reader and the server are different versions".into(),
-        );
-    }
-    let count = u16::from_be_bytes([b[*at], b[*at + 1]]) as usize;
-    *at += 2;
+#[inline(never)]
+fn decode_pairs(r: &mut Rd) -> Vec<PairEntry> {
+    let count =
+        r.count("truncated pair count: the admin reader and the server are different versions");
     let mut out = Vec::new();
     for _ in 0..count {
-        let consumer_id = take_str(b, at)?;
-        let provider_id = take_str(b, at)?;
-        if *at + 2 > b.len() {
-            return Err("truncated pair capability".into());
+        if !r.ok() {
+            break;
         }
-        let want = want_from_byte(b[*at])?;
-        let path = settled_path_from_byte(b[*at + 1])?;
-        *at += 2;
+        let consumer_id = r.str();
+        let provider_id = r.str();
+        r.need(2, "truncated pair capability");
+        let want = want(r);
+        let path = r.settled_path();
         out.push(PairEntry {
             consumer_id,
             provider_id,
@@ -788,25 +891,133 @@ fn decode_pairs(b: &[u8], at: &mut usize) -> Result<Vec<PairEntry>> {
             path,
         });
     }
-    Ok(out)
+    out
+}
+
+#[inline(never)]
+fn decode_listeners(r: &mut Rd) -> Vec<Listener> {
+    let count = r.count("truncated listener count");
+    let mut listeners = Vec::new();
+    for _ in 0..count {
+        if !r.ok() {
+            break;
+        }
+        let bind_ip = r.ip();
+        r.need(4, "truncated listener");
+        let proto = r.proto();
+        let port = r.u16();
+        let source = SOURCES[r.index(3, "unknown source")];
+        listeners.push(Listener {
+            bind_ip,
+            proto,
+            port,
+            source,
+        });
+    }
+    listeners
+}
+
+#[inline(never)]
+fn decode_clients(r: &mut Rd) -> Vec<ClientEntry> {
+    let count = r.count("truncated client count");
+    let mut clients = Vec::new();
+    for _ in 0..count {
+        if !r.ok() {
+            break;
+        }
+        let client_id = r.str();
+        r.need(1, "truncated client transport");
+        let transport = r.one_of(1, 2, "unknown transport");
+        let fwd = take_fwd_entries(r);
+        clients.push(ClientEntry {
+            client_id,
+            transport,
+            fwd,
+        });
+    }
+    clients
+}
+
+#[inline(never)]
+fn decode_routes(r: &mut Rd) -> Vec<RouteEntry> {
+    let count = r.count("truncated route count");
+    let mut routes = Vec::new();
+    for _ in 0..count {
+        if !r.ok() {
+            break;
+        }
+        let bind_ip = r.ip();
+        r.need(3, "truncated route");
+        let proto = r.proto();
+        let port = r.u16();
+        let client_id = r.str();
+        r.need(2, "truncated route state");
+        let state = r.one_of(0, 1, "unknown route state");
+        let source = SOURCES[r.index(3, "unknown source")];
+        routes.push(RouteEntry {
+            bind_ip,
+            proto,
+            port,
+            client_id,
+            state,
+            source,
+        });
+    }
+    routes
+}
+
+/// A `provides` bitset: any bit outside the defined set is rejected.
+#[inline(never)]
+fn provides(r: &mut Rd) -> u8 {
+    let n = r.u8();
+    if n & !PROVIDES_MASK != 0 {
+        r.fail(bad_byte("unknown provides", n));
+    }
+    n
+}
+
+/// A requested capability: exactly one defined provides bit.
+#[inline(never)]
+fn want(r: &mut Rd) -> u8 {
+    let n = r.u8();
+    if n & !PROVIDES_MASK != 0 || n.count_ones() != 1 {
+        r.fail(bad_byte("invalid want", n));
+    }
+    n
+}
+
+/// The `(bind_ip, proto, port)` triple the listener and route mutations carry.
+#[inline(never)]
+fn put_target(b: &mut Vec<u8>, bind_ip: Ipv4Addr, proto: Proto, port: u16) {
+    put_ip(b, bind_ip);
+    put_u8(b, proto_byte(proto));
+    put_u16(b, port);
+}
+
+/// Read the triple `put_target` writes.
+#[inline(never)]
+fn take_target(r: &mut Rd) -> (Ipv4Addr, Proto, u16) {
+    let bind_ip = r.ip();
+    let proto = r.proto();
+    let port = r.u16();
+    (bind_ip, proto, port)
 }
 
 impl Msg {
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Msg::Ping => vec![1],
+            Msg::Ping => tagged(1),
             Msg::Open {
                 proto,
                 port,
                 id,
                 capability,
             } => {
-                let mut b = Vec::with_capacity(12 + CAPABILITY_LEN);
-                b.push(2);
-                b.push(proto_byte(*proto));
-                b.extend_from_slice(&port.to_be_bytes());
-                b.extend_from_slice(&id.to_be_bytes());
-                b.extend_from_slice(capability);
+                let mut b = tagged(2);
+                put_u8(&mut b, proto_byte(*proto));
+                put_u16(&mut b, *port);
+                put_u64(&mut b, *id);
+                put_bytes(&mut b, capability);
                 b
             }
             Msg::Data {
@@ -814,84 +1025,79 @@ impl Msg {
                 id,
                 capability,
             } => {
-                let mut b = Vec::with_capacity(10 + CAPABILITY_LEN);
-                b.push(3);
-                b.push(*version);
-                b.extend_from_slice(&id.to_be_bytes());
-                b.extend_from_slice(capability);
+                let mut b = tagged(3);
+                put_u8(&mut b, *version);
+                put_u64(&mut b, *id);
+                put_bytes(&mut b, capability);
                 b
             }
-            Msg::Pong => vec![4],
+            Msg::Pong => tagged(4),
             Msg::ClientHello { version, client_id } => {
-                let mut b = Vec::new();
-                b.push(5);
-                b.push(*version);
+                let mut b = tagged(5);
+                put_u8(&mut b, *version);
                 put_str(&mut b, client_id);
                 b
             }
             Msg::AdminHello { version, mode } => {
-                vec![6, *version, *mode]
+                let mut b = tagged(6);
+                put_u8(&mut b, *version);
+                put_u8(&mut b, *mode);
+                b
             }
             Msg::Snapshot(snap) => {
-                let mut b = Vec::new();
-                b.push(7);
-                b.push(snap.version);
+                let mut b = tagged(7);
+                put_u8(&mut b, snap.version);
                 put_str(&mut b, &snap.server_id);
                 debug_assert!(snap.listeners.len() <= u16::MAX as usize);
-                b.extend_from_slice(&(snap.listeners.len() as u16).to_be_bytes());
-                for l in &snap.listeners {
-                    put_ip(&mut b, l.bind_ip);
-                    b.push(proto_byte(l.proto));
-                    b.extend_from_slice(&l.port.to_be_bytes());
-                    b.push(source_byte(l.source));
+                let count = put_count(&mut b, snap.listeners.len());
+                for l in &snap.listeners[..count] {
+                    put_target(&mut b, l.bind_ip, l.proto, l.port);
+                    put_u8(&mut b, source_byte(l.source));
                 }
                 debug_assert!(snap.clients.len() <= u16::MAX as usize);
-                b.extend_from_slice(&(snap.clients.len() as u16).to_be_bytes());
-                for c in &snap.clients {
+                let count = put_count(&mut b, snap.clients.len());
+                for c in &snap.clients[..count] {
                     put_str(&mut b, &c.client_id);
-                    b.push(c.transport);
+                    put_u8(&mut b, c.transport);
                     put_fwd_entries(&mut b, &c.fwd);
                 }
                 debug_assert!(snap.routes.len() <= u16::MAX as usize);
-                b.extend_from_slice(&(snap.routes.len() as u16).to_be_bytes());
-                for route in &snap.routes {
-                    put_ip(&mut b, route.bind_ip);
-                    b.push(proto_byte(route.proto));
-                    b.extend_from_slice(&route.port.to_be_bytes());
+                let count = put_count(&mut b, snap.routes.len());
+                for route in &snap.routes[..count] {
+                    put_target(&mut b, route.bind_ip, route.proto, route.port);
                     put_str(&mut b, &route.client_id);
-                    b.push(route.state);
-                    b.push(source_byte(route.source));
+                    put_u8(&mut b, route.state);
+                    put_u8(&mut b, source_byte(route.source));
                 }
                 // Bridge-client trailer: a u16 count then that many entries (the
                 // count is 0 when no bridge clients are attached).
                 debug_assert!(snap.bridge_clients.len() <= u16::MAX as usize);
-                b.extend_from_slice(&(snap.bridge_clients.len() as u16).to_be_bytes());
-                for e in &snap.bridge_clients {
+                let count = put_count(&mut b, snap.bridge_clients.len());
+                for e in &snap.bridge_clients[..count] {
                     put_str(&mut b, &e.label);
-                    b.push(u8::from(e.named));
-                    b.push(e.transport);
+                    put_u8(&mut b, u8::from(e.named));
+                    put_u8(&mut b, e.transport);
                     put_str(&mut b, &e.peer);
                     debug_assert!(e.macs.len() <= u16::MAX as usize);
-                    b.extend_from_slice(&(e.macs.len() as u16).to_be_bytes());
-                    for m in &e.macs {
-                        b.extend_from_slice(m);
+                    let count = put_count(&mut b, e.macs.len());
+                    for m in &e.macs[..count] {
+                        put_bytes(&mut b, m);
                     }
-                    b.extend_from_slice(&e.rx_bytes.to_be_bytes());
-                    b.extend_from_slice(&e.rx_frames.to_be_bytes());
-                    b.extend_from_slice(&e.tx_bytes.to_be_bytes());
-                    b.extend_from_slice(&e.tx_frames.to_be_bytes());
-                    b.extend_from_slice(&e.uptime_secs.to_be_bytes());
-                    b.extend_from_slice(&e.idle_secs.to_be_bytes());
+                    put_u64(&mut b, e.rx_bytes);
+                    put_u64(&mut b, e.rx_frames);
+                    put_u64(&mut b, e.tx_bytes);
+                    put_u64(&mut b, e.tx_frames);
+                    put_u32(&mut b, e.uptime_secs);
+                    put_u32(&mut b, e.idle_secs);
                 }
                 // Pair trailer: a u16 count then that many entries (the count
                 // is 0 when no pairs are up).
-                let count = snap.pairs.len().min(u16::MAX as usize);
-                b.extend_from_slice(&(count as u16).to_be_bytes());
+                let count = put_count(&mut b, snap.pairs.len());
                 for p in &snap.pairs[..count] {
                     put_str(&mut b, &p.consumer_id);
                     put_str(&mut b, &p.provider_id);
-                    b.push(p.want);
-                    b.push(settled_path_byte(p.path));
+                    put_u8(&mut b, p.want);
+                    put_u8(&mut b, settled_path_byte(p.path));
                 }
                 b
             }
@@ -900,11 +1106,8 @@ impl Msg {
                 proto,
                 port,
             } => {
-                let mut b = Vec::with_capacity(8);
-                b.push(8);
-                put_ip(&mut b, *bind_ip);
-                b.push(proto_byte(*proto));
-                b.extend_from_slice(&port.to_be_bytes());
+                let mut b = tagged(8);
+                put_target(&mut b, *bind_ip, *proto, *port);
                 b
             }
             Msg::RemoveListener {
@@ -912,11 +1115,8 @@ impl Msg {
                 proto,
                 port,
             } => {
-                let mut b = Vec::with_capacity(8);
-                b.push(9);
-                put_ip(&mut b, *bind_ip);
-                b.push(proto_byte(*proto));
-                b.extend_from_slice(&port.to_be_bytes());
+                let mut b = tagged(9);
+                put_target(&mut b, *bind_ip, *proto, *port);
                 b
             }
             Msg::SetRoute {
@@ -925,11 +1125,8 @@ impl Msg {
                 port,
                 client_id,
             } => {
-                let mut b = Vec::new();
-                b.push(10);
-                put_ip(&mut b, *bind_ip);
-                b.push(proto_byte(*proto));
-                b.extend_from_slice(&port.to_be_bytes());
+                let mut b = tagged(10);
+                put_target(&mut b, *bind_ip, *proto, *port);
                 put_str(&mut b, client_id);
                 b
             }
@@ -938,27 +1135,22 @@ impl Msg {
                 proto,
                 port,
             } => {
-                let mut b = Vec::with_capacity(8);
-                b.push(11);
-                put_ip(&mut b, *bind_ip);
-                b.push(proto_byte(*proto));
-                b.extend_from_slice(&port.to_be_bytes());
+                let mut b = tagged(11);
+                put_target(&mut b, *bind_ip, *proto, *port);
                 b
             }
             Msg::MutationResult { ok, msg } => {
-                let mut b = Vec::new();
-                b.push(12);
-                b.push(u8::from(*ok));
+                let mut b = tagged(12);
+                put_u8(&mut b, u8::from(*ok));
                 put_str(&mut b, msg);
                 b
             }
             Msg::FwdOptions { entries } => {
-                let mut b = Vec::with_capacity(3 + entries.len() * 8);
-                b.push(13);
+                let mut b = tagged(13);
                 put_fwd_entries(&mut b, entries);
                 b
             }
-            Msg::FwdOptionsAck => vec![14],
+            Msg::FwdOptionsAck => tagged(14),
             Msg::OpenProxy {
                 port,
                 id,
@@ -966,46 +1158,45 @@ impl Msg {
                 peer,
                 local,
             } => {
-                let mut b = Vec::with_capacity(81);
-                b.push(15);
-                b.extend_from_slice(&port.to_be_bytes());
-                b.extend_from_slice(&id.to_be_bytes());
-                b.extend_from_slice(capability);
+                let mut b = tagged(15);
+                put_u16(&mut b, *port);
+                put_u64(&mut b, *id);
+                put_bytes(&mut b, capability);
                 put_sockaddr(&mut b, *peer);
                 put_sockaddr(&mut b, *local);
                 b
             }
             Msg::PeerAnnounce { provides, identity } => {
-                let mut b = Vec::with_capacity(2 + PEER_IDENTITY_LEN);
-                b.extend_from_slice(&[16, *provides]);
-                b.extend_from_slice(identity);
+                let mut b = tagged(16);
+                put_u8(&mut b, *provides);
+                put_bytes(&mut b, identity);
                 b
             }
             Msg::PeerAnnounceAck { observed } => {
-                let mut b = Vec::with_capacity(20);
-                b.push(17);
+                let mut b = tagged(17);
                 put_sockaddr(&mut b, *observed);
                 b
             }
             Msg::PeerChallenge { eph_pub, nonce } => {
-                let mut b = Vec::with_capacity(65);
-                b.push(25);
-                b.extend_from_slice(eph_pub);
-                b.extend_from_slice(nonce);
+                let mut b = tagged(25);
+                put_bytes(&mut b, eph_pub);
+                put_bytes(&mut b, nonce);
                 b
             }
             Msg::PeerProof { mac } => {
-                let mut b = Vec::with_capacity(33);
-                b.push(26);
-                b.extend_from_slice(mac);
+                let mut b = tagged(26);
+                put_bytes(&mut b, mac);
                 b
             }
-            Msg::PeerAnnounceRefuse { reason } => vec![27, refuse_reason_byte(*reason)],
+            Msg::PeerAnnounceRefuse { reason } => {
+                let mut b = tagged(27);
+                put_u8(&mut b, refuse_reason_byte(*reason));
+                b
+            }
             Msg::PeerConnect { peer_id, want } => {
-                let mut b = Vec::with_capacity(2 + PEER_IDENTITY_LEN);
-                b.push(18);
-                b.extend_from_slice(peer_id);
-                b.push(*want);
+                let mut b = tagged(18);
+                put_bytes(&mut b, peer_id);
+                put_u8(&mut b, *want);
                 b
             }
             Msg::PeerResult {
@@ -1014,12 +1205,11 @@ impl Msg {
                 pair_id,
                 status,
             } => {
-                let mut b = Vec::with_capacity(11 + PEER_IDENTITY_LEN);
-                b.push(19);
-                b.extend_from_slice(peer_id);
-                b.push(*want);
-                b.extend_from_slice(&pair_id.to_be_bytes());
-                b.push(peer_status_byte(*status));
+                let mut b = tagged(19);
+                put_bytes(&mut b, peer_id);
+                put_u8(&mut b, *want);
+                put_u64(&mut b, *pair_id);
+                put_u8(&mut b, peer_status_byte(*status));
                 b
             }
             Msg::PeerProbe {
@@ -1030,26 +1220,24 @@ impl Msg {
                 challenge,
                 provides,
             } => {
-                let mut b = Vec::with_capacity(18 + PEER_IDENTITY_LEN + CAPABILITY_LEN + 32);
-                b.push(20);
-                b.extend_from_slice(&pair_id.to_be_bytes());
-                b.extend_from_slice(peer_id);
-                b.extend_from_slice(&probe_id.to_be_bytes());
-                b.extend_from_slice(probe_capability);
-                b.extend_from_slice(challenge);
-                b.push(*provides);
+                let mut b = tagged(20);
+                put_u64(&mut b, *pair_id);
+                put_bytes(&mut b, peer_id);
+                put_u64(&mut b, *probe_id);
+                put_bytes(&mut b, probe_capability);
+                put_bytes(&mut b, challenge);
+                put_u8(&mut b, *provides);
                 b
             }
             Msg::PeerInfo {
                 pair_id,
                 candidates,
             } => {
-                let mut b = Vec::new();
-                b.push(21);
-                b.extend_from_slice(&pair_id.to_be_bytes());
+                let mut b = tagged(21);
+                put_u64(&mut b, *pair_id);
                 debug_assert!(candidates.len() <= u16::MAX as usize);
-                b.extend_from_slice(&(candidates.len() as u16).to_be_bytes());
-                for c in candidates {
+                let count = put_count(&mut b, candidates.len());
+                for c in &candidates[..count] {
                     put_sockaddr(&mut b, *c);
                 }
                 b
@@ -1059,171 +1247,70 @@ impl Msg {
                 id,
                 capability,
             } => {
-                let mut b = Vec::with_capacity(17 + CAPABILITY_LEN);
-                b.push(22);
-                b.extend_from_slice(&pair_id.to_be_bytes());
-                b.extend_from_slice(&id.to_be_bytes());
-                b.extend_from_slice(capability);
+                let mut b = tagged(22);
+                put_u64(&mut b, *pair_id);
+                put_u64(&mut b, *id);
+                put_bytes(&mut b, capability);
                 b
             }
             Msg::PeerPath { pair_id, status } => {
-                let mut b = Vec::with_capacity(10);
-                b.push(23);
-                b.extend_from_slice(&pair_id.to_be_bytes());
-                b.push(path_status_byte(*status));
+                let mut b = tagged(23);
+                put_u64(&mut b, *pair_id);
+                put_u8(&mut b, path_status_byte(*status));
                 b
             }
             Msg::ClientHelloAck {
                 client_id,
                 bridge_capability,
             } => {
-                let mut b = Vec::new();
-                b.push(24);
+                let mut b = tagged(24);
                 put_str(&mut b, client_id);
-                b.extend_from_slice(bridge_capability);
+                put_bytes(&mut b, bridge_capability);
                 b
             }
         }
     }
 
     pub fn decode(b: &[u8]) -> Result<Msg> {
-        match b.first() {
-            Some(1) => Ok(Msg::Ping),
-            Some(2) if b.len() == 12 + CAPABILITY_LEN => {
-                let proto = proto_from_byte(b[1])?;
-                let port = u16::from_be_bytes([b[2], b[3]]);
-                let id = u64::from_be_bytes(b[4..12].try_into().unwrap());
-                let mut at = 12;
-                let capability = take_capability(b, &mut at)?;
-                Ok(Msg::Open {
-                    proto,
-                    port,
-                    id,
-                    capability,
-                })
-            }
-            Some(3) if b.len() == 10 + CAPABILITY_LEN => {
-                let version = b[1];
-                let id = u64::from_be_bytes(b[2..10].try_into().unwrap());
-                let mut at = 10;
-                let capability = take_capability(b, &mut at)?;
-                Ok(Msg::Data {
-                    version,
-                    id,
-                    capability,
-                })
-            }
-            Some(4) => Ok(Msg::Pong),
+        let mut r = Rd::new(b, 1);
+        let msg = match b.first() {
+            Some(1) => Msg::Ping,
+            Some(2) if b.len() == 12 + CAPABILITY_LEN => Msg::Open {
+                proto: r.proto(),
+                port: r.u16(),
+                id: r.u64(),
+                capability: r.arr32("capability"),
+            },
+            Some(3) if b.len() == 10 + CAPABILITY_LEN => Msg::Data {
+                version: r.u8(),
+                id: r.u64(),
+                capability: r.arr32("capability"),
+            },
+            Some(4) => Msg::Pong,
             Some(5) => {
-                let mut at = 2;
-                if b.len() < at {
-                    return Err("truncated client hello".into());
-                }
-                let version = b[1];
-                let client_id = take_str(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in client hello".into());
-                }
-                Ok(Msg::ClientHello { version, client_id })
+                r.need(1, "truncated client hello");
+                let version = r.u8();
+                let client_id = r.str();
+                r.done("trailing bytes in client hello");
+                Msg::ClientHello { version, client_id }
             }
-            Some(6) if b.len() == 3 => Ok(Msg::AdminHello {
+            Some(6) if b.len() == 3 => Msg::AdminHello {
                 version: b[1],
                 mode: b[2],
-            }),
+            },
             Some(7) => {
-                let mut at = 2;
-                if b.len() < at {
-                    return Err("truncated snapshot".into());
-                }
-                let version = b[1];
-                let server_id = take_str(b, &mut at)?;
-                if at + 2 > b.len() {
-                    return Err("truncated listener count".into());
-                }
-                let count = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
-                at += 2;
-                let mut listeners = Vec::new();
-                for _ in 0..count {
-                    let bind_ip = take_ip(b, &mut at)?;
-                    if at + 4 > b.len() {
-                        return Err("truncated listener".into());
-                    }
-                    let proto = proto_from_byte(b[at])?;
-                    let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
-                    let source = source_from_byte(b[at + 3])?;
-                    at += 4;
-                    listeners.push(Listener {
-                        bind_ip,
-                        proto,
-                        port,
-                        source,
-                    });
-                }
-                if at + 2 > b.len() {
-                    return Err("truncated client count".into());
-                }
-                let count = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
-                at += 2;
-                let mut clients = Vec::new();
-                for _ in 0..count {
-                    let client_id = take_str(b, &mut at)?;
-                    if at >= b.len() {
-                        return Err("truncated client transport".into());
-                    }
-                    let transport = b[at];
-                    at += 1;
-                    if transport != 1 && transport != 2 {
-                        return Err(format!("unknown transport byte {transport}").into());
-                    }
-                    let fwd = take_fwd_entries(b, &mut at)?;
-                    clients.push(ClientEntry {
-                        client_id,
-                        transport,
-                        fwd,
-                    });
-                }
-                if at + 2 > b.len() {
-                    return Err("truncated route count".into());
-                }
-                let count = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
-                at += 2;
-                let mut routes = Vec::new();
-                for _ in 0..count {
-                    let bind_ip = take_ip(b, &mut at)?;
-                    if at + 3 > b.len() {
-                        return Err("truncated route".into());
-                    }
-                    let proto = proto_from_byte(b[at])?;
-                    let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
-                    at += 3;
-                    let client_id = take_str(b, &mut at)?;
-                    if at + 2 > b.len() {
-                        return Err("truncated route state".into());
-                    }
-                    let state = b[at];
-                    if state != 0 && state != 1 {
-                        return Err(format!("unknown route state byte {state}").into());
-                    }
-                    let source = source_from_byte(b[at + 1])?;
-                    at += 2;
-                    routes.push(RouteEntry {
-                        bind_ip,
-                        proto,
-                        port,
-                        client_id,
-                        state,
-                        source,
-                    });
-                }
-                let bridge_clients = decode_bridge_clients(b, &mut at)?;
-                let pairs = decode_pairs(b, &mut at)?;
-                if at != b.len() {
-                    return Err(
-                        "trailing bytes in snapshot: the admin reader and the server are different versions"
-                            .into(),
-                    );
-                }
-                Ok(Msg::Snapshot(SnapshotBody {
+                r.need(1, "truncated snapshot");
+                let version = r.u8();
+                let server_id = r.str();
+                let listeners = decode_listeners(&mut r);
+                let clients = decode_clients(&mut r);
+                let routes = decode_routes(&mut r);
+                let bridge_clients = decode_bridge_clients(&mut r);
+                let pairs = decode_pairs(&mut r);
+                r.done(
+                    "trailing bytes in snapshot: the admin reader and the server are different versions",
+                );
+                Msg::Snapshot(SnapshotBody {
                     version,
                     server_id,
                     listeners,
@@ -1231,221 +1318,156 @@ impl Msg {
                     routes,
                     bridge_clients,
                     pairs,
-                }))
+                })
             }
             Some(8) if b.len() == 8 => {
-                let mut at = 1;
-                let bind_ip = take_ip(b, &mut at)?;
-                let proto = proto_from_byte(b[at])?;
-                let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
-                Ok(Msg::AddListener {
+                let (bind_ip, proto, port) = take_target(&mut r);
+                Msg::AddListener {
                     bind_ip,
                     proto,
                     port,
-                })
+                }
             }
             Some(9) if b.len() == 8 => {
-                let mut at = 1;
-                let bind_ip = take_ip(b, &mut at)?;
-                let proto = proto_from_byte(b[at])?;
-                let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
-                Ok(Msg::RemoveListener {
+                let (bind_ip, proto, port) = take_target(&mut r);
+                Msg::RemoveListener {
                     bind_ip,
                     proto,
                     port,
-                })
+                }
             }
             Some(10) => {
-                let mut at = 1;
-                let bind_ip = take_ip(b, &mut at)?;
-                if at + 3 > b.len() {
-                    return Err("truncated set route".into());
-                }
-                let proto = proto_from_byte(b[at])?;
-                let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
-                at += 3;
-                let client_id = take_str(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in set route".into());
-                }
-                Ok(Msg::SetRoute {
+                let bind_ip = r.ip();
+                r.need(3, "truncated set route");
+                let proto = r.proto();
+                let port = r.u16();
+                let client_id = r.str();
+                r.done("trailing bytes in set route");
+                Msg::SetRoute {
                     bind_ip,
                     proto,
                     port,
                     client_id,
-                })
+                }
             }
             Some(11) if b.len() == 8 => {
-                let mut at = 1;
-                let bind_ip = take_ip(b, &mut at)?;
-                let proto = proto_from_byte(b[at])?;
-                let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
-                Ok(Msg::ClearRoute {
+                let (bind_ip, proto, port) = take_target(&mut r);
+                Msg::ClearRoute {
                     bind_ip,
                     proto,
                     port,
-                })
+                }
             }
             Some(12) => {
-                if b.len() < 2 {
-                    return Err("truncated mutation result".into());
-                }
-                let ok = match b[1] {
-                    0 => false,
-                    1 => true,
-                    n => return Err(format!("unknown mutation result ok byte {n}").into()),
-                };
-                let mut at = 2;
-                let msg = take_str(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in mutation result".into());
-                }
-                Ok(Msg::MutationResult { ok, msg })
+                r.need(1, "truncated mutation result");
+                let ok = r.flag("unknown mutation result ok");
+                let msg = r.str();
+                r.done("trailing bytes in mutation result");
+                Msg::MutationResult { ok, msg }
             }
             Some(13) => {
-                let mut at = 1;
-                let entries = take_fwd_entries(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in forward options".into());
-                }
-                Ok(Msg::FwdOptions { entries })
+                let entries = take_fwd_entries(&mut r);
+                r.done("trailing bytes in forward options");
+                Msg::FwdOptions { entries }
             }
-            Some(14) if b.len() == 1 => Ok(Msg::FwdOptionsAck),
+            Some(14) if b.len() == 1 => Msg::FwdOptionsAck,
             Some(15) => {
-                if b.len() < 11 + CAPABILITY_LEN {
-                    return Err("truncated proxy open".into());
-                }
-                let port = u16::from_be_bytes([b[1], b[2]]);
-                let id = u64::from_be_bytes(b[3..11].try_into().unwrap());
-                let mut at = 11;
-                let capability = take_capability(b, &mut at)?;
-                let peer = take_sockaddr(b, &mut at)?;
-                let local = take_sockaddr(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in proxy open".into());
-                }
-                Ok(Msg::OpenProxy {
+                r.need(10 + CAPABILITY_LEN, "truncated proxy open");
+                let port = r.u16();
+                let id = r.u64();
+                let capability = r.arr32("capability");
+                let peer = r.sockaddr();
+                let local = r.sockaddr();
+                r.done("trailing bytes in proxy open");
+                Msg::OpenProxy {
                     port,
                     id,
                     capability,
                     peer,
                     local,
-                })
+                }
             }
-            Some(16) if b.len() == 2 + PEER_IDENTITY_LEN => {
-                let provides = provides_from_byte(b[1])?;
-                let mut at = 2;
-                let identity = take_identity(b, &mut at)?;
-                Ok(Msg::PeerAnnounce { provides, identity })
-            }
+            Some(16) if b.len() == 2 + PEER_IDENTITY_LEN => Msg::PeerAnnounce {
+                provides: provides(&mut r),
+                identity: r.arr32("peer identity"),
+            },
             Some(17) => {
-                let mut at = 1;
-                let observed = take_sockaddr(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in peer announce ack".into());
-                }
-                Ok(Msg::PeerAnnounceAck { observed })
+                let observed = r.sockaddr();
+                r.done("trailing bytes in peer announce ack");
+                Msg::PeerAnnounceAck { observed }
             }
-            Some(18) if b.len() == 2 + PEER_IDENTITY_LEN => {
-                let mut at = 1;
-                let peer_id = take_identity(b, &mut at)?;
-                let want = want_from_byte(b[at])?;
-                Ok(Msg::PeerConnect { peer_id, want })
-            }
-            Some(19) if b.len() == 11 + PEER_IDENTITY_LEN => {
-                let mut at = 1;
-                let peer_id = take_identity(b, &mut at)?;
-                let want = want_from_byte(b[at])?;
-                let pair_id = u64::from_be_bytes(b[at + 1..at + 9].try_into().unwrap());
-                let status = peer_status_from_byte(b[at + 9])?;
-                Ok(Msg::PeerResult {
-                    peer_id,
-                    want,
-                    pair_id,
-                    status,
-                })
-            }
-            Some(20) if b.len() == 18 + PEER_IDENTITY_LEN + CAPABILITY_LEN + 32 => {
-                let pair_id = u64::from_be_bytes(b[1..9].try_into().unwrap());
-                let mut at = 9;
-                let peer_id = take_identity(b, &mut at)?;
-                let probe_id = u64::from_be_bytes(b[at..at + 8].try_into().unwrap());
-                at += 8;
-                let probe_capability = take_capability(b, &mut at)?;
-                let challenge = take_arr(b, &mut at, "pair challenge")?;
-                let provides = want_from_byte(b[at])?;
-                Ok(Msg::PeerProbe {
-                    pair_id,
-                    peer_id,
-                    probe_id,
-                    probe_capability,
-                    challenge,
-                    provides,
-                })
-            }
+            Some(18) if b.len() == 2 + PEER_IDENTITY_LEN => Msg::PeerConnect {
+                peer_id: r.arr32("peer identity"),
+                want: want(&mut r),
+            },
+            Some(19) if b.len() == 11 + PEER_IDENTITY_LEN => Msg::PeerResult {
+                peer_id: r.arr32("peer identity"),
+                want: want(&mut r),
+                pair_id: r.u64(),
+                status: PEER_STATUSES[r.index(6, "unknown peer status")],
+            },
+            Some(20) if b.len() == 18 + PEER_IDENTITY_LEN + CAPABILITY_LEN + 32 => Msg::PeerProbe {
+                pair_id: r.u64(),
+                peer_id: r.arr32("peer identity"),
+                probe_id: r.u64(),
+                probe_capability: r.arr32("capability"),
+                challenge: r.arr32("pair challenge"),
+                provides: want(&mut r),
+            },
             Some(21) => {
-                if b.len() < 11 {
-                    return Err("truncated peer info".into());
-                }
-                let pair_id = u64::from_be_bytes(b[1..9].try_into().unwrap());
-                let count = u16::from_be_bytes([b[9], b[10]]) as usize;
-                let mut at = 11;
+                r.need(10, "truncated peer info");
+                let pair_id = r.u64();
+                let count = r.u16() as usize;
                 let mut candidates = Vec::new();
                 for _ in 0..count {
-                    candidates.push(take_sockaddr(b, &mut at)?);
+                    if !r.ok() {
+                        break;
+                    }
+                    candidates.push(r.sockaddr());
                 }
-                if at != b.len() {
-                    return Err("trailing bytes in peer info".into());
-                }
-                Ok(Msg::PeerInfo {
+                r.done("trailing bytes in peer info");
+                Msg::PeerInfo {
                     pair_id,
                     candidates,
-                })
-            }
-            Some(22) if b.len() == 17 + CAPABILITY_LEN => {
-                let pair_id = u64::from_be_bytes(b[1..9].try_into().unwrap());
-                let id = u64::from_be_bytes(b[9..17].try_into().unwrap());
-                let mut at = 17;
-                let capability = take_capability(b, &mut at)?;
-                Ok(Msg::PeerRelayOpen {
-                    pair_id,
-                    id,
-                    capability,
-                })
-            }
-            Some(23) if b.len() == 10 => {
-                let pair_id = u64::from_be_bytes(b[1..9].try_into().unwrap());
-                let status = path_status_from_byte(b[9])?;
-                Ok(Msg::PeerPath { pair_id, status })
-            }
-            Some(24) => {
-                let mut at = 1;
-                let client_id = take_str(b, &mut at)?;
-                if at + CAPABILITY_LEN != b.len() {
-                    return Err("invalid client hello ack capability".into());
                 }
-                let bridge_capability = take_capability(b, &mut at)?;
-                Ok(Msg::ClientHelloAck {
+            }
+            Some(22) if b.len() == 17 + CAPABILITY_LEN => Msg::PeerRelayOpen {
+                pair_id: r.u64(),
+                id: r.u64(),
+                capability: r.arr32("capability"),
+            },
+            Some(23) if b.len() == 10 => Msg::PeerPath {
+                pair_id: r.u64(),
+                status: PATH_STATUSES[r.index(2, "unknown path status")],
+            },
+            Some(24) => {
+                let client_id = r.str();
+                if r.ok() && r.at + CAPABILITY_LEN != b.len() {
+                    r.fail_msg("invalid client hello ack capability");
+                }
+                let bridge_capability = r.arr32("capability");
+                Msg::ClientHelloAck {
                     client_id,
                     bridge_capability,
-                })
+                }
             }
-            Some(25) if b.len() == 65 => {
-                let mut at = 1;
-                let eph_pub = take_arr(b, &mut at, "challenge ephemeral")?;
-                let nonce = take_arr(b, &mut at, "challenge nonce")?;
-                Ok(Msg::PeerChallenge { eph_pub, nonce })
+            Some(25) if b.len() == 65 => Msg::PeerChallenge {
+                eph_pub: r.arr32("challenge ephemeral"),
+                nonce: r.arr32("challenge nonce"),
+            },
+            Some(26) if b.len() == 33 => Msg::PeerProof {
+                mac: r.arr32("announce proof"),
+            },
+            Some(27) if b.len() == 2 => Msg::PeerAnnounceRefuse {
+                reason: REFUSE_REASONS[r.index(4, "unknown refuse reason")],
+            },
+            _ => {
+                r.fail(errf!("malformed message ({} bytes)", b.len()));
+                Msg::Ping
             }
-            Some(26) if b.len() == 33 => {
-                let mut at = 1;
-                let mac = take_arr(b, &mut at, "announce proof")?;
-                Ok(Msg::PeerProof { mac })
-            }
-            Some(27) if b.len() == 2 => Ok(Msg::PeerAnnounceRefuse {
-                reason: refuse_reason_from_byte(b[1])?,
-            }),
-            _ => Err(format!("malformed message ({} bytes)", b.len()).into()),
-        }
+        };
+        r.end()?;
+        Ok(msg)
     }
 }
 

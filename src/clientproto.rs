@@ -8,8 +8,8 @@
 
 use crate::client::Transport;
 use crate::proto::{
-    proto_byte, proto_from_byte, put_str, settled_path_byte, settled_path_from_byte, take_str,
-    PathStatus, Proto, PROVIDES_EXIT, PROVIDES_SEGMENT,
+    bad_byte, proto_byte, put_count, put_str, put_u16, put_u32, put_u8, settled_path_byte,
+    settled_path_from_byte, tagged, PathStatus, Proto, Rd, PROVIDES_EXIT, PROVIDES_SEGMENT,
 };
 use crate::Result;
 
@@ -48,16 +48,13 @@ fn mode_byte(m: SessionMode) -> u8 {
     }
 }
 
-fn mode_from_byte(n: u8) -> Result<SessionMode> {
-    match n {
-        0 => Ok(SessionMode::Idle),
-        1 => Ok(SessionMode::Forwards),
-        2 => Ok(SessionMode::Device),
-        3 => Ok(SessionMode::Pppoe),
-        4 => Ok(SessionMode::Offline),
-        n => Err(format!("unknown session mode byte {n}").into()),
-    }
-}
+const MODES: [SessionMode; 5] = [
+    SessionMode::Idle,
+    SessionMode::Forwards,
+    SessionMode::Device,
+    SessionMode::Pppoe,
+    SessionMode::Offline,
+];
 
 fn transport_byte(t: Transport) -> u8 {
     match t {
@@ -67,22 +64,17 @@ fn transport_byte(t: Transport) -> u8 {
     }
 }
 
-fn transport_from_byte(n: u8) -> Result<Transport> {
-    match n {
-        0 => Ok(Transport::Auto),
-        1 => Ok(Transport::Udp),
-        2 => Ok(Transport::Tcp),
-        n => Err(format!("unknown transport byte {n}").into()),
-    }
-}
+const TRANSPORTS: [Transport; 3] = [Transport::Auto, Transport::Udp, Transport::Tcp];
 
 /// A peer slot's capability: exactly one defined provides bit. Zero, several,
 /// or an undefined bit names no slot, so the decoder refuses it.
-fn want_from_byte(n: u8) -> Result<u8> {
-    match n {
-        PROVIDES_EXIT | PROVIDES_SEGMENT => Ok(n),
-        n => Err(format!("unknown peer capability byte {n}").into()),
+#[inline(never)]
+fn want(r: &mut Rd) -> u8 {
+    let n = r.u8();
+    if n != PROVIDES_EXIT && n != PROVIDES_SEGMENT {
+        r.fail(bad_byte("unknown peer capability", n));
     }
+    n
 }
 
 fn phase_byte(p: PppPhase) -> u8 {
@@ -96,17 +88,14 @@ fn phase_byte(p: PppPhase) -> u8 {
     }
 }
 
-fn phase_from_byte(n: u8) -> Result<PppPhase> {
-    match n {
-        0 => Ok(PppPhase::None),
-        1 => Ok(PppPhase::Discovery),
-        2 => Ok(PppPhase::Negotiating),
-        3 => Ok(PppPhase::Established),
-        4 => Ok(PppPhase::LinkDown),
-        5 => Ok(PppPhase::Dead),
-        n => Err(format!("unknown ppp phase byte {n}").into()),
-    }
-}
+const PHASES: [PppPhase; 6] = [
+    PppPhase::None,
+    PppPhase::Discovery,
+    PppPhase::Negotiating,
+    PppPhase::Established,
+    PppPhase::LinkDown,
+    PppPhase::Dead,
+];
 
 /// Live PPP phase of the active session, written by the PPPoE datapath shell
 /// and read by snapshot handlers. A single byte cell so the per-frame datapath
@@ -122,7 +111,10 @@ impl PppStatus {
 
     pub fn get(&self) -> PppPhase {
         // Only `set` writes the cell, so the byte is always a valid phase.
-        phase_from_byte(self.0.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(PppPhase::None)
+        PHASES
+            .get(self.0.load(std::sync::atomic::Ordering::Relaxed) as usize)
+            .copied()
+            .unwrap_or(PppPhase::None)
     }
 }
 
@@ -146,15 +138,12 @@ fn link_byte(l: LinkStatus) -> u8 {
     }
 }
 
-fn link_from_byte(n: u8) -> Result<LinkStatus> {
-    match n {
-        0 => Ok(LinkStatus::Offline),
-        1 => Ok(LinkStatus::Dialing),
-        2 => Ok(LinkStatus::Connected),
-        3 => Ok(LinkStatus::Backoff),
-        n => Err(format!("unknown link status byte {n}").into()),
-    }
-}
+const LINKS: [LinkStatus; 4] = [
+    LinkStatus::Offline,
+    LinkStatus::Dialing,
+    LinkStatus::Connected,
+    LinkStatus::Backoff,
+];
 
 /// Shared [`LinkStatus`] cell, the same shape as [`PppStatus`]: a single byte
 /// written without a lock. Starts at `Offline`.
@@ -169,7 +158,9 @@ impl LinkCell {
 
     pub fn get(&self) -> LinkStatus {
         // Only `set` writes the cell, so the byte is always a valid status.
-        link_from_byte(self.0.load(std::sync::atomic::Ordering::Relaxed))
+        LINKS
+            .get(self.0.load(std::sync::atomic::Ordering::Relaxed) as usize)
+            .copied()
             .unwrap_or(LinkStatus::Offline)
     }
 }
@@ -405,65 +396,59 @@ pub enum ClientMsg {
 impl ClientMsg {
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            ClientMsg::ClientAdminHello { version, mode } => vec![1, *version, *mode],
+            ClientMsg::ClientAdminHello { version, mode } => {
+                let mut b = tagged(1);
+                put_u8(&mut b, *version);
+                put_u8(&mut b, *mode);
+                b
+            }
             ClientMsg::ClientSnapshot(snap) => {
-                let mut b = Vec::new();
-                b.push(2);
-                b.push(snap.version);
+                let mut b = tagged(2);
+                put_u8(&mut b, snap.version);
                 put_str(&mut b, &snap.active);
-                b.push(mode_byte(snap.mode));
-                b.push(phase_byte(snap.phase));
+                put_u8(&mut b, mode_byte(snap.mode));
+                put_u8(&mut b, phase_byte(snap.phase));
                 // A client can carry up to two full port maps (tcp + udp),
                 // more forwards than the u16 wire count can name; encode the
                 // first u16::MAX rather than let the count wrap.
-                let count = snap.forwards.len().min(u16::MAX as usize);
-                b.extend_from_slice(&(count as u16).to_be_bytes());
+                let count = put_count(&mut b, snap.forwards.len());
                 for f in &snap.forwards[..count] {
-                    b.push(proto_byte(f.proto));
-                    b.extend_from_slice(&f.port.to_be_bytes());
+                    put_u8(&mut b, proto_byte(f.proto));
+                    put_u16(&mut b, f.port);
                     put_str(&mut b, &f.target);
-                    b.push(u8::from(f.proxy));
-                    b.extend_from_slice(&f.idle_secs.to_be_bytes());
-                    b.push(u8::from(f.enabled));
+                    put_u8(&mut b, u8::from(f.proxy));
+                    put_u32(&mut b, f.idle_secs);
+                    put_u8(&mut b, u8::from(f.enabled));
                 }
-                let count = snap.servers.len().min(u16::MAX as usize);
-                b.extend_from_slice(&(count as u16).to_be_bytes());
+                let count = put_count(&mut b, snap.servers.len());
                 for s in &snap.servers[..count] {
                     put_str(&mut b, &s.name);
                     put_str(&mut b, &s.addr);
-                    b.push(transport_byte(s.transport));
+                    put_u8(&mut b, transport_byte(s.transport));
                 }
-                let count = snap.pppoe.len().min(u16::MAX as usize);
-                b.extend_from_slice(&(count as u16).to_be_bytes());
+                let count = put_count(&mut b, snap.pppoe.len());
                 for name in &snap.pppoe[..count] {
                     put_str(&mut b, name);
                 }
                 put_str(&mut b, &snap.session);
-                b.push(link_byte(snap.link));
-                let count = snap.peers.len().min(u16::MAX as usize);
-                b.extend_from_slice(&(count as u16).to_be_bytes());
+                put_u8(&mut b, link_byte(snap.link));
+                let count = put_count(&mut b, snap.peers.len());
                 for slot in &snap.peers[..count] {
                     put_str(&mut b, &slot.peer_id);
-                    b.push(slot.want);
+                    put_u8(&mut b, slot.want);
                     put_str(&mut b, &slot.iface);
-                    b.push(link_byte(slot.link));
-                    b.push(settled_path_byte(slot.path));
+                    put_u8(&mut b, link_byte(slot.link));
+                    put_u8(&mut b, settled_path_byte(slot.path));
                 }
                 b
             }
             ClientMsg::MutationResult { ok, msg } => {
-                let mut b = Vec::new();
-                b.push(3);
-                b.push(u8::from(*ok));
+                let mut b = tagged(3);
+                put_u8(&mut b, u8::from(*ok));
                 put_str(&mut b, msg);
                 b
             }
-            ClientMsg::SelectServer { name } => {
-                let mut b = Vec::new();
-                b.push(4);
-                put_str(&mut b, name);
-                b
-            }
+            ClientMsg::SelectServer { name } => named(4, name),
             ClientMsg::SetForwardOptions {
                 proto,
                 port,
@@ -471,54 +456,31 @@ impl ClientMsg {
                 proxy,
                 idle_secs,
             } => {
-                let mut b = Vec::with_capacity(10);
-                b.push(5);
-                b.push(proto_byte(*proto));
-                b.extend_from_slice(&port.to_be_bytes());
-                b.push(u8::from(*enabled));
-                b.push(u8::from(*proxy));
-                b.extend_from_slice(&idle_secs.to_be_bytes());
+                let mut b = tagged(5);
+                put_u8(&mut b, proto_byte(*proto));
+                put_u16(&mut b, *port);
+                put_u8(&mut b, u8::from(*enabled));
+                put_u8(&mut b, u8::from(*proxy));
+                put_u32(&mut b, *idle_secs);
                 b
             }
-            ClientMsg::SpawnPppoe { name } => {
-                let mut b = Vec::new();
-                b.push(6);
-                put_str(&mut b, name);
-                b
-            }
-            ClientMsg::StopSession { name } => {
-                let mut b = Vec::new();
-                b.push(7);
-                put_str(&mut b, name);
-                b
-            }
+            ClientMsg::SpawnPppoe { name } => named(6, name),
+            ClientMsg::StopSession { name } => named(7, name),
             ClientMsg::AddServer {
                 name,
                 addr,
                 secret,
                 transport,
             } => {
-                let mut b = Vec::new();
-                b.push(8);
-                put_str(&mut b, name);
+                let mut b = named(8, name);
                 put_str(&mut b, addr);
                 put_str(&mut b, &secret.0);
-                b.push(transport_byte(*transport));
+                put_u8(&mut b, transport_byte(*transport));
                 b
             }
-            ClientMsg::RemoveServer { name } => {
-                let mut b = Vec::new();
-                b.push(9);
-                put_str(&mut b, name);
-                b
-            }
-            ClientMsg::Connect { name } => {
-                let mut b = Vec::new();
-                b.push(10);
-                put_str(&mut b, name);
-                b
-            }
-            ClientMsg::Disconnect => vec![11],
+            ClientMsg::RemoveServer { name } => named(9, name),
+            ClientMsg::Connect { name } => named(10, name),
+            ClientMsg::Disconnect => tagged(11),
             ClientMsg::AddForward {
                 proto,
                 port,
@@ -527,21 +489,19 @@ impl ClientMsg {
                 idle_secs,
                 enabled,
             } => {
-                let mut b = Vec::new();
-                b.push(12);
-                b.push(proto_byte(*proto));
-                b.extend_from_slice(&port.to_be_bytes());
+                let mut b = tagged(12);
+                put_u8(&mut b, proto_byte(*proto));
+                put_u16(&mut b, *port);
                 put_str(&mut b, target);
-                b.push(u8::from(*proxy));
-                b.extend_from_slice(&idle_secs.to_be_bytes());
-                b.push(u8::from(*enabled));
+                put_u8(&mut b, u8::from(*proxy));
+                put_u32(&mut b, *idle_secs);
+                put_u8(&mut b, u8::from(*enabled));
                 b
             }
             ClientMsg::RemoveForward { proto, port } => {
-                let mut b = Vec::with_capacity(4);
-                b.push(13);
-                b.push(proto_byte(*proto));
-                b.extend_from_slice(&port.to_be_bytes());
+                let mut b = tagged(13);
+                put_u8(&mut b, proto_byte(*proto));
+                put_u16(&mut b, *port);
                 b
             }
             ClientMsg::AttachPeer {
@@ -552,70 +512,48 @@ impl ClientMsg {
                 exit_strict,
                 iface,
             } => {
-                let mut b = Vec::new();
-                b.push(14);
-                put_str(&mut b, peer_id);
-                b.push(*want);
+                let mut b = named(14, peer_id);
+                put_u8(&mut b, *want);
                 put_str(&mut b, dev);
-                b.push(u8::from(*exit));
-                b.push(u8::from(*exit_strict));
+                put_u8(&mut b, u8::from(*exit));
+                put_u8(&mut b, u8::from(*exit_strict));
                 put_str(&mut b, iface);
                 b
             }
             ClientMsg::DetachPeer { peer_id, want } => {
-                let mut b = Vec::new();
-                b.push(15);
-                put_str(&mut b, peer_id);
-                b.push(*want);
+                let mut b = named(15, peer_id);
+                put_u8(&mut b, *want);
                 b
             }
         }
     }
 
     pub fn decode(b: &[u8]) -> Result<ClientMsg> {
-        match b.first() {
-            Some(1) if b.len() == 3 => Ok(ClientMsg::ClientAdminHello {
+        let mut r = Rd::new(b, 1);
+        let msg = match b.first() {
+            Some(1) if b.len() == 3 => ClientMsg::ClientAdminHello {
                 version: b[1],
                 mode: b[2],
-            }),
+            },
             Some(2) => {
-                let mut at = 2;
-                if b.len() < at {
-                    return Err("truncated client snapshot".into());
-                }
-                let version = b[1];
-                let active = take_str(b, &mut at)?;
-                if at + 4 > b.len() {
-                    return Err("truncated client snapshot header".into());
-                }
-                let mode = mode_from_byte(b[at])?;
-                let phase = phase_from_byte(b[at + 1])?;
-                let count = u16::from_be_bytes([b[at + 2], b[at + 3]]) as usize;
-                at += 4;
+                r.need(1, "truncated client snapshot");
+                let version = r.u8();
+                let active = r.str();
+                r.need(4, "truncated client snapshot header");
+                let mode = MODES[r.index(5, "unknown session mode")];
+                let phase = PHASES[r.index(6, "unknown ppp phase")];
+                let count = r.u16() as usize;
                 let mut forwards = Vec::new();
                 for _ in 0..count {
-                    if at + 3 > b.len() {
-                        return Err("truncated forward entry".into());
+                    if !r.ok() {
+                        break;
                     }
-                    let proto = proto_from_byte(b[at])?;
-                    let port = u16::from_be_bytes([b[at + 1], b[at + 2]]);
-                    at += 3;
-                    let target = take_str(b, &mut at)?;
-                    if at + 6 > b.len() {
-                        return Err("truncated forward entry options".into());
-                    }
-                    let proxy = match b[at] {
-                        0 => false,
-                        1 => true,
-                        n => return Err(format!("unknown forward proxy byte {n}").into()),
-                    };
-                    let idle_secs = u32::from_be_bytes(b[at + 1..at + 5].try_into().unwrap());
-                    let enabled = match b[at + 5] {
-                        0 => false,
-                        1 => true,
-                        n => return Err(format!("unknown forward enabled byte {n}").into()),
-                    };
-                    at += 6;
+                    r.need(3, "truncated forward entry");
+                    let proto = r.proto();
+                    let port = r.u16();
+                    let target = r.str();
+                    r.need(6, "truncated forward entry options");
+                    let (proxy, idle_secs, enabled) = forward_options(&mut r);
                     forwards.push(ClientForwardEntry {
                         proto,
                         port,
@@ -625,61 +563,46 @@ impl ClientMsg {
                         enabled,
                     });
                 }
-                if at + 2 > b.len() {
-                    return Err("truncated client snapshot server list".into());
-                }
-                let count = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
-                at += 2;
+                let count = r.count("truncated client snapshot server list");
                 let mut servers = Vec::new();
                 for _ in 0..count {
-                    let name = take_str(b, &mut at)?;
-                    let addr = take_str(b, &mut at)?;
-                    if at >= b.len() {
-                        return Err("truncated server entry".into());
+                    if !r.ok() {
+                        break;
                     }
-                    let transport = transport_from_byte(b[at])?;
-                    at += 1;
+                    let name = r.str();
+                    let addr = r.str();
+                    r.need(1, "truncated server entry");
+                    let transport = TRANSPORTS[r.index(3, "unknown transport")];
                     servers.push(ClientServerEntry {
                         name,
                         addr,
                         transport,
                     });
                 }
-                if at + 2 > b.len() {
-                    return Err("truncated client snapshot pppoe list".into());
-                }
-                let count = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
-                at += 2;
+                let count = r.count("truncated client snapshot pppoe list");
                 let mut pppoe = Vec::new();
                 for _ in 0..count {
-                    pppoe.push(take_str(b, &mut at)?);
+                    if !r.ok() {
+                        break;
+                    }
+                    pppoe.push(r.str());
                 }
-                let session = take_str(b, &mut at)?;
-                if at >= b.len() {
-                    return Err("truncated client snapshot link".into());
-                }
-                let link = link_from_byte(b[at])?;
-                at += 1;
-                if at + 2 > b.len() {
-                    return Err("truncated client snapshot peer list".into());
-                }
-                let count = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
-                at += 2;
+                let session = r.str();
+                r.need(1, "truncated client snapshot link");
+                let link = LINKS[r.index(4, "unknown link status")];
+                let count = r.count("truncated client snapshot peer list");
                 let mut peers = Vec::new();
                 for _ in 0..count {
-                    let peer_id = take_str(b, &mut at)?;
-                    if at >= b.len() {
-                        return Err("truncated peer slot capability".into());
+                    if !r.ok() {
+                        break;
                     }
-                    let want = want_from_byte(b[at])?;
-                    at += 1;
-                    let iface = take_str(b, &mut at)?;
-                    if at + 2 > b.len() {
-                        return Err("truncated peer slot status".into());
-                    }
-                    let link = link_from_byte(b[at])?;
-                    let path = settled_path_from_byte(b[at + 1])?;
-                    at += 2;
+                    let peer_id = r.str();
+                    r.need(1, "truncated peer slot capability");
+                    let want = want(&mut r);
+                    let iface = r.str();
+                    r.need(2, "truncated peer slot status");
+                    let link = LINKS[r.index(4, "unknown link status")];
+                    let path = r.settled_path();
                     peers.push(ClientPeerSlotEntry {
                         peer_id,
                         want,
@@ -688,10 +611,8 @@ impl ClientMsg {
                         path,
                     });
                 }
-                if at != b.len() {
-                    return Err("trailing bytes in client snapshot".into());
-                }
-                Ok(ClientMsg::ClientSnapshot(ClientSnapshotBody {
+                r.done("trailing bytes in client snapshot");
+                ClientMsg::ClientSnapshot(ClientSnapshotBody {
                     version,
                     active,
                     mode,
@@ -702,198 +623,133 @@ impl ClientMsg {
                     session,
                     link,
                     peers,
-                }))
-            }
-            Some(3) => {
-                if b.len() < 2 {
-                    return Err("truncated mutation result".into());
-                }
-                let ok = match b[1] {
-                    0 => false,
-                    1 => true,
-                    n => return Err(format!("unknown mutation result ok byte {n}").into()),
-                };
-                let mut at = 2;
-                let msg = take_str(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in mutation result".into());
-                }
-                Ok(ClientMsg::MutationResult { ok, msg })
-            }
-            Some(4) => {
-                let mut at = 1;
-                let name = take_str(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in select server".into());
-                }
-                Ok(ClientMsg::SelectServer { name })
-            }
-            Some(5) if b.len() == 10 => {
-                let proto = proto_from_byte(b[1])?;
-                let port = u16::from_be_bytes([b[2], b[3]]);
-                let enabled = match b[4] {
-                    0 => false,
-                    1 => true,
-                    n => return Err(format!("unknown forward enabled byte {n}").into()),
-                };
-                let proxy = match b[5] {
-                    0 => false,
-                    1 => true,
-                    n => return Err(format!("unknown forward proxy byte {n}").into()),
-                };
-                let idle_secs = u32::from_be_bytes(b[6..10].try_into().unwrap());
-                Ok(ClientMsg::SetForwardOptions {
-                    proto,
-                    port,
-                    enabled,
-                    proxy,
-                    idle_secs,
                 })
             }
-            Some(6) => {
-                let mut at = 1;
-                let name = take_str(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in spawn pppoe".into());
-                }
-                Ok(ClientMsg::SpawnPppoe { name })
+            Some(3) => {
+                r.need(1, "truncated mutation result");
+                let ok = r.flag("unknown mutation result ok");
+                let msg = r.str();
+                r.done("trailing bytes in mutation result");
+                ClientMsg::MutationResult { ok, msg }
             }
-            Some(7) => {
-                let mut at = 1;
-                let name = take_str(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in stop session".into());
-                }
-                Ok(ClientMsg::StopSession { name })
-            }
+            Some(4) => ClientMsg::SelectServer {
+                name: take_named(&mut r, "trailing bytes in select server"),
+            },
+            Some(5) if b.len() == 10 => ClientMsg::SetForwardOptions {
+                proto: r.proto(),
+                port: r.u16(),
+                enabled: r.flag("unknown forward enabled"),
+                proxy: r.flag("unknown forward proxy"),
+                idle_secs: r.u32(),
+            },
+            Some(6) => ClientMsg::SpawnPppoe {
+                name: take_named(&mut r, "trailing bytes in spawn pppoe"),
+            },
+            Some(7) => ClientMsg::StopSession {
+                name: take_named(&mut r, "trailing bytes in stop session"),
+            },
             Some(8) => {
-                let mut at = 1;
-                let name = take_str(b, &mut at)?;
-                let addr = take_str(b, &mut at)?;
-                let secret = ServerSecret(take_str(b, &mut at)?);
-                if at >= b.len() {
-                    return Err("truncated add server".into());
-                }
-                let transport = transport_from_byte(b[at])?;
-                at += 1;
-                if at != b.len() {
-                    return Err("trailing bytes in add server".into());
-                }
-                Ok(ClientMsg::AddServer {
+                let name = r.str();
+                let addr = r.str();
+                let secret = ServerSecret(r.str());
+                r.need(1, "truncated add server");
+                let transport = TRANSPORTS[r.index(3, "unknown transport")];
+                r.done("trailing bytes in add server");
+                ClientMsg::AddServer {
                     name,
                     addr,
                     secret,
                     transport,
-                })
-            }
-            Some(9) => {
-                let mut at = 1;
-                let name = take_str(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in remove server".into());
                 }
-                Ok(ClientMsg::RemoveServer { name })
             }
-            Some(10) => {
-                let mut at = 1;
-                let name = take_str(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in connect".into());
-                }
-                Ok(ClientMsg::Connect { name })
-            }
-            Some(11) if b.len() == 1 => Ok(ClientMsg::Disconnect),
+            Some(9) => ClientMsg::RemoveServer {
+                name: take_named(&mut r, "trailing bytes in remove server"),
+            },
+            Some(10) => ClientMsg::Connect {
+                name: take_named(&mut r, "trailing bytes in connect"),
+            },
+            Some(11) if b.len() == 1 => ClientMsg::Disconnect,
             Some(12) => {
-                if b.len() < 4 {
-                    return Err("truncated add forward".into());
-                }
-                let proto = proto_from_byte(b[1])?;
-                let port = u16::from_be_bytes([b[2], b[3]]);
-                let mut at = 4;
-                let target = take_str(b, &mut at)?;
-                if at + 6 > b.len() {
-                    return Err("truncated add forward options".into());
-                }
-                let proxy = match b[at] {
-                    0 => false,
-                    1 => true,
-                    n => return Err(format!("unknown forward proxy byte {n}").into()),
-                };
-                let idle_secs = u32::from_be_bytes(b[at + 1..at + 5].try_into().unwrap());
-                let enabled = match b[at + 5] {
-                    0 => false,
-                    1 => true,
-                    n => return Err(format!("unknown forward enabled byte {n}").into()),
-                };
-                at += 6;
-                if at != b.len() {
-                    return Err("trailing bytes in add forward".into());
-                }
-                Ok(ClientMsg::AddForward {
+                r.need(3, "truncated add forward");
+                let proto = r.proto();
+                let port = r.u16();
+                let target = r.str();
+                r.need(6, "truncated add forward options");
+                let (proxy, idle_secs, enabled) = forward_options(&mut r);
+                r.done("trailing bytes in add forward");
+                ClientMsg::AddForward {
                     proto,
                     port,
                     target,
                     proxy,
                     idle_secs,
                     enabled,
-                })
+                }
             }
-            Some(13) if b.len() == 4 => Ok(ClientMsg::RemoveForward {
-                proto: proto_from_byte(b[1])?,
-                port: u16::from_be_bytes([b[2], b[3]]),
-            }),
+            Some(13) if b.len() == 4 => ClientMsg::RemoveForward {
+                proto: r.proto(),
+                port: r.u16(),
+            },
             Some(14) => {
-                let mut at = 1;
-                let peer_id = take_str(b, &mut at)?;
-                if at >= b.len() {
-                    return Err("truncated attach peer".into());
-                }
-                let want = want_from_byte(b[at])?;
-                at += 1;
-                let dev = take_str(b, &mut at)?;
-                if at + 2 > b.len() {
-                    return Err("truncated attach peer options".into());
-                }
-                let exit = match b[at] {
-                    0 => false,
-                    1 => true,
-                    n => return Err(format!("unknown peer exit byte {n}").into()),
-                };
-                let exit_strict = match b[at + 1] {
-                    0 => false,
-                    1 => true,
-                    n => return Err(format!("unknown peer exit_strict byte {n}").into()),
-                };
-                at += 2;
-                let iface = take_str(b, &mut at)?;
-                if at != b.len() {
-                    return Err("trailing bytes in attach peer".into());
-                }
-                Ok(ClientMsg::AttachPeer {
+                let peer_id = r.str();
+                r.need(1, "truncated attach peer");
+                let want = want(&mut r);
+                let dev = r.str();
+                r.need(2, "truncated attach peer options");
+                let exit = r.flag("unknown peer exit");
+                let exit_strict = r.flag("unknown peer exit_strict");
+                let iface = r.str();
+                r.done("trailing bytes in attach peer");
+                ClientMsg::AttachPeer {
                     peer_id,
                     want,
                     dev,
                     exit,
                     exit_strict,
                     iface,
-                })
+                }
             }
             Some(15) => {
-                let mut at = 1;
-                let peer_id = take_str(b, &mut at)?;
-                if at >= b.len() {
-                    return Err("truncated detach peer".into());
-                }
-                let want = want_from_byte(b[at])?;
-                at += 1;
-                if at != b.len() {
-                    return Err("trailing bytes in detach peer".into());
-                }
-                Ok(ClientMsg::DetachPeer { peer_id, want })
+                let peer_id = r.str();
+                r.need(1, "truncated detach peer");
+                let want = want(&mut r);
+                r.done("trailing bytes in detach peer");
+                ClientMsg::DetachPeer { peer_id, want }
             }
-            _ => Err(format!("malformed client message ({} bytes)", b.len()).into()),
-        }
+            _ => {
+                r.fail(errf!("malformed client message ({} bytes)", b.len()));
+                ClientMsg::Disconnect
+            }
+        };
+        r.end()?;
+        Ok(msg)
     }
+}
+
+/// A body that is a tag followed by one string.
+#[inline(never)]
+fn named(tag: u8, name: &str) -> Vec<u8> {
+    let mut b = tagged(tag);
+    put_str(&mut b, name);
+    b
+}
+
+/// The single string of a `named` body, which must end there.
+#[inline(never)]
+fn take_named(r: &mut Rd, trailing: &'static str) -> String {
+    let name = r.str();
+    r.done(trailing);
+    name
+}
+
+/// The `proxy`, `idle_secs`, `enabled` option trailer of a forward; the caller
+/// has checked its 6 bytes are present.
+#[inline(never)]
+fn forward_options(r: &mut Rd) -> (bool, u32, bool) {
+    let proxy = r.flag("unknown forward proxy");
+    let idle_secs = r.u32();
+    let enabled = r.flag("unknown forward enabled");
+    (proxy, idle_secs, enabled)
 }
 
 #[cfg(test)]
