@@ -4,7 +4,6 @@
 //! set of recently live nodes and always also seeds the bootstrap routers, with the
 //! persisted cache letting the walk proceed when router DNS resolution fails.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
@@ -12,7 +11,7 @@ use std::time::Duration as StdDuration;
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Duration, Instant};
 
-use super::bencode::{decode, Ben};
+use super::bencode::{decode, insert, Ben, Dict};
 use crate::Result;
 
 const BOOTSTRAP: &[&str] = &[
@@ -90,8 +89,8 @@ impl Node {
         if let Ok(boot) = resolve_bootstrap().await {
             seed.extend(boot);
         }
-        let mut deduped = HashSet::new();
-        seed.retain(|a| deduped.insert(*a));
+        let mut deduped = Vec::new();
+        seed.retain(|a| note(&mut deduped, *a));
         if seed.is_empty() {
             return Err("dht bootstrap resolution failed".into());
         }
@@ -108,15 +107,7 @@ impl Node {
         target: &[u8; 20],
         seed: Vec<SocketAddrV4>,
     ) -> (Lookup, Vec<SocketAddrV4>) {
-        let mut shortlist: Vec<Contact> = Vec::new();
-        let mut seen: HashSet<SocketAddrV4> = HashSet::new();
-        let mut queried: HashSet<SocketAddrV4> = HashSet::new();
-        let mut known: Vec<Contact> = Vec::new();
-        let mut storers: Vec<Contact> = Vec::new();
-        let mut values: Vec<Value> = Vec::new();
-        let mut ip_votes: HashMap<Ipv4Addr, u32> = HashMap::new();
-        let mut responders: Vec<SocketAddrV4> = Vec::new();
-
+        let mut walk = Walk::default();
         let mut current: Vec<Contact> = seed
             .into_iter()
             .map(|addr| Contact {
@@ -130,47 +121,11 @@ impl Node {
             if current.is_empty() {
                 break;
             }
-            for c in &current {
-                queried.insert(c.addr);
-            }
             // Routers reliably answer find_node but may not implement BEP44 get;
             // only switch to get once talking to discovered full nodes.
             let method: &[u8] = if round == 0 { b"find_node" } else { b"get" };
-            for p in self.round(&current, round, target, method).await {
-                responders.push(p.from);
-                if let Some(id) = p.id {
-                    known.push(Contact {
-                        id,
-                        addr: p.from,
-                        token: None,
-                    });
-                }
-                if let Some(ip) = p.ip {
-                    *ip_votes.entry(ip).or_default() += 1;
-                }
-                if let Some(v) = p.value {
-                    values.push(v);
-                }
-                if let (Some(id), Some(token)) = (p.id, p.token) {
-                    storers.push(Contact {
-                        id,
-                        addr: p.from,
-                        token: Some(token),
-                    });
-                }
-                for c in p.nodes {
-                    if seen.insert(c.addr) {
-                        shortlist.push(c);
-                    }
-                }
-            }
-            shortlist.sort_by_key(|c| dist(&c.id, target));
-            current = shortlist
-                .iter()
-                .filter(|c| !queried.contains(&c.addr))
-                .take(K)
-                .cloned()
-                .collect();
+            let answers = self.round(&current, round, target, method).await;
+            current = walk.absorb(&current, answers, target);
         }
 
         // Round 0 marks the seeds queried after only a find_node, so on a warm
@@ -179,68 +134,15 @@ impl Node {
         // with get, over the K closest contacts still worth trying: responders
         // that hold no token yet, plus discovered nodes never queried at all.
         // A walk that already gathered K token holders converged and skips it.
-        if storers.len() < K {
-            let with_token: HashSet<SocketAddrV4> = storers.iter().map(|c| c.addr).collect();
-            let answered: HashSet<SocketAddrV4> = known.iter().map(|c| c.addr).collect();
-            let mut finalists: Vec<Contact> = known
-                .iter()
-                .chain(shortlist.iter())
-                .filter(|c| !with_token.contains(&c.addr))
-                .filter(|c| answered.contains(&c.addr) || !queried.contains(&c.addr))
-                .cloned()
-                .collect();
-            let mut uniq = HashSet::new();
-            finalists.retain(|c| uniq.insert(c.addr));
-            finalists.sort_by_key(|c| dist(&c.id, target));
-            finalists.truncate(K);
+        if walk.storers.len() < K {
+            let finalists = walk.finalists(target);
             if !finalists.is_empty() {
                 for p in self.round(&finalists, ROUNDS, target, b"get").await {
-                    responders.push(p.from);
-                    if let Some(ip) = p.ip {
-                        *ip_votes.entry(ip).or_default() += 1;
-                    }
-                    if let Some(v) = p.value {
-                        values.push(v);
-                    }
-                    if let (Some(id), Some(token)) = (p.id, p.token) {
-                        storers.push(Contact {
-                            id,
-                            addr: p.from,
-                            token: Some(token),
-                        });
-                    }
+                    walk.record(p, false);
                 }
             }
         }
-
-        storers.sort_by_key(|c| dist(&c.id, target));
-        let mut kept = HashSet::new();
-        storers.retain(|c| kept.insert(c.addr));
-        storers.truncate(K);
-        let external_ip = ip_votes
-            .into_iter()
-            .max_by_key(|&(_, n)| n)
-            .map(|(ip, _)| ip);
-        // Collect currently-live nodes for the next lookup's warm start: storers
-        // (answered with a token) first, then any other responder seen this walk.
-        let mut live: Vec<SocketAddrV4> = Vec::new();
-        let mut kept_live = HashSet::new();
-        for c in storers.iter().map(|c| c.addr).chain(responders) {
-            if kept_live.insert(c) {
-                live.push(c);
-            }
-            if live.len() >= MAX_PERSISTED_NODES {
-                break;
-            }
-        }
-        (
-            Lookup {
-                storers,
-                values,
-                external_ip,
-            },
-            live,
-        )
+        walk.finish(target)
     }
 
     /// Store a signed mutable item at the nodes that returned write tokens.
@@ -255,7 +157,7 @@ impl Node {
         sig: &[u8; 64],
         storers: &[Contact],
     ) -> usize {
-        let mut txmap = HashMap::new();
+        let mut txmap = Vec::new();
         for (i, c) in storers.iter().enumerate() {
             let Some(token) = &c.token else {
                 continue;
@@ -263,7 +165,7 @@ impl Node {
             let tx = 0xF000u16 | (i as u16);
             let q = build_put(&self.id, token, pubkey, salt, seq, v, sig, tx);
             let _ = self.sock.send_to(&q, SocketAddr::V4(c.addr)).await;
-            txmap.insert(tx, c.addr);
+            txmap.push((tx, c.addr));
         }
         self.gather(&txmap).await.len()
     }
@@ -275,17 +177,19 @@ impl Node {
         target: &[u8; 20],
         method: &[u8],
     ) -> Vec<Parsed> {
-        let mut txmap = HashMap::new();
+        let mut txmap = Vec::new();
         for (i, c) in contacts.iter().enumerate().take(256) {
             let tx = ((round as u16) << 8) | (i as u16);
             let q = build_lookup(method, &self.id, target, tx);
             let _ = self.sock.send_to(&q, SocketAddr::V4(c.addr)).await;
-            txmap.insert(tx, c.addr);
+            txmap.push((tx, c.addr));
         }
         self.gather(&txmap).await
     }
 
-    async fn gather(&self, txmap: &HashMap<u16, SocketAddrV4>) -> Vec<Parsed> {
+    /// Collect the responses to the queries in `txmap`, transaction id to the
+    /// address it was sent to, until the query timeout passes.
+    async fn gather(&self, txmap: &[(u16, SocketAddrV4)]) -> Vec<Parsed> {
         let mut out = Vec::new();
         let deadline = Instant::now() + QUERY_TIMEOUT;
         let mut buf = vec![0u8; RECV_BUF];
@@ -383,6 +287,157 @@ async fn resolve_bootstrap() -> Result<Vec<SocketAddrV4>> {
     Ok(out)
 }
 
+/// What one lookup has gathered so far.
+#[derive(Default)]
+struct Walk {
+    shortlist: Vec<Contact>,
+    seen: Vec<SocketAddrV4>,
+    queried: Vec<SocketAddrV4>,
+    known: Vec<Contact>,
+    storers: Vec<Contact>,
+    values: Vec<Value>,
+    ip_votes: Vec<(Ipv4Addr, u32)>,
+    responders: Vec<SocketAddrV4>,
+}
+
+impl Walk {
+    /// Take one round's answers to the `queried` contacts and pick the K
+    /// closest unqueried contacts for the next round.
+    #[inline(never)]
+    fn absorb(
+        &mut self,
+        queried: &[Contact],
+        answers: Vec<Parsed>,
+        target: &[u8; 20],
+    ) -> Vec<Contact> {
+        for c in queried {
+            note(&mut self.queried, c.addr);
+        }
+        for p in answers {
+            self.record(p, true);
+        }
+        self.shortlist.sort_by_key(|c| dist(&c.id, target));
+        self.shortlist
+            .iter()
+            .filter(|c| !self.queried.contains(&c.addr))
+            .take(K)
+            .cloned()
+            .collect()
+    }
+
+    /// Record one answer: its BEP42 vote, value and write token, and, while
+    /// `discover` is set, the responder and the contacts it named.
+    #[inline(never)]
+    fn record(&mut self, p: Parsed, discover: bool) {
+        let Parsed {
+            from,
+            id,
+            token,
+            nodes,
+            ip,
+            value,
+        } = p;
+        self.responders.push(from);
+        if let Some(ip) = ip {
+            vote(&mut self.ip_votes, ip);
+        }
+        if let Some(v) = value {
+            self.values.push(v);
+        }
+        if let (Some(id), Some(token)) = (id, token) {
+            self.storers.push(Contact {
+                id,
+                addr: from,
+                token: Some(token),
+            });
+        }
+        if !discover {
+            return;
+        }
+        if let Some(id) = id {
+            self.known.push(Contact {
+                id,
+                addr: from,
+                token: None,
+            });
+        }
+        for c in nodes {
+            if note(&mut self.seen, c.addr) {
+                self.shortlist.push(c);
+            }
+        }
+    }
+
+    /// The K closest contacts still worth a `get`: responders that hold no
+    /// token yet, plus discovered nodes never queried at all.
+    #[inline(never)]
+    fn finalists(&self, target: &[u8; 20]) -> Vec<Contact> {
+        let with_token: Vec<SocketAddrV4> = self.storers.iter().map(|c| c.addr).collect();
+        let answered: Vec<SocketAddrV4> = self.known.iter().map(|c| c.addr).collect();
+        let mut finalists: Vec<Contact> = self
+            .known
+            .iter()
+            .chain(self.shortlist.iter())
+            .filter(|c| !with_token.contains(&c.addr))
+            .filter(|c| answered.contains(&c.addr) || !self.queried.contains(&c.addr))
+            .cloned()
+            .collect();
+        let mut uniq = Vec::new();
+        finalists.retain(|c| note(&mut uniq, c.addr));
+        finalists.sort_by_key(|c| dist(&c.id, target));
+        finalists.truncate(K);
+        finalists
+    }
+
+    /// The lookup result and the live node addresses to persist.
+    #[inline(never)]
+    fn finish(mut self, target: &[u8; 20]) -> (Lookup, Vec<SocketAddrV4>) {
+        self.storers.sort_by_key(|c| dist(&c.id, target));
+        let mut kept = Vec::new();
+        self.storers.retain(|c| note(&mut kept, c.addr));
+        self.storers.truncate(K);
+        let external_ip = self
+            .ip_votes
+            .into_iter()
+            .max_by_key(|&(_, n)| n)
+            .map(|(ip, _)| ip);
+        // Collect currently-live nodes for the next lookup's warm start: storers
+        // (answered with a token) first, then any other responder seen this walk.
+        let mut live: Vec<SocketAddrV4> = Vec::new();
+        for c in self.storers.iter().map(|c| c.addr).chain(self.responders) {
+            note(&mut live, c);
+            if live.len() >= MAX_PERSISTED_NODES {
+                break;
+            }
+        }
+        (
+            Lookup {
+                storers: self.storers,
+                values: self.values,
+                external_ip,
+            },
+            live,
+        )
+    }
+}
+
+/// Add `addr` to `set` unless it is there already; whether it was added.
+fn note(set: &mut Vec<SocketAddrV4>, addr: SocketAddrV4) -> bool {
+    if set.contains(&addr) {
+        return false;
+    }
+    set.push(addr);
+    true
+}
+
+/// Count one BEP42 vote for `ip`.
+fn vote(votes: &mut Vec<(Ipv4Addr, u32)>, ip: Ipv4Addr) {
+    match votes.iter_mut().find(|(v, _)| *v == ip) {
+        Some((_, n)) => *n += 1,
+        None => votes.push((ip, 1)),
+    }
+}
+
 fn dist(a: &[u8; 20], target: &[u8; 20]) -> [u8; 20] {
     let mut d = [0u8; 20];
     for i in 0..20 {
@@ -392,9 +447,9 @@ fn dist(a: &[u8; 20], target: &[u8; 20]) -> [u8; 20] {
 }
 
 fn build_lookup(method: &[u8], id: &[u8; 20], target: &[u8; 20], tx: u16) -> Vec<u8> {
-    let mut a = BTreeMap::new();
-    a.insert(b"id".to_vec(), Ben::Bytes(id.to_vec()));
-    a.insert(b"target".to_vec(), Ben::Bytes(target.to_vec()));
+    let mut a = Dict::new();
+    insert(&mut a, b"id", Ben::Bytes(id.to_vec()));
+    insert(&mut a, b"target", Ben::Bytes(target.to_vec()));
     krpc_query(method, a, tx)
 }
 
@@ -409,33 +464,29 @@ fn build_put(
     sig: &[u8; 64],
     tx: u16,
 ) -> Vec<u8> {
-    let mut a = BTreeMap::new();
-    a.insert(b"id".to_vec(), Ben::Bytes(id.to_vec()));
-    a.insert(b"k".to_vec(), Ben::Bytes(pubkey.to_vec()));
+    let mut a = Dict::new();
+    insert(&mut a, b"id", Ben::Bytes(id.to_vec()));
+    insert(&mut a, b"k", Ben::Bytes(pubkey.to_vec()));
     if let Some(s) = salt {
-        a.insert(b"salt".to_vec(), Ben::Bytes(s.to_vec()));
+        insert(&mut a, b"salt", Ben::Bytes(s.to_vec()));
     }
-    a.insert(b"seq".to_vec(), Ben::Int(seq));
-    a.insert(b"sig".to_vec(), Ben::Bytes(sig.to_vec()));
-    a.insert(b"token".to_vec(), Ben::Bytes(token.to_vec()));
-    a.insert(b"v".to_vec(), Ben::Bytes(v.to_vec()));
+    insert(&mut a, b"seq", Ben::Int(seq));
+    insert(&mut a, b"sig", Ben::Bytes(sig.to_vec()));
+    insert(&mut a, b"token", Ben::Bytes(token.to_vec()));
+    insert(&mut a, b"v", Ben::Bytes(v.to_vec()));
     krpc_query(b"put", a, tx)
 }
 
-fn krpc_query(method: &[u8], args: BTreeMap<Vec<u8>, Ben>, tx: u16) -> Vec<u8> {
-    let mut d = BTreeMap::new();
-    d.insert(b"a".to_vec(), Ben::Dict(args));
-    d.insert(b"q".to_vec(), Ben::Bytes(method.to_vec()));
-    d.insert(b"t".to_vec(), Ben::Bytes(tx.to_be_bytes().to_vec()));
-    d.insert(b"y".to_vec(), Ben::Bytes(b"q".to_vec()));
+fn krpc_query(method: &[u8], args: Dict, tx: u16) -> Vec<u8> {
+    let mut d = Dict::new();
+    insert(&mut d, b"a", Ben::Dict(args));
+    insert(&mut d, b"q", Ben::Bytes(method.to_vec()));
+    insert(&mut d, b"t", Ben::Bytes(tx.to_be_bytes().to_vec()));
+    insert(&mut d, b"y", Ben::Bytes(b"q".to_vec()));
     Ben::Dict(d).encode()
 }
 
-fn parse_response(
-    buf: &[u8],
-    txmap: &HashMap<u16, SocketAddrV4>,
-    from: SocketAddrV4,
-) -> Option<Parsed> {
+fn parse_response(buf: &[u8], txmap: &[(u16, SocketAddrV4)], from: SocketAddrV4) -> Option<Parsed> {
     let msg = decode(buf)?;
     if msg.get(b"y")?.bytes()? != b"r" {
         return None;
@@ -445,7 +496,7 @@ fn parse_response(
         return None;
     }
     let tx = u16::from_be_bytes([t[0], t[1]]);
-    if txmap.get(&tx) != Some(&from) {
+    if !txmap.contains(&(tx, from)) {
         return None;
     }
     let r = msg.get(b"r")?;
@@ -538,19 +589,19 @@ mod tests {
             let Some(t) = msg.get(b"t").and_then(|b| b.bytes()) else {
                 continue;
             };
-            let mut r = BTreeMap::new();
-            r.insert(b"id".to_vec(), Ben::Bytes(id.to_vec()));
+            let mut r = Dict::new();
+            insert(&mut r, b"id", Ben::Bytes(id.to_vec()));
             if q == b"get" {
-                r.insert(b"token".to_vec(), Ben::Bytes(token.to_vec()));
-                r.insert(b"k".to_vec(), Ben::Bytes(vec![3u8; 32]));
-                r.insert(b"seq".to_vec(), Ben::Int(5));
-                r.insert(b"sig".to_vec(), Ben::Bytes(vec![4u8; 64]));
-                r.insert(b"v".to_vec(), Ben::Bytes(b"payload".to_vec()));
+                insert(&mut r, b"token", Ben::Bytes(token.to_vec()));
+                insert(&mut r, b"k", Ben::Bytes(vec![3u8; 32]));
+                insert(&mut r, b"seq", Ben::Int(5));
+                insert(&mut r, b"sig", Ben::Bytes(vec![4u8; 64]));
+                insert(&mut r, b"v", Ben::Bytes(b"payload".to_vec()));
             }
-            let mut d = BTreeMap::new();
-            d.insert(b"r".to_vec(), Ben::Dict(r));
-            d.insert(b"t".to_vec(), Ben::Bytes(t.to_vec()));
-            d.insert(b"y".to_vec(), Ben::Bytes(b"r".to_vec()));
+            let mut d = Dict::new();
+            insert(&mut d, b"r", Ben::Dict(r));
+            insert(&mut d, b"t", Ben::Bytes(t.to_vec()));
+            insert(&mut d, b"y", Ben::Bytes(b"r".to_vec()));
             let _ = sock.send_to(&Ben::Dict(d).encode(), from).await;
         }
     }

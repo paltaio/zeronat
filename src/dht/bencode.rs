@@ -1,14 +1,23 @@
-//! Minimal bencode codec for the KRPC layer. Dicts use a `BTreeMap` so keys
-//! encode in the lexicographic order bencode requires.
+//! Minimal bencode codec for the KRPC layer. A dict is a vector kept sorted
+//! by key, so keys encode in the lexicographic order bencode requires.
 
-use std::collections::BTreeMap;
+/// A dict's entries, sorted by key with no key repeated.
+pub type Dict = Vec<(Vec<u8>, Ben)>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ben {
     Int(i64),
     Bytes(Vec<u8>),
     List(Vec<Ben>),
-    Dict(BTreeMap<Vec<u8>, Ben>),
+    Dict(Dict),
+}
+
+/// Set `key` in `dict`, replacing the value it already holds.
+pub fn insert(dict: &mut Dict, key: &[u8], value: Ben) {
+    match dict.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+        Ok(i) => dict[i].1 = value,
+        Err(i) => dict.insert(i, (key.to_vec(), value)),
+    }
 }
 
 impl Ben {
@@ -29,7 +38,10 @@ impl Ben {
     /// Look up a key in a dict value; `None` for non-dicts or missing keys.
     pub fn get(&self, key: &[u8]) -> Option<&Ben> {
         match self {
-            Ben::Dict(d) => d.get(key),
+            Ben::Dict(d) => d
+                .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+                .ok()
+                .map(|i| &d[i].1),
             _ => None,
         }
     }
@@ -98,11 +110,11 @@ fn parse(buf: &[u8]) -> Option<(Ben, &[u8])> {
         }
         b'd' => {
             let mut rest = &buf[1..];
-            let mut map = BTreeMap::new();
+            let mut map = Dict::new();
             while *rest.first()? != b'e' {
                 let (k, r) = parse_bytes(rest)?;
                 let (v, r2) = parse(r)?;
-                map.insert(k, v);
+                insert(&mut map, &k, v);
                 rest = r2;
             }
             Some((Ben::Dict(map), &rest[1..]))
@@ -132,11 +144,12 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let mut d = BTreeMap::new();
-        d.insert(b"q".to_vec(), Ben::Bytes(b"get".to_vec()));
-        d.insert(b"seq".to_vec(), Ben::Int(-7));
-        d.insert(
-            b"list".to_vec(),
+        let mut d = Dict::new();
+        insert(&mut d, b"q", Ben::Bytes(b"get".to_vec()));
+        insert(&mut d, b"seq", Ben::Int(-7));
+        insert(
+            &mut d,
+            b"list",
             Ben::List(vec![Ben::Int(1), Ben::Bytes(b"x".to_vec())]),
         );
         let v = Ben::Dict(d);
@@ -146,10 +159,16 @@ mod tests {
 
     #[test]
     fn canonical_dict_key_order() {
-        let mut d = BTreeMap::new();
-        d.insert(b"b".to_vec(), Ben::Int(2));
-        d.insert(b"a".to_vec(), Ben::Int(1));
-        assert_eq!(Ben::Dict(d).encode(), b"d1:ai1e1:bi2ee");
+        let mut d = Dict::new();
+        insert(&mut d, b"b", Ben::Int(2));
+        insert(&mut d, b"a", Ben::Int(1));
+        assert_eq!(Ben::Dict(d.clone()).encode(), b"d1:ai1e1:bi2ee");
+        insert(&mut d, b"a", Ben::Int(3));
+        assert_eq!(Ben::Dict(d.clone()).encode(), b"d1:ai3e1:bi2ee");
+        assert_eq!(
+            decode(b"d1:ai1e1:ai3ee"),
+            Some(Ben::Dict(vec![(b"a".to_vec(), Ben::Int(3))]))
+        );
     }
 
     #[test]
