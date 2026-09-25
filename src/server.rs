@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use crate::Result;
@@ -172,11 +174,36 @@ fn transport_byte(t: ActiveTransport) -> u8 {
     }
 }
 
+/// Queue one frame on a session's control channel. A full or closed channel
+/// drops the frame: a client that cannot keep up loses it like any other.
+#[inline(never)]
+fn send(tx: &mpsc::Sender<Vec<u8>>, msg: Msg) {
+    tx.try_send(msg.encode()).ok();
+}
+
 async fn session_cancelled(cancel: &mut watch::Receiver<bool>) {
     if *cancel.borrow_and_update() {
         return;
     }
     let _ = cancel.changed().await;
+}
+
+/// Drive `fut` until it completes or the session is cancelled: its output, or
+/// `None` once the session is gone. Cancellation is checked first on every
+/// poll, so a cancelled session never runs `fut` again.
+async fn until_cancelled<F: Future>(
+    fut: F,
+    cancel: &mut watch::Receiver<bool>,
+) -> Option<F::Output> {
+    let cancelled = session_cancelled(cancel);
+    tokio::pin!(fut, cancelled);
+    std::future::poll_fn(|cx| {
+        if cancelled.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        fut.as_mut().poll(cx).map(Some)
+    })
+    .await
 }
 
 /// A public listener keyed by its bind IP, protocol, and port. The same tuple
@@ -379,16 +406,32 @@ struct PartyProbe {
     path: Option<PathStatus>,
 }
 
-struct RelayLegClaim {
+/// An outstanding rendezvous id (a probe or a relay leg) and the party that
+/// may present it: the pair it belongs to, the client it was handed to, and
+/// the capability that client must show.
+struct Claim {
     pair_id: u64,
     client_id: String,
     capability: Capability,
 }
 
-struct ProbeClaim {
-    pair_id: u64,
-    client_id: String,
-    capability: Capability,
+/// Claim an id for `client_id` and return its pair. An id is single-use, so a
+/// second claim of the same id finds nothing.
+#[inline(never)]
+fn take_claim(
+    claims: &Mutex<HashMap<u64, Claim>>,
+    id: u64,
+    client_id: &str,
+    capability: &Capability,
+) -> Option<u64> {
+    let mut claims = claims.lock().unwrap();
+    let authorized = claims
+        .get(&id)
+        .is_some_and(|claim| client_id == claim.client_id && capability == &claim.capability);
+    authorized
+        .then(|| claims.remove(&id))
+        .flatten()
+        .map(|claim| claim.pair_id)
 }
 
 /// A parked public UDP source awaiting the matching UDP-forward setup conv.
@@ -428,11 +471,11 @@ pub(crate) struct Server {
     /// Outstanding probe ids to their owning `pair_id`, letting the udp
     /// control listener classify a stateless-handshake app id as a probe.
     /// Taken after `pairs` when both are held; entries die with their pair.
-    probes: Mutex<HashMap<u64, ProbeClaim>>,
+    probes: Mutex<HashMap<u64, Claim>>,
     /// Outstanding relay leg ids to their owning `pair_id`, letting a claimed
     /// data channel find the pair to splice it into. Same lock rules as
     /// `probes`; a leg id is single-use and removed when it is claimed.
-    relay_legs: Mutex<HashMap<u64, RelayLegClaim>>,
+    relay_legs: Mutex<HashMap<u64, Claim>>,
     routes: Mutex<HashMap<RouteKey, Route>>,
     listeners: Mutex<HashMap<RouteKey, ListenerHandle>>,
     handshakes: Arc<Semaphore>,
@@ -461,9 +504,8 @@ pub(crate) struct Server {
 impl Server {
     fn capability() -> Result<Capability> {
         let mut capability = [0u8; crate::proto::CAPABILITY_LEN];
-        getrandom::getrandom(&mut capability).map_err(|e| -> crate::Error {
-            format!("cannot read the system random source: {e}").into()
-        })?;
+        getrandom::getrandom(&mut capability)
+            .map_err(|e| -> crate::Error { errf!("cannot read the system random source: {e}") })?;
         Ok(capability)
     }
 
@@ -600,6 +642,7 @@ impl Server {
     /// the same lock hold drops this consumer's own prior pair for the peer and
     /// capability it is asking for again. Lock order is clients before pairs. A
     /// failure status carries pair_id 0.
+    #[inline(never)]
     fn peer_connect(
         &self,
         consumer_id: &str,
@@ -707,6 +750,7 @@ impl Server {
     /// the displaced pairs and answers each displaced session. `None` means
     /// the sender no longer owns its registry slot, so nothing registers. The
     /// recorded entry gates every later peer tag to this client.
+    #[inline(never)]
     fn record_peer_claim(
         &self,
         client_id: &str,
@@ -791,6 +835,7 @@ impl Server {
     /// naming its capability, which is what lets a node announcing both bits
     /// place the pair. The sends run outside every lock; lock order is clients,
     /// pairs, probes, with `next_id` a leaf.
+    #[inline(never)]
     fn start_pair_probes(self: &Arc<Self>, pair_id: u64) {
         let mut sends: Vec<(mpsc::Sender<Vec<u8>>, Vec<u8>)> = Vec::new();
         let settled = {
@@ -841,7 +886,7 @@ impl Server {
                         party.probe_id = Some(probe_id);
                         probes.insert(
                             probe_id,
-                            ProbeClaim {
+                            Claim {
                                 pair_id,
                                 client_id: id.clone(),
                                 capability,
@@ -890,6 +935,7 @@ impl Server {
         self.settle_probe_for_pair(pair_id, probe_id, candidates)
     }
 
+    #[inline(never)]
     fn settle_probe_for_pair(
         &self,
         pair_id: u64,
@@ -916,14 +962,7 @@ impl Server {
     }
 
     fn take_probe(&self, probe_id: u64, client_id: &str, capability: &Capability) -> Option<u64> {
-        let mut probes = self.probes.lock().unwrap();
-        let authorized = probes
-            .get(&probe_id)
-            .is_some_and(|claim| client_id == claim.client_id && capability == &claim.capability);
-        authorized
-            .then(|| probes.remove(&probe_id))
-            .flatten()
-            .map(|claim| claim.pair_id)
+        take_claim(&self.probes, probe_id, client_id, capability)
     }
 
     /// Send both parties their `PeerInfo`, each carrying the other party's
@@ -968,14 +1007,13 @@ impl Server {
         };
         for (tx, candidates) in [(consumer_tx, provider_c), (provider_tx, consumer_c)] {
             if let Some(tx) = tx {
-                tx.try_send(
+                send(
+                    &tx,
                     Msg::PeerInfo {
                         pair_id,
                         candidates,
-                    }
-                    .encode(),
-                )
-                .ok();
+                    },
+                );
             }
         }
     }
@@ -990,6 +1028,7 @@ impl Server {
     /// order is clients, pairs, relay legs, with `next_id` a leaf; the sends
     /// run outside every lock. Opening the relay arms the claim deadline, so a
     /// leg that never arrives cannot pin the pair.
+    #[inline(never)]
     fn peer_path(
         self: &Arc<Self>,
         client_id: &str,
@@ -1041,7 +1080,7 @@ impl Server {
                 {
                     relay_legs.insert(
                         id,
-                        RelayLegClaim {
+                        Claim {
                             pair_id,
                             client_id: party_id.clone(),
                             capability,
@@ -1108,14 +1147,7 @@ impl Server {
     /// claim before they build the leg, so a duplicate claim never registers
     /// transport state the winner then loses.
     fn take_relay_leg(&self, id: u64, client_id: &str, capability: &Capability) -> Option<u64> {
-        let mut claims = self.relay_legs.lock().unwrap();
-        let authorized = claims
-            .get(&id)
-            .is_some_and(|claim| client_id == claim.client_id && capability == &claim.capability);
-        authorized
-            .then(|| claims.remove(&id))
-            .flatten()
-            .map(|claim| claim.pair_id)
+        take_claim(&self.relay_legs, id, client_id, capability)
     }
 
     /// Park a claimed leg against its pair, splicing the two once both are in.
@@ -1266,41 +1298,39 @@ fn tun_nat_plan(
     })
 }
 
-pub async fn run(settings: ServerSettings) -> Result<()> {
-    let ServerSettings {
-        bind,
-        control_port,
-        secret,
-        discovery,
-        client_credentials,
-        admin_secret,
-        server_id,
-        tap,
-        tun,
-        dht,
-        listeners,
-        routes,
-        config_path,
-        file_id,
-        file_control,
-        file_seed,
-        file_admin_secret,
-        file_clients,
-        file_exit,
-        file_exit_iface,
-    } = settings;
-    let secret = crate::secret::normalize(&secret)?;
-    let discovery = discovery
-        .map(|value| crate::secret::normalize(&value))
+/// A booted server: the registry, the listeners it starts with, and the
+/// control address. The TUN NAT guard rides along so it lives as long as
+/// `run()`'s frame.
+struct Boot {
+    srv: Arc<Server>,
+    listeners: Vec<ListenerSpec>,
+    bind_ip: Ipv4Addr,
+    control_port: u16,
+    #[cfg(target_os = "linux")]
+    _nat_guard: Option<netfilter::NatGuard>,
+}
+
+/// Normalize and cross-check the network, client, admin and discovery
+/// credentials: the authorized client table, the admin PSK, and the
+/// normalized discovery credential.
+#[inline(never)]
+fn credentials(
+    settings: &ServerSettings,
+) -> Result<(ClientCredentials, Option<[u8; 32]>, Option<String>)> {
+    let secret = crate::secret::normalize(&settings.secret)?;
+    let discovery = settings
+        .discovery
+        .as_deref()
+        .map(crate::secret::normalize)
         .transpose()?;
     let mut authorized_clients = ClientCredentials::new();
     let mut authorized_ids = HashSet::new();
-    for credential in client_credentials {
+    for credential in &settings.client_credentials {
         if credential.client_id.is_empty() {
             return Err("client id must not be empty".into());
         }
         if !authorized_ids.insert(credential.client_id.clone()) {
-            return Err(format!("duplicate client id `{}`", credential.client_id).into());
+            return Err(errf!("duplicate client id `{}`", credential.client_id));
         }
         let secret = crate::secret::normalize(&credential.secret)?;
         let psk = crate::noise::derive_psk(&secret);
@@ -1312,8 +1342,10 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
             return Err("client credentials must be unique".into());
         }
     }
-    let admin_secret = admin_secret
-        .map(|value| crate::secret::normalize(&value))
+    let admin_secret = settings
+        .admin_secret
+        .as_deref()
+        .map(crate::secret::normalize)
         .transpose()?;
     let admin_psk = admin_secret.as_deref().map(crate::noise::derive_psk);
     if admin_secret.as_deref() == Some(secret.as_str())
@@ -1339,20 +1371,25 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
             );
         }
     }
+    Ok((authorized_clients, admin_psk, discovery))
+}
 
-    // The TUN NAT guard tears the rules down when this future is dropped: on the
-    // SIGTERM/SIGINT cancel in main, or on an early-return error (the accept loop
-    // never returns normally). Held in the frame for the process lifetime; a bare
-    // `_` binding would drop it immediately.
-    #[cfg(target_os = "linux")]
-    let mut _nat_guard: Option<netfilter::NatGuard> = None;
-    // Carries the opened device with whether it is L2 (TAP/Ethernet) or L3 (TUN).
-    // The switch needs that distinction: an L2 device MAC-learns across many
-    // ports, an L3 device serves exactly one client.
-    #[cfg(target_os = "linux")]
-    let tap: Option<(Arc<TapDevice>, bool)> = if let Some(st) = &tun {
+/// Open the `--tun` or `--tap` device, with the TUN NAT rules installed.
+/// Carries the opened device with whether it is L2 (TAP/Ethernet) or L3
+/// (TUN). The switch needs that distinction: an L2 device MAC-learns across
+/// many ports, an L3 device serves exactly one client. The NAT guard tears the
+/// rules down when dropped.
+/// The opened device with whether it is L2, and the TUN NAT guard.
+#[cfg(target_os = "linux")]
+type OpenedDevice = (Option<(Arc<TapDevice>, bool)>, Option<netfilter::NatGuard>);
+
+#[cfg(target_os = "linux")]
+#[inline(never)]
+fn open_device(settings: &ServerSettings) -> Result<OpenedDevice> {
+    let mut nat_guard = None;
+    let tap = if let Some(st) = &settings.tun {
         let route_table = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
-        let plan = tun_nat_plan(st, control_port, &route_table)?;
+        let plan = tun_nat_plan(st, settings.control_port, &route_table)?;
         let dev = Arc::new(TapDevice::open_tun(&st.device)?);
         match netfilter::install(&plan) {
             netfilter::Outcome::Installed(g) => {
@@ -1367,7 +1404,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
                     st.client_ip,
                     g.backend_name(),
                 );
-                if control_port != 22 && !st.except.contains(&22) {
+                if settings.control_port != 22 && !st.except.contains(&22) {
                     crate::elog!(
                         "warning: port 22 (SSH) now routes to the client; pass --except 22 to keep \
                          administering this server over SSH"
@@ -1379,18 +1416,29 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
                         st.device.name
                     );
                 }
-                _nat_guard = Some(g);
+                nat_guard = Some(g);
             }
             netfilter::Outcome::Degraded(msg) => eprint!("{msg}"),
         }
         Some((dev, false))
-    } else if let Some(cfg) = &tap {
+    } else if let Some(cfg) = &settings.tap {
         Some((Arc::new(TapDevice::open(cfg)?), true))
     } else {
         None
     };
+    Ok((tap, nat_guard))
+}
+
+/// Validate the settings, open the device, install NAT, start the DHT
+/// announcer and build the registry: everything `run()` does before it
+/// touches the network.
+#[inline(never)]
+fn boot(settings: ServerSettings) -> Result<Boot> {
+    let (authorized_clients, admin_psk, discovery) = credentials(&settings)?;
+    #[cfg(target_os = "linux")]
+    let (tap, _nat_guard) = open_device(&settings)?;
     #[cfg(not(target_os = "linux"))]
-    if tap.is_some() || tun.is_some() {
+    if settings.tap.is_some() || settings.tun.is_some() {
         return Err("L2/L3 tunnel modes (--tap/--tun) are only supported on Linux".into());
     }
 
@@ -1400,9 +1448,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
     #[cfg(target_os = "linux")]
     let switch = tap.map(|(dev, is_l2)| bridge::TapSwitch::new(dev, is_l2));
 
-    let bind_ip = bind;
-
-    if let Some(ann) = dht {
+    if let Some(ann) = &settings.dht {
         #[cfg(feature = "dht")]
         {
             let Some(discovery) = discovery else {
@@ -1413,7 +1459,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
                 );
             };
             let ip = ann.ip;
-            let port = ann.port.unwrap_or(control_port);
+            let port = ann.port.unwrap_or(settings.control_port);
             crate::spawn(async move {
                 crate::dht::announce_loop(&discovery, ip, port).await;
             });
@@ -1425,6 +1471,22 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         }
     }
 
+    let ServerSettings {
+        bind: bind_ip,
+        control_port,
+        server_id,
+        listeners,
+        routes,
+        config_path,
+        file_id,
+        file_control,
+        file_seed,
+        file_admin_secret,
+        file_clients,
+        file_exit,
+        file_exit_iface,
+        ..
+    } = settings;
     let srv = Arc::new(Server {
         client_credentials: authorized_clients,
         admin_psk,
@@ -1465,6 +1527,37 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
         #[cfg(target_os = "linux")]
         switch,
     });
+    Ok(Boot {
+        srv,
+        listeners,
+        bind_ip,
+        control_port,
+        #[cfg(target_os = "linux")]
+        _nat_guard,
+    })
+}
+
+/// The server, boxed: the caller holds one pointer instead of the accept
+/// loop's whole state.
+#[inline(never)]
+pub fn run(
+    settings: ServerSettings,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+    crate::client::boxed(serve(settings))
+}
+
+async fn serve(settings: ServerSettings) -> Result<()> {
+    // The TUN NAT guard inside `boot` tears the rules down when this future is
+    // dropped: on the SIGTERM/SIGINT cancel in main, or on an early-return
+    // error (the accept loop never returns normally).
+    let Boot {
+        srv,
+        listeners,
+        bind_ip,
+        control_port,
+        #[cfg(target_os = "linux")]
+        _nat_guard,
+    } = boot(settings)?;
 
     // A configured forwarded port that is already in use must not kill the server:
     // log it and keep the others serving, as the single-listener path did.
@@ -1582,55 +1675,9 @@ pub(crate) async fn serve_stream(
     };
     match (auth_identity, Msg::decode(&first)?) {
         (AuthIdentity::Client(client_id), Msg::ClientHello { version, .. }) => {
-            if version != crate::identity::PROTO_VERSION {
-                return Err("unsupported protocol version".into());
-            }
-            let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
-            let (cancel, mut cancelled) = watch::channel(false);
-            let bridge_capability = Server::capability()?;
-            tx.try_send(
-                Msg::ClientHelloAck {
-                    client_id: client_id.clone(),
-                    bridge_capability,
-                }
-                .encode(),
-            )
-            .ok();
-            // Register this session under its client_id. A reconnect with the same
-            // id supersedes the previous handle in one lock acquisition, so the
-            // routing slot is reclaimed immediately; the old reader self-reaps.
-            let superseded = {
-                let mut clients = srv.clients.lock().unwrap();
-                clients.insert(
-                    client_id.clone(),
-                    ClientHandle {
-                        client_id: client_id.clone(),
-                        tx: tx.clone(),
-                        transport,
-                        fwd: Arc::new(HashMap::new()),
-                        observed: peer,
-                        peer_provides: None,
-                        peer_identity: None,
-                        bridge_capability: Some(bridge_capability),
-                        cancel,
-                    },
-                )
-            };
-            if let Some(superseded) = superseded {
-                crate::elog!("client {client_id} reconnected, superseding previous session");
-                superseded.cancel.send(true).ok();
-                srv.revoke_claims(&client_id, &superseded.tx);
-                srv.invalidate_pairs(&client_id);
-            }
-            crate::elog!("client {client_id} connected");
-            let mut w = w;
-            let writer = crate::spawn(async move {
-                while let Some(bytes) = rx.recv().await {
-                    if w.send(&bytes).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            check_version(version)?;
+            let (tx, mut cancelled, writer) =
+                register_client(&srv, &client_id, transport, peer, w)?;
             // Drain inbound control frames. Any frame (Ping, ...) resets the
             // liveness deadline; reply to Ping with Pong so the client's own
             // deadline also keeps resetting. A timeout (no inbound frame for the
@@ -1638,248 +1685,23 @@ pub(crate) async fn serve_stream(
             // black-holed link delivers no FIN/RST, so only the deadline catches it.
             let mut pending_announce: Option<PendingAnnounce> = None;
             loop {
-                let bytes = tokio::select! {
-                    _ = session_cancelled(&mut cancelled) => break,
-                    result = timeout(CONTROL_TIMEOUT, r.recv()) => match result {
-                        Ok(Ok(bytes)) => bytes,
+                let bytes =
+                    match until_cancelled(timeout(CONTROL_TIMEOUT, r.recv()), &mut cancelled).await
+                    {
+                        Some(Ok(Ok(bytes))) => bytes,
                         _ => break,
-                    },
-                };
-                match Msg::decode(&bytes) {
-                    Ok(Msg::Ping) => {
-                        tx.try_send(Msg::Pong.encode()).ok();
-                    }
-                    Ok(Msg::FwdOptions { entries }) => {
-                        let map: HashMap<(Proto, u16), FwdOpt> = entries
-                            .iter()
-                            .map(|e| {
-                                (
-                                    (e.proto, e.port),
-                                    FwdOpt {
-                                        // PROXY headers are a TCP framing; a udp
-                                        // entry claiming one is never honored.
-                                        proxy: e.proxy && e.proto == Proto::Tcp,
-                                        idle: (e.idle_secs > 0)
-                                            .then(|| Duration::from_secs(e.idle_secs.into())),
-                                    },
-                                )
-                            })
-                            .collect();
-                        // Swap the options into the registry only while this
-                        // session still owns its slot (same guard as the
-                        // teardown below), so a superseding session's options
-                        // are never clobbered by a stale reader.
-                        {
-                            let mut clients = srv.clients.lock().unwrap();
-                            if let Some(h) = clients.get_mut(&client_id) {
-                                if h.tx.same_channel(&tx) {
-                                    h.fwd = Arc::new(map);
-                                }
-                            }
-                        }
-                        // The ack tells the client its options (PROXY headers
-                        // included) are honored; it is only ever sent in reply,
-                        // so an old client never sees an undecodable frame.
-                        tx.try_send(Msg::FwdOptionsAck.encode()).ok();
-                    }
-                    Ok(Msg::PeerAnnounce { provides, identity }) => {
-                        // The announce only claims an identity; nothing
-                        // registers until the proof settles. A repeat replaces
-                        // the pending exchange, so the newest challenge is the
-                        // only one a proof can answer.
-                        match AnnounceChallenge::mint(&identity) {
-                            Ok(Some(challenge)) => {
-                                let msg = Msg::PeerChallenge {
-                                    eph_pub: challenge.eph_pub,
-                                    nonce: challenge.nonce,
-                                };
-                                pending_announce = Some(PendingAnnounce {
-                                    provides,
-                                    identity,
-                                    challenge,
-                                });
-                                tx.try_send(msg.encode()).ok();
-                            }
-                            Ok(None) => {
-                                pending_announce = None;
-                                let hex = crate::secret::encode(identity);
-                                crate::elog!(
-                                    "client {client_id}: peer announce for {hex} refused: \
-                                     malformed identity"
-                                );
-                                tx.try_send(
-                                    Msg::PeerAnnounceRefuse {
-                                        reason: PeerRefuseReason::MalformedIdentity,
-                                    }
-                                    .encode(),
-                                )
-                                .ok();
-                            }
-                            Err(e) => {
-                                // Answered like any other refusal: without a
-                                // verdict the client would read the silence as
-                                // a server with no peer support.
-                                pending_announce = None;
-                                let hex = crate::secret::encode(identity);
-                                crate::elog!(
-                                    "client {client_id}: peer announce for {hex} refused: \
-                                     challenge failed: {e}"
-                                );
-                                tx.try_send(
-                                    Msg::PeerAnnounceRefuse {
-                                        reason: PeerRefuseReason::ChallengeFailed,
-                                    }
-                                    .encode(),
-                                )
-                                .ok();
-                            }
-                        }
-                    }
-                    Ok(Msg::PeerProof { mac }) => {
-                        // A proof with no exchange pending answers nothing on
-                        // this session, so there is no verdict to send.
-                        let Some(pending) = pending_announce.take() else {
-                            crate::elog!(
-                                "client {client_id}: peer proof with no announce pending dropped"
-                            );
-                            continue;
-                        };
-                        let hex = crate::secret::encode(pending.identity);
-                        if !pending.challenge.verify(pending.provides, &client_id, &mac) {
-                            crate::elog!(
-                                "client {client_id}: peer announce for {hex} refused: failed proof"
-                            );
-                            tx.try_send(
-                                Msg::PeerAnnounceRefuse {
-                                    reason: PeerRefuseReason::FailedProof,
-                                }
-                                .encode(),
-                            )
-                            .ok();
-                            continue;
-                        }
-                        // A session that lost its slot mid-exchange registers
-                        // nothing and gets no verdict: the supersession that
-                        // took the slot is already tearing this session down,
-                        // and the closed connection is what its client sees.
-                        let Some((observed, displaced)) = srv.record_peer_claim(
-                            &client_id,
-                            &tx,
-                            pending.provides,
-                            pending.identity,
-                        ) else {
-                            continue;
-                        };
-                        for claim in displaced {
-                            srv.invalidate_pairs(&claim.client_id);
-                            crate::elog!(
-                                "peer identity {hex} proven by client {client_id}, \
-                                 superseding client {}; displaced peer state \
-                                 invalidated",
-                                claim.client_id
-                            );
-                            // The displaced session stays live with no claim;
-                            // without a verdict its slots would retry into
-                            // silence until each cycle's deadline.
-                            claim
-                                .tx
-                                .try_send(
-                                    Msg::PeerAnnounceRefuse {
-                                        reason: PeerRefuseReason::IdentityClaimed,
-                                    }
-                                    .encode(),
-                                )
-                                .ok();
-                        }
-                        // The ack echoes the control address recorded at
-                        // registration; like FwdOptionsAck it is only ever sent
-                        // in reply.
-                        if let Some(observed) = observed {
-                            tx.try_send(Msg::PeerAnnounceAck { observed }.encode()).ok();
-                        }
-                    }
-                    Ok(Msg::PeerConnect { peer_id, want }) => {
-                        // `None` marks a sender that never announced or lost
-                        // its slot; the frame is dropped like any unknown
-                        // frame, since replying would send a peer tag through
-                        // an unannounced session.
-                        if let Some((pair_id, status)) =
-                            srv.peer_connect(&client_id, &tx, &peer_id, want)
-                        {
-                            tx.try_send(
-                                Msg::PeerResult {
-                                    peer_id,
-                                    want,
-                                    pair_id,
-                                    status,
-                                }
-                                .encode(),
-                            )
-                            .ok();
-                            if status == PeerStatus::Accepted {
-                                srv.start_pair_probes(pair_id);
-                            }
-                        }
-                    }
-                    Ok(Msg::PeerPath { pair_id, status }) => {
-                        srv.peer_path(&client_id, &tx, pair_id, status);
-                    }
-                    _ => {}
-                }
+                    };
+                handle_control_frame(&srv, &client_id, &tx, &mut pending_announce, &bytes);
             }
-            // Remove this client only if the registry still points at this
-            // session's channel. A superseding session overwrote the entry, so its
-            // tx no longer matches and this teardown preserves the new session.
-            let removed = {
-                let mut clients = srv.clients.lock().unwrap();
-                let owned = clients
-                    .get(&client_id)
-                    .is_some_and(|h| h.tx.same_channel(&tx));
-                if owned {
-                    clients.remove(&client_id)
-                } else {
-                    None
-                }
-            };
-            // Gated on the real removal so a stale reader's teardown cannot drop
-            // pairs the superseding session created or cancel its paths.
-            if let Some(removed) = removed {
-                removed.cancel.send(true).ok();
-                srv.revoke_claims(&client_id, &removed.tx);
-                srv.invalidate_pairs(&client_id);
-                crate::elog!("client {client_id} disconnected");
-            }
+            unregister_client(&srv, &client_id, &tx);
             writer.abort();
             Ok(())
         }
         (AuthIdentity::Admin, Msg::AdminHello { version, mode }) => {
-            if version != crate::identity::PROTO_VERSION {
-                return Err("unsupported protocol version".into());
-            }
-            match mode {
-                0 => {
-                    // No log line: the console polls this every second, which would flood the log.
-                    let mut w = w;
-                    w.send(&Msg::Snapshot(srv.snapshot()).encode()).await?;
-                    Ok(())
-                }
-                1 => {
-                    crate::elog!("admin connected (mutate)");
-                    // Same guard as the first role frame: an admin that says it
-                    // will mutate but never sends the request must not park here.
-                    let bytes = match timeout(CONTROL_TIMEOUT, r.recv()).await {
-                        Ok(res) => res?,
-                        Err(_) => return Err("timed out waiting for admin request".into()),
-                    };
-                    let req = Msg::decode(&bytes)?;
-                    let (ok, msg) = apply_mutation(&srv, req).await;
-                    crate::elog!("admin mutation: ok={ok} {msg}");
-                    let mut w = w;
-                    w.send(&Msg::MutationResult { ok, msg }.encode()).await?;
-                    Ok(())
-                }
-                other => Err(format!("unsupported admin mode {other}").into()),
-            }
+            check_version(version)?;
+            let admin: std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>> =
+                Box::pin(serve_admin(srv, r, w, mode));
+            admin.await
         }
         (
             AuthIdentity::Client(client_id),
@@ -1889,78 +1711,428 @@ pub(crate) async fn serve_stream(
                 capability,
             },
         ) => {
-            if version != crate::identity::PROTO_VERSION {
-                return Err("unsupported protocol version".into());
-            }
+            check_version(version)?;
             #[cfg(target_os = "linux")]
             if id == BRIDGE_ID {
-                let cancel = srv
-                    .clients
-                    .lock()
-                    .map_err(|_| "client registry lock poisoned")?
-                    .get_mut(&client_id)
-                    .and_then(|h| {
-                        h.bridge_capability
-                            .take_if(|expected| *expected == capability)
-                            .map(|_| h.cancel.subscribe())
-                    });
-                if let Some(mut cancel) = cancel {
-                    if let Some(switch) = srv.switch.clone() {
-                        match switch.add_port(transport_byte(transport), peer) {
-                            Ok(handle) => {
-                                handle.set_name(&client_id);
-                                tokio::select! {
-                                    _ = bridge::switch_port_stream(handle, r, w) => {}
-                                    _ = session_cancelled(&mut cancel) => {}
-                                }
-                            }
-                            Err(e) => crate::elog!("rejecting bridge stream: {e}"),
-                        }
-                    }
+                if let Some((handle, mut cancel)) =
+                    attach_bridge_stream(&srv, &client_id, capability, transport, peer)?
+                {
+                    until_cancelled(bridge::switch_port_stream(handle, r, w), &mut cancel).await;
                 }
                 return Ok(());
             }
             // The peer address is only consumed by the linux-only switch above.
             #[cfg(not(target_os = "linux"))]
             let _ = &peer;
-            let claimed = {
-                let clients = srv
-                    .clients
-                    .lock()
-                    .map_err(|_| "client registry lock poisoned")?;
-                let mut pending = srv
-                    .pending
-                    .lock()
-                    .map_err(|_| "pending stream lock poisoned")?;
-                let owned = pending.get(&id).is_some_and(|entry| {
-                    entry.client_id == client_id
-                        && entry.capability == capability
-                        && clients
-                            .get(&client_id)
-                            .is_some_and(|h| h.tx.same_channel(&entry.control_tx))
-                });
-                if owned {
-                    pending.remove(&id)
-                } else {
-                    None
-                }
+            claim_data_stream(&srv, &client_id, id, capability, r, w)
+        }
+        (identity, other) => Err(errf!(
+            "message {other:?} is not valid for {identity:?} authentication"
+        )),
+    }
+}
+
+/// One admin exchange: a snapshot in mode 0, a mutation and its verdict in
+/// mode 1.
+async fn serve_admin(
+    srv: Arc<Server>,
+    mut r: crate::noise::NoiseReader,
+    mut w: crate::noise::NoiseWriter,
+    mode: u8,
+) -> Result<()> {
+    match mode {
+        0 => {
+            // No log line: the console polls this every second, which would flood the log.
+            w.send(&Msg::Snapshot(srv.snapshot()).encode()).await?;
+            Ok(())
+        }
+        1 => {
+            crate::elog!("admin connected (mutate)");
+            // Same guard as the first role frame: an admin that says it
+            // will mutate but never sends the request must not park here.
+            let bytes = match timeout(CONTROL_TIMEOUT, r.recv()).await {
+                Ok(res) => res?,
+                Err(_) => return Err("timed out waiting for admin request".into()),
             };
-            match claimed {
-                Some(PendingStream { tx, .. }) => {
-                    let _ = tx.send((r, w));
-                }
-                // Forward opens and relay legs draw ids from one counter, so
-                // an id no forward parked can only be a relay leg's.
-                None => {
-                    if let Some(pair_id) = srv.take_relay_leg(id, &client_id, &capability) {
-                        srv.park_relay_leg(pair_id, RelayLeg::Stream(r, w));
+            let req = Msg::decode(&bytes)?;
+            let (ok, msg) = apply_mutation(&srv, req).await;
+            crate::elog!("admin mutation: ok={ok} {msg}");
+            w.send(&Msg::MutationResult { ok, msg }.encode()).await?;
+            Ok(())
+        }
+        other => Err(errf!("unsupported admin mode {other}")),
+    }
+}
+
+#[inline(never)]
+fn check_version(version: u8) -> Result<()> {
+    if version != crate::identity::PROTO_VERSION {
+        return Err("unsupported protocol version".into());
+    }
+    Ok(())
+}
+
+/// A registered client session: its control channel, the cancellation it
+/// watches, and the task that writes its outbound frames.
+type Registered = (
+    mpsc::Sender<Vec<u8>>,
+    watch::Receiver<bool>,
+    tokio::task::JoinHandle<()>,
+);
+
+/// Register a client session under its id, ack the hello, and start the task
+/// that writes its outbound frames.
+#[inline(never)]
+fn register_client(
+    srv: &Server,
+    client_id: &str,
+    transport: ActiveTransport,
+    peer: Option<SocketAddr>,
+    mut w: crate::noise::NoiseWriter,
+) -> Result<Registered> {
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+    let (cancel, cancelled) = watch::channel(false);
+    let bridge_capability = Server::capability()?;
+    send(
+        &tx,
+        Msg::ClientHelloAck {
+            client_id: client_id.to_string(),
+            bridge_capability,
+        },
+    );
+    // Register this session under its client_id. A reconnect with the same
+    // id supersedes the previous handle in one lock acquisition, so the
+    // routing slot is reclaimed immediately; the old reader self-reaps.
+    let superseded = {
+        let mut clients = srv.clients.lock().unwrap();
+        clients.insert(
+            client_id.to_string(),
+            ClientHandle {
+                client_id: client_id.to_string(),
+                tx: tx.clone(),
+                transport,
+                fwd: Arc::new(HashMap::new()),
+                observed: peer,
+                peer_provides: None,
+                peer_identity: None,
+                bridge_capability: Some(bridge_capability),
+                cancel,
+            },
+        )
+    };
+    if let Some(superseded) = superseded {
+        crate::elog!("client {client_id} reconnected, superseding previous session");
+        superseded.cancel.send(true).ok();
+        srv.revoke_claims(client_id, &superseded.tx);
+        srv.invalidate_pairs(client_id);
+    }
+    crate::elog!("client {client_id} connected");
+    let writer = crate::spawn(async move {
+        while let Some(bytes) = rx.recv().await {
+            if w.send(&bytes).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok((tx, cancelled, writer))
+}
+
+/// Remove a client session at its end, but only if the registry still points
+/// at this session's channel. A superseding session overwrote the entry, so
+/// its tx no longer matches and this teardown preserves the new session.
+#[inline(never)]
+fn unregister_client(srv: &Server, client_id: &str, tx: &mpsc::Sender<Vec<u8>>) {
+    let removed = {
+        let mut clients = srv.clients.lock().unwrap();
+        let owned = clients
+            .get(client_id)
+            .is_some_and(|h| h.tx.same_channel(tx));
+        if owned {
+            clients.remove(client_id)
+        } else {
+            None
+        }
+    };
+    // Gated on the real removal so a stale reader's teardown cannot drop
+    // pairs the superseding session created or cancel its paths.
+    if let Some(removed) = removed {
+        removed.cancel.send(true).ok();
+        srv.revoke_claims(client_id, &removed.tx);
+        srv.invalidate_pairs(client_id);
+        crate::elog!("client {client_id} disconnected");
+    }
+}
+
+/// Handle one inbound control frame of a registered client session.
+#[inline(never)]
+fn handle_control_frame(
+    srv: &Arc<Server>,
+    client_id: &str,
+    tx: &mpsc::Sender<Vec<u8>>,
+    pending_announce: &mut Option<PendingAnnounce>,
+    bytes: &[u8],
+) {
+    match Msg::decode(bytes) {
+        Ok(Msg::Ping) => {
+            send(tx, Msg::Pong);
+        }
+        Ok(Msg::FwdOptions { entries }) => {
+            let map: HashMap<(Proto, u16), FwdOpt> = entries
+                .iter()
+                .map(|e| {
+                    (
+                        (e.proto, e.port),
+                        FwdOpt {
+                            // PROXY headers are a TCP framing; a udp
+                            // entry claiming one is never honored.
+                            proxy: e.proxy && e.proto == Proto::Tcp,
+                            idle: (e.idle_secs > 0)
+                                .then(|| Duration::from_secs(e.idle_secs.into())),
+                        },
+                    )
+                })
+                .collect();
+            // Swap the options into the registry only while this
+            // session still owns its slot (same guard as the
+            // teardown), so a superseding session's options
+            // are never clobbered by a stale reader.
+            {
+                let mut clients = srv.clients.lock().unwrap();
+                if let Some(h) = clients.get_mut(client_id) {
+                    if h.tx.same_channel(tx) {
+                        h.fwd = Arc::new(map);
                     }
                 }
             }
-            Ok(())
+            // The ack tells the client its options (PROXY headers
+            // included) are honored; it is only ever sent in reply,
+            // so an old client never sees an undecodable frame.
+            send(tx, Msg::FwdOptionsAck);
         }
-        (identity, other) => {
-            Err(format!("message {other:?} is not valid for {identity:?} authentication").into())
+        Ok(Msg::PeerAnnounce { provides, identity }) => {
+            // The announce only claims an identity; nothing
+            // registers until the proof settles. A repeat replaces
+            // the pending exchange, so the newest challenge is the
+            // only one a proof can answer.
+            match AnnounceChallenge::mint(&identity) {
+                Ok(Some(challenge)) => {
+                    let msg = Msg::PeerChallenge {
+                        eph_pub: challenge.eph_pub,
+                        nonce: challenge.nonce,
+                    };
+                    *pending_announce = Some(PendingAnnounce {
+                        provides,
+                        identity,
+                        challenge,
+                    });
+                    send(tx, msg);
+                }
+                Ok(None) => {
+                    *pending_announce = None;
+                    let hex = crate::secret::encode(identity);
+                    crate::elog!(
+                        "client {client_id}: peer announce for {hex} refused: \
+                         malformed identity"
+                    );
+                    send(
+                        tx,
+                        Msg::PeerAnnounceRefuse {
+                            reason: PeerRefuseReason::MalformedIdentity,
+                        },
+                    );
+                }
+                Err(e) => {
+                    // Answered like any other refusal: without a
+                    // verdict the client would read the silence as
+                    // a server with no peer support.
+                    *pending_announce = None;
+                    let hex = crate::secret::encode(identity);
+                    crate::elog!(
+                        "client {client_id}: peer announce for {hex} refused: \
+                         challenge failed: {e}"
+                    );
+                    send(
+                        tx,
+                        Msg::PeerAnnounceRefuse {
+                            reason: PeerRefuseReason::ChallengeFailed,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(Msg::PeerProof { mac }) => {
+            // A proof with no exchange pending answers nothing on
+            // this session, so there is no verdict to send.
+            let Some(pending) = pending_announce.take() else {
+                crate::elog!("client {client_id}: peer proof with no announce pending dropped");
+                return;
+            };
+            let hex = crate::secret::encode(pending.identity);
+            if !pending.challenge.verify(pending.provides, client_id, &mac) {
+                crate::elog!("client {client_id}: peer announce for {hex} refused: failed proof");
+                send(
+                    tx,
+                    Msg::PeerAnnounceRefuse {
+                        reason: PeerRefuseReason::FailedProof,
+                    },
+                );
+                return;
+            }
+            // A session that lost its slot mid-exchange registers
+            // nothing and gets no verdict: the supersession that
+            // took the slot is already tearing this session down,
+            // and the closed connection is what its client sees.
+            let Some((observed, displaced)) =
+                srv.record_peer_claim(client_id, tx, pending.provides, pending.identity)
+            else {
+                return;
+            };
+            for claim in displaced {
+                srv.invalidate_pairs(&claim.client_id);
+                crate::elog!(
+                    "peer identity {hex} proven by client {client_id}, \
+                     superseding client {}; displaced peer state \
+                     invalidated",
+                    claim.client_id
+                );
+                // The displaced session stays live with no claim;
+                // without a verdict its slots would retry into
+                // silence until each cycle's deadline.
+                send(
+                    &claim.tx,
+                    Msg::PeerAnnounceRefuse {
+                        reason: PeerRefuseReason::IdentityClaimed,
+                    },
+                );
+            }
+            // The ack echoes the control address recorded at
+            // registration; like FwdOptionsAck it is only ever sent
+            // in reply.
+            if let Some(observed) = observed {
+                send(tx, Msg::PeerAnnounceAck { observed });
+            }
+        }
+        Ok(Msg::PeerConnect { peer_id, want }) => {
+            // `None` marks a sender that never announced or lost
+            // its slot; the frame is dropped like any unknown
+            // frame, since replying would send a peer tag through
+            // an unannounced session.
+            if let Some((pair_id, status)) = srv.peer_connect(client_id, tx, &peer_id, want) {
+                send(
+                    tx,
+                    Msg::PeerResult {
+                        peer_id,
+                        want,
+                        pair_id,
+                        status,
+                    },
+                );
+                if status == PeerStatus::Accepted {
+                    srv.start_pair_probes(pair_id);
+                }
+            }
+        }
+        Ok(Msg::PeerPath { pair_id, status }) => {
+            srv.peer_path(client_id, tx, pair_id, status);
+        }
+        _ => {}
+    }
+}
+
+/// Take the bridge lease a client's `Data` stream presents and open its
+/// switch port. `None` when the lease does not match or the server has no
+/// switch; the stream is closed either way.
+#[cfg(target_os = "linux")]
+#[inline(never)]
+fn attach_bridge_stream(
+    srv: &Server,
+    client_id: &str,
+    capability: Capability,
+    transport: ActiveTransport,
+    peer: Option<SocketAddr>,
+) -> Result<Option<(bridge::SwitchHandle, watch::Receiver<bool>)>> {
+    let cancel = srv
+        .clients
+        .lock()
+        .map_err(|_| "client registry lock poisoned")?
+        .get_mut(client_id)
+        .and_then(|h| {
+            h.bridge_capability
+                .take_if(|expected| *expected == capability)
+                .map(|_| h.cancel.subscribe())
+        });
+    let Some(cancel) = cancel else {
+        return Ok(None);
+    };
+    let Some(switch) = srv.switch.clone() else {
+        return Ok(None);
+    };
+    match switch.add_port(transport_byte(transport), peer) {
+        Ok(handle) => {
+            handle.set_name(client_id);
+            Ok(Some((handle, cancel)))
+        }
+        Err(e) => {
+            crate::elog!("rejecting bridge stream: {e}");
+            Ok(None)
+        }
+    }
+}
+
+/// Hand a client's `Data` stream to the public connection that opened it, or
+/// park it as a relay leg. Forward opens and relay legs draw ids from one
+/// counter, so an id no forward parked can only be a relay leg's.
+#[inline(never)]
+fn claim_data_stream(
+    srv: &Arc<Server>,
+    client_id: &str,
+    id: u64,
+    capability: Capability,
+    r: crate::noise::NoiseReader,
+    w: crate::noise::NoiseWriter,
+) -> Result<()> {
+    let claimed = {
+        let clients = srv
+            .clients
+            .lock()
+            .map_err(|_| "client registry lock poisoned")?;
+        let mut pending = srv
+            .pending
+            .lock()
+            .map_err(|_| "pending stream lock poisoned")?;
+        let owned = pending.get(&id).is_some_and(|entry| {
+            entry.client_id == client_id
+                && entry.capability == capability
+                && clients
+                    .get(client_id)
+                    .is_some_and(|h| h.tx.same_channel(&entry.control_tx))
+        });
+        if owned {
+            pending.remove(&id)
+        } else {
+            None
+        }
+    };
+    match claimed {
+        Some(PendingStream { tx, .. }) => {
+            let _ = tx.send((r, w));
+        }
+        None => {
+            if let Some(pair_id) = srv.take_relay_leg(id, client_id, &capability) {
+                srv.park_relay_leg(pair_id, RelayLeg::Stream(r, w));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stable insertion sort for the short snapshot lists, ordered by `less`.
+fn sort_by<T>(v: &mut [T], less: impl Fn(&T, &T) -> bool) {
+    for i in 1..v.len() {
+        let mut j = i;
+        while j > 0 && less(&v[j], &v[j - 1]) {
+            v.swap(j, j - 1);
+            j -= 1;
         }
     }
 }
@@ -1969,6 +2141,7 @@ impl Server {
     /// Build a point-in-time snapshot of this server's topology. Each lock is held
     /// only long enough to copy its contents; the connected client ids are snapped
     /// into a local set so route states are computed without re-locking `clients`.
+    #[inline(never)]
     fn snapshot(&self) -> SnapshotBody {
         let (connected, clients): (HashSet<String>, Vec<ClientEntry>) = {
             let map = self.clients.lock().unwrap();
@@ -1989,7 +2162,9 @@ impl Server {
                                 .unwrap_or(0),
                         })
                         .collect();
-                    fwd.sort_unstable_by_key(|e| (e.port, e.proto == Proto::Udp));
+                    sort_by(&mut fwd, |a, b| {
+                        (a.port, a.proto == Proto::Udp) < (b.port, b.proto == Proto::Udp)
+                    });
                     ClientEntry {
                         client_id: id.clone(),
                         transport: transport_byte(h.transport),
@@ -2035,37 +2210,39 @@ impl Server {
         // so the fleet view reads them from the switch's port table. The switch is
         // linux-only; other platforms report no bridge clients.
         #[cfg(target_os = "linux")]
-        let bridge_clients =
-            self.switch
-                .as_ref()
-                .map(|sw| {
-                    sw.ports_snapshot()
-                        .into_iter()
-                        .map(|p| {
-                            let named = p.name.as_ref().is_some_and(|s| !s.is_empty());
-                            let label = p.name.filter(|s| !s.is_empty()).unwrap_or_else(|| match p
-                                .peer
-                            {
-                                Some(a) => a.to_string(),
-                                None => format!("bridge-{}", p.port_id),
-                            });
-                            BridgeEntry {
-                                label,
-                                named,
-                                transport: p.transport,
-                                peer: p.peer.map(|a| a.to_string()).unwrap_or_default(),
-                                macs: p.macs,
-                                rx_bytes: p.rx_bytes,
-                                rx_frames: p.rx_frames,
-                                tx_bytes: p.tx_bytes,
-                                tx_frames: p.tx_frames,
-                                uptime_secs: p.uptime_secs,
-                                idle_secs: p.idle_secs,
+        let bridge_clients = self
+            .switch
+            .as_ref()
+            .map(|sw| {
+                sw.ports_snapshot()
+                    .into_iter()
+                    .map(|p| {
+                        let named = p.name.as_ref().is_some_and(|s| !s.is_empty());
+                        let peer = p.peer.map(|a| a.to_string()).unwrap_or_default();
+                        let label = p.name.filter(|s| !s.is_empty()).unwrap_or_else(|| {
+                            if p.peer.is_some() {
+                                peer.clone()
+                            } else {
+                                format!("bridge-{}", p.port_id)
                             }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+                        });
+                        BridgeEntry {
+                            label,
+                            named,
+                            transport: p.transport,
+                            peer,
+                            macs: p.macs,
+                            rx_bytes: p.rx_bytes,
+                            rx_frames: p.rx_frames,
+                            tx_bytes: p.tx_bytes,
+                            tx_frames: p.tx_frames,
+                            uptime_secs: p.uptime_secs,
+                            idle_secs: p.idle_secs,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         #[cfg(not(target_os = "linux"))]
         let bridge_clients = Vec::new();
         // Accepted pairs, each with the path its two parties settled on. The
@@ -2093,8 +2270,8 @@ impl Server {
                 },
             })
             .collect();
-        pairs.sort_unstable_by(|a, b| {
-            (&a.consumer_id, &a.provider_id, a.want).cmp(&(&b.consumer_id, &b.provider_id, b.want))
+        sort_by(&mut pairs, |a, b| {
+            (&a.consumer_id, &a.provider_id, a.want) < (&b.consumer_id, &b.provider_id, b.want)
         });
 
         SnapshotBody {
@@ -2122,9 +2299,18 @@ impl Server {
             return Ok(());
         };
         let _guard = self.save_lock.lock().await;
+        let text = self.file_config_text();
+        match tokio::task::spawn_blocking(move || config::save_atomic(&path, &text)).await {
+            Ok(res) => res,
+            Err(e) => Err(errf!("config save task failed: {e}")),
+        }
+    }
 
-        // Snapshot each map independently, releasing one lock before taking the
-        // next, so persist never holds two of the maps at once.
+    /// The file-owned topology serialized as the backing config's text.
+    /// Snapshots each map independently, releasing one lock before taking the
+    /// next, so a save never holds two of the maps at once.
+    #[inline(never)]
+    fn file_config_text(&self) -> String {
         let listeners: Vec<config::CfgListener> = self
             .listeners
             .lock()
@@ -2161,12 +2347,7 @@ impl Server {
             listeners,
             routes,
         };
-
-        let text = config::serialize(&cfg);
-        match tokio::task::spawn_blocking(move || config::save_atomic(&path, &text)).await {
-            Ok(res) => res,
-            Err(e) => Err(format!("config save task failed: {e}").into()),
-        }
+        config::serialize(&cfg)
     }
 }
 
@@ -2177,21 +2358,34 @@ impl Server {
 /// even though the mutation already applied in memory, so a scripted admin detects
 /// that the on-disk config did not change.
 async fn apply_mutation(srv: &Arc<Server>, req: Msg) -> (bool, String) {
-    // File-owned on a config-backed node, runtime-owned otherwise.
-    let mutation_source = if srv.config_path.is_some() {
-        Source::File
-    } else {
-        Source::Runtime
-    };
-    match req {
+    let applied = match req {
         Msg::AddListener {
             bind_ip,
             proto,
             port,
-        } => match spawn_listener(srv, bind_ip, proto, port, mutation_source, false).await {
-            Ok(()) => save_after_mutation(srv).await,
-            Err(e) => (false, e.to_string()),
-        },
+        } => spawn_listener(srv, bind_ip, proto, port, mutation_source(srv), false).await,
+        other => apply_sync_mutation(srv, other),
+    };
+    match applied {
+        Ok(()) => save_after_mutation(srv).await,
+        Err(e) => (false, e.to_string()),
+    }
+}
+
+/// File-owned on a config-backed node, runtime-owned otherwise.
+fn mutation_source(srv: &Server) -> Source {
+    if srv.config_path.is_some() {
+        Source::File
+    } else {
+        Source::Runtime
+    }
+}
+
+/// Apply a mutation that touches only the registry: everything but a listener
+/// add, which has to bind. An unknown message is an error like a refused one.
+#[inline(never)]
+fn apply_sync_mutation(srv: &Server, req: Msg) -> Result<()> {
+    match req {
         Msg::RemoveListener {
             bind_ip,
             proto,
@@ -2206,18 +2400,12 @@ async fn apply_mutation(srv: &Arc<Server>, req: Msg) -> (bool, String) {
                 .get(&(bind_ip, proto, port))
                 .is_some_and(|h| h.cli_locked)
             {
-                return (
-                    false,
-                    format!(
-                        "listener {bind_ip} {} {port} is controlled by CLI args",
-                        proto_name(proto)
-                    ),
-                );
+                return Err(errf!(
+                    "listener {bind_ip} {} {port} is controlled by CLI args",
+                    proto_name(proto)
+                ));
             }
-            match remove_listener(srv, (bind_ip, proto, port)) {
-                Ok(()) => save_after_mutation(srv).await,
-                Err(e) => (false, e.to_string()),
-            }
+            remove_listener(srv, (bind_ip, proto, port))
         }
         Msg::SetRoute {
             bind_ip,
@@ -2233,13 +2421,13 @@ async fn apply_mutation(srv: &Arc<Server>, req: Msg) -> (bool, String) {
                 key,
                 Route {
                     client_id: client_id.clone(),
-                    source: mutation_source,
+                    source: mutation_source(srv),
                 },
             );
             if prev.as_deref() != Some(client_id.as_str()) {
                 cut_established(srv, key);
             }
-            save_after_mutation(srv).await
+            Ok(())
         }
         Msg::ClearRoute {
             bind_ip,
@@ -2254,9 +2442,9 @@ async fn apply_mutation(srv: &Arc<Server>, req: Msg) -> (bool, String) {
             if prev != srv.serving_client_id(key) {
                 cut_established(srv, key);
             }
-            save_after_mutation(srv).await
+            Ok(())
         }
-        other => (false, format!("unexpected mutation message: {other:?}")),
+        other => Err(errf!("unexpected mutation message: {other:?}")),
     }
 }
 
@@ -2275,7 +2463,18 @@ async fn save_after_mutation(srv: &Arc<Server>) -> (bool, String) {
 /// Bind the requested public port synchronously, register a cancellable listener,
 /// and spawn its accept/recv loop. The bind happens before the registry insert so
 /// an in-use port reports its error to the caller instead of failing in a task.
-async fn spawn_listener(
+fn spawn_listener<'a>(
+    srv: &'a Arc<Server>,
+    bind_ip: Ipv4Addr,
+    proto: Proto,
+    port: u16,
+    source: Source,
+    cli_locked: bool,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(bind_listener(srv, bind_ip, proto, port, source, cli_locked))
+}
+
+async fn bind_listener(
     srv: &Arc<Server>,
     bind_ip: Ipv4Addr,
     proto: Proto,
@@ -2285,24 +2484,51 @@ async fn spawn_listener(
 ) -> Result<()> {
     let key = (bind_ip, proto, port);
     if srv.listeners.lock().unwrap().contains_key(&key) {
-        return Err(format!(
+        return Err(errf!(
             "listener {bind_ip} {} {port} already exists",
             proto_name(proto)
-        )
-        .into());
+        ));
     }
+    let bound = match proto {
+        Proto::Tcp => match TcpListener::bind((bind_ip, port)).await {
+            Ok(l) => Bound::Tcp(l),
+            Err(e) => return Err(bind_error(bind_ip, port, e)),
+        },
+        Proto::Udp => match UdpSocket::bind((bind_ip, port)).await {
+            Ok(s) => Bound::Udp(s),
+            Err(e) => return Err(bind_error(bind_ip, port, e)),
+        },
+    };
+    start_listener(srv, key, source, cli_locked, bound)
+}
 
+/// A freshly bound public socket, before its listener loop runs.
+enum Bound {
+    Tcp(TcpListener),
+    Udp(UdpSocket),
+}
+
+#[inline(never)]
+fn bind_error(bind_ip: Ipv4Addr, port: u16, e: std::io::Error) -> crate::Error {
+    errf!("cannot bind {bind_ip}:{port}: {e}")
+}
+
+/// Register a bound socket's listener handle and spawn its accept/recv loop.
+#[inline(never)]
+fn start_listener(
+    srv: &Arc<Server>,
+    key: RouteKey,
+    source: Source,
+    cli_locked: bool,
+    bound: Bound,
+) -> Result<()> {
+    let (bind_ip, proto, port) = key;
     let cancel = Arc::new(Notify::new());
     let bridges = Arc::new(Mutex::new(Vec::new()));
     let flush = Arc::new(Notify::new());
 
-    match proto {
-        Proto::Tcp => {
-            let l = TcpListener::bind((bind_ip, port))
-                .await
-                .map_err(|e| -> crate::Error {
-                    format!("cannot bind {bind_ip}:{port}: {e}").into()
-                })?;
+    match bound {
+        Bound::Tcp(l) => {
             srv.listeners.lock().unwrap().insert(
                 key,
                 ListenerHandle {
@@ -2313,21 +2539,16 @@ async fn spawn_listener(
                     cli_locked,
                 },
             );
-            let srv = srv.clone();
-            crate::spawn(async move {
-                tcp_listener(srv, l, bind_ip, port, cancel, bridges).await;
-            });
+            crate::spawn(tcp_listener(srv.clone(), l, bind_ip, port, cancel, bridges));
         }
-        Proto::Udp => {
-            let socket = Arc::new(UdpSocket::bind((bind_ip, port)).await.map_err(
-                |e| -> crate::Error { format!("cannot bind {bind_ip}:{port}: {e}").into() },
-            )?);
+        Bound::Udp(socket) => {
+            let socket = Arc::new(socket);
             // A bind covering more than one local address must answer each source
             // from the address that source sent to; a forwarded client whose
             // socket is connected to the dialed address drops every other reply,
             // and UDP has no fallback path to fail over to.
             crate::pktinfo::record_local_addr(&socket).map_err(|e| -> crate::Error {
-                format!("cannot record local addresses on {bind_ip}:{port}: {e}").into()
+                errf!("cannot record local addresses on {bind_ip}:{port}: {e}")
             })?;
             srv.listeners.lock().unwrap().insert(
                 key,
@@ -2339,10 +2560,14 @@ async fn spawn_listener(
                     cli_locked,
                 },
             );
-            let srv = srv.clone();
-            crate::spawn(async move {
-                udp_listener(srv, socket, bind_ip, port, cancel, flush).await;
-            });
+            crate::spawn(udp_listener(
+                srv.clone(),
+                socket,
+                bind_ip,
+                port,
+                cancel,
+                flush,
+            ));
         }
     }
     crate::elog!("listener added: {bind_ip} {} {port}", proto_name(proto));
@@ -2395,7 +2620,10 @@ fn remove_listener(srv: &Server, key: RouteKey) -> Result<()> {
         }
         None => {
             let (bind_ip, proto, port) = key;
-            Err(format!("no such listener {bind_ip} {} {port}", proto_name(proto)).into())
+            Err(errf!(
+                "no such listener {bind_ip} {} {port}",
+                proto_name(proto)
+            ))
         }
     }
 }
@@ -2440,56 +2668,71 @@ async fn tcp_listener(
                 }
             },
         };
-        // Admit against this listener's own live-task count, so one flooded
-        // port cannot spend another port's capacity. Dropping `public` closes
-        // the socket before it can pin a task, a pending entry, or a client
-        // open.
-        let at_cap = {
-            let mut active = bridges.lock().unwrap();
-            active.retain(|h| !h.is_finished());
-            active.len() >= MAX_CONNS_PER_TCP_FORWARD
-        };
-        if at_cap {
-            if drop_log_due(&mut last_drop_log, Instant::now()) {
-                crate::elog!(
-                    "tcp listener {bind_ip}:{port}: \
-                     {MAX_CONNS_PER_TCP_FORWARD} connections active, \
-                     dropping new connections ({peer})"
-                );
-            }
-            continue;
-        }
-        let srv = srv.clone();
-        let handle = crate::spawn(async move {
-            // The accept's peer and local addresses feed a PROXY header when the
-            // routed client asked for one; the bound tuple stands in if the
-            // kernel cannot report the local side.
-            let local = public
-                .local_addr()
-                .unwrap_or_else(|_| SocketAddr::from((bind_ip, port)));
-            let Some((id, rx, idle, mut session_cancel)) =
-                srv.open(bind_ip, Proto::Tcp, port, Some((peer, local)))
-            else {
-                return;
-            };
-            let _reclaim = PendingReclaim {
-                srv: srv.clone(),
-                id,
-            };
-            tokio::select! {
-                result = timeout(OPEN_TIMEOUT, rx) => {
-                    if let Ok(Ok((nr, nw))) = result {
-                        tokio::select! {
-                            _ = bridge::tcp(public, nr, nw, idle) => {}
-                            _ = session_cancelled(&mut session_cancel) => {}
-                        }
-                    }
-                },
-                _ = session_cancelled(&mut session_cancel) => {}
-            }
-        });
-        bridges.lock().unwrap().push(handle);
+        admit_tcp_conn(
+            &srv,
+            &bridges,
+            bind_ip,
+            port,
+            public,
+            peer,
+            &mut last_drop_log,
+        );
     }
+}
+
+/// Admit one accepted public connection against its listener's own live-task
+/// count, so one flooded port cannot spend another port's capacity, and start
+/// its bridge task. Dropping `public` closes the socket before it can pin a
+/// task, a pending entry, or a client open.
+#[inline(never)]
+fn admit_tcp_conn(
+    srv: &Arc<Server>,
+    bridges: &Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    bind_ip: Ipv4Addr,
+    port: u16,
+    public: TcpStream,
+    peer: SocketAddr,
+    last_drop_log: &mut Option<Instant>,
+) {
+    let at_cap = {
+        let mut active = bridges.lock().unwrap();
+        active.retain(|h| !h.is_finished());
+        active.len() >= MAX_CONNS_PER_TCP_FORWARD
+    };
+    if at_cap {
+        if drop_log_due(last_drop_log, Instant::now()) {
+            crate::elog!(
+                "tcp listener {bind_ip}:{port}: \
+                 {MAX_CONNS_PER_TCP_FORWARD} connections active, \
+                 dropping new connections ({peer})"
+            );
+        }
+        return;
+    }
+    let srv = srv.clone();
+    let handle = crate::spawn(async move {
+        // The accept's peer and local addresses feed a PROXY header when the
+        // routed client asked for one; the bound tuple stands in if the
+        // kernel cannot report the local side.
+        let local = public
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from((bind_ip, port)));
+        let Some((id, rx, idle, mut session_cancel)) =
+            srv.open(bind_ip, Proto::Tcp, port, Some((peer, local)))
+        else {
+            return;
+        };
+        let _reclaim = PendingReclaim {
+            srv: srv.clone(),
+            id,
+        };
+        if let Some(Ok(Ok((nr, nw)))) =
+            until_cancelled(timeout(OPEN_TIMEOUT, rx), &mut session_cancel).await
+        {
+            until_cancelled(bridge::tcp(public, nr, nw, idle), &mut session_cancel).await;
+        }
+    });
+    bridges.lock().unwrap().push(handle);
 }
 
 /// Accept public UDP datagrams on a pre-bound socket, demux per source, and bridge
@@ -2566,144 +2809,167 @@ async fn udp_listener(
             data
         };
 
-        // Admit the new source against this listener's own session count, so a
-        // source flood on one port cannot spend another port's capacity. At the
-        // cap, one eviction pass reclaims dead entries the sweep has not
-        // reached yet; a source refused here parks nothing and reaches no
-        // client.
+        park_udp_source(
+            &srv,
+            &socket,
+            bind_ip,
+            port,
+            src,
+            local,
+            data,
+            &mut sessions,
+            &mut last_drop_log,
+        );
+    }
+}
+
+/// Park a datagram from a new public source: admit it against the listener's
+/// own session count, resolve the client serving the port, and open the
+/// bridge that will carry the source. A refused source parks nothing and
+/// reaches no client.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn park_udp_source(
+    srv: &Arc<Server>,
+    socket: &Arc<UdpSocket>,
+    bind_ip: Ipv4Addr,
+    port: u16,
+    src: SocketAddr,
+    local: Option<crate::pktinfo::LocalAddr>,
+    data: Vec<u8>,
+    sessions: &mut HashMap<SocketAddr, (mpsc::Sender<Vec<u8>>, Instant, Duration)>,
+    last_drop_log: &mut Option<Instant>,
+) {
+    // Admit the new source against this listener's own session count, so a
+    // source flood on one port cannot spend another port's capacity. At the
+    // cap, one eviction pass reclaims dead entries the sweep has not
+    // reached yet; a source refused here parks nothing and reaches no
+    // client.
+    if sessions.len() >= MAX_SOURCES_PER_UDP_FORWARD {
+        let now = Instant::now();
+        sessions.retain(|_, (tx, last, ttl)| !tx.is_closed() && now.duration_since(*last) < *ttl);
         if sessions.len() >= MAX_SOURCES_PER_UDP_FORWARD {
-            let now = Instant::now();
-            sessions
-                .retain(|_, (tx, last, ttl)| !tx.is_closed() && now.duration_since(*last) < *ttl);
-            if sessions.len() >= MAX_SOURCES_PER_UDP_FORWARD {
-                if drop_log_due(&mut last_drop_log, now) {
-                    crate::elog!(
-                        "udp listener {bind_ip}:{port}: \
-                         {MAX_SOURCES_PER_UDP_FORWARD} sources active, \
-                         dropping datagrams from new sources ({src})"
-                    );
-                }
-                continue;
-            }
-        }
-
-        // Resolve the client serving this listener before parking the source. A
-        // source with no route (and no single-client fallback) is dropped.
-        let Some(handle) = srv.route_to((bind_ip, Proto::Udp, port)) else {
-            continue;
-        };
-
-        // A custom per-forward idle widens the entry's TTL so the sweep cannot
-        // evict a source whose bridge is deliberately allowed to idle longer.
-        let fwd_idle = handle.fwd.get(&(Proto::Udp, port)).and_then(|o| o.idle);
-        let ttl = match fwd_idle {
-            Some(idle) => UDP_DATA_TTL.max(idle + Duration::from_secs(60)),
-            None => UDP_DATA_TTL,
-        };
-        let (dtx, drx) = mpsc::channel::<Vec<u8>>(64);
-        dtx.try_send(data).ok();
-        sessions.insert(src, (dtx, Instant::now(), ttl));
-
-        match handle.transport {
-            ActiveTransport::Tcp => {
-                let Some((id, rx, idle, mut session_cancel)) =
-                    srv.open(bind_ip, Proto::Udp, port, None)
-                else {
-                    sessions.remove(&src);
-                    continue;
-                };
-                let socket = socket.clone();
-                let srv = srv.clone();
-                crate::spawn(async move {
-                    tokio::select! {
-                        result = timeout(OPEN_TIMEOUT, rx) => match result {
-                            Ok(Ok((nr, nw))) => {
-                                tokio::select! {
-                                    _ = bridge::udp_server(socket, src, local, drx, nr, nw, idle) => {}
-                                    _ = session_cancelled(&mut session_cancel) => {}
-                                }
-                            }
-                            _ => {
-                                if let Ok(mut pending) = srv.pending.lock() {
-                                    pending.remove(&id);
-                                }
-                            }
-                        },
-                        _ = session_cancelled(&mut session_cancel) => {
-                            if let Ok(mut pending) = srv.pending.lock() {
-                                pending.remove(&id);
-                            }
-                        }
-                    }
-                });
-            }
-            ActiveTransport::Udp => {
-                let id = srv.next_id();
-                let Ok(capability) = Server::capability() else {
-                    sessions.remove(&src);
-                    continue;
-                };
-                let idle = fwd_idle.unwrap_or(bridge::UDP_IDLE);
-                let cancel = handle.cancel.subscribe();
-                if *cancel.borrow() {
-                    sessions.remove(&src);
-                    continue;
-                }
-                let Ok(mut pending) = srv.udp_pending.lock() else {
-                    sessions.remove(&src);
-                    continue;
-                };
-                pending.insert(
-                    id,
-                    UdpPending {
-                        client_id: handle.client_id.clone(),
-                        control_tx: handle.tx.clone(),
-                        capability,
-                        public_socket: socket.clone(),
-                        public_src: src,
-                        public_local: local,
-                        dgram_rx: drx,
-                        idle,
-                        cancel,
-                    },
+            if drop_log_due(last_drop_log, now) {
+                crate::elog!(
+                    "udp listener {bind_ip}:{port}: \
+                     {MAX_SOURCES_PER_UDP_FORWARD} sources active, \
+                     dropping datagrams from new sources ({src})"
                 );
-                drop(pending);
-                if *handle.cancel.borrow() {
-                    if let Ok(mut pending) = srv.udp_pending.lock() {
-                        pending.remove(&id);
+            }
+            return;
+        }
+    }
+
+    // Resolve the client serving this listener before parking the source. A
+    // source with no route (and no single-client fallback) is dropped.
+    let Some(handle) = srv.route_to((bind_ip, Proto::Udp, port)) else {
+        return;
+    };
+
+    // A custom per-forward idle widens the entry's TTL so the sweep cannot
+    // evict a source whose bridge is deliberately allowed to idle longer.
+    let fwd_idle = handle.fwd.get(&(Proto::Udp, port)).and_then(|o| o.idle);
+    let ttl = match fwd_idle {
+        Some(idle) => UDP_DATA_TTL.max(idle + Duration::from_secs(60)),
+        None => UDP_DATA_TTL,
+    };
+    let (dtx, drx) = mpsc::channel::<Vec<u8>>(64);
+    dtx.try_send(data).ok();
+    sessions.insert(src, (dtx, Instant::now(), ttl));
+
+    match handle.transport {
+        ActiveTransport::Tcp => {
+            let Some((id, rx, idle, mut session_cancel)) =
+                srv.open(bind_ip, Proto::Udp, port, None)
+            else {
+                sessions.remove(&src);
+                return;
+            };
+            let socket = socket.clone();
+            let srv = srv.clone();
+            crate::spawn(async move {
+                match until_cancelled(timeout(OPEN_TIMEOUT, rx), &mut session_cancel).await {
+                    Some(Ok(Ok((nr, nw)))) => {
+                        until_cancelled(
+                            bridge::udp_server(socket, src, local, drx, nr, nw, idle),
+                            &mut session_cancel,
+                        )
+                        .await;
                     }
-                    sessions.remove(&src);
-                    continue;
-                }
-                if handle
-                    .tx
-                    .try_send(
-                        Msg::Open {
-                            proto: Proto::Udp,
-                            port,
-                            id,
-                            capability,
-                        }
-                        .encode(),
-                    )
-                    .is_err()
-                {
-                    if let Ok(mut pending) = srv.udp_pending.lock() {
-                        pending.remove(&id);
-                    }
-                    sessions.remove(&src);
-                } else {
-                    // Reclaim the parked entry if the matching setup conv never
-                    // arrives (vanished/spoofed source). `remove` by id is a no-op
-                    // once `take_udp_pending` claimed it, so this is idempotent.
-                    let srv = srv.clone();
-                    crate::spawn(async move {
-                        tokio::time::sleep(OPEN_TIMEOUT).await;
-                        if let Ok(mut pending) = srv.udp_pending.lock() {
+                    _ => {
+                        if let Ok(mut pending) = srv.pending.lock() {
                             pending.remove(&id);
                         }
-                    });
+                    }
                 }
+            });
+        }
+        ActiveTransport::Udp => {
+            let id = srv.next_id();
+            let Ok(capability) = Server::capability() else {
+                sessions.remove(&src);
+                return;
+            };
+            let idle = fwd_idle.unwrap_or(bridge::UDP_IDLE);
+            let cancel = handle.cancel.subscribe();
+            if *cancel.borrow() {
+                sessions.remove(&src);
+                return;
+            }
+            let Ok(mut pending) = srv.udp_pending.lock() else {
+                sessions.remove(&src);
+                return;
+            };
+            pending.insert(
+                id,
+                UdpPending {
+                    client_id: handle.client_id.clone(),
+                    control_tx: handle.tx.clone(),
+                    capability,
+                    public_socket: socket.clone(),
+                    public_src: src,
+                    public_local: local,
+                    dgram_rx: drx,
+                    idle,
+                    cancel,
+                },
+            );
+            drop(pending);
+            if *handle.cancel.borrow() {
+                if let Ok(mut pending) = srv.udp_pending.lock() {
+                    pending.remove(&id);
+                }
+                sessions.remove(&src);
+                return;
+            }
+            if handle
+                .tx
+                .try_send(
+                    Msg::Open {
+                        proto: Proto::Udp,
+                        port,
+                        id,
+                        capability,
+                    }
+                    .encode(),
+                )
+                .is_err()
+            {
+                if let Ok(mut pending) = srv.udp_pending.lock() {
+                    pending.remove(&id);
+                }
+                sessions.remove(&src);
+            } else {
+                // Reclaim the parked entry if the matching setup conv never
+                // arrives (vanished/spoofed source). `remove` by id is a no-op
+                // once `take_udp_pending` claimed it, so this is idempotent.
+                let srv = srv.clone();
+                crate::spawn(async move {
+                    tokio::time::sleep(OPEN_TIMEOUT).await;
+                    if let Ok(mut pending) = srv.udp_pending.lock() {
+                        pending.remove(&id);
+                    }
+                });
             }
         }
     }
@@ -2780,15 +3046,7 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
                 }
                 CLASS_ADMIT => {
                     if !sessions.contains_key(&src) && admit_new_udp_session(sessions.len()) {
-                        if let Some((issued, issued_at)) = cookies.verify(src, body) {
-                            record_udp_admission(
-                                &mut pending,
-                                src,
-                                issued,
-                                issued_at + UDP_ADMISSION_TTL,
-                                Instant::now(),
-                            );
-                        }
+                        admit_udp_source(&cookies, &mut pending, src, body);
                     }
                     continue;
                 }
@@ -2801,25 +3059,12 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
                 if !can_open_session(packet) || !admit_new_udp_session(sessions.len()) {
                     continue;
                 }
-                let now = Instant::now();
-                if pending
-                    .get(&src)
-                    .is_none_or(|admission| admission.expires <= now)
-                {
-                    pending.remove(&src);
-                    continue;
-                }
-                let Ok(permit) = srv.handshakes.clone().try_acquire_owned() else {
+                let Some((sess, permit)) =
+                    open_udp_session(&srv, &socket, &mut pending, src, local)
+                else {
                     continue;
                 };
-                if !take_udp_admission(&mut pending, src, now) {
-                    continue;
-                }
-                (
-                    admitted_session_from(socket.clone(), src, local, 0, srv.handshakes.clone()),
-                    false,
-                    Some(permit),
-                )
+                (sess, false, Some(permit))
             }
         };
 
@@ -2839,69 +3084,133 @@ async fn udp_control_listener(srv: Arc<Server>, socket: Arc<UdpSocket>) -> Resul
         // Otherwise `sess` is a candidate that routed nothing; dropping it here
         // closes its send channel and ends its socket_writer task.
 
-        match accepted {
-            Some(Accepted::Stream {
-                stream,
-                permit: Some(permit),
-                ..
-            }) => {
-                let srv = srv.clone();
-                let client_credentials = srv.client_credentials.clone();
-                let admin_psk = srv.admin_psk;
-                crate::spawn(async move {
-                    let handshake = timeout(
-                        HANDSHAKE_TIMEOUT,
-                        server_handshake_remote(stream, &client_credentials, admin_psk.as_ref()),
-                    )
-                    .await;
-                    drop(permit);
-                    if let Ok(Ok((role, (r, w)))) = handshake {
-                        let _ =
-                            serve_stream(srv, role, r, w, ActiveTransport::Udp, Some(src)).await;
-                    }
-                });
-            }
-            Some(Accepted::Setup {
-                conv,
-                stream,
-                permit: Some(permit),
-            }) => {
-                let srv = srv.clone();
-                let sess2 = sess.clone();
-                let client_credentials = srv.client_credentials.clone();
-                crate::spawn(async move {
-                    // Message 2's payload carries the datagram source address
-                    // back to the initiator: a probe reads its public mapping
-                    // from it, every other initiator discards it.
-                    let reply = crate::proto::encode_sockaddr(src);
-                    let handshake = timeout(
-                        HANDSHAKE_TIMEOUT,
-                        server_handshake_stateless_claim(stream, &client_credentials, &reply),
-                    )
-                    .await;
-                    drop(permit);
-                    if let Ok(Ok((client_id, id, capability, noise))) = handshake {
-                        #[cfg(target_os = "linux")]
-                        if conv == BRIDGE_CONV {
-                            accept_bridge(srv, sess2, conv, &client_id, capability, noise, src)
-                                .await;
-                            return;
-                        }
-                        if let Some(pair_id) = srv.take_probe(id, &client_id, &capability) {
-                            accept_probe(srv, sess2, conv, pair_id, id, noise, src).await;
-                        } else if srv.relay_legs.lock().unwrap().contains_key(&id) {
-                            accept_relay_leg(&srv, &sess2, conv, id, &client_id, capability, noise);
-                        } else {
-                            accept_udp_forward(srv, sess2, conv, id, &client_id, capability, noise)
-                                .await;
-                        }
-                    }
-                });
-            }
-            Some(_) => {}
-            None => {}
-        }
+        dispatch_accepted(&srv, &sess, src, accepted);
     }
+}
+
+/// Start the task that serves a conv the session router accepted: a stream
+/// conv runs the streaming server handshake plus `serve_stream`; a setup conv
+/// runs the stateless handshake and then attaches as a bridge, probe, relay
+/// leg or UDP-forward.
+#[inline(never)]
+fn dispatch_accepted(
+    srv: &Arc<Server>,
+    sess: &Arc<Session>,
+    src: SocketAddr,
+    accepted: Option<Accepted>,
+) {
+    match accepted {
+        Some(Accepted::Stream {
+            stream,
+            permit: Some(permit),
+            ..
+        }) => {
+            let srv = srv.clone();
+            let client_credentials = srv.client_credentials.clone();
+            let admin_psk = srv.admin_psk;
+            crate::spawn(async move {
+                let handshake = timeout(
+                    HANDSHAKE_TIMEOUT,
+                    server_handshake_remote(stream, &client_credentials, admin_psk.as_ref()),
+                )
+                .await;
+                drop(permit);
+                if let Ok(Ok((role, (r, w)))) = handshake {
+                    let _ = serve_stream(srv, role, r, w, ActiveTransport::Udp, Some(src)).await;
+                }
+            });
+        }
+        Some(Accepted::Setup {
+            conv,
+            stream,
+            permit: Some(permit),
+        }) => {
+            let srv = srv.clone();
+            let sess2 = sess.clone();
+            let client_credentials = srv.client_credentials.clone();
+            crate::spawn(async move {
+                // Message 2's payload carries the datagram source address
+                // back to the initiator: a probe reads its public mapping
+                // from it, every other initiator discards it.
+                let reply = crate::proto::encode_sockaddr(src);
+                let handshake = timeout(
+                    HANDSHAKE_TIMEOUT,
+                    server_handshake_stateless_claim(stream, &client_credentials, &reply),
+                )
+                .await;
+                drop(permit);
+                if let Ok(Ok((client_id, id, capability, noise))) = handshake {
+                    #[cfg(target_os = "linux")]
+                    if conv == BRIDGE_CONV {
+                        accept_bridge(srv, sess2, conv, &client_id, capability, noise, src).await;
+                        return;
+                    }
+                    if let Some(pair_id) = srv.take_probe(id, &client_id, &capability) {
+                        let probe: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> =
+                            Box::pin(accept_probe(srv, sess2, conv, pair_id, id, noise, src));
+                        probe.await;
+                    } else if srv.relay_legs.lock().unwrap().contains_key(&id) {
+                        accept_relay_leg(&srv, &sess2, conv, id, &client_id, capability, noise);
+                    } else {
+                        accept_udp_forward(srv, sess2, conv, id, &client_id, capability, noise)
+                            .await;
+                    }
+                }
+            });
+        }
+        Some(_) => {}
+        None => {}
+    }
+}
+
+/// Record a verified admit cookie from `src` as a pending admission.
+#[inline(never)]
+fn admit_udp_source(
+    cookies: &CookieJar,
+    pending: &mut HashMap<SocketAddr, PendingUdpAdmission>,
+    src: SocketAddr,
+    body: &[u8],
+) {
+    if let Some((issued, issued_at)) = cookies.verify(src, body) {
+        record_udp_admission(
+            pending,
+            src,
+            issued,
+            issued_at + UDP_ADMISSION_TTL,
+            Instant::now(),
+        );
+    }
+}
+
+/// Open a session for a source whose admission is pending and unexpired, with
+/// the handshake permit its first conv will hold. `None` refuses the source:
+/// no live admission, or every permit taken.
+#[inline(never)]
+fn open_udp_session(
+    srv: &Server,
+    socket: &Arc<UdpSocket>,
+    pending: &mut HashMap<SocketAddr, PendingUdpAdmission>,
+    src: SocketAddr,
+    local: Option<crate::pktinfo::LocalAddr>,
+) -> Option<(Arc<Session>, OwnedSemaphorePermit)> {
+    let now = Instant::now();
+    if pending
+        .get(&src)
+        .is_none_or(|admission| admission.expires <= now)
+    {
+        pending.remove(&src);
+        return None;
+    }
+    let Ok(permit) = srv.handshakes.clone().try_acquire_owned() else {
+        return None;
+    };
+    if !take_udp_admission(pending, src, now) {
+        return None;
+    }
+    Some((
+        admitted_session_from(socket.clone(), src, local, 0, srv.handshakes.clone()),
+        permit,
+    ))
 }
 
 /// Bridge a UDP-forward setup conv to its parked public source. The matching public
@@ -2936,13 +3245,10 @@ async fn accept_udp_forward(
     else {
         return;
     };
-    let noise = Arc::new(noise);
     // `_guard` keeps the session counted live for the whole bridge.
-    let (inbound, _guard) = sess.register_dgram(conv);
-    let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
-    let rx = DgramRx::new(inbound, noise);
-    tokio::select! {
-        _ = crate::bridge::udp_server_stateless(
+    let (rx, tx, _guard) = dgram_leg(&sess, conv, noise);
+    until_cancelled(
+        crate::bridge::udp_server_stateless(
             public_socket,
             public_src,
             public_local,
@@ -2950,11 +3256,25 @@ async fn accept_udp_forward(
             rx,
             tx,
             idle,
-        ) => {}
-        _ = session_cancelled(&mut cancel) => {}
-    }
+        ),
+        &mut cancel,
+    )
+    .await;
 }
 
+/// The datagram channel of a stateless conv: the inner-frame reader and
+/// writer under `conv`'s tag, and the guard that keeps the session counted
+/// live while the tag is registered.
+#[inline(never)]
+fn dgram_leg(sess: &Session, conv: u32, noise: StatelessNoise) -> (DgramRx, DgramTx, ConvGuard) {
+    let noise = Arc::new(noise);
+    let (inbound, guard) = sess.register_dgram(conv);
+    let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
+    let rx = DgramRx::new(inbound, noise);
+    (rx, tx, guard)
+}
+
+#[inline(never)]
 fn take_udp_pending(
     srv: &Server,
     id: u64,
@@ -2979,6 +3299,7 @@ fn take_udp_pending(
 /// Claim a udp-transport party's relay leg: the setup conv's app id is the leg
 /// id its `PeerRelayOpen` carried, and the datagram channel under the matching
 /// tag carries one inner frame per datagram.
+#[inline(never)]
 fn accept_relay_leg(
     srv: &Arc<Server>,
     sess: &Session,
@@ -2994,12 +3315,9 @@ fn accept_relay_leg(
     let Some(pair_id) = srv.take_relay_leg(id, client_id, &capability) else {
         return;
     };
-    let noise = Arc::new(noise);
     // The guard rides the leg, keeping the session counted live for as long as
     // the splice holds it.
-    let (inbound, guard) = sess.register_dgram(conv);
-    let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
-    let rx = DgramRx::new(inbound, noise);
+    let (rx, tx, guard) = dgram_leg(sess, conv, noise);
     srv.park_relay_leg(pair_id, RelayLeg::Dgram(rx, tx, guard));
 }
 
@@ -3093,10 +3411,7 @@ async fn accept_bridge(
     let noise = Arc::new(noise);
     let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
     let rx = DgramRx::new(inbound, noise);
-    tokio::select! {
-        _ = bridge::switch_port_dgram(handle, rx, tx) => {}
-        _ = session_cancelled(&mut cancel) => {}
-    }
+    until_cancelled(bridge::switch_port_dgram(handle, rx, tx), &mut cancel).await;
 }
 
 #[cfg(test)]
@@ -3470,7 +3785,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let capability = [3; crate::proto::CAPABILITY_LEN];
         srv.probes.lock().unwrap().insert(
             7,
-            ProbeClaim {
+            Claim {
                 pair_id: 40,
                 client_id: "owner".into(),
                 capability,
@@ -3486,7 +3801,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
 
         srv.relay_legs.lock().unwrap().insert(
             8,
-            RelayLegClaim {
+            Claim {
                 pair_id: 41,
                 client_id: "owner".into(),
                 capability,
