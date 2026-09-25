@@ -12,7 +12,18 @@ if [ ${#targets[@]} -eq 0 ]; then
   targets=("$(rustc -vV | sed -n 's/^host: //p' | sed 's/-gnu$/-musl/')")
 fi
 
+musl_flags="-Crelocation-model=static -Ctarget-feature=+crt-static -Clinker-features=+lld -Clink-self-contained=+linker -Clink-arg=-Wl,--icf=all -Clink-arg=-Wl,--build-id=none -Clink-arg=-Wl,-z,noseparate-code -Clink-arg=-Wl,--no-eh-frame-hdr -Clink-arg=-Wl,-O2"
+base_flags="$RUSTFLAGS"
+
 for t in "${targets[@]}"; do
+  RUSTFLAGS="$base_flags"
+  case "$t" in
+    *-musl*) RUSTFLAGS="$RUSTFLAGS $musl_flags" ;;
+  esac
+  if [ "$t" = armv7-unknown-linux-musleabihf ]; then
+    RUSTFLAGS="$RUSTFLAGS -Ctarget-feature=+thumb-mode"
+  fi
+  export RUSTFLAGS
   cargo +nightly build \
     -Z build-std=std,panic_abort \
     -Z build-std-features=optimize_for_size \

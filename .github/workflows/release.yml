@@ -90,8 +90,18 @@ jobs:
       - name: Build
         env:
           RUSTFLAGS: '-Zlocation-detail=none -Zfmt-debug=none -Zunstable-options -Cpanic=immediate-abort -Cforce-unwind-tables=no --cfg curve25519_dalek_backend="serial"'
+          # Static non-PIE link through rustc's bundled lld, with identical
+          # code folding; the cross images ship no lld of their own.
+          MUSL_RUSTFLAGS: '-Crelocation-model=static -Ctarget-feature=+crt-static -Clinker-features=+lld -Clink-self-contained=+linker -Clink-arg=-Wl,--icf=all -Clink-arg=-Wl,--build-id=none -Clink-arg=-Wl,-z,noseparate-code -Clink-arg=-Wl,--no-eh-frame-hdr -Clink-arg=-Wl,-O2'
           ZERONAT_RELEASE_PUBKEY: ${{ startsWith(github.ref, 'refs/tags/') && vars.ZERONAT_RELEASE_PUBKEY || needs.throwaway-key.outputs.pubkey }}
         run: |
+          case "${{ matrix.target }}" in
+            *-musl*) RUSTFLAGS="$RUSTFLAGS $MUSL_RUSTFLAGS" ;;
+          esac
+          if [ "${{ matrix.target }}" = armv7-unknown-linux-musleabihf ]; then
+            RUSTFLAGS="$RUSTFLAGS -Ctarget-feature=+thumb-mode"
+          fi
+          export RUSTFLAGS
           cross build --release --locked \
             -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
             --target ${{ matrix.target }}
