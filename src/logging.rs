@@ -40,11 +40,17 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Writes one timestamped line to stderr; every `elog!` call site lands here.
+#[inline(never)]
+pub fn log_line(args: std::fmt::Arguments<'_>) {
+    eprintln!("{} {}", now_utc(), args);
+}
+
 /// `eprintln!` with a leading UTC timestamp, for operational/runtime log lines.
 #[macro_export]
 macro_rules! elog {
     ($($arg:tt)*) => {
-        eprintln!("{} {}", $crate::logging::now_utc(), format_args!($($arg)*))
+        $crate::logging::log_line(format_args!($($arg)*))
     };
 }
 

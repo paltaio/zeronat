@@ -54,7 +54,7 @@ impl IfReq {
     fn new(name: &str) -> Result<Self> {
         let bytes = name.as_bytes();
         if bytes.len() >= libc::IFNAMSIZ {
-            return Err(format!("interface name too long: {name}").into());
+            return Err(errf!("interface name too long: {name}"));
         }
         let mut name_buf = [0 as libc::c_char; libc::IFNAMSIZ];
         for (i, b) in bytes.iter().enumerate() {
@@ -95,10 +95,11 @@ impl IfReq {
     }
 }
 
-/// Run one `ifreq` ioctl on `sock`, mapping a kernel error to a labeled `Err`.
-fn ioctl_ifr(sock: RawFd, req: u64, ifr: &mut IfReq, label: &str) -> Result<()> {
+/// Run one `ifreq` ioctl on `sock`; a kernel error becomes `"{op} {name}: {err}"`.
+#[inline(never)]
+fn ioctl_ifr(sock: RawFd, req: u64, ifr: &mut IfReq, op: &str, name: &str) -> Result<()> {
     if unsafe { libc::ioctl(sock, req as _, ifr as *mut IfReq as *mut libc::c_void) } < 0 {
-        return Err(format!("{label}: {}", io::Error::last_os_error()).into());
+        return Err(errf!("{op} {name}: {}", io::Error::last_os_error()));
     }
     Ok(())
 }
@@ -106,32 +107,22 @@ fn ioctl_ifr(sock: RawFd, req: u64, ifr: &mut IfReq, label: &str) -> Result<()> 
 fn set_mtu_ioctl(sock: RawFd, name: &str, mtu: usize) -> Result<()> {
     let mut ifr = IfReq::new(name)?;
     ifr.set_mtu(mtu as i32);
-    ioctl_ifr(sock, SIOCSIFMTU, &mut ifr, &format!("SIOCSIFMTU {name}"))
+    ioctl_ifr(sock, SIOCSIFMTU, &mut ifr, "SIOCSIFMTU", name)
 }
 
 fn get_mtu_ioctl(sock: RawFd, name: &str) -> Result<i32> {
     let mut ifr = IfReq::new(name)?;
-    ioctl_ifr(sock, SIOCGIFMTU, &mut ifr, &format!("SIOCGIFMTU {name}"))?;
+    ioctl_ifr(sock, SIOCGIFMTU, &mut ifr, "SIOCGIFMTU", name)?;
     Ok(ifr.get_mtu())
 }
 
 /// Bring the interface up and mark it running.
 fn bring_up(sock: RawFd, name: &str) -> Result<()> {
     let mut ifr = IfReq::new(name)?;
-    ioctl_ifr(
-        sock,
-        SIOCGIFFLAGS,
-        &mut ifr,
-        &format!("SIOCGIFFLAGS {name}"),
-    )?;
+    ioctl_ifr(sock, SIOCGIFFLAGS, &mut ifr, "SIOCGIFFLAGS", name)?;
     let flags = ifr.get_flags() | (libc::IFF_UP as i16) | (libc::IFF_RUNNING as i16);
     ifr.set_flags(flags);
-    ioctl_ifr(
-        sock,
-        SIOCSIFFLAGS,
-        &mut ifr,
-        &format!("SIOCSIFFLAGS {name}"),
-    )
+    ioctl_ifr(sock, SIOCSIFFLAGS, &mut ifr, "SIOCSIFFLAGS", name)
 }
 
 /// Bring an L2 TAP up, set its MTU, and optionally enslave it to a bridge. Runs
@@ -157,12 +148,7 @@ fn configure_inner(sock: RawFd, name: &str, mtu: usize, bridge: Option<&str>) ->
         // on the bridge keeps its full MTU (the smaller TAP port stays at its MTU).
         let br_mtu = get_mtu_ioctl(sock, br).ok();
         let mut ifr = IfReq::new(name)?;
-        ioctl_ifr(
-            sock,
-            SIOCGIFINDEX,
-            &mut ifr,
-            &format!("SIOCGIFINDEX {name}"),
-        )?;
+        ioctl_ifr(sock, SIOCGIFINDEX, &mut ifr, "SIOCGIFINDEX", name)?;
         let idx = ifr.get_ifindex();
         let mut brifr = IfReq::new(br)?;
         brifr.set_ifindex(idx);
@@ -170,7 +156,8 @@ fn configure_inner(sock: RawFd, name: &str, mtu: usize, bridge: Option<&str>) ->
             sock,
             SIOCBRADDIF,
             &mut brifr,
-            &format!("SIOCBRADDIF {br} <- {name}"),
+            "SIOCBRADDIF",
+            &format!("{br} <- {name}"),
         )?;
         if let Some(m) = br_mtu {
             let _ = set_mtu_ioctl(sock, br, m as usize);
@@ -189,15 +176,10 @@ fn configure_tun(name: &str, mtu: usize, addr: Ipv4Addr, netmask: Ipv4Addr) -> R
     let res = (|| {
         let mut ifr = IfReq::new(name)?;
         ifr.set_sockaddr_in(addr);
-        ioctl_ifr(sock, SIOCSIFADDR, &mut ifr, &format!("SIOCSIFADDR {name}"))?;
+        ioctl_ifr(sock, SIOCSIFADDR, &mut ifr, "SIOCSIFADDR", name)?;
         let mut ifr = IfReq::new(name)?;
         ifr.set_sockaddr_in(netmask);
-        ioctl_ifr(
-            sock,
-            SIOCSIFNETMASK,
-            &mut ifr,
-            &format!("SIOCSIFNETMASK {name}"),
-        )?;
+        ioctl_ifr(sock, SIOCSIFNETMASK, &mut ifr, "SIOCSIFNETMASK", name)?;
         set_mtu_ioctl(sock, name, mtu)?;
         bring_up(sock, name)
     })();
@@ -223,6 +205,37 @@ fn net_admin_in_status(status: &str) -> bool {
         .find_map(|line| line.strip_prefix("CapEff:"))
         .and_then(|bits| u64::from_str_radix(bits.trim(), 16).ok())
         .is_none_or(|caps| caps & (1 << CAP_NET_ADMIN) != 0)
+}
+
+/// Open `/dev/net/tun` non-blocking and attach it to the named interface with
+/// the given `IFF_*` flags, creating the interface if absent.
+#[inline(never)]
+fn attach(name: &str, flags: i16) -> Result<RawFd> {
+    let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+    if fd < 0 {
+        return Err(errf!("open /dev/net/tun: {}", io::Error::last_os_error()));
+    }
+    let mut ifr = match IfReq::new(name) {
+        Ok(r) => r,
+        Err(e) => {
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+    };
+    ifr.set_flags(flags);
+    if unsafe {
+        libc::ioctl(
+            fd,
+            TUNSETIFF as _,
+            &mut ifr as *mut IfReq as *mut libc::c_void,
+        )
+    } < 0
+    {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(errf!("TUNSETIFF {name}: {e}"));
+    }
+    Ok(fd)
 }
 
 /// Owns the tun fd and closes it on drop.
@@ -254,30 +267,7 @@ impl TapDevice {
     /// Open `/dev/net/tun`, attach (creating it if absent) the named TAP, bring it
     /// up, set its MTU, and optionally enslave it to an existing bridge.
     pub fn open(cfg: &TapConfig) -> Result<Self> {
-        let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
-        if fd < 0 {
-            return Err(format!("open /dev/net/tun: {}", io::Error::last_os_error()).into());
-        }
-        let mut ifr = match IfReq::new(&cfg.name) {
-            Ok(r) => r,
-            Err(e) => {
-                unsafe { libc::close(fd) };
-                return Err(e);
-            }
-        };
-        ifr.set_flags(IFF_TAP | IFF_NO_PI);
-        if unsafe {
-            libc::ioctl(
-                fd,
-                TUNSETIFF as _,
-                &mut ifr as *mut IfReq as *mut libc::c_void,
-            )
-        } < 0
-        {
-            let e = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(format!("TUNSETIFF {}: {e}", cfg.name).into());
-        }
+        let fd = attach(&cfg.name, IFF_TAP | IFF_NO_PI)?;
         if let Err(e) = configure(&cfg.name, cfg.mtu, cfg.bridge.as_deref()) {
             unsafe { libc::close(fd) };
             return Err(e);
@@ -289,30 +279,7 @@ impl TapDevice {
     /// its address/netmask, set its MTU, and bring it up. A TUN read is one whole
     /// IP packet; the same `read_frame`/`write_frame` path as TAP carries it.
     pub fn open_tun(cfg: &TunConfig) -> Result<Self> {
-        let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
-        if fd < 0 {
-            return Err(format!("open /dev/net/tun: {}", io::Error::last_os_error()).into());
-        }
-        let mut ifr = match IfReq::new(&cfg.name) {
-            Ok(r) => r,
-            Err(e) => {
-                unsafe { libc::close(fd) };
-                return Err(e);
-            }
-        };
-        ifr.set_flags(IFF_TUN | IFF_NO_PI);
-        if unsafe {
-            libc::ioctl(
-                fd,
-                TUNSETIFF as _,
-                &mut ifr as *mut IfReq as *mut libc::c_void,
-            )
-        } < 0
-        {
-            let e = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(format!("TUNSETIFF {}: {e}", cfg.name).into());
-        }
+        let fd = attach(&cfg.name, IFF_TUN | IFF_NO_PI)?;
         let netmask = netmask_from_prefix(cfg.prefix_len);
         if let Err(e) = configure_tun(&cfg.name, cfg.mtu, cfg.addr, netmask) {
             unsafe { libc::close(fd) };
@@ -404,7 +371,7 @@ impl TapDevice {
                 }
             }) {
                 Ok(Ok(n)) if n == frame.len() => return Ok(()),
-                Ok(Ok(n)) => return Err(format!("short tap write: {n}/{}", frame.len()).into()),
+                Ok(Ok(n)) => return Err(errf!("short tap write: {n}/{}", frame.len())),
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_would_block) => continue,
             }

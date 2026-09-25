@@ -77,20 +77,20 @@ fn short_hostname() -> String {
         })
         .unwrap_or_else(|| "node".to_string());
 
-    let normalized: String = raw
-        .to_ascii_lowercase()
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .chars()
-        .map(|c| {
+    let mut normalized = String::new();
+    for c in raw.chars() {
+        if c == '.' {
+            break;
+        }
+        let c = c.to_ascii_lowercase();
+        normalized.push(
             if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' {
                 c
             } else {
                 '_'
-            }
-        })
-        .collect();
+            },
+        );
+    }
 
     if normalized.is_empty() {
         "node".to_string()

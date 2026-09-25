@@ -80,6 +80,7 @@ impl NetCfgGuard {
 
     /// Revert everything this guard applied. Idempotent: a second call is a no-op,
     /// and every step ignores "already gone" so a partial apply reverts cleanly.
+    #[inline(never)]
     pub fn revert(&mut self) {
         let Some(a) = self.applied.take() else {
             return;
@@ -127,6 +128,7 @@ impl Drop for NetCfgGuard {
 /// (the link stays up, degraded), never fatal; the guard records only what
 /// succeeded. `server_ip` is the resolved IPv4 tunnel endpoint, or `None` when the
 /// server was reached over IPv6 or given as a hostname (the pin is then skipped).
+#[inline(never)]
 pub fn apply(
     opts: NetCfgOpts,
     server_ip: Option<Ipv4Addr>,
@@ -205,6 +207,7 @@ pub fn apply(
 /// Apply IPCP DNS to `/etc/resolv.conf`, backing up the prior content for revert.
 /// Always log the servers: under Docker the file is bind-managed and the write may
 /// not stick, so the operator can apply them on the host.
+#[inline(never)]
 fn apply_dns(dns: &[Option<Ipv4Addr>; 2], state: &mut AppliedState) {
     let servers: Vec<Ipv4Addr> = dns.iter().flatten().copied().collect();
     if servers.is_empty() {

@@ -140,11 +140,13 @@ pub fn plan_underlay_pins(
     tun_name: &str,
     peers: &[Ipv4Addr],
 ) -> crate::Result<Vec<UplinkPin>> {
-    peers
-        .iter()
-        .filter(|&&peer| !route::covered_beyond_half(proc_route, tun_name, peer))
-        .map(|&peer| plan_server_pin(proc_route, tun_name, peer))
-        .collect()
+    let mut pins = Vec::new();
+    for &peer in peers {
+        if !route::covered_beyond_half(proc_route, tun_name, peer) {
+            pins.push(plan_server_pin(proc_route, tun_name, peer)?);
+        }
+    }
+    Ok(pins)
 }
 
 /// Whether a route mutation failed only because the route already exists.
@@ -355,7 +357,14 @@ impl<S: StrictOps> StrictRouteGuard<S> {
     /// never leaves the host without its working default. A failed step
     /// drops the guard, which unwinds the whole set.
     pub fn bring_up_with(ops: S, mut defaults: Vec<route::CapturedDefault>) -> crate::Result<Self> {
-        defaults.sort_by_key(|d| std::cmp::Reverse(d.metric));
+        // Worst metric first; equal metrics keep their captured order.
+        for i in 1..defaults.len() {
+            let mut j = i;
+            while j > 0 && defaults[j].metric > defaults[j - 1].metric {
+                defaults.swap(j, j - 1);
+                j -= 1;
+            }
+        }
         let mut guard = StrictRouteGuard { defaults, ops };
         for change in guard.changes(true) {
             guard.ops.apply(&change)?;

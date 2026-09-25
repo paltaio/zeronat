@@ -292,6 +292,7 @@ impl<'a> PppoeDatapath<'a> {
 
     /// Kick discovery: emit the first PADI into the outbound queue. Call once
     /// after `new`.
+    #[inline(never)]
     pub fn start(&mut self) {
         let action = self.discovery.start();
         self.apply_discovery_action(action);
@@ -309,6 +310,7 @@ impl<'a> PppoeDatapath<'a> {
     /// and still owns when the next PADI goes out.
     ///
     /// Errors only if the system RNG fails while drawing the new Magic-Number.
+    #[inline(never)]
     pub fn release(&mut self) -> super::Result<()> {
         let mut cfg = PppConfig::with_random_magic(self.username, self.password)?;
         cfg.mru = self.mru;
@@ -340,6 +342,7 @@ impl<'a> PppoeDatapath<'a> {
     /// Errors only if the system RNG fails while drawing the new Magic-Number,
     /// which on Linux does not happen in practice; the shell then tears down the
     /// tunnel and the reconnect loop redials from scratch.
+    #[inline(never)]
     pub fn reset(&mut self) -> super::Result<()> {
         self.release()?;
         self.discovery = Discovery::new(
@@ -361,6 +364,7 @@ impl<'a> PppoeDatapath<'a> {
     ///   0x8863 -> discovery FSM; on Established, latch session params, open PPP.
     ///   0x8864 (our session_id) -> strip the PPPoE header, feed the PPP session.
     ///   anything else / parse error / wrong session_id -> dropped, no panic.
+    #[inline(never)]
     pub fn on_l2_frame(&mut self, frame: &[u8]) -> DpPhase {
         // Demux on ethertype via the bounds-checked header parser; <14 bytes or a
         // parse error drops the frame.
@@ -382,6 +386,7 @@ impl<'a> PppoeDatapath<'a> {
     /// Submit one IP packet read from zppp0: wrap it in a 0x8864 session frame
     /// addressed to the AC and queue it. A no-op before discovery is Established
     /// (no session id / AC yet); the shell does not read zppp0 until then.
+    #[inline(never)]
     pub fn on_tun_ip(&mut self, ip: &[u8]) {
         let session = match self.session {
             Some(s) => s,
@@ -403,6 +408,7 @@ impl<'a> PppoeDatapath<'a> {
     /// `Discovery::on_tick` (PADI/PADR retransmit) and `PppSession::on_tick`
     /// (LCP/IPCP restart timers, phase advance, originating ConfReqs once a
     /// sub-FSM is Closed).
+    #[inline(never)]
     pub fn on_tick(&mut self) -> DpPhase {
         let action = self.discovery.on_tick();
         self.apply_discovery_action(action);

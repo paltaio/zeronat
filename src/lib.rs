@@ -1,6 +1,20 @@
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Builds a message error from format arguments.
+#[inline(never)]
+pub fn errf(args: std::fmt::Arguments<'_>) -> Error {
+    std::fmt::format(args).into()
+}
+
+/// `format!` whose result is an [`Error`].
+#[macro_export]
+macro_rules! errf {
+    ($($arg:tt)*) => {
+        $crate::errf(format_args!($($arg)*))
+    };
+}
+
 pub mod admin;
 pub mod admission;
 pub mod bridge;

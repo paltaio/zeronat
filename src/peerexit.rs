@@ -33,13 +33,14 @@ pub(crate) fn precheck(exit: &PeerExit) -> Result<()> {
     let route_table = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
     egress_iface(&exit.device, exit.iface.as_deref(), &route_table)?;
     if !has_net_admin() {
-        return Err(format!(
-            "this process may not open the tun {}; it holds no CAP_NET_ADMIN",
-            exit.device
-        )
-        .into());
+        return Err(no_net_admin(&exit.device));
     }
     Ok(())
+}
+
+#[inline(never)]
+fn no_net_admin(device: &str) -> crate::Error {
+    errf!("this process may not open the tun {device}; it holds no CAP_NET_ADMIN")
 }
 
 /// What a consumer can settle about its bringup before it asks for a pair: the
@@ -49,15 +50,11 @@ pub(crate) fn precheck(exit: &PeerExit) -> Result<()> {
 /// end drops on arrival.
 pub(crate) fn consumer_precheck(via: &ExitVia) -> Result<()> {
     if !has_net_admin() {
-        return Err(format!(
-            "this process may not open the tun {}; it holds no CAP_NET_ADMIN",
-            via.device
-        )
-        .into());
+        return Err(no_net_admin(&via.device));
     }
     if via.exit {
         std::fs::read_to_string("/proc/net/route")
-            .map_err(|e| -> crate::Error { format!("reading /proc/net/route: {e}").into() })?;
+            .map_err(|e| -> crate::Error { errf!("reading /proc/net/route: {e}") })?;
     }
     Ok(())
 }
@@ -159,7 +156,7 @@ async fn consumer_routes(
 ) -> Result<(ExitRoutes, PinGuard)> {
     let server = crate::client::exit_server_v4(server).await?;
     let table = std::fs::read_to_string("/proc/net/route")
-        .map_err(|e| -> crate::Error { format!("reading /proc/net/route: {e}").into() })?;
+        .map_err(|e| -> crate::Error { errf!("reading /proc/net/route: {e}") })?;
     let pins = PinGuard::bring_up(plan_underlay_pins(&table, tun, &path.punched_v4())?)?;
     let exit = ExitRoutes::bring_up_from_table(&table, tun, server, strict)?;
     Ok((exit, pins))
@@ -196,10 +193,9 @@ fn tun_config(exit: &PeerExit, secret: &str) -> TunConfig {
 /// the traffic back where it came from.
 fn egress_iface(device: &str, iface: Option<&str>, route_table: &str) -> Result<String> {
     match iface {
-        Some(name) if name == device => Err(format!(
+        Some(name) if name == device => Err(errf!(
             "the exit provider's egress interface cannot be its own tun {device}"
-        )
-        .into()),
+        )),
         Some(name) => Ok(name.to_string()),
         None => {
             crate::route::default_route_iface(route_table, device).ok_or_else(|| -> crate::Error {

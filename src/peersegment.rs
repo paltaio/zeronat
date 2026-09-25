@@ -48,7 +48,7 @@ pub(crate) fn precheck(segment: &PeerSegment) -> Result<()> {
 fn check_bridge(name: &str, sysfs: &Path) -> Result<()> {
     let entry: PathBuf = sysfs.join(name);
     if !entry.exists() {
-        return Err(format!("the segment provider has no interface named {name}").into());
+        return Err(errf!("the segment provider has no interface named {name}"));
     }
     if !entry.join("bridge").is_dir() {
         return Err(format!(

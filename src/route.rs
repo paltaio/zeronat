@@ -55,9 +55,13 @@ fn parse_default(
     skip_iface: &str,
     require_gateway: bool,
 ) -> Option<CapturedDefault> {
-    scan_defaults(contents, skip_iface, require_gateway)
-        .into_iter()
-        .min_by_key(|d| d.metric)
+    let mut best: Option<CapturedDefault> = None;
+    for d in scan_defaults(contents, skip_iface, require_gateway) {
+        if best.as_ref().is_none_or(|b| d.metric < b.metric) {
+            best = Some(d);
+        }
+    }
+    best
 }
 
 /// The shared default-route scan: every dest==0/mask==0 row excluding
@@ -65,11 +69,9 @@ fn parse_default(
 fn scan_defaults(contents: &str, skip_iface: &str, require_gateway: bool) -> Vec<CapturedDefault> {
     let mut rows = Vec::new();
     for line in contents.lines().skip(1) {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        // Iface Destination Gateway Flags RefCnt Use Metric Mask ...
-        if f.len() < 11 {
+        let Some(f) = route_fields(line) else {
             continue;
-        }
+        };
         let iface = f[0];
         if iface == skip_iface {
             continue;
@@ -109,11 +111,9 @@ fn scan_defaults(contents: &str, skip_iface: &str, require_gateway: bool) -> Vec
 pub fn covered_beyond_half(contents: &str, skip_iface: &str, addr: Ipv4Addr) -> bool {
     let target = u32::from_be_bytes(addr.octets());
     for line in contents.lines().skip(1) {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        // Iface Destination Gateway Flags RefCnt Use Metric Mask ...
-        if f.len() < 11 {
+        let Some(f) = route_fields(line) else {
             continue;
-        }
+        };
         if f[0] == skip_iface {
             continue;
         }
@@ -133,6 +133,15 @@ pub fn covered_beyond_half(contents: &str, skip_iface: &str, addr: Ipv4Addr) -> 
 
 /// `RTF_GATEWAY` as it appears in the `/proc/net/route` Flags column.
 const RTF_GATEWAY_BITS: u32 = 0x0002;
+
+/// The columns of one `/proc/net/route` row (Iface Destination Gateway Flags
+/// RefCnt Use Metric Mask ...); `None` for a row short of the eleven the
+/// kernel writes.
+#[inline(never)]
+fn route_fields(line: &str) -> Option<Vec<&str>> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    (f.len() >= 11).then_some(f)
+}
 
 /// Decode a `/proc/net/route` little-endian hex address into an `Ipv4Addr`. The
 /// column `0150A8C0` is `192.168.80.1`: byte-reversed network order.
@@ -194,9 +203,10 @@ pub fn modify_route(
     priority: u32,
 ) -> crate::Result<()> {
     let dev_c = match dev {
-        Some(d) => Some(CString::new(d).map_err(|_| -> crate::Error {
-            format!("interface name has interior NUL: {d}").into()
-        })?),
+        Some(d) => Some(
+            CString::new(d)
+                .map_err(|_| -> crate::Error { errf!("interface name has interior NUL: {d}") })?,
+        ),
         None => None,
     };
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
@@ -250,14 +260,7 @@ fn modify_route_inner(
         )
     } < 0
     {
-        let os = io::Error::last_os_error();
-        let op = if add { "SIOCADDRT" } else { "SIOCDELRT" };
-        // Wrapped as an io::Error so callers can match the kind (an
-        // already-present route adds as AlreadyExists).
-        return Err(Box::new(io::Error::new(
-            os.kind(),
-            format!("{op} {dst}/{prefix}: {os}"),
-        )));
+        return Err(ioctl_error(add, &dst, prefix));
     }
     Ok(())
 }
@@ -319,14 +322,22 @@ fn modify_route6_inner(sock: RawFd, add: bool, dst: Ipv6Addr, prefix: u8) -> cra
         libc::SIOCDELRT
     };
     if unsafe { libc::ioctl(sock, req as _, &rt as *const In6Rtmsg as *mut libc::c_void) } < 0 {
-        let os = io::Error::last_os_error();
-        let op = if add { "SIOCADDRT" } else { "SIOCDELRT" };
-        return Err(Box::new(io::Error::new(
-            os.kind(),
-            format!("{op} {dst}/{prefix}: {os}"),
-        )));
+        return Err(ioctl_error(add, &dst, prefix));
     }
     Ok(())
+}
+
+/// The error for a route ioctl that just failed. Wrapped as an io::Error so
+/// callers can match the kind (an already-present route adds as
+/// AlreadyExists). Reads `errno`, so it runs before any other libc call.
+#[inline(never)]
+fn ioctl_error(add: bool, dst: &dyn std::fmt::Display, prefix: u8) -> crate::Error {
+    let os = io::Error::last_os_error();
+    let op = if add { "SIOCADDRT" } else { "SIOCDELRT" };
+    Box::new(io::Error::new(
+        os.kind(),
+        format!("{op} {dst}/{prefix}: {os}"),
+    ))
 }
 
 #[cfg(test)]
