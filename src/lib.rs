@@ -70,3 +70,25 @@ pub(crate) fn spawn<T: Send + 'static>(
     let f: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>> = Box::pin(f);
     tokio::spawn(f)
 }
+
+/// Static musl's `pthread_setname_np` formats a `/proc/self/task/<tid>/comm`
+/// path with `snprintf`, which links the whole printf engine into the binary.
+/// This definition takes precedence over the libc archive member. std names
+/// threads only from the thread itself, and that path is a single `prctl`.
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[no_mangle]
+pub unsafe extern "C" fn pthread_setname_np(
+    thread: libc::pthread_t,
+    name: *const libc::c_char,
+) -> libc::c_int {
+    if libc::strnlen(name, 16) > 15 {
+        return libc::ERANGE;
+    }
+    if thread != libc::pthread_self() {
+        return libc::EINVAL;
+    }
+    if libc::prctl(libc::PR_SET_NAME, name as libc::c_ulong, 0, 0, 0) != 0 {
+        return *libc::__errno_location();
+    }
+    0
+}
