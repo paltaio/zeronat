@@ -9,11 +9,25 @@
 pub use zntui::{frame, style};
 
 mod client_console;
+mod common;
 mod console;
 mod input;
 mod render;
 mod term;
 
-pub use client_console::run as run_client;
-pub use console::run;
 pub use term::stdout_is_tty;
+
+type Session = std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<()>>>>;
+
+/// The server console, boxed: the caller holds one pointer instead of the
+/// console's whole state.
+#[inline(never)]
+pub fn run(server: String, secret: String) -> Session {
+    Box::pin(console::run(server, secret))
+}
+
+/// The client console, boxed like [`run`].
+#[inline(never)]
+pub fn run_client(socket: Option<std::path::PathBuf>) -> Session {
+    Box::pin(client_console::run(socket))
+}

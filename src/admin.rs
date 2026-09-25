@@ -422,6 +422,24 @@ pub(crate) fn order(n: usize, less: &mut dyn FnMut(usize, usize) -> bool) -> Vec
     idx
 }
 
+/// Apply `order` through `swap`, so position `i` ends up holding what was at
+/// `order[i]`.
+pub(crate) fn permute(order: &[usize], swap: &mut dyn FnMut(usize, usize)) {
+    let mut done = vec![false; order.len()];
+    for start in 0..order.len() {
+        let mut i = start;
+        while !done[i] {
+            done[i] = true;
+            let src = order[i];
+            if src == start {
+                break;
+            }
+            swap(i, src);
+            i = src;
+        }
+    }
+}
+
 /// Compact duration for the fleet view, e.g. "45s", "4m12s", "1h03m".
 pub(crate) fn fmt_dur(secs: u32) -> String {
     let s = secs % 60;

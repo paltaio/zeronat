@@ -38,21 +38,31 @@ impl Renderer {
         for (i, line) in lines.iter().enumerate() {
             let changed = self.prev.get(i) != Some(line);
             if changed {
-                out.push_str(&format!("\x1b[{};1H\x1b[2K", i + 1));
+                goto(&mut out, i + 1, true);
                 out.push_str(line);
             }
         }
         // Clear rows that existed last frame but not this one.
         for i in lines.len()..self.prev.len() {
-            out.push_str(&format!("\x1b[{};1H\x1b[2K", i + 1));
+            goto(&mut out, i + 1, true);
         }
 
-        out.push_str(&format!("\x1b[{};1H", lines.len() + 1));
+        goto(&mut out, lines.len() + 1, false);
 
         self.prev = lines;
 
         let mut stdout = io::stdout();
         stdout.write_all(out.as_bytes())?;
         stdout.flush()
+    }
+}
+
+/// Move the cursor to column 1 of `row`, clearing the row when asked.
+fn goto(out: &mut String, row: usize, clear: bool) {
+    out.push_str("\x1b[");
+    out.push_str(&row.to_string());
+    out.push_str(";1H");
+    if clear {
+        out.push_str("\x1b[2K");
     }
 }

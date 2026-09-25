@@ -20,7 +20,7 @@ pub fn top(width: usize, mut left: Line, mut right: Line) -> String {
     l.add(MUTED, "┌─ ");
     l.append(&left);
     l.add(MUTED, " ");
-    l.add(MUTED, &"─".repeat(fill));
+    l.push(MUTED, "─".repeat(fill));
     l.add(MUTED, " ");
     l.append(&right);
     l.add(MUTED, " ─┐");
@@ -45,7 +45,7 @@ pub fn row_center(width: usize, content: Line) -> String {
     let cw = content.visible_width().min(inner);
     let left_pad = (inner - cw) / 2;
     let mut padded = Line::new();
-    padded.add(PLAIN, &" ".repeat(left_pad));
+    padded.push(PLAIN, " ".repeat(left_pad));
     padded.append(&content);
     row(width, padded)
 }
@@ -56,19 +56,19 @@ pub fn blank(width: usize) -> String {
 
 /// A `├────┤` divider between sections.
 pub fn divider(width: usize) -> String {
-    let mut l = Line::new();
-    l.add(MUTED, "├");
-    l.add(MUTED, &"─".repeat(width.saturating_sub(2)));
-    l.add(MUTED, "┤");
-    l.fill(width)
+    edge(width, "├", "┤")
 }
 
 /// The closing `└────┘` border.
 pub fn bottom(width: usize) -> String {
+    edge(width, "└", "┘")
+}
+
+fn edge(width: usize, left: &str, right: &str) -> String {
     let mut l = Line::new();
-    l.add(MUTED, "└");
-    l.add(MUTED, &"─".repeat(width.saturating_sub(2)));
-    l.add(MUTED, "┘");
+    l.add(MUTED, left);
+    l.push(MUTED, "─".repeat(width.saturating_sub(2)));
+    l.add(MUTED, right);
     l.fill(width)
 }
 
@@ -79,7 +79,7 @@ pub fn panel_title(width: usize, caption: &str) -> String {
     l.add(MUTED, "  ");
     let used = caption.chars().count() + 2;
     let inner = width.saturating_sub(4);
-    l.add(MUTED, &"─".repeat(inner.saturating_sub(used)));
+    l.push(MUTED, "─".repeat(inner.saturating_sub(used)));
     row(width, l)
 }
 

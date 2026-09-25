@@ -20,15 +20,15 @@ pub enum Color {
 }
 
 impl Color {
-    fn code(self) -> Option<u8> {
+    fn code(self) -> Option<&'static str> {
         match self {
             Color::Default => None,
-            Color::Accent => Some(96),
-            Color::Good => Some(92),
-            Color::Warn => Some(93),
-            Color::Bad => Some(91),
-            Color::Muted => Some(90),
-            Color::Magenta => Some(95),
+            Color::Accent => Some("96"),
+            Color::Good => Some("92"),
+            Color::Warn => Some("93"),
+            Color::Bad => Some("91"),
+            Color::Muted => Some("90"),
+            Color::Magenta => Some("95"),
         }
     }
 }
@@ -68,25 +68,26 @@ impl Style {
         if self.is_plain() {
             return String::new();
         }
-        let mut codes: Vec<u8> = Vec::new();
+        let mut s = String::from("\x1b[");
         if self.bold {
-            codes.push(1);
+            s.push('1');
         }
         if self.reverse {
-            codes.push(7);
+            sep(&mut s);
+            s.push('7');
         }
         if let Some(c) = self.fg.code() {
-            codes.push(c);
-        }
-        let mut s = String::from("\x1b[");
-        for (i, c) in codes.iter().enumerate() {
-            if i > 0 {
-                s.push(';');
-            }
-            s.push_str(&c.to_string());
+            sep(&mut s);
+            s.push_str(c);
         }
         s.push('m');
         s
+    }
+}
+
+fn sep(s: &mut String) {
+    if s.len() > 2 {
+        s.push(';');
     }
 }
 
@@ -113,8 +114,13 @@ impl Line {
 
     /// Append `text` in `style`. Returns `&mut self` for call chaining.
     pub fn add(&mut self, style: Style, text: &str) -> &mut Line {
+        self.push(style, text.to_string())
+    }
+
+    /// Append an owned `text` in `style`.
+    pub fn push(&mut self, style: Style, text: String) -> &mut Line {
         self.width += text.chars().count();
-        self.segs.push((style, text.to_string()));
+        self.segs.push((style, text));
         self
     }
 
@@ -132,7 +138,7 @@ impl Line {
     pub fn pad_to(&mut self, target: usize) -> &mut Line {
         if self.width < target {
             let n = target - self.width;
-            self.add(PLAIN, &" ".repeat(n));
+            self.push(PLAIN, " ".repeat(n));
         }
         self
     }
@@ -144,23 +150,22 @@ impl Line {
             return self;
         }
         let mut acc = 0;
-        let mut kept: Vec<(Style, String)> = Vec::new();
-        for (style, text) in &self.segs {
+        let mut kept = 0;
+        for (_, text) in self.segs.iter_mut() {
             if acc >= max {
                 break;
             }
-            let chars: Vec<char> = text.chars().collect();
-            let avail = max - acc;
-            if chars.len() <= avail {
-                acc += chars.len();
-                kept.push((*style, text.clone()));
-            } else {
-                kept.push((*style, chars[..avail].iter().collect()));
-                acc = max;
-                break;
+            kept += 1;
+            match text.char_indices().nth(max - acc) {
+                None => acc += text.chars().count(),
+                Some((cut, _)) => {
+                    text.truncate(cut);
+                    acc = max;
+                    break;
+                }
             }
         }
-        self.segs = kept;
+        self.segs.truncate(kept);
         self.width = acc;
         self
     }
@@ -179,14 +184,12 @@ impl Line {
             if used >= total {
                 break;
             }
-            let avail = total - used;
-            let chars: Vec<char> = text.chars().collect();
-            let take = chars.len().min(avail);
-            let slice: String = chars[..take].iter().collect();
-            used += take;
             let prefix = style.sgr();
             out.push_str(&prefix);
-            out.push_str(&slice);
+            for c in text.chars().take(total - used) {
+                out.push(c);
+                used += 1;
+            }
             if !prefix.is_empty() {
                 out.push_str("\x1b[0m");
             }
