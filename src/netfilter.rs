@@ -9,9 +9,9 @@
 //! (nft) or carry a `zeronat` comment (iptables) so teardown never touches
 //! operator rules.
 
+use crate::spawn::{Command, Stdio};
 use std::io::Write;
 use std::net::Ipv4Addr;
-use std::process::{Command, Stdio};
 
 use crate::Result;
 
@@ -139,14 +139,30 @@ struct IptRule {
 
 impl IptRule {
     fn command(&self) -> Vec<String> {
-        let mut c = vec!["-t".into(), self.table.into()];
-        if self.insert {
-            c.extend(["-I".into(), self.chain.into(), "1".into()]);
+        let head: &[&str] = if self.insert {
+            &["-t", self.table, "-I", self.chain, "1"]
         } else {
-            c.extend(["-A".into(), self.chain.into()]);
-        }
+            &["-t", self.table, "-A", self.chain]
+        };
+        let mut c = strs(head);
         c.extend(self.args.iter().cloned());
         c
+    }
+}
+
+fn strs(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|s| s.to_string()).collect()
+}
+
+/// A rule tagged with the `zeronat` comment.
+fn rule(table: &'static str, chain: &'static str, insert: bool, parts: &[&str]) -> IptRule {
+    let mut args = strs(parts);
+    args.extend(strs(&["-m", "comment", "--comment", "zeronat"]));
+    IptRule {
+        table,
+        chain,
+        insert,
+        args,
     }
 }
 
@@ -156,182 +172,156 @@ impl IptRule {
 /// adds tunnel accepts to Docker's DOCKER-USER chain when it exists, where
 /// Docker's FORWARD drop policy cannot override them.
 fn iptables_rules(plan: &NatPlan, docker_user: bool) -> Vec<IptRule> {
-    let iface = plan.iface.clone();
+    let iface = plan.iface.as_str();
     let cidr = plan.cidr();
-    let comment = || {
-        vec![
-            "-m".into(),
-            "comment".into(),
-            "--comment".into(),
-            "zeronat".into(),
-        ]
-    };
 
     let mut rules = Vec::new();
     if let Some(dnat) = &plan.dnat {
         let client = dnat.client_ip.to_string();
         let server = plan.server_ip.to_string();
         let keep = dnat.kept_ports();
-
         // Negated destination-port match: one port uses `! --dport`, several use
         // the multiport module (`! --dports a,b,c`).
-        let dport_neg = |proto: &str| -> Vec<String> {
-            let mut v = vec!["-p".into(), proto.into()];
-            if keep.len() == 1 {
-                v.extend(["!".into(), "--dport".into(), keep[0].to_string()]);
-            } else {
-                let list = keep
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                v.extend([
-                    "-m".into(),
-                    "multiport".into(),
-                    "!".into(),
-                    "--dports".into(),
-                    list,
-                ]);
-            }
-            v
-        };
-
+        let one = keep.len() == 1;
+        let list = keep
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         for proto in ["tcp", "udp"] {
-            let mut args = vec![
-                "!".into(),
-                "-i".into(),
-                iface.clone(),
-                "!".into(),
-                "-d".into(),
-                cidr.clone(),
-            ];
-            args.extend(dport_neg(proto));
-            args.extend([
-                "-j".into(),
-                "DNAT".into(),
-                "--to-destination".into(),
-                client.clone(),
-            ]);
-            args.extend(comment());
-            rules.push(IptRule {
-                table: "nat",
-                chain: "PREROUTING",
-                insert: false,
-                args,
-            });
+            let r = if one {
+                rule(
+                    "nat",
+                    "PREROUTING",
+                    false,
+                    &[
+                        "!",
+                        "-i",
+                        iface,
+                        "!",
+                        "-d",
+                        &cidr,
+                        "-p",
+                        proto,
+                        "!",
+                        "--dport",
+                        &list,
+                        "-j",
+                        "DNAT",
+                        "--to-destination",
+                        &client,
+                    ],
+                )
+            } else {
+                rule(
+                    "nat",
+                    "PREROUTING",
+                    false,
+                    &[
+                        "!",
+                        "-i",
+                        iface,
+                        "!",
+                        "-d",
+                        &cidr,
+                        "-p",
+                        proto,
+                        "-m",
+                        "multiport",
+                        "!",
+                        "--dports",
+                        &list,
+                        "-j",
+                        "DNAT",
+                        "--to-destination",
+                        &client,
+                    ],
+                )
+            };
+            rules.push(r);
         }
-        {
-            let mut args = vec![
-                "!".into(),
-                "-i".into(),
-                iface.clone(),
-                "!".into(),
-                "-d".into(),
-                cidr.clone(),
-                "-p".into(),
-                "icmp".into(),
-                "-j".into(),
-                "DNAT".into(),
-                "--to-destination".into(),
-                client.clone(),
-            ];
-            args.extend(comment());
-            rules.push(IptRule {
-                table: "nat",
-                chain: "PREROUTING",
-                insert: false,
-                args,
-            });
-        }
-        {
-            let mut args = vec![
-                "-o".into(),
-                iface.clone(),
-                "-j".into(),
-                "SNAT".into(),
-                "--to-source".into(),
-                server,
-            ];
-            args.extend(comment());
-            rules.push(IptRule {
-                table: "nat",
-                chain: "POSTROUTING",
-                insert: false,
-                args,
-            });
-        }
+        rules.push(rule(
+            "nat",
+            "PREROUTING",
+            false,
+            &[
+                "!",
+                "-i",
+                iface,
+                "!",
+                "-d",
+                &cidr,
+                "-p",
+                "icmp",
+                "-j",
+                "DNAT",
+                "--to-destination",
+                &client,
+            ],
+        ));
+        rules.push(rule(
+            "nat",
+            "POSTROUTING",
+            false,
+            &["-o", iface, "-j", "SNAT", "--to-source", &server],
+        ));
     }
     // Masquerade tunnel-sourced traffic out the egress interface (exit mode).
     if let Some(egress) = &plan.egress {
-        let mut args = vec![
-            "-s".into(),
-            cidr.clone(),
-            "-o".into(),
-            egress.clone(),
-            "-j".into(),
-            "MASQUERADE".into(),
-        ];
-        args.extend(comment());
-        rules.push(IptRule {
-            table: "nat",
-            chain: "POSTROUTING",
-            insert: false,
-            args,
-        });
+        rules.push(rule(
+            "nat",
+            "POSTROUTING",
+            false,
+            &["-s", &cidr, "-o", egress, "-j", "MASQUERADE"],
+        ));
     }
     // Clamp forwarded TCP MSS in both tunnel directions so large segments fit the
     // tunnel MTU. Scoped to the tunnel interface so unrelated forwarding (e.g. a
     // container bridge) is untouched.
     let mss = plan.mss().to_string();
     for dir in ["-o", "-i"] {
-        let mut args = vec![
-            dir.into(),
-            iface.clone(),
-            "-p".into(),
-            "tcp".into(),
-            "--tcp-flags".into(),
-            "SYN,RST".into(),
-            "SYN".into(),
-            "-j".into(),
-            "TCPMSS".into(),
-            "--set-mss".into(),
-            mss.clone(),
-        ];
-        args.extend(comment());
-        rules.push(IptRule {
-            table: "mangle",
-            chain: "FORWARD",
-            insert: false,
-            args,
-        });
+        rules.push(rule(
+            "mangle",
+            "FORWARD",
+            false,
+            &[
+                dir,
+                iface,
+                "-p",
+                "tcp",
+                "--tcp-flags",
+                "SYN,RST",
+                "SYN",
+                "-j",
+                "TCPMSS",
+                "--set-mss",
+                &mss,
+            ],
+        ));
     }
     // Accept forwarding to/from the tunnel so a default-deny host does not
     // black-hole the DNAT'd traffic. Appended, so it is reached before the
     // policy fallthrough. A host that installs its own explicit FORWARD drop
     // ahead of this still needs operator integration (see manual_instructions).
     for dir in ["-o", "-i"] {
-        let mut args = vec![dir.into(), iface.clone(), "-j".into(), "ACCEPT".into()];
-        args.extend(comment());
-        rules.push(IptRule {
-            table: "filter",
-            chain: "FORWARD",
-            insert: false,
-            args,
-        });
+        rules.push(rule(
+            "filter",
+            "FORWARD",
+            false,
+            &[dir, iface, "-j", "ACCEPT"],
+        ));
     }
     // When Docker manages the firewall, put the accepts at the top of its
     // DOCKER-USER chain as well: that chain is evaluated ahead of everything
     // Docker programs into FORWARD, so its drop policy cannot override them.
     if docker_user {
         for dir in ["-o", "-i"] {
-            let mut args = vec![dir.into(), iface.clone(), "-j".into(), "ACCEPT".into()];
-            args.extend(comment());
-            rules.push(IptRule {
-                table: "filter",
-                chain: "DOCKER-USER",
-                insert: true,
-                args,
-            });
+            rules.push(rule(
+                "filter",
+                "DOCKER-USER",
+                true,
+                &[dir, iface, "-j", "ACCEPT"],
+            ));
         }
     }
     rules
@@ -476,20 +466,12 @@ fn enable_ip_forward() -> Result<bool> {
         .map(|s| s.trim() == "1")
         .unwrap_or(false);
     std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n")
-        .map_err(|e| -> crate::Error { format!("write ip_forward: {e}").into() })?;
+        .map_err(|e| -> crate::Error { errf!("write ip_forward: {e}") })?;
     Ok(!was_on)
 }
 
 fn nft_delete_table() {
-    run_ignore(
-        "nft",
-        &[
-            "delete".into(),
-            "table".into(),
-            "ip".into(),
-            "zeronat".into(),
-        ],
-    );
+    run_ignore("nft", &["delete", "table", "ip", "zeronat"]);
 }
 
 /// True when Docker's DOCKER-USER chain exists in the nft `ip filter` table,
@@ -499,7 +481,7 @@ fn nft_delete_table() {
 /// next zeronat start.
 fn nft_docker_user_exists() -> bool {
     Command::new("nft")
-        .args(["list", "chain", "ip", "filter", "DOCKER-USER"])
+        .args(&["list", "chain", "ip", "filter", "DOCKER-USER"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -512,7 +494,7 @@ fn nft_docker_user_exists() -> bool {
 /// zeronat table never reaches these rules.
 fn nft_delete_docker_user_rules() {
     let out = match Command::new("nft")
-        .args(["-a", "list", "chain", "ip", "filter", "DOCKER-USER"])
+        .args(&["-a", "list", "chain", "ip", "filter", "DOCKER-USER"])
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -532,13 +514,13 @@ fn nft_delete_docker_user_rules() {
         run_ignore(
             "nft",
             &[
-                "delete".into(),
-                "rule".into(),
-                "ip".into(),
-                "filter".into(),
-                "DOCKER-USER".into(),
-                "handle".into(),
-                handle.to_string(),
+                "delete",
+                "rule",
+                "ip",
+                "filter",
+                "DOCKER-USER",
+                "handle",
+                &handle.to_string(),
             ],
         );
     }
@@ -548,7 +530,7 @@ fn nft_delete_docker_user_rules() {
 /// manages the firewall).
 fn iptables_chain_exists(table: &str, chain: &str) -> bool {
     Command::new("iptables")
-        .args(["-t", table, "-S", chain])
+        .args(&["-t", table, "-S", chain])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -562,7 +544,7 @@ fn iptables_chain_exists(table: &str, chain: &str) -> bool {
 fn flush_iptables() {
     for (table, chain) in IPT_CHAINS {
         let out = match Command::new("iptables")
-            .args(["-t", table, "-S", chain])
+            .args(&["-t", table, "-S", chain])
             .output()
         {
             Ok(o) if o.status.success() => o,
@@ -579,16 +561,7 @@ fn flush_iptables() {
             }
         }
         for n in nums.into_iter().rev() {
-            run_ignore(
-                "iptables",
-                &[
-                    "-t".into(),
-                    (*table).into(),
-                    "-D".into(),
-                    (*chain).into(),
-                    n.to_string(),
-                ],
-            );
+            run_ignore("iptables", &["-t", table, "-D", chain, &n.to_string()]);
         }
     }
 }
@@ -615,18 +588,18 @@ fn nft_apply(script: &str) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| -> crate::Error { format!("spawn nft: {e}").into() })?;
+        .map_err(|e| -> crate::Error { errf!("spawn nft: {e}") })?;
     {
         let mut si = child
             .stdin
             .take()
             .ok_or_else(|| -> crate::Error { "nft stdin unavailable".into() })?;
         si.write_all(script.as_bytes())
-            .map_err(|e| -> crate::Error { format!("write nft script: {e}").into() })?;
+            .map_err(|e| -> crate::Error { errf!("write nft script: {e}") })?;
     }
     let out = child
         .wait_with_output()
-        .map_err(|e| -> crate::Error { format!("wait nft: {e}").into() })?;
+        .map_err(|e| -> crate::Error { errf!("wait nft: {e}") })?;
     if out.status.success() {
         Ok(())
     } else {
@@ -641,7 +614,9 @@ fn install_iptables(rules: &[IptRule]) -> Result<()> {
     // Clear any stale zeronat rules (idempotent re-run), then append fresh.
     flush_iptables();
     for r in rules {
-        run("iptables", &r.command())?;
+        let c = r.command();
+        let c: Vec<&str> = c.iter().map(String::as_str).collect();
+        run("iptables", &c)?;
     }
     Ok(())
 }
@@ -656,11 +631,11 @@ fn command_available(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn run(cmd: &str, args: &[String]) -> Result<()> {
+fn run(cmd: &str, args: &[&str]) -> Result<()> {
     let out = Command::new(cmd)
         .args(args)
         .output()
-        .map_err(|e| -> crate::Error { format!("spawn {cmd}: {e}").into() })?;
+        .map_err(|e| -> crate::Error { errf!("spawn {cmd}: {e}") })?;
     if out.status.success() {
         Ok(())
     } else {
@@ -673,7 +648,7 @@ fn run(cmd: &str, args: &[String]) -> Result<()> {
     }
 }
 
-fn run_ignore(cmd: &str, args: &[String]) {
+fn run_ignore(cmd: &str, args: &[&str]) {
     let _ = Command::new(cmd)
         .args(args)
         .stdout(Stdio::null())

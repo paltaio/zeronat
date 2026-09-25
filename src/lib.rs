@@ -52,6 +52,8 @@ pub mod route;
 pub use zeronat_secret as secret;
 pub mod seed;
 pub mod server;
+#[cfg(unix)]
+pub(crate) mod spawn;
 pub mod tap;
 #[cfg(all(feature = "tui", unix))]
 pub mod tui;

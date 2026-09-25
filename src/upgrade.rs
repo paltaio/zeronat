@@ -4,11 +4,15 @@
 //! scratch container ships nothing it could upgrade itself with. Meant to run on
 //! the host, not inside the container.
 
+#[cfg(unix)]
+use crate::spawn::{Command, Stdio};
 use crate::Result;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
+#[cfg(not(unix))]
+use std::process::{Command, Stdio};
 use zeronat_install_support::release::{
     embedded_public_key, ReleaseManifest, MANIFEST_LIMIT, MANIFEST_NAME, SIGNATURE_LIMIT,
     SIGNATURE_NAME,
@@ -208,6 +212,7 @@ fn upgrade_systemd(latest: &str) -> Result<()> {
     upgrade_systemd_with(latest, &key, &mut CommandRunner)
 }
 
+#[inline(never)]
 fn upgrade_systemd_with(
     latest: &str,
     public_key: &[u8; 32],
@@ -251,15 +256,15 @@ fn upgrade_systemd_with(
             ],
             download.output(),
         )
-        .map_err(|e| format!("running curl: {e}"))?;
+        .map_err(|e| errf!("running curl: {e}"))?;
     if !dl.status.success() {
-        return Err(format!("download failed (no release asset for {target}?)").into());
+        return Err(errf!("download failed (no release asset for {target}?)"));
     }
     let mut input = download.prepare_install()?;
     manifest.verify_artifact(&name, input)?;
     input
         .seek(SeekFrom::Start(0))
-        .map_err(|e| format!("failed to read downloaded binary: {e}"))?;
+        .map_err(|e| errf!("failed to read downloaded binary: {e}"))?;
     let inst = runner
         .run_with_stdin(
             true,
@@ -267,16 +272,16 @@ fn upgrade_systemd_with(
             &["-m", "0755", "/dev/stdin", BIN_PATH],
             input,
         )
-        .map_err(|e| format!("running install: {e}"))?;
+        .map_err(|e| errf!("running install: {e}"))?;
     if !inst.status.success() {
-        return Err(format!("installing {BIN_PATH}: {}", errtext(&inst)).into());
+        return Err(errf!("installing {BIN_PATH}: {}", errtext(&inst)));
     }
     println!("systemd: restarting service");
     let res = runner
         .run(true, "systemctl", &["restart", "zeronat"])
-        .map_err(|e| format!("running systemctl: {e}"))?;
+        .map_err(|e| errf!("running systemctl: {e}"))?;
     if !res.status.success() {
-        return Err(format!("systemctl restart: {}", errtext(&res)).into());
+        return Err(errf!("systemctl restart: {}", errtext(&res)));
     }
     Ok(())
 }
@@ -297,12 +302,12 @@ fn fetch_small(runner: &mut dyn UpgradeRunner, url: &str, limit: u64) -> Result<
                 url,
             ],
         )
-        .map_err(|e| format!("running curl: {e}"))?;
+        .map_err(|e| errf!("running curl: {e}"))?;
     if !out.status.success() {
-        return Err(format!("download failed for {url}").into());
+        return Err(errf!("download failed for {url}"));
     }
     if out.stdout.len() as u64 > limit {
-        return Err(format!("{url} exceeds its size limit").into());
+        return Err(errf!("{url} exceeds its size limit"));
     }
     Ok(out.stdout)
 }
@@ -315,9 +320,9 @@ fn upgrade_docker(dep: &DockerDeployment) -> Result<()> {
         compose(dep.mode, &["-f", COMPOSE_FILE, "up", "-d"])?;
     } else {
         println!("docker:  pulling {IMAGE}");
-        let pull = dk(dep.mode, &["pull", IMAGE]).map_err(|e| format!("running docker: {e}"))?;
+        let pull = dk(dep.mode, &["pull", IMAGE]).map_err(|e| errf!("running docker: {e}"))?;
         if !pull.status.success() {
-            return Err(format!("docker pull: {}", errtext(&pull)).into());
+            return Err(errf!("docker pull: {}", errtext(&pull)));
         }
         println!("docker:  recreating container");
         recreate_run(dep.mode)?;
@@ -350,37 +355,36 @@ fn recreate_run(mode: DockerMode) -> Result<()> {
     let restart = inspect_one(mode, "{{.HostConfig.RestartPolicy.Name}}")
         .unwrap_or_else(|| "unless-stopped".into());
 
-    let rm = dk(mode, &["rm", "-f", CONTAINER]).map_err(|e| format!("running docker: {e}"))?;
+    let rm = dk(mode, &["rm", "-f", CONTAINER]).map_err(|e| errf!("running docker: {e}"))?;
     if !rm.status.success() {
-        return Err(format!("docker rm: {}", errtext(&rm)).into());
+        return Err(errf!("docker rm: {}", errtext(&rm)));
     }
 
-    let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--name".into(), CONTAINER.into()];
+    let mut args: Vec<&str> = vec!["run", "-d", "--name", CONTAINER];
     if !restart.is_empty() && restart != "no" {
-        args.push("--restart".into());
-        args.push(restart);
+        args.push("--restart");
+        args.push(&restart);
     }
     if !network.is_empty() {
-        args.push("--network".into());
-        args.push(network);
+        args.push("--network");
+        args.push(&network);
     }
     for c in &caps {
-        args.push("--cap-add".into());
-        args.push(c.clone());
+        args.push("--cap-add");
+        args.push(c);
     }
     for d in &devices {
-        args.push("--device".into());
-        args.push(d.clone());
+        args.push("--device");
+        args.push(d);
     }
-    args.push("--env-file".into());
-    args.push(ENV_FILE.into());
-    args.push(IMAGE.into());
-    args.extend(cmd);
+    args.push("--env-file");
+    args.push(ENV_FILE);
+    args.push(IMAGE);
+    args.extend(cmd.iter().map(String::as_str));
 
-    let aref: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = dk(mode, &aref).map_err(|e| format!("running docker: {e}"))?;
+    let out = dk(mode, &args).map_err(|e| errf!("running docker: {e}"))?;
     if !out.status.success() {
-        return Err(format!("docker run: {}", errtext(&out)).into());
+        return Err(errf!("docker run: {}", errtext(&out)));
     }
     Ok(())
 }
@@ -423,11 +427,11 @@ fn compose(mode: DockerMode, args: &[&str]) -> Result<()> {
     } else {
         return Err("a compose file exists but docker compose is not available".into());
     };
-    let out = out.map_err(|e| format!("running docker compose: {e}"))?;
+    let out = out.map_err(|e| errf!("running docker compose: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(format!("compose: {}", errtext(&out)).into())
+        Err(errf!("compose: {}", errtext(&out)))
     }
 }
 
@@ -452,13 +456,13 @@ fn latest_version() -> Result<String> {
             LATEST_URL,
         ],
     )
-    .map_err(|e| format!("running curl: {e}"))?;
+    .map_err(|e| errf!("running curl: {e}"))?;
     if !out.status.success() {
         return Err("could not reach the release server to check the latest version".into());
     }
     let url = String::from_utf8_lossy(&out.stdout);
     version_from_url(&url)
-        .ok_or_else(|| format!("could not parse the latest release from '{}'", url.trim()).into())
+        .ok_or_else(|| errf!("could not parse the latest release from '{}'", url.trim()))
 }
 
 /// Pull the version out of a GitHub `releases/latest` redirect target, e.g.
@@ -516,7 +520,7 @@ fn arch_target() -> Result<&'static str> {
         "mipsel" => "mipsel-unknown-linux-gnu",
         "mips64" => "mips64-unknown-linux-gnuabi64",
         "mips64el" => "mips64el-unknown-linux-gnuabi64",
-        other => return Err(format!("unsupported architecture '{other}'").into()),
+        other => return Err(errf!("unsupported architecture '{other}'")),
     })
 }
 
@@ -584,7 +588,7 @@ fn cmd_ok(mut c: Command) -> bool {
 fn have(cmd: &str) -> bool {
     Command::new("sh")
         .arg("-c")
-        .arg(format!("command -v {cmd} >/dev/null 2>&1"))
+        .arg(&format!("command -v {cmd} >/dev/null 2>&1"))
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
