@@ -2,11 +2,12 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use zeronat::client::{DEFAULT_TAP_MTU, DEFAULT_TUN_NAME};
 use zeronat::clientcfg::{CfgForward, CfgPppoe, CfgServer, ClientConfig};
+use zeronat::clientproto::ClientMsg;
 use zeronat::identity::ClientId;
 use zeronat::proto::{Proto, Source};
 use zeronat::seed::Seed;
 use zeronat::tap::TapConfig;
-use zeronat::{admin, client, client_admin, server, Result};
+use zeronat::{admin, client, client_admin, errf, server, Result};
 
 const TUN_PREFIX_LEN: u8 = 24;
 
@@ -23,7 +24,7 @@ fn apply_kcp_window(flag: Option<String>) -> zeronat::Result<()> {
     };
     zeronat::kcp::set_window(
         zeronat::kcp::parse_window(&value)
-            .map_err(|e| -> zeronat::Error { format!("{source}: {e}").into() })?,
+            .map_err(|e| -> zeronat::Error { errf!("{source}: {e}") })?,
     );
     Ok(())
 }
@@ -207,59 +208,63 @@ Options:
   -V, --version       Print the version and exit
 ";
 
+struct ClientArgs {
+    server: Option<String>,
+    seed: Option<String>,
+    secret: Option<String>,
+    credential: Option<String>,
+    discovery: Option<String>,
+    id_prefix: Option<String>,
+    tcp: Vec<String>,
+    udp: Vec<String>,
+    proxy: bool,
+    transport: Option<String>,
+    tap_name: Option<String>,
+    bridge: Option<String>,
+    tun: bool,
+    exit: bool,
+    exit_strict: bool,
+    mtu: Option<usize>,
+    pppoe: bool,
+    pppoe_user: Option<String>,
+    pppoe_pass: Option<String>,
+    pppoe_pass_file: Option<std::path::PathBuf>,
+    pppoe_service: Option<String>,
+    pppoe_ac: Option<String>,
+    pppoe_tun: String,
+    pppoe_mtu: usize,
+    pppoe_default_route: bool,
+    pppoe_no_mss_clamp: bool,
+    pppoe_dns: bool,
+    config: Option<std::path::PathBuf>,
+}
+
+struct ServerArgs {
+    bind: Option<Ipv4Addr>,
+    control: Option<u16>,
+    seed: Option<String>,
+    secret: Option<String>,
+    discovery: Option<String>,
+    client_credentials: Vec<zeronat::config::CfgClient>,
+    admin_secret: Option<String>,
+    server_id: Option<String>,
+    tcp: Vec<u16>,
+    udp: Vec<u16>,
+    tap: Option<TapConfig>,
+    tun: bool,
+    mtu: usize,
+    except: Vec<u16>,
+    exit: bool,
+    exit_iface: Option<String>,
+    dht: bool,
+    announce_ip: Option<Ipv4Addr>,
+    announce_port: Option<u16>,
+    config: Option<std::path::PathBuf>,
+}
+
 enum Cmd {
-    Server {
-        bind: Option<Ipv4Addr>,
-        control: Option<u16>,
-        seed: Option<String>,
-        secret: Option<String>,
-        discovery: Option<String>,
-        client_credentials: Vec<zeronat::config::CfgClient>,
-        admin_secret: Option<String>,
-        server_id: Option<String>,
-        tcp: Vec<u16>,
-        udp: Vec<u16>,
-        tap: Option<TapConfig>,
-        tun: bool,
-        mtu: usize,
-        except: Vec<u16>,
-        exit: bool,
-        exit_iface: Option<String>,
-        dht: bool,
-        announce_ip: Option<Ipv4Addr>,
-        announce_port: Option<u16>,
-        config: Option<std::path::PathBuf>,
-    },
-    Client {
-        server: Option<String>,
-        seed: Option<String>,
-        secret: Option<String>,
-        credential: Option<String>,
-        discovery: Option<String>,
-        id_prefix: Option<String>,
-        tcp: Vec<String>,
-        udp: Vec<String>,
-        proxy: bool,
-        transport: Option<String>,
-        tap_name: Option<String>,
-        bridge: Option<String>,
-        tun: bool,
-        exit: bool,
-        exit_strict: bool,
-        mtu: Option<usize>,
-        pppoe: bool,
-        pppoe_user: Option<String>,
-        pppoe_pass: Option<String>,
-        pppoe_pass_file: Option<std::path::PathBuf>,
-        pppoe_service: Option<String>,
-        pppoe_ac: Option<String>,
-        pppoe_tun: String,
-        pppoe_mtu: usize,
-        pppoe_default_route: bool,
-        pppoe_no_mss_clamp: bool,
-        pppoe_dns: bool,
-        config: Option<std::path::PathBuf>,
-    },
+    Server(Box<ServerArgs>),
+    Client(Box<ClientArgs>),
     ClientAdmin {
         command: Option<ClientAdminCmd>,
         socket: Option<std::path::PathBuf>,
@@ -341,7 +346,9 @@ fn parse_transport(v: Option<&str>) -> Result<client::Transport> {
         "auto" => Ok(client::Transport::Auto),
         "udp" => Ok(client::Transport::Udp),
         "tcp" => Ok(client::Transport::Tcp),
-        other => Err(format!("invalid --transport '{other}' (expected auto|udp|tcp)").into()),
+        other => Err(errf!(
+            "invalid --transport '{other}' (expected auto|udp|tcp)"
+        )),
     }
 }
 
@@ -366,23 +373,15 @@ fn parse_forward(spec: &str, proto: Proto) -> Result<client::Forward> {
     };
 
     let parts: Vec<&str> = base.split(':').collect();
-    let (port, target) = match parts.as_slice() {
-        [p] => {
-            let port: u16 = p.parse()?;
-            (port, format!("127.0.0.1:{port}"))
-        }
-        [p, lp] => {
-            let port: u16 = p.parse()?;
-            let lport: u16 = lp.parse()?;
-            (port, format!("127.0.0.1:{lport}"))
-        }
-        [p, host, lp] => {
-            let port: u16 = p.parse()?;
-            let lport: u16 = lp.parse()?;
-            (port, format!("{host}:{lport}"))
-        }
-        _ => return Err(format!("invalid forward spec '{spec}'").into()),
+    let (p, host, lp) = match parts.as_slice() {
+        [p] => (p, "127.0.0.1", p),
+        [p, lp] => (p, "127.0.0.1", lp),
+        [p, host, lp] => (p, *host, lp),
+        _ => return Err(errf!("invalid forward spec '{spec}'")),
     };
+    let port: u16 = p.parse()?;
+    let lport: u16 = lp.parse()?;
+    let target = format!("{host}:{lport}");
 
     let mut proxy = false;
     let mut idle: Option<std::time::Duration> = None;
@@ -390,7 +389,7 @@ fn parse_forward(spec: &str, proto: Proto) -> Result<client::Forward> {
         for m in mods.split('+') {
             if m == "proxy" {
                 if proxy {
-                    return Err(format!("duplicate modifier '+proxy' in '{spec}'").into());
+                    return Err(errf!("duplicate modifier '+proxy' in '{spec}'"));
                 }
                 if proto == Proto::Udp {
                     return Err("+proxy is not supported on udp forwards".into());
@@ -398,17 +397,17 @@ fn parse_forward(spec: &str, proto: Proto) -> Result<client::Forward> {
                 proxy = true;
             } else if let Some(v) = m.strip_prefix("idle=") {
                 if idle.is_some() {
-                    return Err(format!("duplicate modifier '+idle' in '{spec}'").into());
+                    return Err(errf!("duplicate modifier '+idle' in '{spec}'"));
                 }
                 let secs: u32 = v.parse().map_err(|_| -> zeronat::Error {
-                    format!("+idle wants whole seconds, got '{v}'").into()
+                    errf!("+idle wants whole seconds, got '{v}'")
                 })?;
                 if secs == 0 {
                     return Err("+idle must be at least 1 second".into());
                 }
                 idle = Some(std::time::Duration::from_secs(secs.into()));
             } else {
-                return Err(format!("unknown modifier '+{m}' in '{spec}'").into());
+                return Err(errf!("unknown modifier '+{m}' in '{spec}'"));
             }
         }
     }
@@ -427,11 +426,11 @@ fn parse_forward(spec: &str, proto: Proto) -> Result<client::Forward> {
 fn parse_proto_forward(spec: &str) -> Result<(Proto, client::Forward)> {
     let (proto, rest) = spec
         .split_once(':')
-        .ok_or_else(|| -> zeronat::Error { format!("expected PROTO:SPEC, got '{spec}'").into() })?;
+        .ok_or_else(|| -> zeronat::Error { errf!("expected PROTO:SPEC, got '{spec}'") })?;
     let proto = match proto {
         "tcp" => Proto::Tcp,
         "udp" => Proto::Udp,
-        other => return Err(format!("proto must be tcp or udp, got '{other}'").into()),
+        other => return Err(errf!("proto must be tcp or udp, got '{other}'")),
     };
     Ok((proto, parse_forward(rest, proto)?))
 }
@@ -485,11 +484,14 @@ fn split_forwards(fwds: &[CfgForward]) -> (Vec<client::Forward>, Vec<client::For
 fn pppoe_from_entry(p: &CfgPppoe) -> Result<client::PppoeRunConfig> {
     use zeronat::pppoe::cli;
     if p.password.is_none() && p.password_file.is_none() {
-        return Err(format!("pppoe '{}' needs `password` or `password_file`", p.name).into());
+        return Err(errf!(
+            "pppoe '{}' needs `password` or `password_file`",
+            p.name
+        ));
     }
     let pass_file = match &p.password_file {
         Some(path) => Some(std::fs::read(path).map_err(|e| -> zeronat::Error {
-            format!("reading [[pppoe]] password_file {path}: {e}").into()
+            errf!("reading [[pppoe]] password_file {path}: {e}")
         })?),
         None => None,
     };
@@ -520,23 +522,296 @@ fn pppoe_from_entry(p: &CfgPppoe) -> Result<client::PppoeRunConfig> {
     })
 }
 
+fn usage_exit() -> ! {
+    print!("{USAGE}");
+    std::process::exit(0);
+}
+
+fn unknown_flag(flag: &str) -> ! {
+    eprintln!("error: unknown flag '{flag}'");
+    std::process::exit(1);
+}
+
+/// The value following `flag`.
+#[inline(never)]
+fn value(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<String> {
+    iter.next().ok_or_else(|| errf!("{flag} requires a value"))
+}
+
+/// The value following `flag`, parsed as `what`: an integer up to `max`.
+#[inline(never)]
+fn parsed(iter: &mut std::vec::IntoIter<String>, flag: &str, what: &str, max: u64) -> Result<u64> {
+    let v = value(iter, flag)?;
+    match v.parse::<u64>() {
+        Ok(n) if n <= max => Ok(n),
+        _ => Err(errf!("{flag} must be {what}, got '{v}'")),
+    }
+}
+
+/// The value following `flag`, parsed as an IPv4 address.
+#[inline(never)]
+fn parsed_ip(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<Ipv4Addr> {
+    let v = value(iter, flag)?;
+    v.parse()
+        .map_err(|_| errf!("{flag} must be an IPv4 address, got '{v}'"))
+}
+
+/// The position of `name` in the space-separated `names`.
+#[inline(never)]
+fn lookup(names: &'static str, name: &str) -> Option<usize> {
+    names.split(' ').position(|n| n == name)
+}
+
+/// How a flag in a subcommand's table is consumed.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// `-h` / `--help`.
+    Help,
+    /// A bare switch; sets `switches[i]`.
+    Switch(u8),
+    /// A string value; sets `strs[i]`.
+    Str(u8),
+    /// A repeatable string value; appends to `lists[i]`.
+    List(u8),
+    /// A u16 value; sets `u16s[i]`.
+    U16(u8),
+    /// A repeatable u16 value; appends to `ports[i]`.
+    Port(u8),
+    /// A positive integer; sets `sizes[i]`.
+    Size(u8),
+    /// An IPv4 address; sets `ipv4s[i]`.
+    Ipv4(u8),
+    /// `server --server dht`.
+    Dht,
+    /// `server --client ID[:64-HEX]`.
+    Client,
+}
+
+/// A subcommand's flags: space-separated names, each with the kind at the
+/// same position.
+struct Table {
+    names: &'static str,
+    kinds: &'static [Kind],
+}
+
+/// Everything a subcommand's flags set.
+#[derive(Default)]
+struct Parsed {
+    switches: [bool; 8],
+    strs: [Option<String>; 17],
+    lists: [Vec<String>; 2],
+    u16s: [Option<u16>; 2],
+    ports: [Vec<u16>; 3],
+    sizes: [Option<usize>; 2],
+    ipv4s: [Option<Ipv4Addr>; 2],
+    dht: bool,
+    clients: Vec<zeronat::config::CfgClient>,
+    /// Bare arguments, in order.
+    pos: Vec<String>,
+}
+
+/// Consume `iter` against `table`. `positional` is how many bare arguments
+/// the subcommand takes: `None` makes every unknown token an unknown flag,
+/// `Some(n)` collects bare tokens and rejects the `n+1`th.
+fn walk(
+    mut iter: std::vec::IntoIter<String>,
+    table: &Table,
+    positional: Option<usize>,
+) -> Result<Parsed> {
+    let iter = &mut iter;
+    let mut p = Parsed::default();
+    while let Some(flag) = iter.next() {
+        let name = if flag == "--tun-mtu" {
+            "--tap-mtu"
+        } else {
+            flag.as_str()
+        };
+        let Some(kind) = lookup(table.names, name).map(|i| table.kinds[i]) else {
+            match positional {
+                Some(max) if !flag.starts_with('-') => {
+                    if p.pos.len() >= max {
+                        return Err(errf!("unexpected argument '{flag}'"));
+                    }
+                    p.pos.push(flag);
+                    continue;
+                }
+                _ => unknown_flag(&flag),
+            }
+        };
+        match kind {
+            Kind::Help => usage_exit(),
+            Kind::Switch(i) => p.switches[i as usize] = true,
+            Kind::Str(i) => p.strs[i as usize] = Some(value(iter, name)?),
+            Kind::List(i) => p.lists[i as usize].push(value(iter, name)?),
+            Kind::U16(i) => {
+                p.u16s[i as usize] = Some(parsed(iter, name, "a u16", u16::MAX.into())? as u16)
+            }
+            Kind::Port(i) => {
+                p.ports[i as usize].push(parsed(iter, name, "a u16", u16::MAX.into())? as u16)
+            }
+            Kind::Size(i) => {
+                p.sizes[i as usize] =
+                    Some(parsed(iter, name, "a positive integer", usize::MAX as u64)? as usize)
+            }
+            Kind::Ipv4(i) => p.ipv4s[i as usize] = Some(parsed_ip(iter, name)?),
+            Kind::Dht => {
+                let v = value(iter, name)?;
+                if v != "dht" {
+                    return Err(errf!("server --server only accepts 'dht', got '{v}'"));
+                }
+                p.dht = true;
+            }
+            Kind::Client => {
+                let value = iter.next().ok_or("--client requires ID or ID:64-HEX")?;
+                let (client_id, secret) = match value.split_once(':') {
+                    Some((client_id, secret)) => {
+                        (client_id, Some(runtime_secret(secret.to_string())?))
+                    }
+                    None => (value.as_str(), None),
+                };
+                if client_id.is_empty() {
+                    return Err("--client id must not be empty".into());
+                }
+                p.clients.push(zeronat::config::CfgClient {
+                    id: client_id.to_string(),
+                    secret,
+                });
+            }
+        }
+    }
+    Ok(p)
+}
+
+const SERVER_FLAGS: Table = Table {
+    names: "-h --help --bind --config --server --announce-ip --announce-port --control --seed \
+            --secret --discovery --client --admin-secret --kcp-window --id --tcp --udp --tap \
+            --tap-mtu --bridge --tun --except --exit --exit-iface",
+    kinds: &[
+        Kind::Help,
+        Kind::Help,
+        Kind::Ipv4(0),
+        Kind::Str(0),
+        Kind::Dht,
+        Kind::Ipv4(1),
+        Kind::U16(0),
+        Kind::U16(1),
+        Kind::Str(1),
+        Kind::Str(2),
+        Kind::Str(3),
+        Kind::Client,
+        Kind::Str(4),
+        Kind::Str(5),
+        Kind::Str(6),
+        Kind::Port(0),
+        Kind::Port(1),
+        Kind::Str(7),
+        Kind::Size(0),
+        Kind::Str(8),
+        Kind::Switch(0),
+        Kind::Port(2),
+        Kind::Switch(1),
+        Kind::Str(9),
+    ],
+};
+
+const CLIENT_FLAGS: Table = Table {
+    names:
+        "-h --help --tun --exit --exit-strict --server --seed --secret --credential --discovery \
+            --id --tcp --udp --proxy --kcp-window --transport --config --tap --tap-mtu --bridge \
+            --pppoe --pppoe-user --pppoe-pass --pppoe-pass-file --pppoe-service --pppoe-ac \
+            --pppoe-tun --pppoe-mtu --pppoe-default-route --pppoe-no-mss-clamp --pppoe-dns",
+    kinds: &[
+        Kind::Help,
+        Kind::Help,
+        Kind::Switch(0),
+        Kind::Switch(1),
+        Kind::Switch(2),
+        Kind::Str(0),
+        Kind::Str(1),
+        Kind::Str(2),
+        Kind::Str(3),
+        Kind::Str(4),
+        Kind::Str(5),
+        Kind::List(0),
+        Kind::List(1),
+        Kind::Switch(3),
+        Kind::Str(6),
+        Kind::Str(7),
+        Kind::Str(8),
+        Kind::Str(9),
+        Kind::Size(0),
+        Kind::Str(10),
+        Kind::Switch(4),
+        Kind::Str(11),
+        Kind::Str(12),
+        Kind::Str(13),
+        Kind::Str(14),
+        Kind::Str(15),
+        Kind::Str(16),
+        Kind::Size(1),
+        Kind::Switch(5),
+        Kind::Switch(6),
+        Kind::Switch(7),
+    ],
+};
+
+const CLIENT_ADMIN_FLAGS: Table = Table {
+    names: "-h --help --socket --transport --dev --exit --exit-strict",
+    kinds: &[
+        Kind::Help,
+        Kind::Help,
+        Kind::Str(0),
+        Kind::Str(1),
+        Kind::Str(2),
+        Kind::Switch(0),
+        Kind::Switch(1),
+    ],
+};
+
+const DERIVE_CLIENT_FLAGS: Table = Table {
+    names: "-h --help --seed --dht",
+    kinds: &[Kind::Help, Kind::Help, Kind::Str(0), Kind::Switch(0)],
+};
+
+const UPGRADE_FLAGS: Table = Table {
+    names: "-h --help --check",
+    kinds: &[Kind::Help, Kind::Help, Kind::Switch(0)],
+};
+
+const CLIENT_ADMIN_COMMANDS: &str = "show select-server add-server remove-server enable-forward \
+                                     disable-forward add-forward remove-forward connect disconnect \
+                                     spawn-pppoe stop-pppoe attach-peer attach-provider detach-peer \
+                                     detach-provider";
+
+const ADMIN_FLAGS: Table = Table {
+    names: "-h --help --server --secret",
+    kinds: &[Kind::Help, Kind::Help, Kind::Str(0), Kind::Str(1)],
+};
+
+#[derive(Clone, Copy, PartialEq)]
+enum Sub {
+    Server,
+    Client,
+    Admin,
+    DeriveClient,
+    Upgrade,
+}
+
+#[inline(never)]
 fn parse_args() -> Result<Cmd> {
     let mut args = std::env::args().skip(1);
 
     let subcmd = match args.next().as_deref() {
-        Some("-h") | Some("--help") => {
-            print!("{USAGE}");
-            std::process::exit(0);
-        }
+        Some("-h") | Some("--help") => usage_exit(),
         Some("-V") | Some("--version") => {
             println!("zeronat {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
         }
-        Some("server") => "server",
-        Some("client") => "client",
-        Some("admin") => "admin",
-        Some("derive-client") => "derive-client",
-        Some("upgrade") => "upgrade",
+        Some("server") => Sub::Server,
+        Some("client") => Sub::Client,
+        Some("admin") => Sub::Admin,
+        Some("derive-client") => Sub::DeriveClient,
+        Some("upgrade") => Sub::Upgrade,
         Some(other) => {
             eprintln!("error: unknown subcommand '{other}'\n{USAGE}");
             std::process::exit(1);
@@ -564,621 +839,261 @@ fn parse_args() -> Result<Cmd> {
 
     // `client admin` drives a running client; everything else under `client`
     // runs one.
-    let client_admin = subcmd == "client" && tokens.first().is_some_and(|t| t == "admin");
+    let client_admin = subcmd == Sub::Client && tokens.first().is_some_and(|t| t == "admin");
 
     let mut iter = tokens.into_iter();
 
     if client_admin {
         iter.next();
-        let mut command: Option<String> = None;
-        let mut pos: Vec<String> = Vec::new();
-        let mut socket: Option<std::path::PathBuf> = None;
-        let mut transport: Option<String> = None;
-        let mut dev: Option<String> = None;
-        let mut exit = false;
-        let mut exit_strict = false;
+        return parse_client_admin(iter);
+    }
+    match subcmd {
+        Sub::Server => parse_server(iter),
+        Sub::Client => parse_client(iter),
+        Sub::DeriveClient => parse_derive_client(iter),
+        Sub::Upgrade => {
+            let p = walk(iter, &UPGRADE_FLAGS, None)?;
+            Ok(Cmd::Upgrade {
+                check: p.switches[0],
+            })
+        }
+        Sub::Admin => parse_admin(iter),
+    }
+}
 
-        while let Some(flag) = iter.next() {
-            match flag.as_str() {
-                "-h" | "--help" => {
-                    print!("{USAGE}");
-                    std::process::exit(0);
-                }
-                "--socket" => {
-                    socket = Some(iter.next().ok_or("--socket requires a value")?.into());
-                }
-                "--transport" => {
-                    transport = Some(iter.next().ok_or("--transport requires a value")?);
-                }
-                "--dev" => {
-                    dev = Some(iter.next().ok_or("--dev requires a value")?);
-                }
-                "--exit" => exit = true,
-                "--exit-strict" => exit_strict = true,
-                other if other.starts_with('-') => {
-                    eprintln!("error: unknown flag '{other}'");
-                    std::process::exit(1);
-                }
-                other => {
-                    if command.is_none() {
-                        command = Some(other.to_string());
-                    } else {
-                        pos.push(other.to_string());
-                    }
-                }
-            }
-        }
-        if transport.is_some() && command.as_deref() != Some("add-server") {
-            return Err("--transport only applies to add-server".into());
-        }
-        if (dev.is_some() || exit || exit_strict) && command.as_deref() != Some("attach-peer") {
-            return Err("--dev, --exit, and --exit-strict only apply to attach-peer".into());
-        }
+type Args = std::vec::IntoIter<String>;
 
-        let mut pos = pos.into_iter();
-        let named = |pos: &mut std::vec::IntoIter<String>, cmd: &str| -> Result<String> {
-            pos.next()
-                .ok_or_else(|| format!("{cmd} requires a name").into())
-        };
-        let command = match command.as_deref() {
-            None => None,
-            Some("show") => Some(ClientAdminCmd::Show),
-            Some("select-server") => Some(ClientAdminCmd::SelectServer(named(
-                &mut pos,
-                "select-server",
-            )?)),
-            Some("add-server") => {
-                let name = named(&mut pos, "add-server")?;
+#[inline(never)]
+fn parse_client_admin(iter: Args) -> Result<Cmd> {
+    let mut p = walk(iter, &CLIENT_ADMIN_FLAGS, Some(usize::MAX))?;
+    let mut pos = std::mem::take(&mut p.pos).into_iter();
+    let command = pos.next();
+    let [exit, exit_strict, ..] = p.switches;
+
+    if p.strs[1].is_some() && command.as_deref() != Some("add-server") {
+        return Err("--transport only applies to add-server".into());
+    }
+    if (p.strs[2].is_some() || exit || exit_strict) && command.as_deref() != Some("attach-peer") {
+        return Err("--dev, --exit, and --exit-strict only apply to attach-peer".into());
+    }
+
+    let named = |pos: &mut std::vec::IntoIter<String>, cmd: &str| -> Result<String> {
+        pos.next().ok_or_else(|| errf!("{cmd} requires a name"))
+    };
+    let command = match command {
+        None => None,
+        Some(cmd) => Some(match lookup(CLIENT_ADMIN_COMMANDS, &cmd) {
+            Some(0) => ClientAdminCmd::Show,
+            Some(1) => ClientAdminCmd::SelectServer(named(&mut pos, &cmd)?),
+            Some(2) => {
+                let name = named(&mut pos, &cmd)?;
                 let addr = pos
                     .next()
                     .ok_or("add-server requires a name and an address")?;
-                Some(ClientAdminCmd::AddServer {
+                ClientAdminCmd::AddServer {
                     name,
                     addr,
-                    transport: parse_transport(transport.as_deref())?,
-                })
+                    transport: parse_transport(p.strs[1].as_deref())?,
+                }
             }
-            Some("remove-server") => Some(ClientAdminCmd::RemoveServer(named(
-                &mut pos,
-                "remove-server",
-            )?)),
-            Some("enable-forward") => Some(ClientAdminCmd::EnableForward(named(
-                &mut pos,
-                "enable-forward",
-            )?)),
-            Some("disable-forward") => Some(ClientAdminCmd::DisableForward(named(
-                &mut pos,
-                "disable-forward",
-            )?)),
-            Some("add-forward") => {
-                Some(ClientAdminCmd::AddForward(named(&mut pos, "add-forward")?))
-            }
-            Some("remove-forward") => Some(ClientAdminCmd::RemoveForward(named(
-                &mut pos,
-                "remove-forward",
-            )?)),
-            Some("connect") => Some(ClientAdminCmd::Connect(pos.next())),
-            Some("disconnect") => Some(ClientAdminCmd::Disconnect),
-            Some("spawn-pppoe") => {
-                Some(ClientAdminCmd::SpawnPppoe(named(&mut pos, "spawn-pppoe")?))
-            }
-            Some("stop-pppoe") => Some(ClientAdminCmd::StopPppoe(named(&mut pos, "stop-pppoe")?)),
-            Some("attach-peer") => Some(ClientAdminCmd::AttachPeer {
-                peer: named(&mut pos, "attach-peer")?,
-                dev,
+            Some(3) => ClientAdminCmd::RemoveServer(named(&mut pos, &cmd)?),
+            Some(4) => ClientAdminCmd::EnableForward(named(&mut pos, &cmd)?),
+            Some(5) => ClientAdminCmd::DisableForward(named(&mut pos, &cmd)?),
+            Some(6) => ClientAdminCmd::AddForward(named(&mut pos, &cmd)?),
+            Some(7) => ClientAdminCmd::RemoveForward(named(&mut pos, &cmd)?),
+            Some(8) => ClientAdminCmd::Connect(pos.next()),
+            Some(9) => ClientAdminCmd::Disconnect,
+            Some(10) => ClientAdminCmd::SpawnPppoe(named(&mut pos, &cmd)?),
+            Some(11) => ClientAdminCmd::StopPppoe(named(&mut pos, &cmd)?),
+            Some(12) => ClientAdminCmd::AttachPeer {
+                peer: named(&mut pos, &cmd)?,
+                dev: p.strs[2].take(),
                 exit,
                 exit_strict,
-            }),
-            Some("attach-provider") => Some(ClientAdminCmd::AttachProvider {
+            },
+            Some(13) => ClientAdminCmd::AttachProvider {
                 capability: pos
                     .next()
                     .ok_or("attach-provider requires exit or segment")?,
                 iface: pos.next(),
-            }),
-            Some("detach-peer") => {
-                Some(ClientAdminCmd::DetachPeer(named(&mut pos, "detach-peer")?))
-            }
-            Some("detach-provider") => Some(ClientAdminCmd::DetachProvider(
+            },
+            Some(14) => ClientAdminCmd::DetachPeer(named(&mut pos, &cmd)?),
+            Some(15) => ClientAdminCmd::DetachProvider(
                 pos.next()
                     .ok_or("detach-provider requires exit or segment")?,
-            )),
-            Some(other) => return Err(format!("unknown client admin command '{other}'").into()),
-        };
-        if let Some(extra) = pos.next() {
-            return Err(format!("unexpected argument '{extra}'").into());
-        }
-
-        let interactive = command.is_none() && interactive_default();
-        return Ok(Cmd::ClientAdmin {
-            command,
-            socket,
-            interactive,
-        });
+            ),
+            _ => return Err(errf!("unknown client admin command '{cmd}'")),
+        }),
+    };
+    if let Some(extra) = pos.next() {
+        return Err(errf!("unexpected argument '{extra}'"));
     }
 
-    if subcmd == "server" {
-        let mut bind: Option<Ipv4Addr> = None;
-        let mut control: Option<u16> = None;
-        let mut seed: Option<String> = None;
-        let mut secret: Option<String> = None;
-        let mut discovery: Option<String> = None;
-        let mut client_credentials: Vec<zeronat::config::CfgClient> = Vec::new();
-        let mut admin_secret: Option<String> = None;
-        let mut kcp_window: Option<String> = None;
-        let mut server_id: Option<String> = None;
-        let mut tcp: Vec<u16> = Vec::new();
-        let mut udp: Vec<u16> = Vec::new();
-        let mut tap_name: Option<String> = None;
-        let mut tap_mtu: usize = DEFAULT_TAP_MTU;
-        let mut bridge: Option<String> = None;
-        let mut tun = false;
-        let mut except: Vec<u16> = Vec::new();
-        let mut exit = false;
-        let mut exit_iface: Option<String> = None;
-        let mut dht = false;
-        let mut announce_ip: Option<Ipv4Addr> = None;
-        let mut announce_port: Option<u16> = None;
-        let mut config: Option<std::path::PathBuf> = None;
+    let interactive = command.is_none() && interactive_default();
+    Ok(Cmd::ClientAdmin {
+        command,
+        socket: p.strs[0].take().map(Into::into),
+        interactive,
+    })
+}
 
-        while let Some(flag) = iter.next() {
-            match flag.as_str() {
-                "-h" | "--help" => {
-                    print!("{USAGE}");
-                    std::process::exit(0);
+#[inline(never)]
+fn parse_server(iter: Args) -> Result<Cmd> {
+    let mut p = walk(iter, &SERVER_FLAGS, None)?;
+
+    apply_kcp_window(p.strs[5].take())?;
+
+    // Credentials the seed may fill stay unresolved here: the config file,
+    // read at run time, may carry the seed.
+    p.strs[1] = seed_from(p.strs[1].take())?.map(|seed| seed.to_hex());
+    p.strs[2] = p.strs[2]
+        .take()
+        .or_else(|| std::env::var("ZERONAT_SECRET").ok())
+        .map(runtime_secret)
+        .transpose()?;
+    if p.clients.is_empty() {
+        match (
+            std::env::var("ZERONAT_CLIENT_ID").ok(),
+            std::env::var("ZERONAT_CLIENT_SECRET").ok(),
+        ) {
+            (Some(id), secret) => {
+                if id.is_empty() {
+                    return Err("ZERONAT_CLIENT_ID must not be empty".into());
                 }
-                "--bind" => {
-                    let v = iter.next().ok_or("--bind requires a value")?;
-                    bind = Some(v.parse().map_err(|_| -> zeronat::Error {
-                        format!("--bind must be an IPv4 address, got '{v}'").into()
-                    })?);
-                }
-                "--config" => {
-                    config = Some(iter.next().ok_or("--config requires a value")?.into());
-                }
-                "--server" => {
-                    let v = iter.next().ok_or("--server requires a value")?;
-                    if v != "dht" {
-                        return Err(format!("server --server only accepts 'dht', got '{v}'").into());
-                    }
-                    dht = true;
-                }
-                "--announce-ip" => {
-                    let v = iter.next().ok_or("--announce-ip requires a value")?;
-                    announce_ip = Some(v.parse().map_err(|_| -> zeronat::Error {
-                        format!("--announce-ip must be an IPv4 address, got '{v}'").into()
-                    })?);
-                }
-                "--announce-port" => {
-                    let v = iter.next().ok_or("--announce-port requires a value")?;
-                    announce_port = Some(v.parse().map_err(|_| -> zeronat::Error {
-                        format!("--announce-port must be a u16, got '{v}'").into()
-                    })?);
-                }
-                "--control" => {
-                    let v = iter.next().ok_or("--control requires a value")?;
-                    control = Some(v.parse().map_err(|_| -> zeronat::Error {
-                        format!("--control must be a u16, got '{v}'").into()
-                    })?);
-                }
-                "--seed" => {
-                    seed = Some(iter.next().ok_or("--seed requires a value")?);
-                }
-                "--secret" => {
-                    secret = Some(iter.next().ok_or("--secret requires a value")?);
-                }
-                "--discovery" => {
-                    discovery = Some(iter.next().ok_or("--discovery requires a value")?);
-                }
-                "--client" => {
-                    let value = iter.next().ok_or("--client requires ID or ID:64-HEX")?;
-                    let (client_id, secret) = match value.split_once(':') {
-                        Some((client_id, secret)) => {
-                            (client_id, Some(runtime_secret(secret.to_string())?))
-                        }
-                        None => (value.as_str(), None),
-                    };
-                    if client_id.is_empty() {
-                        return Err("--client id must not be empty".into());
-                    }
-                    client_credentials.push(zeronat::config::CfgClient {
-                        id: client_id.to_string(),
-                        secret,
-                    });
-                }
-                "--admin-secret" => {
-                    admin_secret = Some(iter.next().ok_or("--admin-secret requires a value")?);
-                }
-                "--kcp-window" => {
-                    kcp_window = Some(iter.next().ok_or("--kcp-window requires a value")?);
-                }
-                "--id" => {
-                    server_id = Some(iter.next().ok_or("--id requires a value")?);
-                }
-                "--tcp" => {
-                    let v = iter.next().ok_or("--tcp requires a value")?;
-                    let port: u16 = v.parse().map_err(|_| -> zeronat::Error {
-                        format!("--tcp must be a u16, got '{v}'").into()
-                    })?;
-                    tcp.push(port);
-                }
-                "--udp" => {
-                    let v = iter.next().ok_or("--udp requires a value")?;
-                    let port: u16 = v.parse().map_err(|_| -> zeronat::Error {
-                        format!("--udp must be a u16, got '{v}'").into()
-                    })?;
-                    udp.push(port);
-                }
-                "--tap" => {
-                    tap_name = Some(iter.next().ok_or("--tap requires a value")?);
-                }
-                "--tap-mtu" | "--tun-mtu" => {
-                    let v = iter.next().ok_or("--tap-mtu requires a value")?;
-                    tap_mtu = v.parse().map_err(|_| -> zeronat::Error {
-                        format!("--tap-mtu must be a positive integer, got '{v}'").into()
-                    })?;
-                }
-                "--bridge" => {
-                    bridge = Some(iter.next().ok_or("--bridge requires a value")?);
-                }
-                "--tun" => {
-                    tun = true;
-                }
-                "--except" => {
-                    let v = iter.next().ok_or("--except requires a value")?;
-                    let port: u16 = v.parse().map_err(|_| -> zeronat::Error {
-                        format!("--except must be a u16, got '{v}'").into()
-                    })?;
-                    except.push(port);
-                }
-                "--exit" => {
-                    exit = true;
-                }
-                "--exit-iface" => {
-                    exit_iface = Some(iter.next().ok_or("--exit-iface requires a value")?);
-                }
-                other => {
-                    eprintln!("error: unknown flag '{other}'");
-                    std::process::exit(1);
-                }
+                p.clients.push(zeronat::config::CfgClient {
+                    id,
+                    secret: secret.map(runtime_secret).transpose()?,
+                });
             }
-        }
-
-        apply_kcp_window(kcp_window)?;
-
-        // Credentials the seed may fill stay unresolved here: the config file,
-        // read at run time, may carry the seed.
-        let seed = seed_from(seed)?.map(|seed| seed.to_hex());
-        let secret = secret
-            .or_else(|| std::env::var("ZERONAT_SECRET").ok())
-            .map(runtime_secret)
-            .transpose()?;
-        let discovery = discovery.or_else(|| std::env::var("ZERONAT_DISCOVERY_SECRET").ok());
-        let admin_secret = admin_secret.or_else(|| std::env::var("ZERONAT_ADMIN_SECRET").ok());
-        if client_credentials.is_empty() {
-            match (
-                std::env::var("ZERONAT_CLIENT_ID").ok(),
-                std::env::var("ZERONAT_CLIENT_SECRET").ok(),
-            ) {
-                (Some(id), secret) => {
-                    if id.is_empty() {
-                        return Err("ZERONAT_CLIENT_ID must not be empty".into());
-                    }
-                    client_credentials.push(zeronat::config::CfgClient {
-                        id,
-                        secret: secret.map(runtime_secret).transpose()?,
-                    });
-                }
-                (None, Some(_)) => {
-                    return Err("ZERONAT_CLIENT_SECRET is set without ZERONAT_CLIENT_ID".into());
-                }
-                (None, None) => {}
+            (None, Some(_)) => {
+                return Err("ZERONAT_CLIENT_SECRET is set without ZERONAT_CLIENT_ID".into());
             }
+            (None, None) => {}
         }
-
-        if tun && bridge.is_some() {
-            return Err("--bridge applies to --tap only, not --tun".into());
-        }
-
-        let tap = build_tap(tap_name, tap_mtu, bridge);
-        Ok(Cmd::Server {
-            bind,
-            control,
-            seed,
-            secret,
-            discovery,
-            client_credentials,
-            admin_secret,
-            server_id,
-            tcp,
-            udp,
-            tap,
-            tun,
-            mtu: tap_mtu,
-            except,
-            exit,
-            exit_iface,
-            dht,
-            announce_ip,
-            announce_port,
-            config,
-        })
-    } else if subcmd == "client" {
-        // client
-        let mut server: Option<String> = None;
-        let mut seed: Option<String> = None;
-        let mut secret: Option<String> = None;
-        let mut credential: Option<String> = None;
-        let mut discovery: Option<String> = None;
-        let mut id_prefix: Option<String> = None;
-        let mut tcp: Vec<String> = Vec::new();
-        let mut udp: Vec<String> = Vec::new();
-        let mut proxy = false;
-        let mut kcp_window: Option<String> = None;
-        let mut transport: Option<String> = None;
-        let mut tap_name: Option<String> = None;
-        let mut tap_mtu: Option<usize> = None;
-        let mut bridge: Option<String> = None;
-        let mut tun = false;
-        let mut exit = false;
-        let mut exit_strict = false;
-        let mut config: Option<std::path::PathBuf> = None;
-        let mut pppoe = false;
-        let mut pppoe_user: Option<String> = None;
-        let mut pppoe_pass: Option<String> = None;
-        let mut pppoe_pass_file: Option<std::path::PathBuf> = None;
-        let mut pppoe_service: Option<String> = None;
-        let mut pppoe_ac: Option<String> = None;
-        let mut pppoe_tun = "zppp0".to_string();
-        let mut pppoe_mtu: usize = 1492;
-        let mut pppoe_default_route = false;
-        let mut pppoe_no_mss_clamp = false;
-        let mut pppoe_dns = false;
-
-        while let Some(flag) = iter.next() {
-            match flag.as_str() {
-                "-h" | "--help" => {
-                    print!("{USAGE}");
-                    std::process::exit(0);
-                }
-                "--tun" => {
-                    tun = true;
-                }
-                "--exit" => {
-                    exit = true;
-                }
-                "--exit-strict" => {
-                    exit_strict = true;
-                }
-                "--server" => {
-                    server = Some(iter.next().ok_or("--server requires a value")?);
-                }
-                "--seed" => {
-                    seed = Some(iter.next().ok_or("--seed requires a value")?);
-                }
-                "--secret" => {
-                    secret = Some(iter.next().ok_or("--secret requires a value")?);
-                }
-                "--credential" => {
-                    credential = Some(iter.next().ok_or("--credential requires a value")?);
-                }
-                "--discovery" => {
-                    discovery = Some(iter.next().ok_or("--discovery requires a value")?);
-                }
-                "--id" => {
-                    id_prefix = Some(iter.next().ok_or("--id requires a value")?);
-                }
-                "--tcp" => {
-                    let v = iter.next().ok_or("--tcp requires a value")?;
-                    tcp.push(v);
-                }
-                "--udp" => {
-                    let v = iter.next().ok_or("--udp requires a value")?;
-                    udp.push(v);
-                }
-                "--proxy" => {
-                    proxy = true;
-                }
-                "--kcp-window" => {
-                    kcp_window = Some(iter.next().ok_or("--kcp-window requires a value")?);
-                }
-                "--transport" => {
-                    transport = Some(iter.next().ok_or("--transport requires a value")?);
-                }
-                "--config" => {
-                    config = Some(iter.next().ok_or("--config requires a value")?.into());
-                }
-                "--tap" => {
-                    tap_name = Some(iter.next().ok_or("--tap requires a value")?);
-                }
-                "--tap-mtu" | "--tun-mtu" => {
-                    let v = iter.next().ok_or("--tap-mtu requires a value")?;
-                    tap_mtu = Some(v.parse().map_err(|_| -> zeronat::Error {
-                        format!("--tap-mtu must be a positive integer, got '{v}'").into()
-                    })?);
-                }
-                "--bridge" => {
-                    bridge = Some(iter.next().ok_or("--bridge requires a value")?);
-                }
-                "--pppoe" => {
-                    pppoe = true;
-                }
-                "--pppoe-user" => {
-                    pppoe_user = Some(iter.next().ok_or("--pppoe-user requires a value")?);
-                }
-                "--pppoe-pass" => {
-                    pppoe_pass = Some(iter.next().ok_or("--pppoe-pass requires a value")?);
-                }
-                "--pppoe-pass-file" => {
-                    pppoe_pass_file = Some(
-                        iter.next()
-                            .ok_or("--pppoe-pass-file requires a value")?
-                            .into(),
-                    );
-                }
-                "--pppoe-service" => {
-                    pppoe_service = Some(iter.next().ok_or("--pppoe-service requires a value")?);
-                }
-                "--pppoe-ac" => {
-                    pppoe_ac = Some(iter.next().ok_or("--pppoe-ac requires a value")?);
-                }
-                "--pppoe-tun" => {
-                    pppoe_tun = iter.next().ok_or("--pppoe-tun requires a value")?;
-                }
-                "--pppoe-mtu" => {
-                    let v = iter.next().ok_or("--pppoe-mtu requires a value")?;
-                    pppoe_mtu = v.parse().map_err(|_| -> zeronat::Error {
-                        format!("--pppoe-mtu must be a positive integer, got '{v}'").into()
-                    })?;
-                }
-                "--pppoe-default-route" => pppoe_default_route = true,
-                "--pppoe-no-mss-clamp" => pppoe_no_mss_clamp = true,
-                "--pppoe-dns" => pppoe_dns = true,
-                other => {
-                    eprintln!("error: unknown flag '{other}'");
-                    std::process::exit(1);
-                }
-            }
-        }
-
-        apply_kcp_window(kcp_window)?;
-
-        Ok(Cmd::Client {
-            server,
-            seed,
-            secret,
-            credential,
-            discovery,
-            id_prefix,
-            tcp,
-            udp,
-            proxy,
-            transport,
-            tun,
-            exit,
-            exit_strict,
-            mtu: tap_mtu,
-            tap_name,
-            bridge,
-            pppoe,
-            pppoe_user,
-            pppoe_pass,
-            pppoe_pass_file,
-            pppoe_service,
-            pppoe_ac,
-            pppoe_tun,
-            pppoe_mtu,
-            pppoe_default_route,
-            pppoe_no_mss_clamp,
-            pppoe_dns,
-            config,
-        })
-    } else if subcmd == "derive-client" {
-        let mut seed: Option<String> = None;
-        let mut id: Option<String> = None;
-        let mut dht = false;
-        while let Some(flag) = iter.next() {
-            match flag.as_str() {
-                "-h" | "--help" => {
-                    print!("{USAGE}");
-                    std::process::exit(0);
-                }
-                "--seed" => {
-                    seed = Some(iter.next().ok_or("--seed requires a value")?);
-                }
-                "--dht" => dht = true,
-                other if other.starts_with('-') => {
-                    eprintln!("error: unknown flag '{other}'");
-                    std::process::exit(1);
-                }
-                other => {
-                    if id.is_some() {
-                        return Err(format!("unexpected argument '{other}'").into());
-                    }
-                    id = Some(other.to_string());
-                }
-            }
-        }
-        let id = id.ok_or("derive-client requires a client id")?;
-        if id.is_empty() {
-            return Err("client id must not be empty".into());
-        }
-        let seed = seed_from(seed)?.ok_or("--seed or ZERONAT_SEED is required")?;
-        Ok(Cmd::DeriveClient {
-            secret: seed.network(),
-            credential: seed.client(&id),
-            discovery: dht.then(|| seed.discovery()),
-        })
-    } else if subcmd == "upgrade" {
-        let mut check = false;
-        for flag in iter {
-            match flag.as_str() {
-                "-h" | "--help" => {
-                    print!("{USAGE}");
-                    std::process::exit(0);
-                }
-                "--check" => check = true,
-                other => {
-                    eprintln!("error: unknown flag '{other}'");
-                    std::process::exit(1);
-                }
-            }
-        }
-        Ok(Cmd::Upgrade { check })
-    } else {
-        // admin
-        let mut command: Option<String> = None;
-        let mut server: Option<String> = None;
-        let mut secret: Option<String> = None;
-
-        while let Some(flag) = iter.next() {
-            match flag.as_str() {
-                "-h" | "--help" => {
-                    print!("{USAGE}");
-                    std::process::exit(0);
-                }
-                "--server" => {
-                    server = Some(iter.next().ok_or("--server requires a value")?);
-                }
-                "--secret" => {
-                    secret = Some(iter.next().ok_or("--secret requires a value")?);
-                }
-                other if other.starts_with('-') => {
-                    eprintln!("error: unknown flag '{other}'");
-                    std::process::exit(1);
-                }
-                other => {
-                    if command.is_some() {
-                        return Err(format!("unexpected argument '{other}'").into());
-                    }
-                    command = Some(other.to_string());
-                }
-            }
-        }
-
-        match command.as_deref() {
-            None | Some("show") => {}
-            Some(other) => return Err(format!("unknown admin command '{other}'").into()),
-        }
-
-        let server = server.ok_or("--server is required")?;
-        let secret = match secret.or_else(|| std::env::var("ZERONAT_ADMIN_SECRET").ok()) {
-            Some(secret) => secret,
-            None => match seed_from(None)? {
-                Some(seed) => seed.admin(),
-                None => zeronat::admin::admin_secret_from_env_file().ok_or(
-                    "no admin secret: pass --secret, set ZERONAT_ADMIN_SECRET or ZERONAT_SEED, or add either to /etc/zeronat/.env",
-                )?,
-            },
-        };
-        let secret = runtime_secret(secret)?;
-
-        let interactive = command.is_none() && interactive_default();
-        Ok(Cmd::Admin {
-            server,
-            secret,
-            interactive,
-        })
     }
+
+    let [tun, exit, ..] = p.switches;
+    if tun && p.strs[8].is_some() {
+        return Err("--bridge applies to --tap only, not --tun".into());
+    }
+
+    let tap_mtu = p.sizes[0].unwrap_or(DEFAULT_TAP_MTU);
+    let [config, seed, secret, discovery, admin_secret, _, server_id, tap_name, bridge, exit_iface, ..] =
+        p.strs;
+    let [tcp, udp, except] = p.ports;
+    Ok(Cmd::Server(Box::new(ServerArgs {
+        bind: p.ipv4s[0],
+        control: p.u16s[1],
+        seed,
+        secret,
+        discovery: discovery.or_else(|| std::env::var("ZERONAT_DISCOVERY_SECRET").ok()),
+        client_credentials: p.clients,
+        admin_secret: admin_secret.or_else(|| std::env::var("ZERONAT_ADMIN_SECRET").ok()),
+        server_id,
+        tcp,
+        udp,
+        tap: build_tap(tap_name, tap_mtu, bridge),
+        tun,
+        mtu: tap_mtu,
+        except,
+        exit,
+        exit_iface,
+        dht: p.dht,
+        announce_ip: p.ipv4s[1],
+        announce_port: p.u16s[0],
+        config: config.map(Into::into),
+    })))
+}
+
+#[inline(never)]
+fn parse_client(iter: Args) -> Result<Cmd> {
+    let mut p = walk(iter, &CLIENT_FLAGS, None)?;
+
+    apply_kcp_window(p.strs[6].take())?;
+
+    let [tun, exit, exit_strict, proxy, pppoe, pppoe_default_route, pppoe_no_mss_clamp, pppoe_dns] =
+        p.switches;
+    let [server, seed, secret, credential, discovery, id_prefix, _, transport, config, tap_name, bridge, pppoe_user, pppoe_pass, pppoe_pass_file, pppoe_service, pppoe_ac, pppoe_tun] =
+        p.strs;
+    let [tcp, udp] = p.lists;
+    Ok(Cmd::Client(Box::new(ClientArgs {
+        server,
+        seed,
+        secret,
+        credential,
+        discovery,
+        id_prefix,
+        tcp,
+        udp,
+        proxy,
+        transport,
+        tun,
+        exit,
+        exit_strict,
+        mtu: p.sizes[0],
+        tap_name,
+        bridge,
+        pppoe,
+        pppoe_user,
+        pppoe_pass,
+        pppoe_pass_file: pppoe_pass_file.map(Into::into),
+        pppoe_service,
+        pppoe_ac,
+        pppoe_tun: pppoe_tun.unwrap_or_else(|| "zppp0".to_string()),
+        pppoe_mtu: p.sizes[1].unwrap_or(1492),
+        pppoe_default_route,
+        pppoe_no_mss_clamp,
+        pppoe_dns,
+        config: config.map(Into::into),
+    })))
+}
+
+#[inline(never)]
+fn parse_derive_client(iter: Args) -> Result<Cmd> {
+    let mut p = walk(iter, &DERIVE_CLIENT_FLAGS, Some(1))?;
+    let id = p.pos.pop().ok_or("derive-client requires a client id")?;
+    if id.is_empty() {
+        return Err("client id must not be empty".into());
+    }
+    let seed = seed_from(p.strs[0].take())?.ok_or("--seed or ZERONAT_SEED is required")?;
+    Ok(Cmd::DeriveClient {
+        secret: seed.network(),
+        credential: seed.client(&id),
+        discovery: p.switches[0].then(|| seed.discovery()),
+    })
+}
+
+#[inline(never)]
+fn parse_admin(iter: Args) -> Result<Cmd> {
+    let mut p = walk(iter, &ADMIN_FLAGS, Some(1))?;
+    let command = p.pos.pop();
+
+    match command.as_deref() {
+        None | Some("show") => {}
+        Some(other) => return Err(errf!("unknown admin command '{other}'")),
+    }
+
+    let server = p.strs[0].take().ok_or("--server is required")?;
+    let secret = match p.strs[1]
+        .take()
+        .or_else(|| std::env::var("ZERONAT_ADMIN_SECRET").ok())
+    {
+        Some(secret) => secret,
+        None => match seed_from(None)? {
+            Some(seed) => seed.admin(),
+            None => zeronat::admin::admin_secret_from_env_file().ok_or(
+                "no admin secret: pass --secret, set ZERONAT_ADMIN_SECRET or ZERONAT_SEED, or add either to /etc/zeronat/.env",
+            )?,
+        },
+    };
+    let secret = runtime_secret(secret)?;
+
+    let interactive = command.is_none() && interactive_default();
+    Ok(Cmd::Admin {
+        server,
+        secret,
+        interactive,
+    })
 }
 
 #[tokio::main]
@@ -1241,28 +1156,29 @@ async fn shutdown() {
 
 async fn run(cmd: Cmd) -> Result<()> {
     match cmd {
-        Cmd::Server {
-            bind,
-            control,
-            seed,
-            secret,
-            discovery,
-            client_credentials,
-            admin_secret,
-            server_id,
-            tcp,
-            udp,
-            tap,
-            tun,
-            mtu,
-            except,
-            exit,
-            exit_iface,
-            dht,
-            announce_ip,
-            announce_port,
-            config,
-        } => {
+        Cmd::Server(args) => {
+            let ServerArgs {
+                bind,
+                control,
+                seed,
+                secret,
+                discovery,
+                client_credentials,
+                admin_secret,
+                server_id,
+                tcp,
+                udp,
+                tap,
+                tun,
+                mtu,
+                except,
+                exit,
+                exit_iface,
+                dht,
+                announce_ip,
+                announce_port,
+                config,
+            } = *args;
             // A valid config is authoritative. The recovery for a broken one
             // depends on why it broke: a missing file is a normal first boot
             // (default, then self-heal); a malformed file is set aside so its
@@ -1596,36 +1512,37 @@ async fn run(cmd: Cmd) -> Result<()> {
             })
             .await
         }
-        Cmd::Client {
-            server,
-            seed,
-            secret,
-            credential,
-            discovery,
-            id_prefix,
-            tcp,
-            udp,
-            proxy,
-            transport,
-            tap_name,
-            bridge,
-            tun,
-            exit,
-            exit_strict,
-            mtu,
-            pppoe,
-            pppoe_user,
-            pppoe_pass,
-            pppoe_pass_file,
-            pppoe_service,
-            pppoe_ac,
-            pppoe_tun,
-            pppoe_mtu,
-            pppoe_default_route,
-            pppoe_no_mss_clamp,
-            pppoe_dns,
-            config,
-        } => {
+        Cmd::Client(args) => {
+            let ClientArgs {
+                server,
+                seed,
+                secret,
+                credential,
+                discovery,
+                id_prefix,
+                tcp,
+                udp,
+                proxy,
+                transport,
+                tap_name,
+                bridge,
+                tun,
+                exit,
+                exit_strict,
+                mtu,
+                pppoe,
+                pppoe_user,
+                pppoe_pass,
+                pppoe_pass_file,
+                pppoe_service,
+                pppoe_ac,
+                pppoe_tun,
+                pppoe_mtu,
+                pppoe_default_route,
+                pppoe_no_mss_clamp,
+                pppoe_dns,
+                config,
+            } = *args;
             use zeronat::pppoe::cli;
             // Same recovery split as the server: a missing file is a normal
             // first boot; a malformed file is set aside so its contents stay
@@ -2024,56 +1941,47 @@ async fn run(cmd: Cmd) -> Result<()> {
             }
             let _ = interactive;
             let socket = socket.as_deref();
-            match command {
-                None | Some(ClientAdminCmd::Show) => client_admin::show(socket).await,
-                Some(ClientAdminCmd::SelectServer(name)) => {
-                    client_admin::select_server(socket, name).await
-                }
+            let req = match command {
+                None | Some(ClientAdminCmd::Show) => return client_admin::show(socket).await,
+                Some(ClientAdminCmd::SelectServer(name)) => ClientMsg::SelectServer { name },
                 Some(ClientAdminCmd::AddServer {
                     name,
                     addr,
                     transport,
-                }) => client_admin::add_server(socket, name, addr, transport).await,
-                Some(ClientAdminCmd::RemoveServer(name)) => {
-                    client_admin::remove_server(socket, name).await
-                }
+                }) => client_admin::add_server(name, addr, transport)?,
+                Some(ClientAdminCmd::RemoveServer(name)) => ClientMsg::RemoveServer { name },
                 Some(ClientAdminCmd::EnableForward(spec)) => {
-                    client_admin::set_forward_enabled(socket, &spec, true).await
+                    return client_admin::set_forward_enabled(socket, &spec, true).await
                 }
                 Some(ClientAdminCmd::DisableForward(spec)) => {
-                    client_admin::set_forward_enabled(socket, &spec, false).await
+                    return client_admin::set_forward_enabled(socket, &spec, false).await
                 }
                 Some(ClientAdminCmd::AddForward(spec)) => {
                     let (proto, fwd) = parse_proto_forward(&spec)?;
-                    client_admin::add_forward(socket, proto, fwd).await
+                    client_admin::add_forward(proto, fwd)
                 }
-                Some(ClientAdminCmd::RemoveForward(spec)) => {
-                    client_admin::remove_forward(socket, &spec).await
+                Some(ClientAdminCmd::RemoveForward(spec)) => client_admin::remove_forward(&spec)?,
+                Some(ClientAdminCmd::Connect(name)) => {
+                    return client_admin::connect(socket, name).await
                 }
-                Some(ClientAdminCmd::Connect(name)) => client_admin::connect(socket, name).await,
-                Some(ClientAdminCmd::Disconnect) => client_admin::disconnect(socket).await,
-                Some(ClientAdminCmd::SpawnPppoe(name)) => {
-                    client_admin::spawn_pppoe(socket, name).await
-                }
-                Some(ClientAdminCmd::StopPppoe(name)) => {
-                    client_admin::stop_pppoe(socket, name).await
-                }
+                Some(ClientAdminCmd::Disconnect) => ClientMsg::Disconnect,
+                Some(ClientAdminCmd::SpawnPppoe(name)) => ClientMsg::SpawnPppoe { name },
+                Some(ClientAdminCmd::StopPppoe(name)) => ClientMsg::StopSession { name },
                 Some(ClientAdminCmd::AttachPeer {
                     peer,
                     dev,
                     exit,
                     exit_strict,
-                }) => client_admin::attach_peer(socket, peer, dev, exit, exit_strict).await,
+                }) => client_admin::attach_peer(peer, dev, exit, exit_strict)?,
                 Some(ClientAdminCmd::AttachProvider { capability, iface }) => {
-                    client_admin::attach_provider(socket, &capability, iface).await
+                    client_admin::attach_provider(&capability, iface)?
                 }
-                Some(ClientAdminCmd::DetachPeer(peer)) => {
-                    client_admin::detach_peer(socket, peer).await
-                }
+                Some(ClientAdminCmd::DetachPeer(peer)) => client_admin::detach_peer(peer)?,
                 Some(ClientAdminCmd::DetachProvider(capability)) => {
-                    client_admin::detach_provider(socket, &capability).await
+                    client_admin::detach_provider(&capability)?
                 }
-            }
+            };
+            client_admin::command(socket, req).await
         }
         Cmd::Admin {
             server,

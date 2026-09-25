@@ -2595,16 +2595,22 @@ async fn client_admin_show_renders_forward_options() {
         zeronat::client_admin::show(Some(&sock))
             .await
             .expect("show command");
-        let err = zeronat::client_admin::spawn_pppoe(Some(&sock), "wan".into())
-            .await
-            .expect_err("spawn must be refused with no pppoe entries");
+        let err = zeronat::client_admin::command(
+            Some(&sock),
+            ClientMsg::SpawnPppoe { name: "wan".into() },
+        )
+        .await
+        .expect_err("spawn must be refused with no pppoe entries");
         assert!(
             err.to_string().contains("no configured pppoe session"),
             "unexpected refusal: {err}"
         );
-        let err = zeronat::client_admin::stop_pppoe(Some(&sock), "wan".into())
-            .await
-            .expect_err("stop must be refused on a forwards body");
+        let err = zeronat::client_admin::command(
+            Some(&sock),
+            ClientMsg::StopSession { name: "wan".into() },
+        )
+        .await
+        .expect_err("stop must be refused on a forwards body");
         assert!(
             err.to_string().contains("no active pppoe session"),
             "unexpected refusal: {err}"
@@ -2672,9 +2678,14 @@ async fn select_server_moves_session_and_persists() {
         // An unknown profile is refused through the admin command (the client's
         // refusal message is the error) and changes nothing, on disk or live.
         let before = std::fs::read_to_string(&path).unwrap();
-        let err = zeronat::client_admin::select_server(Some(&sock), "nope".into())
-            .await
-            .expect_err("an unknown server name must be refused");
+        let err = zeronat::client_admin::command(
+            Some(&sock),
+            ClientMsg::SelectServer {
+                name: "nope".into(),
+            },
+        )
+        .await
+        .expect_err("an unknown server name must be refused");
         assert!(
             err.to_string().contains("no configured server"),
             "unexpected refusal: {err}"
@@ -2690,7 +2701,7 @@ async fn select_server_moves_session_and_persists() {
         // Selecting b through the admin command moves the session: the relay
         // through a is cut and traffic round-trips through b's public port
         // under b's secret.
-        zeronat::client_admin::select_server(Some(&sock), "b".into())
+        zeronat::client_admin::command(Some(&sock), ClientMsg::SelectServer { name: "b".into() })
             .await
             .expect("select server b");
         timeout(Duration::from_secs(15), async {
@@ -2996,16 +3007,18 @@ async fn add_and_remove_forward_move_live_traffic() {
 
         // add-forward through the admin helper: the new public port starts
         // serving real traffic, and the entry persists with its options.
-        zeronat::client_admin::add_forward(
+        zeronat::client_admin::command(
             Some(&sock),
-            Proto::Tcp,
-            zeronat::client::Forward {
-                port: public_b,
-                target: format!("127.0.0.1:{local_echo}"),
-                proxy: false,
-                idle: Some(Duration::from_secs(600)),
-                enabled: true,
-            },
+            zeronat::client_admin::add_forward(
+                Proto::Tcp,
+                zeronat::client::Forward {
+                    port: public_b,
+                    target: format!("127.0.0.1:{local_echo}"),
+                    proxy: false,
+                    idle: Some(Duration::from_secs(600)),
+                    enabled: true,
+                },
+            ),
         )
         .await
         .expect("add forward");
@@ -3031,9 +3044,12 @@ async fn add_and_remove_forward_move_live_traffic() {
 
         // remove-forward drops the port: the established relay is cut, fresh
         // probes get no echo, and the other tcp forward keeps serving.
-        zeronat::client_admin::remove_forward(Some(&sock), &format!("tcp:{public_b}"))
-            .await
-            .expect("remove forward");
+        zeronat::client_admin::command(
+            Some(&sock),
+            zeronat::client_admin::remove_forward(&format!("tcp:{public_b}")).unwrap(),
+        )
+        .await
+        .expect("remove forward");
         timeout(Duration::from_secs(15), wait_tcp_cut(&mut conn_b))
             .await
             .expect("remove did not cut the established relay");
@@ -3049,20 +3065,29 @@ async fn add_and_remove_forward_move_live_traffic() {
             .any(|f| f.proto == Proto::Tcp && f.port == public_b));
 
         // A second removal of the same key is a no-such-forward refusal.
-        let err = zeronat::client_admin::remove_forward(Some(&sock), &format!("tcp:{public_b}"))
-            .await
-            .expect_err("removing a removed forward must be refused");
+        let err = zeronat::client_admin::command(
+            Some(&sock),
+            zeronat::client_admin::remove_forward(&format!("tcp:{public_b}")).unwrap(),
+        )
+        .await
+        .expect_err("removing a removed forward must be refused");
         assert!(err.to_string().contains("no tcp forward"), "{err}");
 
         // Removing every remaining forward leaves the live body running as a
         // bare control session: the snapshot still answers, the mode stays
         // forwards, and the dial stays connected.
-        zeronat::client_admin::remove_forward(Some(&sock), &format!("tcp:{public_a}"))
-            .await
-            .expect("remove the tcp forward");
-        zeronat::client_admin::remove_forward(Some(&sock), &format!("udp:{public_udp}"))
-            .await
-            .expect("remove the udp forward");
+        zeronat::client_admin::command(
+            Some(&sock),
+            zeronat::client_admin::remove_forward(&format!("tcp:{public_a}")).unwrap(),
+        )
+        .await
+        .expect("remove the tcp forward");
+        zeronat::client_admin::command(
+            Some(&sock),
+            zeronat::client_admin::remove_forward(&format!("udp:{public_udp}")).unwrap(),
+        )
+        .await
+        .expect("remove the udp forward");
         wait_client_snapshot(&sock, |s| {
             s.forwards.is_empty()
                 && s.mode == SessionMode::Forwards
@@ -3125,16 +3150,18 @@ async fn add_first_forward_promotes_an_idle_client() {
 
         // The first add promotes the idle client to the forwards body and it
         // starts serving: real traffic round-trips through the new port.
-        zeronat::client_admin::add_forward(
+        zeronat::client_admin::command(
             Some(&sock),
-            Proto::Tcp,
-            zeronat::client::Forward {
-                port: public_tcp,
-                target: format!("127.0.0.1:{local_echo}"),
-                proxy: false,
-                idle: None,
-                enabled: true,
-            },
+            zeronat::client_admin::add_forward(
+                Proto::Tcp,
+                zeronat::client::Forward {
+                    port: public_tcp,
+                    target: format!("127.0.0.1:{local_echo}"),
+                    proxy: false,
+                    idle: None,
+                    enabled: true,
+                },
+            ),
         )
         .await
         .expect("add the first forward");
@@ -3199,9 +3226,12 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
         // Attaching a provider leaves the park: the body still has nothing to
         // run, while the control session under it is what every pairing goes
         // through.
-        zeronat::client_admin::attach_provider(Some(&sock), "exit", Some("wan0".into()))
-            .await
-            .expect("attach the exit provider");
+        zeronat::client_admin::command(
+            Some(&sock),
+            zeronat::client_admin::attach_provider("exit", Some("wan0".into())).unwrap(),
+        )
+        .await
+        .expect("attach the exit provider");
         let snap = wait_client_snapshot(&sock, |s| s.link == LinkStatus::Connected).await;
         assert_eq!(snap.mode, SessionMode::Idle);
         let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
@@ -3210,21 +3240,22 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
 
         // A consumer names the peer it exits through, which the file records
         // as the `[tun]` table feeding that slot.
-        zeronat::client_admin::attach_peer(Some(&sock), office.clone(), None, false, false)
-            .await
-            .expect("attach the exit consumer");
+        zeronat::client_admin::command(
+            Some(&sock),
+            zeronat::client_admin::attach_peer(office.clone(), None, false, false).unwrap(),
+        )
+        .await
+        .expect("attach the exit consumer");
         let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
         on_disk.validate().unwrap();
         assert!(on_disk.tun.is_some(), "the file gained the [tun] table");
 
         // A second consumer is refused, and the refusal reaches the caller as
         // an error naming the consumer this client already runs.
-        let err = zeronat::client_admin::attach_peer(
+        let err = zeronat::client_admin::command(
             Some(&sock),
-            peer_identity_hex("depot"),
-            None,
-            true,
-            false,
+            zeronat::client_admin::attach_peer(peer_identity_hex("depot"), None, true, false)
+                .unwrap(),
         )
         .await
         .expect_err("a second consumer must be refused");
@@ -3236,12 +3267,18 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
 
         // Detaching every slot takes the client back to the park, and the file
         // back to the servers it started with.
-        zeronat::client_admin::detach_peer(Some(&sock), office.clone())
-            .await
-            .expect("detach the consumer");
-        zeronat::client_admin::detach_provider(Some(&sock), "exit")
-            .await
-            .expect("detach the provider");
+        zeronat::client_admin::command(
+            Some(&sock),
+            zeronat::client_admin::detach_peer(office.clone()).unwrap(),
+        )
+        .await
+        .expect("detach the consumer");
+        zeronat::client_admin::command(
+            Some(&sock),
+            zeronat::client_admin::detach_provider("exit").unwrap(),
+        )
+        .await
+        .expect("detach the provider");
         wait_client_snapshot(&sock, |s| s.link == LinkStatus::Offline).await;
         let on_disk = zeronat::clientcfg::load(&path).expect("persisted config parses");
         on_disk.validate().unwrap();
@@ -3253,9 +3290,12 @@ async fn client_admin_attaches_and_detaches_peer_slots() {
         assert_eq!(peer.allow, [office]);
         assert_eq!(on_disk.servers.len(), 1);
 
-        let err = zeronat::client_admin::detach_provider(Some(&sock), "exit")
-            .await
-            .expect_err("detaching a detached slot must be refused");
+        let err = zeronat::client_admin::command(
+            Some(&sock),
+            zeronat::client_admin::detach_provider("exit").unwrap(),
+        )
+        .await
+        .expect_err("detaching a detached slot must be refused");
         assert!(
             err.to_string().contains("no attached exit provider"),
             "{err}"
@@ -3310,16 +3350,18 @@ async fn offline_add_forward_lands_after_connect() {
         wait_client_snapshot(&sock, |s| s.mode == SessionMode::Offline).await;
 
         // While offline, the add edits memory and file only: the park holds.
-        zeronat::client_admin::add_forward(
+        zeronat::client_admin::command(
             Some(&sock),
-            Proto::Tcp,
-            zeronat::client::Forward {
-                port: public_tcp,
-                target: format!("127.0.0.1:{local_echo}"),
-                proxy: false,
-                idle: None,
-                enabled: true,
-            },
+            zeronat::client_admin::add_forward(
+                Proto::Tcp,
+                zeronat::client::Forward {
+                    port: public_tcp,
+                    target: format!("127.0.0.1:{local_echo}"),
+                    proxy: false,
+                    idle: None,
+                    enabled: true,
+                },
+            ),
         )
         .await
         .expect("add a forward while offline");
@@ -3731,9 +3773,12 @@ async fn spawn_and_stop_pppoe_swap_the_session_body() {
         assert_eq!(snap.mode, SessionMode::Forwards);
         assert_eq!(snap.phase, PppPhase::None);
 
-        let err = zeronat::client_admin::spawn_pppoe(Some(&sock), "dsl".into())
-            .await
-            .expect_err("an unknown pppoe name must be refused");
+        let err = zeronat::client_admin::command(
+            Some(&sock),
+            ClientMsg::SpawnPppoe { name: "dsl".into() },
+        )
+        .await
+        .expect_err("an unknown pppoe name must be refused");
         assert!(
             err.to_string().contains("no configured pppoe session"),
             "unexpected refusal: {err}"
@@ -3741,7 +3786,7 @@ async fn spawn_and_stop_pppoe_swap_the_session_body() {
 
         // Spawn tears the forwards body down and brings the pppoe up; the
         // live datapath writes its phase into the status cell.
-        zeronat::client_admin::spawn_pppoe(Some(&sock), "wan".into())
+        zeronat::client_admin::command(Some(&sock), ClientMsg::SpawnPppoe { name: "wan".into() })
             .await
             .expect("spawn pppoe");
         let snap = wait_client_snapshot(&sock, |s| {
@@ -3777,14 +3822,17 @@ async fn spawn_and_stop_pppoe_swap_the_session_body() {
         // Stop with the wrong name is refused; the right name returns to the
         // boot-derived base mode and the forwards session (with the edited
         // options) comes back up.
-        let err = zeronat::client_admin::stop_pppoe(Some(&sock), "dsl".into())
-            .await
-            .expect_err("stopping a session that is not running must be refused");
+        let err = zeronat::client_admin::command(
+            Some(&sock),
+            ClientMsg::StopSession { name: "dsl".into() },
+        )
+        .await
+        .expect_err("stopping a session that is not running must be refused");
         assert!(
             err.to_string().contains("no active pppoe session"),
             "unexpected refusal: {err}"
         );
-        zeronat::client_admin::stop_pppoe(Some(&sock), "wan".into())
+        zeronat::client_admin::command(Some(&sock), ClientMsg::StopSession { name: "wan".into() })
             .await
             .expect("stop pppoe");
         wait_client_snapshot(&sock, |s| s.mode == SessionMode::Forwards).await;
@@ -3792,9 +3840,12 @@ async fn spawn_and_stop_pppoe_swap_the_session_body() {
 
         // With the forwards body running there is no pppoe to stop.
         assert!(
-            zeronat::client_admin::stop_pppoe(Some(&sock), "wan".into())
-                .await
-                .is_err(),
+            zeronat::client_admin::command(
+                Some(&sock),
+                ClientMsg::StopSession { name: "wan".into() },
+            )
+            .await
+            .is_err(),
             "stop must be refused when the body is not that pppoe"
         );
 

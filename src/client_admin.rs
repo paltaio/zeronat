@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::admin::{cat, num, pad};
 use crate::client::{Forward, Transport};
 use crate::clientproto::{
     ClientMsg, ClientPeerSlotEntry, ClientSnapshotBody, LinkStatus, PppPhase, ServerSecret,
@@ -48,31 +49,23 @@ fn default_socket(primary: &Path, runtime_dir: Option<&Path>) -> Result<PathBuf>
         }
     }
     let tried = match &fallback {
-        Some(path) => format!("{} or {}", primary.display(), path.display()),
-        None => format!("{} (XDG_RUNTIME_DIR is unset)", primary.display()),
+        Some(path) => cat(&[&primary.to_string_lossy(), " or ", &path.to_string_lossy()]),
+        None => cat(&[&primary.to_string_lossy(), " (XDG_RUNTIME_DIR is unset)"]),
     };
-    Err(format!("no admin socket at {tried}: the client is not running or has none").into())
-}
-
-/// Connect to the control socket at `path` and run the admin handshake.
-async fn handshake(path: &Path) -> Result<crate::noise::Noise> {
-    let stream = tokio::net::UnixStream::connect(path)
-        .await
-        .map_err(|e| -> crate::Error {
-            format!("connecting to admin socket {}: {e}", path.display()).into()
-        })?;
-    crate::noise::client_handshake(stream, &crate::clientctl::admin_psk()).await
+    Err(cat(&[
+        "no admin socket at ",
+        &tried,
+        ": the client is not running or has none",
+    ])
+    .into())
 }
 
 /// Request one snapshot and return it. A complete connect/handshake/exchange,
 /// so callers hold no long-lived state.
 pub async fn snapshot(path: &Path) -> Result<ClientSnapshotBody> {
-    let (mut r, mut w) = handshake(path).await?;
-    w.send(&hello(0)).await?;
-    let frame = r.recv().await?;
-    match ClientMsg::decode(&frame)? {
+    match exchange(path, 0, None).await? {
         ClientMsg::ClientSnapshot(snap) => Ok(snap),
-        other => Err(format!("expected client snapshot, got {other:?}").into()),
+        other => Err(errf!("expected client snapshot, got {other:?}")),
     }
 }
 
@@ -81,80 +74,80 @@ pub async fn snapshot(path: &Path) -> Result<ClientSnapshotBody> {
 /// errors propagate as `Err`; a refused mutation comes back as
 /// `Ok((false, reason))`.
 pub async fn mutate(path: &Path, req: ClientMsg) -> Result<(bool, String)> {
-    let (mut r, mut w) = handshake(path).await?;
-    w.send(&hello(1)).await?;
-    w.send(&req.encode()).await?;
-    let frame = r.recv().await?;
-    match ClientMsg::decode(&frame)? {
+    match exchange(path, 1, Some(req)).await? {
         ClientMsg::MutationResult { ok, msg } => Ok((ok, msg)),
-        other => Err(format!("expected mutation result, got {other:?}").into()),
+        other => Err(errf!("expected mutation result, got {other:?}")),
     }
 }
 
-fn hello(mode: u8) -> Vec<u8> {
-    ClientMsg::ClientAdminHello {
-        version: crate::identity::PROTO_VERSION,
-        mode,
+/// One admin round trip over the control socket at `path`: connect,
+/// handshake, hello in `mode`, the request if any, and the client's one reply.
+async fn exchange(path: &Path, mode: u8, req: Option<ClientMsg>) -> Result<ClientMsg> {
+    let stream = tokio::net::UnixStream::connect(path)
+        .await
+        .map_err(|e| -> crate::Error {
+            errf!("connecting to admin socket {}: {e}", path.display())
+        })?;
+    let (mut r, mut w) =
+        crate::noise::client_handshake(stream, &crate::clientctl::admin_psk()).await?;
+    w.send(
+        &ClientMsg::ClientAdminHello {
+            version: crate::identity::PROTO_VERSION,
+            mode,
+        }
+        .encode(),
+    )
+    .await?;
+    if let Some(req) = req {
+        w.send(&req.encode()).await?;
     }
-    .encode()
+    let frame = r.recv().await?;
+    ClientMsg::decode(&frame)
 }
 
 /// Fetch the running client's snapshot, render it, and exit.
-pub async fn show(socket: Option<&Path>) -> Result<()> {
+#[inline(never)]
+pub fn show(socket: Option<&Path>) -> Reply<'_> {
+    Box::pin(print_snapshot(socket))
+}
+
+/// A CLI command's reply future, boxed: the caller holds one pointer instead
+/// of the exchange's whole state.
+type Reply<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+async fn print_snapshot(socket: Option<&Path>) -> Result<()> {
     let path = resolve_socket(socket)?;
     let snap = snapshot(&path).await?;
     print!("{}", render(&snap));
     Ok(())
 }
 
-/// `select-server NAME`: switch the active server profile.
-pub async fn select_server(socket: Option<&Path>, name: String) -> Result<()> {
-    command(socket, ClientMsg::SelectServer { name }).await
-}
-
-/// `spawn-pppoe NAME`: bring up the named PPPoE session.
-pub async fn spawn_pppoe(socket: Option<&Path>, name: String) -> Result<()> {
-    command(socket, ClientMsg::SpawnPppoe { name }).await
-}
-
-/// `stop-pppoe NAME`: stop the named PPPoE session and fall back to
-/// the client's base mode.
-pub async fn stop_pppoe(socket: Option<&Path>, name: String) -> Result<()> {
-    command(socket, ClientMsg::StopSession { name }).await
-}
-
-/// `add-server NAME ADDR [--transport MODE]`: append a server profile. The
+/// `add-server NAME ADDR [--transport MODE]`: the profile to append. The
 /// secret comes from stdin, never from argv, which leaks through the process
 /// list.
-pub async fn add_server(
-    socket: Option<&Path>,
-    name: String,
-    addr: String,
-    transport: Transport,
-) -> Result<()> {
+pub fn add_server(name: String, addr: String, transport: Transport) -> Result<ClientMsg> {
     let secret = ServerSecret(crate::secret::normalize(&read_secret()?)?);
-    command(
-        socket,
-        ClientMsg::AddServer {
-            name,
-            addr,
-            secret,
-            transport,
-        },
-    )
-    .await
-}
-
-/// `remove-server NAME`: remove a server profile. The active profile is
-/// refused; select another or disconnect first.
-pub async fn remove_server(socket: Option<&Path>, name: String) -> Result<()> {
-    command(socket, ClientMsg::RemoveServer { name }).await
+    Ok(ClientMsg::AddServer {
+        name,
+        addr,
+        secret,
+        transport,
+    })
 }
 
 /// `enable-forward PROTO:PORT` / `disable-forward PROTO:PORT`: flip one
 /// forward's `enabled` flag. `SetForwardOptions` is full-state, so a snapshot
 /// supplies the forward's current `proxy`/`idle` and only the flag changes.
-pub async fn set_forward_enabled(socket: Option<&Path>, spec: &str, enabled: bool) -> Result<()> {
+#[inline(never)]
+pub fn set_forward_enabled<'a>(
+    socket: Option<&'a Path>,
+    spec: &'a str,
+    enabled: bool,
+) -> Reply<'a> {
+    Box::pin(send_forward_enabled(socket, spec, enabled))
+}
+
+async fn send_forward_enabled(socket: Option<&Path>, spec: &str, enabled: bool) -> Result<()> {
     let (proto, port) = parse_proto_port(spec)?;
     let path = resolve_socket(socket)?;
     let snap = snapshot(&path).await?;
@@ -163,7 +156,13 @@ pub async fn set_forward_enabled(socket: Option<&Path>, spec: &str, enabled: boo
         .iter()
         .find(|f| f.proto == proto && f.port == port)
         .ok_or_else(|| -> crate::Error {
-            format!("no {} forward on port {port}", proto_name(proto)).into()
+            cat(&[
+                "no ",
+                proto_name(proto),
+                " forward on port ",
+                &num(port as u64),
+            ])
+            .into()
         })?;
     let req = ClientMsg::SetForwardOptions {
         proto,
@@ -181,88 +180,67 @@ pub async fn set_forward_enabled(socket: Option<&Path>, spec: &str, enabled: boo
     }
 }
 
-/// `add-forward PROTO:SPEC`: append one forward. The caller parses the spec
-/// (the `--tcp`/`--udp` grammar) into a forward with a resolved target, so
-/// the daemon never sees an empty one.
-pub async fn add_forward(socket: Option<&Path>, proto: Proto, fwd: Forward) -> Result<()> {
-    command(
-        socket,
-        ClientMsg::AddForward {
-            proto,
-            port: fwd.port,
-            target: fwd.target,
-            proxy: fwd.proxy,
-            idle_secs: fwd.idle.map(|d| d.as_secs() as u32).unwrap_or(0),
-            enabled: fwd.enabled,
-        },
-    )
-    .await
+/// `add-forward PROTO:SPEC`: the forward to append. The caller parses the
+/// spec (the `--tcp`/`--udp` grammar) into a forward with a resolved target,
+/// so the daemon never sees an empty one.
+pub fn add_forward(proto: Proto, fwd: Forward) -> ClientMsg {
+    ClientMsg::AddForward {
+        proto,
+        port: fwd.port,
+        target: fwd.target,
+        proxy: fwd.proxy,
+        idle_secs: fwd.idle.map(|d| d.as_secs() as u32).unwrap_or(0),
+        enabled: fwd.enabled,
+    }
 }
 
-/// `remove-forward PROTO:PORT`: remove one forward. Removing a live
+/// `remove-forward PROTO:PORT`: the forward to remove. Removing a live
 /// forward's port drops its open connections on the redial.
-pub async fn remove_forward(socket: Option<&Path>, spec: &str) -> Result<()> {
+pub fn remove_forward(spec: &str) -> Result<ClientMsg> {
     let (proto, port) = parse_proto_port(spec)?;
-    command(socket, ClientMsg::RemoveForward { proto, port }).await
+    Ok(ClientMsg::RemoveForward { proto, port })
 }
 
-/// `attach-peer PEER-ID [--dev NAME] [--exit] [--exit-strict]`: add a consumer
+/// `attach-peer PEER-ID [--dev NAME] [--exit] [--exit-strict]`: a consumer
 /// slot that exits through `PEER-ID`. `--exit` routes the host's IPv4 traffic
 /// through the pair; without it the device comes up for routes the operator
 /// installs.
-pub async fn attach_peer(
-    socket: Option<&Path>,
+pub fn attach_peer(
     peer_id: String,
     dev: Option<String>,
     exit: bool,
     exit_strict: bool,
-) -> Result<()> {
-    command(
-        socket,
-        ClientMsg::AttachPeer {
-            peer_id: consumer_peer("attach-peer", peer_id)?,
-            want: PROVIDES_EXIT,
-            dev: dev.unwrap_or_default(),
-            exit,
-            exit_strict,
-            iface: String::new(),
-        },
-    )
-    .await
+) -> Result<ClientMsg> {
+    Ok(ClientMsg::AttachPeer {
+        peer_id: consumer_peer("attach-peer", peer_id)?,
+        want: PROVIDES_EXIT,
+        dev: dev.unwrap_or_default(),
+        exit,
+        exit_strict,
+        iface: String::new(),
+    })
 }
 
-/// `attach-provider exit|segment [NAME]`: add a provider slot. NAME is the
+/// `attach-provider exit|segment [NAME]`: a provider slot. NAME is the
 /// interface an exit provider masquerades out of (the default-route interface
 /// when omitted) and the bridge a segment provider joins, which is required.
-pub async fn attach_provider(
-    socket: Option<&Path>,
-    capability: &str,
-    iface: Option<String>,
-) -> Result<()> {
-    command(
-        socket,
-        ClientMsg::AttachPeer {
-            peer_id: String::new(),
-            want: parse_capability(capability)?,
-            dev: String::new(),
-            exit: false,
-            exit_strict: false,
-            iface: iface.unwrap_or_default(),
-        },
-    )
-    .await
+pub fn attach_provider(capability: &str, iface: Option<String>) -> Result<ClientMsg> {
+    Ok(ClientMsg::AttachPeer {
+        peer_id: String::new(),
+        want: parse_capability(capability)?,
+        dev: String::new(),
+        exit: false,
+        exit_strict: false,
+        iface: iface.unwrap_or_default(),
+    })
 }
 
 /// `detach-peer PEER-ID`: remove the consumer slot exiting through `PEER-ID`.
-pub async fn detach_peer(socket: Option<&Path>, peer_id: String) -> Result<()> {
-    command(
-        socket,
-        ClientMsg::DetachPeer {
-            peer_id: consumer_peer("detach-peer", peer_id)?,
-            want: PROVIDES_EXIT,
-        },
-    )
-    .await
+pub fn detach_peer(peer_id: String) -> Result<ClientMsg> {
+    Ok(ClientMsg::DetachPeer {
+        peer_id: consumer_peer("detach-peer", peer_id)?,
+        want: PROVIDES_EXIT,
+    })
 }
 
 /// The peer a consumer command names. An empty id is the provider slot on the
@@ -270,22 +248,18 @@ pub async fn detach_peer(socket: Option<&Path>, peer_id: String) -> Result<()> {
 /// here rather than sent.
 fn consumer_peer(command: &str, peer_id: String) -> Result<String> {
     if peer_id.is_empty() {
-        return Err(format!("{command} must name a peer").into());
+        return Err(cat(&[command, " must name a peer"]).into());
     }
     Ok(peer_id)
 }
 
 /// `detach-provider exit|segment`: remove the provider slot for one
 /// capability. The pairs it serves go down with it.
-pub async fn detach_provider(socket: Option<&Path>, capability: &str) -> Result<()> {
-    command(
-        socket,
-        ClientMsg::DetachPeer {
-            peer_id: String::new(),
-            want: parse_capability(capability)?,
-        },
-    )
-    .await
+pub fn detach_provider(capability: &str) -> Result<ClientMsg> {
+    Ok(ClientMsg::DetachPeer {
+        peer_id: String::new(),
+        want: parse_capability(capability)?,
+    })
 }
 
 /// The capability a provider command names.
@@ -293,7 +267,7 @@ fn parse_capability(capability: &str) -> Result<u8> {
     match capability {
         "exit" => Ok(PROVIDES_EXIT),
         "segment" => Ok(PROVIDES_SEGMENT),
-        other => Err(format!("capability must be exit or segment, got `{other}`").into()),
+        other => Err(cat(&["capability must be exit or segment, got `", other, "`"]).into()),
     }
 }
 
@@ -301,7 +275,12 @@ fn parse_capability(capability: &str) -> Result<u8> {
 /// session body, retargeting first when named. Reports the mode a follow-up
 /// snapshot shows, so a connect on an idle-boot client truthfully answers
 /// `idle`.
-pub async fn connect(socket: Option<&Path>, name: Option<String>) -> Result<()> {
+#[inline(never)]
+pub fn connect(socket: Option<&Path>, name: Option<String>) -> Reply<'_> {
+    Box::pin(send_connect(socket, name))
+}
+
+async fn send_connect(socket: Option<&Path>, name: Option<String>) -> Result<()> {
     let path = resolve_socket(socket)?;
     let req = ClientMsg::Connect {
         name: name.unwrap_or_default(),
@@ -315,16 +294,15 @@ pub async fn connect(socket: Option<&Path>, name: Option<String>) -> Result<()> 
     Ok(())
 }
 
-/// `disconnect`: tear the session body down and park offline; nothing is
-/// dialed until `connect`.
-pub async fn disconnect(socket: Option<&Path>) -> Result<()> {
-    command(socket, ClientMsg::Disconnect).await
-}
-
 /// Send one mutation and report the verdict: what the client has to say about
 /// the change it accepted, else `ok`; its refusal message as the error
 /// otherwise.
-async fn command(socket: Option<&Path>, req: ClientMsg) -> Result<()> {
+#[inline(never)]
+pub fn command(socket: Option<&Path>, req: ClientMsg) -> Reply<'_> {
+    Box::pin(send_command(socket, req))
+}
+
+async fn send_command(socket: Option<&Path>, req: ClientMsg) -> Result<()> {
     let path = resolve_socket(socket)?;
     let (ok, msg) = mutate(&path, req).await?;
     if !ok {
@@ -342,17 +320,17 @@ async fn command(socket: Option<&Path>, req: ClientMsg) -> Result<()> {
 fn parse_proto_port(spec: &str) -> Result<(Proto, u16)> {
     let (proto, port) = spec
         .split_once(':')
-        .ok_or_else(|| -> crate::Error { format!("expected PROTO:PORT, got `{spec}`").into() })?;
+        .ok_or_else(|| -> crate::Error { errf!("expected PROTO:PORT, got `{spec}`") })?;
     let proto = match proto {
         "tcp" => Proto::Tcp,
         "udp" => Proto::Udp,
-        other => return Err(format!("proto must be tcp or udp, got `{other}`").into()),
+        other => return Err(cat(&["proto must be tcp or udp, got `", other, "`"]).into()),
     };
     let port: u16 = port
         .parse()
         .ok()
         .filter(|p| *p != 0)
-        .ok_or_else(|| -> crate::Error { format!("invalid port `{port}`").into() })?;
+        .ok_or_else(|| -> crate::Error { errf!("invalid port `{port}`") })?;
     Ok((proto, port))
 }
 
@@ -370,9 +348,7 @@ fn read_secret() -> Result<String> {
         std::io::stdin()
             .lock()
             .read_line(&mut line)
-            .map_err(|e| -> crate::Error {
-                format!("reading the secret from stdin: {e}").into()
-            })?;
+            .map_err(|e| -> crate::Error { errf!("reading the secret from stdin: {e}") })?;
     }
     if tty {
         eprintln!();
@@ -453,15 +429,16 @@ fn link_name(link: LinkStatus) -> &'static str {
 
 /// Render a client snapshot to a human-readable report. The PPP phase appears
 /// only under a pppoe body, where it means something.
+#[inline(never)]
 pub fn render(snap: &ClientSnapshotBody) -> String {
     let mut out = String::new();
 
     out.push_str("Client\n");
-    out.push_str(&format!("  active  {}\n", snap.active));
-    out.push_str(&format!("  mode    {}\n", mode_name(snap.mode)));
-    out.push_str(&format!("  link    {}\n", link_name(snap.link)));
+    out.push_str(&cat(&["  active  ", &snap.active, "\n"]));
+    out.push_str(&cat(&["  mode    ", mode_name(snap.mode), "\n"]));
+    out.push_str(&cat(&["  link    ", link_name(snap.link), "\n"]));
     if snap.mode == SessionMode::Pppoe {
-        out.push_str(&format!("  phase   {}\n", phase_name(snap.phase)));
+        out.push_str(&cat(&["  phase   ", phase_name(snap.phase), "\n"]));
     }
 
     out.push_str("\nForwards\n");
@@ -469,14 +446,18 @@ pub fn render(snap: &ClientSnapshotBody) -> String {
         out.push_str("  (no forwards)\n");
     } else {
         for f in &snap.forwards {
-            out.push_str(&format!(
-                "  {}:{} -> {}  {}{}\n",
+            out.push_str(&cat(&[
+                "  ",
                 proto_name(f.proto),
-                f.port,
-                f.target,
-                crate::admin::fwd_opts(f.proxy, f.idle_secs),
+                ":",
+                &num(f.port as u64),
+                " -> ",
+                &f.target,
+                "  ",
+                &crate::admin::fwd_opts(f.proxy, f.idle_secs),
                 if f.enabled { "" } else { "  off" },
-            ));
+                "\n",
+            ]));
         }
     }
 
@@ -485,20 +466,26 @@ pub fn render(snap: &ClientSnapshotBody) -> String {
         out.push_str("  (no peer slots)\n");
     } else {
         for slot in &snap.peers {
-            out.push_str(&format!(
-                "  {:<28}  {:<12}  {}{}\n",
-                slot_name(slot),
-                if slot.iface.is_empty() {
-                    "-"
-                } else {
-                    &slot.iface
-                },
+            out.push_str(&cat(&[
+                "  ",
+                &pad(&slot_name(slot), 28),
+                "  ",
+                &pad(
+                    if slot.iface.is_empty() {
+                        "-"
+                    } else {
+                        &slot.iface
+                    },
+                    12,
+                ),
+                "  ",
                 link_name(slot.link),
-                match slot.path {
-                    Some(path) => format!("  {}", crate::proto::path_name(path)),
+                &match slot.path {
+                    Some(path) => cat(&["  ", crate::proto::path_name(path)]),
                     None => String::new(),
                 },
-            ));
+                "\n",
+            ]));
         }
     }
 
@@ -510,8 +497,8 @@ pub fn render(snap: &ClientSnapshotBody) -> String {
 fn slot_name(slot: &ClientPeerSlotEntry) -> String {
     let capability = provides_name(slot.want);
     match slot.peer() {
-        Some(peer) => format!("{capability} via {}", crate::admin::strip_ctrl(peer)),
-        None => format!("{capability} provider"),
+        Some(peer) => cat(&[capability, " via ", &crate::admin::strip_ctrl(peer)]),
+        None => cat(&[capability, " provider"]),
     }
 }
 

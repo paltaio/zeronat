@@ -8,6 +8,7 @@ use tokio::net::TcpStream;
 const ENV_FILE: &str = "/etc/zeronat/.env";
 
 /// Best-effort read of the installer env file's administrative secret.
+#[inline(never)]
 pub fn admin_secret_from_env_file() -> Option<String> {
     parse_env_admin_secret(&std::fs::read_to_string(ENV_FILE).ok()?)
 }
@@ -34,7 +35,15 @@ fn env_value(body: &str, key: &str) -> Option<String> {
 
 /// Connect to a server's control port, request one snapshot, render it, and exit.
 /// Read-only: the admin path never registers as a client or evicts a live one.
-pub async fn show(server: String, secret: String) -> Result<()> {
+#[inline(never)]
+pub fn show(
+    server: String,
+    secret: String,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+    Box::pin(print_snapshot(server, secret))
+}
+
+async fn print_snapshot(server: String, secret: String) -> Result<()> {
     let secret = crate::secret::normalize(&secret)?;
     let psk = crate::noise::derive_psk(&secret);
     let snap = fetch_snapshot(&server, &psk).await?;
@@ -45,22 +54,9 @@ pub async fn show(server: String, secret: String) -> Result<()> {
 /// Open a fresh admin connection, request one snapshot, and return it. Each call
 /// is a complete connect/handshake/exchange so callers hold no long-lived state.
 pub async fn fetch_snapshot(server: &str, psk: &[u8; 32]) -> Result<SnapshotBody> {
-    let sock = TcpStream::connect(server).await?;
-    sock.set_nodelay(true).ok();
-    let (mut r, mut w) =
-        crate::noise::client_handshake_remote(sock, psk, crate::noise::AuthRole::Admin).await?;
-    w.send(
-        &Msg::AdminHello {
-            version: crate::identity::PROTO_VERSION,
-            mode: 0,
-        }
-        .encode(),
-    )
-    .await?;
-    let body = r.recv().await?;
-    match Msg::decode(&body)? {
+    match exchange(server, psk, 0, None).await? {
         Msg::Snapshot(snap) => Ok(snap),
-        other => Err(format!("expected snapshot, got {other:?}").into()),
+        other => Err(errf!("expected snapshot, got {other:?}")),
     }
 }
 
@@ -68,6 +64,15 @@ pub async fn fetch_snapshot(server: &str, psk: &[u8; 32]) -> Result<SnapshotBody
 /// return the server's `(ok, message)` verdict. Transport errors propagate as
 /// `Err`; an applied-but-rejected mutation comes back as `Ok((false, reason))`.
 pub async fn mutate(server: &str, psk: &[u8; 32], req: Msg) -> Result<(bool, String)> {
+    match exchange(server, psk, 1, Some(req)).await? {
+        Msg::MutationResult { ok, msg } => Ok((ok, msg)),
+        other => Err(errf!("expected mutation result, got {other:?}")),
+    }
+}
+
+/// One admin round trip: connect, handshake, hello in `mode`, the request if
+/// any, and the server's one reply.
+async fn exchange(server: &str, psk: &[u8; 32], mode: u8, req: Option<Msg>) -> Result<Msg> {
     let sock = TcpStream::connect(server).await?;
     sock.set_nodelay(true).ok();
     let (mut r, mut w) =
@@ -75,17 +80,16 @@ pub async fn mutate(server: &str, psk: &[u8; 32], req: Msg) -> Result<(bool, Str
     w.send(
         &Msg::AdminHello {
             version: crate::identity::PROTO_VERSION,
-            mode: 1,
+            mode,
         }
         .encode(),
     )
     .await?;
-    w.send(&req.encode()).await?;
-    let body = r.recv().await?;
-    match Msg::decode(&body)? {
-        Msg::MutationResult { ok, msg } => Ok((ok, msg)),
-        other => Err(format!("expected mutation result, got {other:?}").into()),
+    if let Some(req) = req {
+        w.send(&req.encode()).await?;
     }
+    let body = r.recv().await?;
+    Msg::decode(&body)
 }
 
 fn route_state(state: u8) -> &'static str {
@@ -104,40 +108,54 @@ fn source_name(source: Source) -> &'static str {
 }
 
 /// Render a snapshot to a human-readable report. Pure (no IO) so it is testable.
+#[inline(never)]
 fn render(snap: &SnapshotBody, addr: &str) -> String {
     let mut out = String::new();
 
     out.push_str("Servers\n");
-    out.push_str(&format!(
-        "  {:<8}  connected  {}  clients {}  bridge {}  routes {}  pairs {}\n",
-        snap.server_id,
+    out.push_str(&cat(&[
+        "  ",
+        &pad(&snap.server_id, 8),
+        "  connected  ",
         addr,
-        snap.clients.len(),
-        snap.bridge_clients.len(),
-        snap.routes.len(),
-        snap.pairs.len()
-    ));
+        "  clients ",
+        &num(snap.clients.len() as u64),
+        "  bridge ",
+        &num(snap.bridge_clients.len() as u64),
+        "  routes ",
+        &num(snap.routes.len() as u64),
+        "  pairs ",
+        &num(snap.pairs.len() as u64),
+        "\n",
+    ]));
 
     out.push_str("\nRoutes\n");
     if snap.routes.is_empty() {
         out.push_str("  (no routes)\n");
     } else {
-        out.push_str(&format!(
-            "  {:<8}  {:<15}  {:<5}  {:<5}  {:<16}  {:<14}  {:<16}  {}\n",
-            "SERVER", "BIND IP", "PROTO", "PORT", "TARGET", "STATE", "OPTIONS", "SOURCE"
-        ));
+        const W: [usize; 8] = [8, 15, 5, 5, 16, 14, 16, 0];
+        cols(
+            &mut out,
+            &W,
+            &[
+                "SERVER", "BIND IP", "PROTO", "PORT", "TARGET", "STATE", "OPTIONS", "SOURCE",
+            ],
+        );
         for route in &snap.routes {
-            out.push_str(&format!(
-                "  {:<8}  {:<15}  {:<5}  {:<5}  {:<16}  {:<14}  {:<16}  {}\n",
-                snap.server_id,
-                route.bind_ip,
-                proto_name(route.proto),
-                route.port,
-                route.client_id,
-                route_state(route.state),
-                route_opts(snap, route),
-                source_name(route.source),
-            ));
+            cols(
+                &mut out,
+                &W,
+                &[
+                    &snap.server_id,
+                    &route.bind_ip.to_string(),
+                    proto_name(route.proto),
+                    &num(route.port as u64),
+                    &route.client_id,
+                    route_state(route.state),
+                    &route_opts(snap, route),
+                    source_name(route.source),
+                ],
+            );
         }
     }
 
@@ -146,17 +164,23 @@ fn render(snap: &SnapshotBody, addr: &str) -> String {
         out.push_str("  (no clients connected)\n");
     } else {
         for c in &snap.clients {
-            out.push_str(&format!(
-                "  {}  connected to {}\n",
-                c.client_id, snap.server_id
-            ));
+            out.push_str(&cat(&[
+                "  ",
+                &c.client_id,
+                "  connected to ",
+                &snap.server_id,
+                "\n",
+            ]));
             for e in &c.fwd {
-                out.push_str(&format!(
-                    "    {}:{}  {}\n",
+                out.push_str(&cat(&[
+                    "    ",
                     proto_name(e.proto),
-                    e.port,
-                    fwd_opts(e.proxy, e.idle_secs),
-                ));
+                    ":",
+                    &num(e.port as u64),
+                    "  ",
+                    &fwd_opts(e.proxy, e.idle_secs),
+                    "\n",
+                ]));
             }
         }
     }
@@ -165,34 +189,39 @@ fn render(snap: &SnapshotBody, addr: &str) -> String {
     if snap.bridge_clients.is_empty() {
         out.push_str("  (no bridge clients)\n");
     } else {
-        out.push_str(&format!(
-            "  {:<20}  {:<5}  {:<21}  {:<4}  {:<18}  {:<18}  {:<8}  {}\n",
-            "NAME", "TRANS", "PEER", "MACS", "RX", "TX", "UPTIME", "IDLE"
-        ));
+        const W: [usize; 8] = [20, 5, 21, 4, 18, 18, 8, 0];
+        cols(
+            &mut out,
+            &W,
+            &[
+                "NAME", "TRANS", "PEER", "MACS", "RX", "TX", "UPTIME", "IDLE",
+            ],
+        );
         for e in &snap.bridge_clients {
             let label = if e.named {
                 strip_ctrl(&e.label)
             } else {
-                format!("{} (anon)", strip_ctrl(&e.label))
+                cat(&[&strip_ctrl(&e.label), " (anon)"])
             };
             let peer = if e.peer.is_empty() {
                 "-".to_string()
             } else {
                 strip_ctrl(&e.peer)
             };
-            let rx = format!("{} / {}", human_bytes(e.rx_bytes), human_count(e.rx_frames));
-            let tx = format!("{} / {}", human_bytes(e.tx_bytes), human_count(e.tx_frames));
-            out.push_str(&format!(
-                "  {:<20}  {:<5}  {:<21}  {:<4}  {:<18}  {:<18}  {:<8}  {}\n",
-                label,
-                transport_name(e.transport),
-                peer,
-                e.macs.len(),
-                rx,
-                tx,
-                fmt_dur(e.uptime_secs),
-                fmt_dur(e.idle_secs),
-            ));
+            cols(
+                &mut out,
+                &W,
+                &[
+                    &label,
+                    transport_name(e.transport),
+                    &peer,
+                    &num(e.macs.len() as u64),
+                    &traffic(e.rx_bytes, e.rx_frames),
+                    &traffic(e.tx_bytes, e.tx_frames),
+                    &fmt_dur(e.uptime_secs),
+                    &fmt_dur(e.idle_secs),
+                ],
+            );
         }
     }
 
@@ -200,18 +229,19 @@ fn render(snap: &SnapshotBody, addr: &str) -> String {
     if snap.pairs.is_empty() {
         out.push_str("  (no pairs)\n");
     } else {
-        out.push_str(&format!(
-            "  {:<20}  {:<20}  {:<8}  {}\n",
-            "CONSUMER", "PROVIDER", "CAP", "PATH"
-        ));
+        const W: [usize; 4] = [20, 20, 8, 0];
+        cols(&mut out, &W, &["CONSUMER", "PROVIDER", "CAP", "PATH"]);
         for p in &snap.pairs {
-            out.push_str(&format!(
-                "  {:<20}  {:<20}  {:<8}  {}\n",
-                strip_ctrl(&p.consumer_id),
-                strip_ctrl(&p.provider_id),
-                provides_name(p.want),
-                p.path.map_or("pairing", path_name),
-            ));
+            cols(
+                &mut out,
+                &W,
+                &[
+                    &strip_ctrl(&p.consumer_id),
+                    &strip_ctrl(&p.provider_id),
+                    provides_name(p.want),
+                    p.path.map_or("pairing", path_name),
+                ],
+            );
         }
     }
 
@@ -219,22 +249,62 @@ fn render(snap: &SnapshotBody, addr: &str) -> String {
     if snap.listeners.is_empty() {
         out.push_str("  (none)\n");
     } else {
-        out.push_str(&format!(
-            "  {:<5}  {:<15}  {:<5}  {}\n",
-            "PROTO", "BIND IP", "PORT", "SOURCE"
-        ));
+        const W: [usize; 4] = [5, 15, 5, 0];
+        cols(&mut out, &W, &["PROTO", "BIND IP", "PORT", "SOURCE"]);
         for l in &snap.listeners {
-            out.push_str(&format!(
-                "  {:<5}  {:<15}  {:<5}  {}\n",
-                proto_name(l.proto),
-                l.bind_ip,
-                l.port,
-                source_name(l.source),
-            ));
+            cols(
+                &mut out,
+                &W,
+                &[
+                    proto_name(l.proto),
+                    &l.bind_ip.to_string(),
+                    &num(l.port as u64),
+                    source_name(l.source),
+                ],
+            );
         }
     }
 
     out
+}
+
+/// One table row: two leading spaces, each cell padded to its column width
+/// (0 leaves it as is), cells two spaces apart, a newline.
+fn cols(out: &mut String, widths: &[usize], cells: &[&str]) {
+    for (cell, w) in cells.iter().zip(widths) {
+        out.push_str("  ");
+        out.push_str(&pad(cell, *w));
+    }
+    out.push('\n');
+}
+
+/// Bytes and frames as one `BYTES / FRAMES` cell.
+fn traffic(bytes: u64, frames: u64) -> String {
+    cat(&[&human_bytes(bytes), " / ", &human_count(frames)])
+}
+
+/// The parts joined into one string.
+pub(crate) fn cat(parts: &[&str]) -> String {
+    let mut s = String::new();
+    for p in parts {
+        s.push_str(p);
+    }
+    s
+}
+
+pub(crate) fn num(n: u64) -> String {
+    n.to_string()
+}
+
+/// `text` padded with trailing spaces to `width` columns; longer text is
+/// returned whole.
+pub(crate) fn pad(text: &str, width: usize) -> String {
+    let mut s = String::from(text);
+    let n = text.chars().count();
+    if n < width {
+        s.push_str(&" ".repeat(width - n));
+    }
+    s
 }
 
 /// Transport label for a `BridgeEntry.transport` byte (1 = tcp, 2 = udp).
@@ -256,7 +326,7 @@ pub(crate) fn strip_ctrl(s: &str) -> String {
 pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     if n < 1024 {
-        return format!("{n} B");
+        return cat(&[&num(n), " B"]);
     }
     let mut v = n as f64;
     let mut unit = 0;
@@ -264,14 +334,14 @@ pub(crate) fn human_bytes(n: u64) -> String {
         v /= 1024.0;
         unit += 1;
     }
-    format!("{v:.1} {}", UNITS[unit])
+    cat(&[&one_decimal(v), " ", UNITS[unit]])
 }
 
 /// Compact 1000-based frame count for the fleet view, e.g. "900", "1.2k", "24.0k".
 pub(crate) fn human_count(n: u64) -> String {
     const UNITS: [&str; 4] = ["", "k", "M", "B"];
     if n < 1000 {
-        return format!("{n}");
+        return num(n);
     }
     let mut v = n as f64;
     let mut unit = 0;
@@ -279,7 +349,31 @@ pub(crate) fn human_count(n: u64) -> String {
         v /= 1000.0;
         unit += 1;
     }
-    format!("{v:.1}{}", UNITS[unit])
+    cat(&[&one_decimal(v), UNITS[unit]])
+}
+
+/// `v` to one decimal place, correctly rounded with ties to even, for
+/// `1.0 <= v < 2^63`.
+fn one_decimal(v: f64) -> String {
+    let bits = v.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i32;
+    let mant = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
+    // v = mant * 2^(exp - 1075); ten times that, rounded to an integer.
+    let tenths = match exp - 1075 {
+        e if e >= 0 => (mant << e) * 10,
+        e => {
+            let shift = (-e) as u32;
+            let x = mant * 10;
+            let mut q = x >> shift;
+            let rem = x & ((1u64 << shift) - 1);
+            let half = 1u64 << (shift - 1);
+            if rem > half || (rem == half && q & 1 == 1) {
+                q += 1;
+            }
+            q
+        }
+    };
+    cat(&[&num(tenths / 10), ".", &num(tenths % 10)])
 }
 
 /// The announced options for a route's forward, joined from the routed
@@ -306,7 +400,8 @@ pub(crate) fn fwd_opts(proxy: bool, idle_secs: u32) -> String {
         s.push_str("+proxy");
     }
     if idle_secs > 0 {
-        s.push_str(&format!("+idle={idle_secs}"));
+        s.push_str("+idle=");
+        s.push_str(&num(idle_secs as u64));
     }
     if s.is_empty() {
         s.push('-');
@@ -524,6 +619,52 @@ mod tests {
         ] {
             assert!(s.contains(row), "{s}");
         }
+    }
+
+    #[test]
+    fn one_decimal_matches_fixed_formatting() {
+        for v in [
+            1.0, 1.25, 1.35, 2.5, 9.95, 9.96, 999.95, 1023.99, 1.05, 3.94159,
+        ] {
+            assert_eq!(one_decimal(v), format!("{v:.1}"), "{v}");
+        }
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let n = x >> (x % 40);
+            assert_eq!(human_bytes(n), reference_bytes(n), "{n}");
+            assert_eq!(human_count(n), reference_count(n), "{n}");
+        }
+    }
+
+    fn reference_bytes(n: u64) -> String {
+        const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+        if n < 1024 {
+            return format!("{n} B");
+        }
+        let mut v = n as f64;
+        let mut unit = 0;
+        while v >= 1024.0 && unit < UNITS.len() - 1 {
+            v /= 1024.0;
+            unit += 1;
+        }
+        format!("{v:.1} {}", UNITS[unit])
+    }
+
+    fn reference_count(n: u64) -> String {
+        const UNITS: [&str; 4] = ["", "k", "M", "B"];
+        if n < 1000 {
+            return format!("{n}");
+        }
+        let mut v = n as f64;
+        let mut unit = 0;
+        while v >= 1000.0 && unit < UNITS.len() - 1 {
+            v /= 1000.0;
+            unit += 1;
+        }
+        format!("{v:.1}{}", UNITS[unit])
     }
 
     #[test]
