@@ -175,7 +175,7 @@ fn decode_signature(hex: &str) -> Option<Signature> {
         return None;
     }
     let mut bytes = [0u8; 64];
-    for (out, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+    for (out, pair) in bytes.iter_mut().zip(hex.as_bytes().as_chunks::<2>().0) {
         *out = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Some(Signature::from_bytes(&bytes))

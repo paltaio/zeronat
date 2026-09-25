@@ -1829,7 +1829,10 @@ mod tests {
         c.mode = Mode::Client;
         c.server_addr = "1.2.3.4".into();
         c.ports = "443/tcp".into();
-        assert_eq!(subcmd(&c), "client --server 1.2.3.4:2222 --id client --tcp 443");
+        assert_eq!(
+            subcmd(&c),
+            "client --server 1.2.3.4:2222 --id client --tcp 443"
+        );
     }
 
     #[test]
@@ -1859,7 +1862,10 @@ mod tests {
         c.mode = Mode::Server;
         c.kind = Kind::Bridge;
         c.tap = "zn0".into();
-        assert_eq!(subcmd(&c), "server --control 2222 --client client --tap zn0");
+        assert_eq!(
+            subcmd(&c),
+            "server --control 2222 --client client --tap zn0"
+        );
     }
 
     #[test]

@@ -548,7 +548,10 @@ mod tests {
         let seed = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         let derived = crate::seed::Seed::parse(seed).unwrap().admin();
         let body = format!("ZERONAT_SEED={seed}\nZERONAT_ARGS=server\n");
-        assert_eq!(parse_env_admin_secret(&body).as_deref(), Some(derived.as_str()));
+        assert_eq!(
+            parse_env_admin_secret(&body).as_deref(),
+            Some(derived.as_str())
+        );
         // An explicit admin secret wins over the seed.
         let body = format!("ZERONAT_SEED={seed}\nZERONAT_ADMIN_SECRET=deadbeef\n");
         assert_eq!(parse_env_admin_secret(&body).as_deref(), Some("deadbeef"));

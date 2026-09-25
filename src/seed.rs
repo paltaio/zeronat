@@ -67,7 +67,10 @@ mod tests {
     #[test]
     fn parse_takes_only_the_runtime_format() {
         assert_eq!(Seed::parse(SEED).unwrap().to_hex(), SEED);
-        assert_eq!(Seed::parse(&SEED.to_ascii_uppercase()).unwrap().to_hex(), SEED);
+        assert_eq!(
+            Seed::parse(&SEED.to_ascii_uppercase()).unwrap().to_hex(),
+            SEED
+        );
         let short_by_one = "a".repeat(63);
         let non_hex = "g".repeat(64);
         for invalid in ["short", short_by_one.as_str(), non_hex.as_str()] {
@@ -95,7 +98,10 @@ mod tests {
             }
         }
         assert_eq!(seed.client("rpi"), Seed::parse(SEED).unwrap().client("rpi"));
-        assert_ne!(seed.network(), Seed::parse(&"7".repeat(64)).unwrap().network());
+        assert_ne!(
+            seed.network(),
+            Seed::parse(&"7".repeat(64)).unwrap().network()
+        );
     }
 
     #[test]

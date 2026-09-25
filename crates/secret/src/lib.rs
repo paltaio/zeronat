@@ -20,7 +20,7 @@ pub fn decode(value: &str) -> Result<[u8; BYTE_LEN], FormatError> {
     }
 
     let mut decoded = [0u8; BYTE_LEN];
-    for (out, pair) in decoded.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+    for (out, pair) in decoded.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
         *out = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Ok(decoded)

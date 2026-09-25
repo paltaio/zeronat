@@ -10,8 +10,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
-use tokio::time::timeout as tokio_timeout;
 use tokio::time::sleep;
+use tokio::time::timeout as tokio_timeout;
 
 use crate::bridge;
 use crate::clientcfg::{CfgPeer, CfgTun, ClientConfig};
@@ -2465,14 +2465,8 @@ async fn pppoe_tcp(
     link.set(LinkStatus::Connected);
     // Pin the IP the tunnel actually connected to (handles a hostname --server).
     let server_ip = peer.and_then(peer_v4);
-    let result = crate::pppoe::tunnel::run_stream(
-        dp,
-        bringup(server_ip, &pp, status),
-        nr,
-        nw,
-        cancel,
-    )
-    .await;
+    let result =
+        crate::pppoe::tunnel::run_stream(dp, bringup(server_ip, &pp, status), nr, nw, cancel).await;
     (result, true)
 }
 
@@ -4018,7 +4012,10 @@ mod tests {
         let silent = PONG_WAIT + PROBE_INTERVAL * PROBE_STRIKES;
         let elapsed = start.elapsed();
         assert!(elapsed >= PING_INTERVAL * 2 + silent, "{elapsed:?}");
-        assert!(elapsed < PING_INTERVAL * 2 + silent + Duration::from_secs(1), "{elapsed:?}");
+        assert!(
+            elapsed < PING_INTERVAL * 2 + silent + Duration::from_secs(1),
+            "{elapsed:?}"
+        );
         assert_eq!(server.await.unwrap(), 2 + PROBE_STRIKES);
     }
 }

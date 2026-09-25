@@ -1164,7 +1164,8 @@ mod tests {
 
     #[test]
     fn seeded_server_needs_a_client_id_and_a_valid_seed() {
-        let text = format!("[[servers]]\nname = \"home\"\naddr = \"dht\"\nseed = \"{TEST_SECRET}\"\n");
+        let text =
+            format!("[[servers]]\nname = \"home\"\naddr = \"dht\"\nseed = \"{TEST_SECRET}\"\n");
         let error = parse_client(&text).unwrap_err().to_string();
         assert!(error.contains("[client].id"), "{error}");
         let text = "[[servers]]\nname = \"home\"\naddr = \"dht\"\nseed = \"short\"\n";

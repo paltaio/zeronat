@@ -355,7 +355,9 @@ fn encode_nodes(nodes: &[SocketAddrV4]) -> Vec<u8> {
 
 /// Parse the 6-byte node format; a trailing partial record is ignored.
 fn decode_nodes(b: &[u8]) -> Vec<SocketAddrV4> {
-    b.chunks_exact(6)
+    b.as_chunks::<6>()
+        .0
+        .iter()
         .map(|c| {
             let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
             let port = u16::from_be_bytes([c[4], c[5]]);
@@ -470,7 +472,9 @@ fn parse_value(r: &Ben) -> Option<Value> {
 }
 
 fn parse_nodes(b: &[u8]) -> Vec<Contact> {
-    b.chunks_exact(26)
+    b.as_chunks::<26>()
+        .0
+        .iter()
         .filter_map(|c| {
             let id = to_array::<20>(&c[..20])?;
             let addr = parse_sockv4(&c[20..26])?;

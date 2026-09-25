@@ -278,7 +278,9 @@ fn parse() -> Result<Config> {
         .map(|_| match (std::env::var("ZN_PEER_SECRET"), &seed) {
             (Ok(value), _) => runtime_peer_secret(value, &secret, &credential),
             (Err(_), Some(seed)) => Ok(seed.peer()),
-            (Err(_), None) => Err(anyhow!("ZN_PEER_SECRET or ZN_SEED env is required with --peer")),
+            (Err(_), None) => Err(anyhow!(
+                "ZN_PEER_SECRET or ZN_SEED env is required with --peer"
+            )),
         })
         .transpose()?;
     let discovery = if dht {
