@@ -24,10 +24,12 @@ pub enum Stdio {
 }
 
 impl Stdio {
+    #[cfg(target_os = "linux")]
     pub fn null() -> Stdio {
         Stdio::Null
     }
 
+    #[cfg(target_os = "linux")]
     pub fn piped() -> Stdio {
         Stdio::Piped
     }
@@ -174,11 +176,13 @@ impl Command {
         self
     }
 
+    #[cfg(target_os = "linux")]
     pub fn stderr(&mut self, io: Stdio) -> &mut Command {
         self.stderr = Some(io);
         self
     }
 
+    #[cfg(target_os = "linux")]
     /// Start the child; unset streams are inherited.
     pub fn spawn(&mut self) -> io::Result<Child> {
         self.spawn_with(&Stdio::Inherit, true)
