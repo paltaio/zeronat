@@ -53,9 +53,11 @@ pub fn set_window(segments: u16) {
 pub fn parse_window(value: &str) -> crate::Result<u16> {
     let n: u16 = value
         .parse()
-        .map_err(|_| -> crate::Error { format!("window must be a u16, got '{value}'").into() })?;
+        .map_err(|_| -> crate::Error { errf!("window must be a u16, got '{value}'") })?;
     if !(MIN_WINDOW..=MAX_WINDOW).contains(&n) {
-        return Err(format!("window must be {MIN_WINDOW}-{MAX_WINDOW} segments, got {n}").into());
+        return Err(errf!(
+            "window must be {MIN_WINDOW}-{MAX_WINDOW} segments, got {n}"
+        ));
     }
     Ok(n)
 }
@@ -96,7 +98,7 @@ const CONV_IDLE: Duration = Duration::from_secs(180);
 /// prefix the class byte and hand it to the socket-sender channel without
 /// blocking (KCP retransmits anything dropped under backpressure).
 pub struct ChannelWriter {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<Outbound>,
     class: u8,
 }
 
@@ -105,7 +107,7 @@ impl Write for ChannelWriter {
         let mut pkt = Vec::with_capacity(buf.len() + 1);
         pkt.push(self.class);
         pkt.extend_from_slice(buf);
-        let _ = self.tx.try_send(pkt);
+        let _ = self.tx.try_send(Outbound { pkt, back: None });
         Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -113,13 +115,21 @@ impl Write for ChannelWriter {
     }
 }
 
-fn new_kcp(conv: u32, tx: mpsc::Sender<Vec<u8>>, class: u8) -> Kcp<ChannelWriter> {
+fn new_kcp(conv: u32, tx: mpsc::Sender<Outbound>, class: u8) -> Kcp<ChannelWriter> {
     let mut k = Kcp::new(conv, ChannelWriter { tx, class });
     k.set_nodelay(true, 10, 2, true);
     let window = WINDOW.load(Ordering::Relaxed);
     k.set_wndsize(window, window);
     let _ = k.set_mtu(KCP_MTU);
     k
+}
+
+/// A packet queued for the socket writer. `back` is the lane its buffer goes
+/// back on once sent, so the sender fills that buffer for a later packet
+/// instead of a new one; a packet without one is freed after sending.
+pub struct Outbound {
+    pub(crate) pkt: Vec<u8>,
+    pub(crate) back: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 /// Drains the socket-sender channel to the single per-session peer address. With
@@ -129,17 +139,119 @@ async fn socket_writer(
     socket: Arc<UdpSocket>,
     peer: std::net::SocketAddr,
     local: Option<LocalAddr>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<Outbound>,
 ) {
-    while let Some(pkt) = rx.recv().await {
+    while let Some(Outbound { pkt, back }) = rx.recv().await {
         let _ = crate::pktinfo::send_to(&socket, &pkt, peer, local).await;
+        if let Some(back) = back {
+            let _ = back.try_send(pkt);
+        }
+    }
+}
+
+/// Bound on buffers parked on a return lane. The consumer hands each packet's
+/// buffer back once it is done with it and the sender fills that buffer next,
+/// so a steady flow cycles one or two; anything past the bound is dropped.
+const RECYCLE_CAP: usize = 16;
+
+/// The sending side of an inbound lane: the packet channel, the lane consumed
+/// buffers come back on, and the buffer a full lane refused, kept for the
+/// next packet.
+pub(crate) struct Slot {
+    tx: mpsc::Sender<Vec<u8>>,
+    recycle: mpsc::Receiver<Vec<u8>>,
+    spare: Vec<u8>,
+}
+
+/// What became of a packet handed to `Slot::deliver`.
+pub(crate) enum Delivery {
+    Queued,
+    /// The lane is full; the packet was dropped.
+    Full,
+    /// The receiver is gone; the packet comes back for rerouting.
+    Closed(Vec<u8>),
+}
+
+impl Slot {
+    /// A lane with room for `cap` packets in flight.
+    pub(crate) fn pair(cap: usize) -> (Slot, Inbound) {
+        let (tx, rx) = mpsc::channel(cap);
+        let (recycle_tx, recycle) = mpsc::channel(RECYCLE_CAP);
+        (
+            Slot {
+                tx,
+                recycle,
+                spare: Vec::new(),
+            },
+            Inbound {
+                rx,
+                recycle: recycle_tx,
+            },
+        )
+    }
+
+    /// Queue a copy of `body` without blocking, in the spare buffer, one the
+    /// consumer handed back, or a fresh one.
+    pub(crate) fn deliver(&mut self, body: &[u8]) -> Delivery {
+        let mut buf = if self.spare.capacity() != 0 {
+            std::mem::take(&mut self.spare)
+        } else {
+            self.recycle.try_recv().unwrap_or_default()
+        };
+        buf.clear();
+        buf.extend_from_slice(body);
+        match self.tx.try_send(buf) {
+            Ok(()) => Delivery::Queued,
+            Err(mpsc::error::TrySendError::Full(buf)) => {
+                self.spare = buf;
+                Delivery::Full
+            }
+            Err(mpsc::error::TrySendError::Closed(buf)) => Delivery::Closed(buf),
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+}
+
+/// The receiving side of an inbound lane. `reclaim` hands a consumed buffer
+/// back to the sender, which fills it for a later packet instead of a new one.
+pub struct Inbound {
+    rx: mpsc::Receiver<Vec<u8>>,
+    recycle: mpsc::Sender<Vec<u8>>,
+}
+
+impl Inbound {
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.rx.recv().await
+    }
+
+    pub fn reclaim(&self, buf: Vec<u8>) {
+        if buf.capacity() != 0 {
+            let _ = self.recycle.try_send(buf);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Result<Vec<u8>, mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
+}
+
+/// Test-only: a lane fed by a bare channel, whose reclaimed buffers are dropped.
+#[cfg(test)]
+impl From<mpsc::Receiver<Vec<u8>>> for Inbound {
+    fn from(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        let (recycle, _) = mpsc::channel(1);
+        Inbound { rx, recycle }
     }
 }
 
 /// Channels connecting a `KcpStream` to its driver task.
 struct ConvChannels {
-    inbound_rx: mpsc::Receiver<Vec<u8>>, // KCP packets (class byte stripped)
-    write_rx: mpsc::Receiver<Vec<u8>>,   // app bytes to send
+    inbound: Inbound,                  // KCP packets (class byte stripped)
+    write_rx: mpsc::Receiver<Vec<u8>>, // app bytes to send
     read_tx: mpsc::Sender<Vec<u8>>, // decoded app bytes out (empty Vec => EOF not used; closing the channel signals EOF)
 }
 
@@ -176,8 +288,12 @@ async fn drive_conv(mut kcp: Kcp<ChannelWriter>, mut ch: ConvChannels) {
         }
         let delay = kcp.check(now_ms()).max(1);
         tokio::select! {
-            pkt = ch.inbound_rx.recv() => match pkt {
-                Some(p) => { let _ = kcp.input(&p); last_seen = Instant::now(); }
+            pkt = ch.inbound.recv() => match pkt {
+                Some(p) => {
+                    let _ = kcp.input(&p);
+                    ch.inbound.reclaim(p);
+                    last_seen = Instant::now();
+                }
                 None => return, // mux dropped this conv
             },
             data = ch.write_rx.recv(), if write_open => match data {
@@ -288,7 +404,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-type ConvMap = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
+type ConvMap = Arc<Mutex<HashMap<u32, Slot>>>;
 
 /// When a conv driver or dgram receiver ends, decrements the session's live
 /// counter (so an idle session can be reclaimed) and erases its own entry from
@@ -322,7 +438,7 @@ impl Drop for BridgeGuard {
 
 /// Shared per-(socket,peer) multiplexing state.
 pub struct Session {
-    send_tx: mpsc::Sender<Vec<u8>>,
+    send_tx: mpsc::Sender<Outbound>,
     convs: ConvMap,  // conv id -> inbound packets
     dgrams: ConvMap, // tag -> [nonce][ct] bodies
     next_conv: Mutex<u32>,
@@ -338,10 +454,10 @@ pub struct Session {
 
 impl Session {
     fn spawn_conv(&self, conv: u32, class: u8) -> KcpStream {
-        let (inbound_tx, inbound_rx) = mpsc::channel(SOCKET_SEND_CAP);
+        let (slot, inbound) = Slot::pair(SOCKET_SEND_CAP);
         let (write_tx, write_rx) = mpsc::channel(APP_CHAN_CAP);
         let (read_tx, read_rx) = mpsc::channel(APP_CHAN_CAP);
-        self.convs.lock().unwrap().insert(conv, inbound_tx);
+        self.convs.lock().unwrap().insert(conv, slot);
         self.live.fetch_add(1, Ordering::Relaxed);
         let guard = ConvGuard {
             live: self.live.clone(),
@@ -354,7 +470,7 @@ impl Session {
             drive_conv(
                 kcp,
                 ConvChannels {
-                    inbound_rx,
+                    inbound,
                     write_rx,
                     read_tx,
                 },
@@ -403,13 +519,13 @@ impl Session {
         &self,
         conv: u32,
         class: u8,
-        payload: Vec<u8>,
+        payload: &[u8],
         permit: Option<OwnedSemaphorePermit>,
     ) -> Option<(KcpStream, Option<OwnedSemaphorePermit>)> {
         {
-            let convs = self.convs.lock().unwrap();
-            if let Some(tx) = convs.get(&conv) {
-                let _ = tx.try_send(payload);
+            let mut convs = self.convs.lock().unwrap();
+            if let Some(slot) = convs.get_mut(&conv) {
+                slot.deliver(payload);
                 return None;
             }
             // Unknown conv beyond the per-session cap: drop the datagram and spawn
@@ -428,23 +544,23 @@ impl Session {
         };
         // Unknown conv: a peer-initiated connection. Create it, deliver the packet.
         let stream = self.spawn_conv(conv, class);
-        if let Some(tx) = self.convs.lock().unwrap().get(&conv) {
-            let _ = tx.try_send(payload);
+        if let Some(slot) = self.convs.lock().unwrap().get_mut(&conv) {
+            slot.deliver(payload);
         }
         Some((stream, permit))
     }
 
-    fn route_dgram(&self, tag: u32, body: Vec<u8>) {
-        if let Some(tx) = self.dgrams.lock().unwrap().get(&tag) {
-            let _ = tx.try_send(body);
+    fn route_dgram(&self, tag: u32, body: &[u8]) {
+        if let Some(slot) = self.dgrams.lock().unwrap().get_mut(&tag) {
+            slot.deliver(body);
         }
     }
 
     /// Register a dgram tag. The returned guard must outlive the dgram bridge so
     /// the session is not reclaimed while the bridge is still running.
-    pub fn register_dgram(&self, tag: u32) -> (mpsc::Receiver<Vec<u8>>, ConvGuard) {
-        let (tx, rx) = mpsc::channel(APP_CHAN_CAP);
-        self.dgrams.lock().unwrap().insert(tag, tx);
+    pub fn register_dgram(&self, tag: u32) -> (Inbound, ConvGuard) {
+        let (slot, rx) = Slot::pair(APP_CHAN_CAP);
+        self.dgrams.lock().unwrap().insert(tag, slot);
         self.live.fetch_add(1, Ordering::Relaxed);
         let guard = ConvGuard {
             live: self.live.clone(),
@@ -454,7 +570,7 @@ impl Session {
         (rx, guard)
     }
 
-    pub fn send_tx(&self) -> mpsc::Sender<Vec<u8>> {
+    pub fn send_tx(&self) -> mpsc::Sender<Outbound> {
         self.send_tx.clone()
     }
 
@@ -577,7 +693,7 @@ fn route_inner(
                 return None;
             }
             let conv = kcp::get_conv(rest);
-            match session.route_kcp(conv, class, rest.to_vec(), permit) {
+            match session.route_kcp(conv, class, rest, permit) {
                 Some((stream, permit)) if class == CLASS_KCP => Some(Accepted::Stream {
                     conv,
                     stream,
@@ -596,7 +712,7 @@ fn route_inner(
                 return None;
             }
             let tag = u32::from_be_bytes(rest[..4].try_into().unwrap());
-            session.route_dgram(tag, rest[4..].to_vec());
+            session.route_dgram(tag, &rest[4..]);
             None
         }
         _ => None,
@@ -631,7 +747,7 @@ mod tests {
                         crate::spawn(async move {
                             let (mut r, mut w) = server_handshake(stream, &psk).await.unwrap();
                             let msg = r.recv().await.unwrap();
-                            w.send(&msg).await.unwrap();
+                            w.send(msg).await.unwrap();
                         });
                     }
                 }

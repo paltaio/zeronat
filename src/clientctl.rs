@@ -274,7 +274,7 @@ impl Drop for ControlListener {
 async fn handle(stream: UnixStream, state: &ControlState) -> Result<()> {
     let (mut r, mut w) = crate::noise::server_handshake(stream, &admin_psk()).await?;
     let frame = r.recv().await?;
-    let mode = match ClientMsg::decode(&frame)? {
+    let mode = match ClientMsg::decode(frame)? {
         ClientMsg::ClientAdminHello { version: _, mode } => mode,
         other => return Err(errf!("expected client admin hello, got {other:?}")),
     };
@@ -285,7 +285,7 @@ async fn handle(stream: UnixStream, state: &ControlState) -> Result<()> {
         }
         1 => {
             let frame = r.recv().await?;
-            let (ok, msg) = mutate(state, ClientMsg::decode(&frame)?).await;
+            let (ok, msg) = mutate(state, ClientMsg::decode(frame)?).await;
             w.send(&ClientMsg::MutationResult { ok, msg }.encode())
                 .await?;
         }
@@ -2276,7 +2276,7 @@ mod tests {
         .await
         .unwrap();
         let frame = r.recv().await.unwrap();
-        match ClientMsg::decode(&frame).unwrap() {
+        match ClientMsg::decode(frame).unwrap() {
             ClientMsg::ClientSnapshot(snap) => {
                 assert_eq!(snap.active, "home");
                 assert_eq!(snap.mode, SessionMode::Idle);

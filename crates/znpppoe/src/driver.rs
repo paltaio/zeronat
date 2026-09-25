@@ -234,12 +234,12 @@ async fn session_loop(
     let (rx, tx, cancel, idle, grace) = match link {
         Link::Bridge { rx, tx, cancel, .. } => (
             rx,
-            &*tx,
+            &mut *tx,
             Some(&**cancel),
             Some(UDP_IDLE),
             Some(REBRIDGE_GRACE),
         ),
-        Link::Peer { rx, tx } => (rx, &*tx, None, None, None),
+        Link::Peer { rx, tx } => (rx, &mut *tx, None, None, None),
     };
     let mut nego = tokio::time::interval(NEGO_TICK);
     nego.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -305,7 +305,7 @@ async fn handle_l2(
     idx: usize,
     frame: &[u8],
     dps: &mut [PppoeDatapath<'_>],
-    tx: &LinkTx,
+    tx: &mut LinkTx,
     inbound_txs: &[mpsc::Sender<Vec<u8>>],
     est_txs: &[watch::Sender<Option<Established>>],
     state: &mut [SessionState],
@@ -328,7 +328,7 @@ async fn handle_l2(
 async fn tick_sessions(
     count: usize,
     dps: &mut [PppoeDatapath<'_>],
-    tx: &LinkTx,
+    tx: &mut LinkTx,
     inbound_txs: &[mpsc::Sender<Vec<u8>>],
     est_txs: &[watch::Sender<Option<Established>>],
     state: &mut [SessionState],
@@ -349,7 +349,7 @@ async fn apply_phase(
     idx: usize,
     phase: DpPhase,
     dps: &mut [PppoeDatapath<'_>],
-    tx: &LinkTx,
+    tx: &mut LinkTx,
     inbound_txs: &[mpsc::Sender<Vec<u8>>],
     est_txs: &[watch::Sender<Option<Established>>],
     state: &mut [SessionState],
@@ -410,13 +410,13 @@ async fn apply_phase(
     }
 }
 
-async fn flush_one(idx: usize, dps: &mut [PppoeDatapath<'_>], tx: &LinkTx) {
+async fn flush_one(idx: usize, dps: &mut [PppoeDatapath<'_>], tx: &mut LinkTx) {
     while let Some(frame) = dps[idx].poll_transmit_frame() {
         tx.send(&frame).await;
     }
 }
 
-async fn flush_all(dps: &mut [PppoeDatapath<'_>], tx: &LinkTx) {
+async fn flush_all(dps: &mut [PppoeDatapath<'_>], tx: &mut LinkTx) {
     for i in 0..dps.len() {
         flush_one(i, dps, tx).await;
     }
@@ -501,7 +501,7 @@ mod tests {
                 est_txs: vec![est_tx],
             };
             let _ = b.dps[0].reset();
-            flush_all(&mut b.dps, &b.tx).await;
+            flush_all(&mut b.dps, &mut b.tx).await;
             b
         }
 
@@ -509,7 +509,7 @@ mod tests {
             tick_sessions(
                 1,
                 &mut self.dps,
-                &self.tx,
+                &mut self.tx,
                 &self.inbound_txs,
                 &self.est_txs,
                 &mut self.state,
@@ -522,7 +522,7 @@ mod tests {
                 0,
                 frame,
                 &mut self.dps,
-                &self.tx,
+                &mut self.tx,
                 &self.inbound_txs,
                 &self.est_txs,
                 &mut self.state,

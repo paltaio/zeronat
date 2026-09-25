@@ -207,14 +207,14 @@ impl Link {
 
     fn peer(session: PeerSlotSession) -> Self {
         Link::Peer {
-            rx: LinkRx::Peer(session.inbound),
+            rx: LinkRx::Peer(session.inbound, Vec::new()),
             tx: LinkTx::Peer(session.outbound),
         }
     }
 
     /// The send half on its own, for callers that only put frames on the
     /// channel.
-    pub fn tx(&self) -> &LinkTx {
+    pub fn tx(&mut self) -> &mut LinkTx {
         match self {
             Link::Bridge { tx, .. } | Link::Peer { tx, .. } => tx,
         }
@@ -223,26 +223,30 @@ impl Link {
 
 /// What a channel delivered: an Ethernet frame, or a control frame that only
 /// proves the channel is alive.
-pub enum Inbound {
-    Frame(Vec<u8>),
+pub enum Inbound<'a> {
+    Frame(&'a [u8]),
     Alive,
 }
 
-/// The receive half of a channel.
+/// The receive half of a channel. A peer channel keeps the frame it last
+/// delivered, so an `Inbound` borrows from the half on either kind.
 pub enum LinkRx {
     Bridge(DgramRx),
-    Peer(mpsc::Receiver<Vec<u8>>),
+    Peer(mpsc::Receiver<Vec<u8>>, Vec<u8>),
 }
 
 impl LinkRx {
     /// The next thing the channel delivers, or `None` once it is gone.
-    pub async fn recv(&mut self) -> Option<Inbound> {
+    pub async fn recv(&mut self) -> Option<Inbound<'_>> {
         match self {
             LinkRx::Bridge(rx) => Some(match rx.recv().await? {
                 Frame::Data(frame) => Inbound::Frame(frame),
                 Frame::Keepalive | Frame::Name(_) => Inbound::Alive,
             }),
-            LinkRx::Peer(rx) => Some(Inbound::Frame(rx.recv().await?)),
+            LinkRx::Peer(rx, last) => {
+                *last = rx.recv().await?;
+                Some(Inbound::Frame(last))
+            }
         }
     }
 }
@@ -261,7 +265,7 @@ pub enum LinkTx {
 impl LinkTx {
     /// Put one Ethernet frame on the channel. A full queue drops the frame; a
     /// dead channel is what the receive half reports.
-    pub async fn send(&self, frame: &[u8]) {
+    pub async fn send(&mut self, frame: &[u8]) {
         match self {
             LinkTx::Bridge { tx, .. } => {
                 tx.send(frame).await.ok();
@@ -274,7 +278,7 @@ impl LinkTx {
 
     /// Hold the channel open. A bridge port probes the tunnel and re-announces
     /// its label, so a dropped attach frame self-heals.
-    pub async fn keepalive(&self) {
+    pub async fn keepalive(&mut self) {
         if let LinkTx::Bridge { tx, name } = self {
             tx.send_name(name).await.ok();
             tx.probe().await.ok();

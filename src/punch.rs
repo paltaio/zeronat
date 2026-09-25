@@ -258,7 +258,7 @@ pub async fn punch(
     let tx = DgramTx::new(sess.send_tx(), conv, noise.clone());
     let rx = DgramRx::new(inbound, noise.clone());
     let keepalive = {
-        let tx = DgramTx::new(sess.send_tx(), conv, noise);
+        let mut tx = DgramTx::new(sess.send_tx(), conv, noise);
         AbortOnDrop(crate::spawn(async move {
             // Every other punch message is a KCP segment and is retransmitted;
             // the initiator's nomination rides the unreliable datagram channel,

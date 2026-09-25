@@ -1,10 +1,8 @@
 //! Async shell for the PPPoE-over-tunnel datapath (Linux only).
 //!
 //! Drives the sans-IO `PppoeDatapath` over the tunnel L2 channel and owns the
-//! zppp0 TUN lifecycle. `run_dgram` is the UDP path (unreliable datagram channel);
-//! `run_stream` is the TCP fallback (reliable Noise stream). Both share the
-//! datapath core and the zppp0 bring-up helper; they differ only in the frame
-//! in/out primitives.
+//! zppp0 TUN lifecycle. `run` takes the channel as a [`Wire`]: the UDP path
+//! (unreliable datagram channel) or the TCP fallback (reliable Noise stream).
 //!
 //! zppp0 is opened only after PPP reaches Established, because its IPv4 address
 //! comes from IPCP and `TapDevice::open_tun` assigns the address at open time.
@@ -74,6 +72,7 @@ fn wire_phase(phase: DpPhase) -> PppPhase {
 /// Bring up zppp0 once PPP reports Established. Opens the TUN with the IPCP
 /// address as a /32 host route, the negotiated effective MTU, and the interface
 /// up. The peer address and DNS are logged; no routes or DNS are applied.
+#[inline(never)]
 fn maybe_bring_up_zppp0(
     tun: Option<Arc<TapDevice>>,
     phase: DpPhase,
@@ -118,6 +117,7 @@ fn maybe_bring_up_zppp0(
 /// path already reverts any prior guard before a re-Established edge can occur,
 /// so the `None` reset here is defensive (it would revert a stale guard only if a
 /// future change left one).
+#[inline(never)]
 fn on_established_edge(
     guard: &mut Option<NetCfgGuard>,
     stranded: &mut bool,
@@ -139,6 +139,7 @@ fn on_established_edge(
 /// than `PPPOE_STRAND_REVERT` since the default route was swapped. Keeps zppp0 and
 /// the process up; the swap is not re-applied until a real redial proves recovery
 /// (a fresh Established edge clears the latch). Returns whether it just reverted.
+#[inline(never)]
 fn strand_watchdog(guard: &mut Option<NetCfgGuard>, stranded: &mut bool, last_in: Instant) -> bool {
     if *stranded || !guard.as_ref().is_some_and(|g| g.default_applied()) {
         return false;
@@ -171,6 +172,7 @@ fn strand_watchdog(guard: &mut Option<NetCfgGuard>, stranded: &mut bool, last_in
 /// `drop` closes the last fd and the kernel removes the non-persistent TUN. The
 /// caller drains the fresh PADI right after this returns. Errors only if the new
 /// PPP session cannot be built (system RNG failure), which tears down the tunnel.
+#[inline(never)]
 fn on_link_down(
     dp: &mut PppoeDatapath<'_>,
     tun: Option<Arc<TapDevice>>,
@@ -191,20 +193,64 @@ fn on_link_down(
     Ok(None)
 }
 
-/// Drain every queued outbound L2 frame to the unreliable datagram channel.
-async fn flush_to_dgram(dp: &mut PppoeDatapath<'_>, tx: &DgramTx) -> crate::Result<()> {
-    while let Some(frame) = dp.poll_transmit_frame() {
-        tx.send(&frame).await?;
-    }
-    Ok(())
+/// The channel the PPPoE frames ride: the unreliable datagram channel of the
+/// UDP transport, or a reliable Noise stream on the TCP fallback where each
+/// record is one Ethernet frame and an empty record is a keepalive.
+pub enum Wire<'a> {
+    Dgram {
+        rx: DgramRx,
+        tx: DgramTx,
+        name: &'a str,
+    },
+    Stream {
+        nr: NoiseReader,
+        nw: NoiseWriter,
+    },
 }
 
-/// Drain every queued outbound L2 frame to the reliable Noise stream.
-async fn flush_to_stream(dp: &mut PppoeDatapath<'_>, nw: &mut NoiseWriter) -> crate::Result<()> {
-    while let Some(frame) = dp.poll_transmit_frame() {
-        nw.send(&frame).await?;
+impl Wire<'_> {
+    /// The next inbound frame: `Some(Some(frame))` for an L2 frame,
+    /// `Some(None)` for a keepalive, `None` once the channel is closed.
+    async fn recv(&mut self) -> Option<Option<&[u8]>> {
+        match self {
+            Wire::Dgram { rx, .. } => match rx.recv().await? {
+                Frame::Data(d) => Some(Some(d)),
+                // A name frame is server-bound only; never reaches this datapath.
+                Frame::Keepalive | Frame::Name(_) => Some(None),
+            },
+            Wire::Stream { nr, .. } => match nr.recv().await {
+                Ok([]) => Some(None),
+                Ok(d) => Some(Some(d)),
+                Err(_) => None,
+            },
+        }
     }
-    Ok(())
+
+    /// Drain every queued outbound L2 frame to the channel.
+    async fn flush(&mut self, dp: &mut PppoeDatapath<'_>) -> crate::Result<()> {
+        while let Some(frame) = dp.poll_transmit_frame() {
+            match self {
+                Wire::Dgram { tx, .. } => tx.send(&frame).await?,
+                Wire::Stream { nw, .. } => nw.send(&frame).await?,
+            }
+        }
+        Ok(())
+    }
+
+    /// The keepalive probe. On the datagram channel the name rides along, so a
+    /// lost attach frame self-heals; the server applies it idempotently on
+    /// every receipt.
+    async fn probe(&mut self) {
+        match self {
+            Wire::Dgram { tx, name, .. } => {
+                tx.send_name(name).await.ok();
+                tx.probe().await.ok();
+            }
+            Wire::Stream { nw, .. } => {
+                nw.probe().await.ok();
+            }
+        }
+    }
 }
 
 /// Drain every queued inbound IP packet to zppp0 (one IP packet per write).
@@ -220,38 +266,41 @@ async fn drain_inbound_to_tun(
     Ok(())
 }
 
-/// UDP path: shuttle PPPoE frames between the datapath and the unreliable datagram
-/// channel, bring up zppp0 on the Established edge, and pump IP both ways. Returns
-/// Ok on a clean idle reap or cancel, Err on a TUN failure or discovery death (so
-/// the reconnect loop redials).
-pub async fn run_dgram(
-    mut dp: PppoeDatapath<'_>,
+/// Shuttle PPPoE frames between the datapath and the wire, bring up zppp0 on
+/// the Established edge, and pump IP both ways. Returns Ok on a clean idle reap
+/// or cancel, Err on a TUN failure or discovery death (so the reconnect loop
+/// redials).
+pub async fn run(
+    dp: PppoeDatapath<'_>,
     cfg: ZpppBringup<'_>,
-    mut rx: DgramRx,
-    tx: DgramTx,
+    wire: Wire<'_>,
     cancel: Arc<Notify>,
-    name: &str,
 ) -> crate::Result<()> {
     let half = UDP_IDLE / 2;
     let mut keepalive = interval_at(Instant::now() + half, half);
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut nego = interval(NEGO_TICK);
     nego.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut last_in = Instant::now();
-    let mut tun: Option<Arc<TapDevice>> = None;
-    let mut netcfg: Option<NetCfgGuard> = None;
-    let mut stranded = false;
-    let mut up_since: Option<Instant> = None;
-    let mut redial = Redial::default();
+    let mut shell = Shell {
+        redial: Redial::default(),
+        up_since: None,
+        stranded: false,
+        netcfg: None,
+        tun: None,
+        last_in: Instant::now(),
+        wire,
+        cfg,
+        dp,
+    };
 
-    dp.start();
-    cfg.status.set(PppPhase::Discovery);
-    flush_to_dgram(&mut dp, &tx).await?;
+    shell.dp.start();
+    shell.cfg.status.set(PppPhase::Discovery);
+    shell.flush().await?;
 
     loop {
         // The zppp0 read future is only armed once the TUN exists.
         let tun_read = async {
-            match &tun {
+            match &shell.tun {
                 Some(t) => t.read_frame().await,
                 None => std::future::pending().await,
             }
@@ -260,185 +309,100 @@ pub async fn run_dgram(
         tokio::select! {
             _ = cancel.notified() => break Ok(()),
 
-            m = rx.recv() => match m {
-                Some(Frame::Keepalive) => last_in = Instant::now(),
-                // A name frame is server-bound only; never reaches this datapath.
-                Some(Frame::Name(_)) => last_in = Instant::now(),
-                Some(Frame::Data(d)) => {
-                    last_in = Instant::now();
-                    let phase = dp.on_l2_frame(&d);
-                    cfg.status.set(wire_phase(phase));
-                    flush_to_dgram(&mut dp, &tx).await?;
-                    // Bring-up first: a no-op on any non-Established phase, so it is
-                    // safe to call before the LinkDown handler that closes zppp0.
-                    let (t, est_edge) = maybe_bring_up_zppp0(tun, phase, &cfg)?;
-                    tun = t;
-                    on_established_edge(&mut netcfg, &mut stranded, &mut up_since, est_edge, &cfg);
-                    drain_inbound_to_tun(&mut dp, &tun).await?;
-                    match phase {
-                        DpPhase::Dead => break Err("pppoe discovery failed".into()),
-                        DpPhase::LinkDown => {
-                            netcfg = None; // revert host routing before zppp0 goes away
-                            stranded = false;
-                            tun = on_link_down(&mut dp, tun, &mut redial, up_since.take())?;
-                            flush_to_dgram(&mut dp, &tx).await?; // drain the fresh PADI
-                        }
-                        _ => {}
-                    }
+            m = shell.wire.recv() => match m {
+                Some(None) => shell.last_in = Instant::now(),
+                Some(Some(d)) => {
+                    shell.last_in = Instant::now();
+                    let phase = shell.dp.on_l2_frame(d);
+                    shell.on_phase(phase, true).await?;
                 }
                 None => break Ok(()),
             },
 
             ip = tun_read => {
                 let ip = ip?;
-                dp.on_tun_ip(&ip);
-                flush_to_dgram(&mut dp, &tx).await?;
+                shell.dp.on_tun_ip(&ip);
+                shell.flush().await?;
             }
 
             _ = nego.tick() => {
                 // The wait a link-down armed dials here, so a session the segment
                 // tears down as fast as it hands it out stays off the segment for
                 // the wait rather than redialing at the round trip.
-                if redial.due() {
-                    dp.reset()?;
-                    flush_to_dgram(&mut dp, &tx).await?;
+                if shell.redial.due() {
+                    shell.dp.reset()?;
+                    shell.flush().await?;
                 }
-                let phase = dp.on_tick();
-                cfg.status.set(wire_phase(phase));
-                flush_to_dgram(&mut dp, &tx).await?;
-                let (t, est_edge) = maybe_bring_up_zppp0(tun, phase, &cfg)?;
-                tun = t;
-                on_established_edge(&mut netcfg, &mut stranded, &mut up_since, est_edge, &cfg);
-                match phase {
-                    DpPhase::Dead => break Err("pppoe discovery failed".into()),
-                    DpPhase::LinkDown => {
-                        netcfg = None;
-                        stranded = false;
-                        tun = on_link_down(&mut dp, tun, &mut redial, up_since.take())?;
-                        flush_to_dgram(&mut dp, &tx).await?;
-                    }
-                    _ => {}
-                }
-                strand_watchdog(&mut netcfg, &mut stranded, last_in);
+                let phase = shell.dp.on_tick();
+                shell.on_phase(phase, false).await?;
+                strand_watchdog(&mut shell.netcfg, &mut shell.stranded, shell.last_in);
             }
 
             _ = keepalive.tick() => {
-                if last_in.elapsed() >= UDP_IDLE {
+                if shell.last_in.elapsed() >= UDP_IDLE {
                     break Ok(());
                 }
-                // Re-announce the name so a lost attach frame self-heals; the
-                // server applies it idempotently on every receipt.
-                tx.send_name(name).await.ok();
-                tx.probe().await.ok();
+                shell.wire.probe().await;
             }
         }
     }
 }
 
-/// TCP fallback: same datapath, frames over a reliable Noise stream. Each Noise
-/// record is one Ethernet frame; an empty record is a keepalive.
-pub async fn run_stream(
-    mut dp: PppoeDatapath<'_>,
-    cfg: ZpppBringup<'_>,
-    mut nr: NoiseReader,
-    mut nw: NoiseWriter,
-    cancel: Arc<Notify>,
-) -> crate::Result<()> {
-    let half = UDP_IDLE / 2;
-    let mut keepalive = interval_at(Instant::now() + half, half);
-    keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut nego = interval(NEGO_TICK);
-    nego.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut last_in = Instant::now();
-    let mut tun: Option<Arc<TapDevice>> = None;
-    let mut netcfg: Option<NetCfgGuard> = None;
-    let mut stranded = false;
-    let mut up_since: Option<Instant> = None;
-    let mut redial = Redial::default();
+/// The state one tunnel session drives: the datapath, its wire, and the zppp0
+/// device with the host routing programmed over it. Fields drop in order, so
+/// the host routing is reverted before zppp0 goes away.
+struct Shell<'a> {
+    redial: Redial,
+    up_since: Option<Instant>,
+    stranded: bool,
+    netcfg: Option<NetCfgGuard>,
+    tun: Option<Arc<TapDevice>>,
+    last_in: Instant,
+    wire: Wire<'a>,
+    cfg: ZpppBringup<'a>,
+    dp: PppoeDatapath<'a>,
+}
 
-    dp.start();
-    cfg.status.set(PppPhase::Discovery);
-    flush_to_stream(&mut dp, &mut nw).await?;
+impl Shell<'_> {
+    /// Drain every queued outbound L2 frame to the wire.
+    async fn flush(&mut self) -> crate::Result<()> {
+        self.wire.flush(&mut self.dp).await
+    }
 
-    loop {
-        let tun_read = async {
-            match &tun {
-                Some(t) => t.read_frame().await,
-                None => std::future::pending().await,
+    /// The datapath moved to `phase`: report it, drain what it queued for the
+    /// wire, bring zppp0 up on the Established edge, pump the decoded IP to
+    /// zppp0 after an inbound frame, then act on a dead or downed link.
+    async fn on_phase(&mut self, phase: DpPhase, inbound: bool) -> crate::Result<()> {
+        self.cfg.status.set(wire_phase(phase));
+        self.flush().await?;
+        // Bring-up first: a no-op on any non-Established phase, so it is
+        // safe to call before the LinkDown handler that closes zppp0.
+        let (t, est_edge) = maybe_bring_up_zppp0(self.tun.take(), phase, &self.cfg)?;
+        self.tun = t;
+        on_established_edge(
+            &mut self.netcfg,
+            &mut self.stranded,
+            &mut self.up_since,
+            est_edge,
+            &self.cfg,
+        );
+        if inbound {
+            drain_inbound_to_tun(&mut self.dp, &self.tun).await?;
+        }
+        match phase {
+            DpPhase::Dead => Err("pppoe discovery failed".into()),
+            DpPhase::LinkDown => {
+                self.netcfg = None; // revert host routing before zppp0 goes away
+                self.stranded = false;
+                self.tun = on_link_down(
+                    &mut self.dp,
+                    self.tun.take(),
+                    &mut self.redial,
+                    self.up_since.take(),
+                )?;
+                self.flush().await // drain the fresh PADI
             }
-        };
-
-        tokio::select! {
-            _ = cancel.notified() => break Ok(()),
-
-            m = nr.recv() => match m {
-                Ok(d) => {
-                    last_in = Instant::now();
-                    if d.is_empty() {
-                        continue; // keepalive record
-                    }
-                    let phase = dp.on_l2_frame(&d);
-                    cfg.status.set(wire_phase(phase));
-                    flush_to_stream(&mut dp, &mut nw).await?;
-                    // Bring-up first: a no-op on any non-Established phase, so it is
-                    // safe to call before the LinkDown handler that closes zppp0.
-                    let (t, est_edge) = maybe_bring_up_zppp0(tun, phase, &cfg)?;
-                    tun = t;
-                    on_established_edge(&mut netcfg, &mut stranded, &mut up_since, est_edge, &cfg);
-                    drain_inbound_to_tun(&mut dp, &tun).await?;
-                    match phase {
-                        DpPhase::Dead => break Err("pppoe discovery failed".into()),
-                        DpPhase::LinkDown => {
-                            netcfg = None; // revert host routing before zppp0 goes away
-                            stranded = false;
-                            tun = on_link_down(&mut dp, tun, &mut redial, up_since.take())?;
-                            flush_to_stream(&mut dp, &mut nw).await?; // drain the fresh PADI
-                        }
-                        _ => {}
-                    }
-                }
-                Err(_) => break Ok(()),
-            },
-
-            ip = tun_read => {
-                let ip = ip?;
-                dp.on_tun_ip(&ip);
-                flush_to_stream(&mut dp, &mut nw).await?;
-            }
-
-            _ = nego.tick() => {
-                // The wait a link-down armed dials here, so a session the segment
-                // tears down as fast as it hands it out stays off the segment for
-                // the wait rather than redialing at the round trip.
-                if redial.due() {
-                    dp.reset()?;
-                    flush_to_stream(&mut dp, &mut nw).await?;
-                }
-                let phase = dp.on_tick();
-                cfg.status.set(wire_phase(phase));
-                flush_to_stream(&mut dp, &mut nw).await?;
-                let (t, est_edge) = maybe_bring_up_zppp0(tun, phase, &cfg)?;
-                tun = t;
-                on_established_edge(&mut netcfg, &mut stranded, &mut up_since, est_edge, &cfg);
-                match phase {
-                    DpPhase::Dead => break Err("pppoe discovery failed".into()),
-                    DpPhase::LinkDown => {
-                        netcfg = None;
-                        stranded = false;
-                        tun = on_link_down(&mut dp, tun, &mut redial, up_since.take())?;
-                        flush_to_stream(&mut dp, &mut nw).await?;
-                    }
-                    _ => {}
-                }
-                strand_watchdog(&mut netcfg, &mut stranded, last_in);
-            }
-
-            _ = keepalive.tick() => {
-                if last_in.elapsed() >= UDP_IDLE {
-                    break Ok(());
-                }
-                nw.probe().await.ok();
-            }
+            _ => Ok(()),
         }
     }
 }
@@ -461,9 +425,9 @@ mod tests {
 
     /// Forward tunnel packets the way the router does: the class byte and the
     /// tag are stripped before the body reaches a datagram session.
-    async fn strip_tag(mut rx: mpsc::Receiver<Vec<u8>>, tx: mpsc::Sender<Vec<u8>>) {
-        while let Some(pkt) = rx.recv().await {
-            if pkt.len() < 5 || tx.send(pkt[5..].to_vec()).await.is_err() {
+    async fn strip_tag(mut rx: mpsc::Receiver<crate::kcp::Outbound>, tx: mpsc::Sender<Vec<u8>>) {
+        while let Some(out) = rx.recv().await {
+            if out.pkt.len() < 5 || tx.send(out.pkt[5..].to_vec()).await.is_err() {
                 return;
             }
         }
@@ -490,11 +454,11 @@ mod tests {
 
         (
             (
-                DgramRx::new(shell_in_rx, shell.clone()),
+                DgramRx::new(crate::kcp::Inbound::from(shell_in_rx), shell.clone()),
                 DgramTx::new(shell_out, 0, shell),
             ),
             (
-                DgramRx::new(segment_in_rx, segment.clone()),
+                DgramRx::new(crate::kcp::Inbound::from(segment_in_rx), segment.clone()),
                 DgramTx::new(segment_out, 0, segment),
             ),
         )
@@ -537,7 +501,7 @@ mod tests {
                 Ok(Some(_)) => continue, // tunnel keepalive or label
                 _ => return None,        // the shell went quiet or gave up
             };
-            match parse_discovery_frame(&frame) {
+            match parse_discovery_frame(frame) {
                 Ok(p) if p.code == CODE_PADI => return Some(p),
                 _ => continue, // a session frame or a PADR, not a fresh dial
             }
@@ -559,10 +523,10 @@ mod tests {
                 Ok(Some(_)) => continue,
                 _ => return (None, on_that_id),
             };
-            if parse_session_frame(&frame).is_ok_and(|h| h.session_id == session_id) {
+            if parse_session_frame(frame).is_ok_and(|h| h.session_id == session_id) {
                 on_that_id += 1;
             }
-            match parse_discovery_frame(&frame) {
+            match parse_discovery_frame(frame) {
                 Ok(p) if p.code == CODE_PADI => return (Some(p), on_that_id),
                 _ => continue,
             }
@@ -612,13 +576,15 @@ mod tests {
         let dp = PppoeDatapath::new(b"user", b"pass", Vec::new(), 1280, 3, 5)
             .expect("build the datapath");
         let cancel = Arc::new(Notify::new());
-        let shell = crate::spawn(run_dgram(
+        let shell = crate::spawn(run(
             dp,
             bringup(),
-            shell_rx,
-            shell_tx,
+            Wire::Dgram {
+                rx: shell_rx,
+                tx: shell_tx,
+                name: "test",
+            },
             cancel.clone(),
-            "test",
         ));
         (segment_rx, segment_tx, cancel, shell)
     }
@@ -629,7 +595,7 @@ mod tests {
     // reaches PPP, so zppp0 is never opened.
     #[tokio::test(start_paused = true)]
     async fn a_tunnel_session_torn_down_before_it_holds_dials_on_a_widening_wait() {
-        let (mut segment_rx, segment_tx, cancel, shell) = shell_on_a_segment().await;
+        let (mut segment_rx, mut segment_tx, cancel, shell) = shell_on_a_segment().await;
 
         const WINDOW: Duration = Duration::from_secs(200);
         let start = Instant::now();
@@ -690,7 +656,7 @@ mod tests {
     // timer would otherwise re-offer the Configure-Request through every wait.
     #[tokio::test(start_paused = true)]
     async fn a_torn_down_session_id_leaves_the_wire_at_once() {
-        let (mut segment_rx, segment_tx, cancel, shell) = shell_on_a_segment().await;
+        let (mut segment_rx, mut segment_tx, cancel, shell) = shell_on_a_segment().await;
 
         const WINDOW: Duration = Duration::from_secs(200);
         let mut dial = next_dial(&mut segment_rx, WINDOW)

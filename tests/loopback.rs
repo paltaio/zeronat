@@ -424,7 +424,7 @@ async fn recv_open_claim(r: &mut zeronat::noise::NoiseReader) -> (u64, zeronat::
         .await
         .expect("client did not receive a routed open")
         .expect("routed open failed");
-    match Msg::decode(&frame).expect("decode routed open") {
+    match Msg::decode(frame).expect("decode routed open") {
         Msg::Open { id, capability, .. } | Msg::OpenProxy { id, capability, .. } => {
             (id, capability)
         }
@@ -500,7 +500,7 @@ async fn fetch_snapshot(control: u16) -> zeronat::proto::SnapshotBody {
     .await
     .unwrap();
     let frame = r.recv().await.unwrap();
-    match Msg::decode(&frame).unwrap() {
+    match Msg::decode(frame).unwrap() {
         Msg::Snapshot(snap) => snap,
         other => panic!("expected snapshot, got {other:?}"),
     }
@@ -520,7 +520,7 @@ async fn admin_mutate(control: u16, req: Msg) -> (bool, String) {
     .unwrap();
     w.send(&req.encode()).await.unwrap();
     let frame = r.recv().await.unwrap();
-    match Msg::decode(&frame).unwrap() {
+    match Msg::decode(frame).unwrap() {
         Msg::MutationResult { ok, msg } => (ok, msg),
         other => panic!("expected mutation result, got {other:?}"),
     }
@@ -833,7 +833,7 @@ async fn client_credential_cannot_read_admin_over_tcp_or_udp() {
     assert!(
         !matches!(
             timeout(Duration::from_secs(2), tcp_r.recv()).await,
-            Ok(Ok(frame)) if matches!(Msg::decode(&frame), Ok(Msg::Snapshot(_)))
+            Ok(Ok(frame)) if matches!(Msg::decode(frame), Ok(Msg::Snapshot(_)))
         ),
         "the client credential read an admin snapshot over tcp"
     );
@@ -853,7 +853,7 @@ async fn client_credential_cannot_read_admin_over_tcp_or_udp() {
     assert!(
         !matches!(
             timeout(Duration::from_secs(2), udp_r.recv()).await,
-            Ok(Ok(frame)) if matches!(Msg::decode(&frame), Ok(Msg::Snapshot(_)))
+            Ok(Ok(frame)) if matches!(Msg::decode(frame), Ok(Msg::Snapshot(_)))
         ),
         "the client credential read an admin snapshot over udp"
     );
@@ -880,7 +880,7 @@ async fn admin_credential_cannot_register_clients_over_tcp_or_udp() {
     assert!(
         !matches!(
             timeout(Duration::from_secs(2), tcp_r.recv()).await,
-            Ok(Ok(frame)) if matches!(Msg::decode(&frame), Ok(Msg::Pong))
+            Ok(Ok(frame)) if matches!(Msg::decode(frame), Ok(Msg::Pong))
         ),
         "the admin credential registered a client over tcp"
     );
@@ -901,7 +901,7 @@ async fn admin_credential_cannot_register_clients_over_tcp_or_udp() {
     assert!(
         !matches!(
             timeout(Duration::from_secs(2), udp_r.recv()).await,
-            Ok(Ok(frame)) if matches!(Msg::decode(&frame), Ok(Msg::Pong))
+            Ok(Ok(frame)) if matches!(Msg::decode(frame), Ok(Msg::Pong))
         ),
         "the admin credential registered a client over udp"
     );
@@ -934,7 +934,7 @@ async fn client_credential_cannot_register_an_unassigned_identity() {
         .expect("client hello acknowledgement timed out")
         .expect("client hello acknowledgement failed");
     assert!(matches!(
-        Msg::decode(&ack),
+        Msg::decode(ack),
         Ok(Msg::ClientHelloAck { client_id, .. }) if client_id == "rpi"
     ));
 
@@ -982,7 +982,7 @@ async fn client_credential_cannot_impersonate_supersede_or_route_as_another_clie
         .await
         .unwrap();
     assert!(matches!(
-        Msg::decode(&victim_r.recv().await.unwrap()),
+        Msg::decode(victim_r.recv().await.unwrap()),
         Ok(Msg::ClientHelloAck { client_id, .. }) if client_id == "victim"
     ));
 
@@ -1000,7 +1000,7 @@ async fn client_credential_cannot_impersonate_supersede_or_route_as_another_clie
         .await
         .unwrap();
     assert!(matches!(
-        Msg::decode(&attacker_r.recv().await.unwrap()),
+        Msg::decode(attacker_r.recv().await.unwrap()),
         Ok(Msg::ClientHelloAck { client_id, .. }) if client_id == "attacker"
     ));
 
@@ -1021,7 +1021,7 @@ async fn client_credential_cannot_impersonate_supersede_or_route_as_another_clie
         .await
         .expect("the victim did not receive its routed open")
         .unwrap();
-    assert!(matches!(Msg::decode(&frame), Ok(Msg::Open { .. })));
+    assert!(matches!(Msg::decode(frame), Ok(Msg::Open { .. })));
     assert!(
         timeout(Duration::from_millis(200), attacker_r.recv())
             .await
@@ -1034,7 +1034,7 @@ async fn client_credential_cannot_impersonate_supersede_or_route_as_another_clie
         .await
         .expect("the impersonating connection superseded the victim")
         .unwrap();
-    assert!(matches!(Msg::decode(&frame), Ok(Msg::Pong)));
+    assert!(matches!(Msg::decode(frame), Ok(Msg::Pong)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1068,7 +1068,7 @@ async fn reconnect_revokes_the_superseded_session_and_its_data_paths() {
         )
         .await
         .unwrap();
-    let old_bridge_capability = match Msg::decode(&old_r.recv().await.unwrap()).unwrap() {
+    let old_bridge_capability = match Msg::decode(old_r.recv().await.unwrap()).unwrap() {
         Msg::ClientHelloAck {
             client_id,
             bridge_capability,
@@ -1114,7 +1114,7 @@ async fn reconnect_revokes_the_superseded_session_and_its_data_paths() {
         .await
         .unwrap();
     assert!(matches!(
-        Msg::decode(&current_r.recv().await.unwrap()),
+        Msg::decode(current_r.recv().await.unwrap()),
         Ok(Msg::ClientHelloAck { client_id, .. }) if client_id == "client"
     ));
 
@@ -1212,7 +1212,7 @@ async fn admin_snapshot_over_udp_uses_the_admin_credential() {
         .await
         .expect("admin snapshot timed out")
         .unwrap();
-    assert!(matches!(Msg::decode(&frame), Ok(Msg::Snapshot(_))));
+    assert!(matches!(Msg::decode(frame), Ok(Msg::Snapshot(_))));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1240,15 +1240,12 @@ async fn missing_admin_credential_disables_admin_without_disabling_clients() {
         .await
         .expect("tcp client received no hello acknowledgement")
         .unwrap();
-    assert!(matches!(
-        Msg::decode(&frame),
-        Ok(Msg::ClientHelloAck { .. })
-    ));
+    assert!(matches!(Msg::decode(frame), Ok(Msg::ClientHelloAck { .. })));
     let frame = timeout(Duration::from_secs(2), tcp_r.recv())
         .await
         .expect("tcp client received no pong")
         .unwrap();
-    assert!(matches!(Msg::decode(&frame), Ok(Msg::Pong)));
+    assert!(matches!(Msg::decode(frame), Ok(Msg::Pong)));
 
     let (mut udp_r, mut udp_w, _pump) =
         udp_control_connect(control, &client_psk, zeronat::noise::AuthRole::Client).await;
@@ -1267,15 +1264,12 @@ async fn missing_admin_credential_disables_admin_without_disabling_clients() {
         .await
         .expect("udp client received no hello acknowledgement")
         .unwrap();
-    assert!(matches!(
-        Msg::decode(&frame),
-        Ok(Msg::ClientHelloAck { .. })
-    ));
+    assert!(matches!(Msg::decode(frame), Ok(Msg::ClientHelloAck { .. })));
     let frame = timeout(Duration::from_secs(2), udp_r.recv())
         .await
         .expect("udp client received no pong")
         .unwrap();
-    assert!(matches!(Msg::decode(&frame), Ok(Msg::Pong)));
+    assert!(matches!(Msg::decode(frame), Ok(Msg::Pong)));
 
     let admin_psk = zeronat::noise::derive_psk(ADMIN_SECRET);
     let sock = TcpStream::connect(("127.0.0.1", control)).await.unwrap();
@@ -2196,7 +2190,7 @@ async fn proxy_forward_refuses_headerless_open() {
                             .expect("control handshake");
                     assert_eq!(identity, zeronat::noise::AuthIdentity::Client("rpi".into()));
                     let first = r.recv().await.expect("client hello");
-                    if !matches!(Msg::decode(&first), Ok(Msg::ClientHello { .. })) {
+                    if !matches!(Msg::decode(first), Ok(Msg::ClientHello { .. })) {
                         return; // drops open_sent_tx
                     }
                     w.send(
@@ -2212,7 +2206,7 @@ async fn proxy_forward_refuses_headerless_open() {
                     .expect("send open");
                     open_sent_tx.send(()).ok();
                     while let Ok(bytes) = r.recv().await {
-                        if let Ok(Msg::Ping) = Msg::decode(&bytes) {
+                        if let Ok(Msg::Ping) = Msg::decode(bytes) {
                             w.send(&Msg::Pong.encode()).await.ok();
                         }
                     }
@@ -4183,13 +4177,13 @@ async fn peer_control_connect(
     .await
     .unwrap();
     let frame = r.recv().await.unwrap();
-    match Msg::decode(&frame).unwrap() {
+    match Msg::decode(frame).unwrap() {
         Msg::ClientHelloAck { client_id, .. } => assert_eq!(client_id, expected_id),
         other => panic!("expected client hello ack, got {other:?}"),
     }
     answer_announce_challenge(&mut r, &mut w, client_id, provides).await;
     let frame = r.recv().await.unwrap();
-    match Msg::decode(&frame).unwrap() {
+    match Msg::decode(frame).unwrap() {
         Msg::PeerAnnounceAck { observed } => assert_eq!(observed, local),
         other => panic!("expected announce ack, got {other:?}"),
     }
@@ -4205,7 +4199,7 @@ async fn answer_announce_challenge(
     provides: u8,
 ) {
     let frame = r.recv().await.unwrap();
-    let (eph_pub, nonce) = match Msg::decode(&frame).unwrap() {
+    let (eph_pub, nonce) = match Msg::decode(frame).unwrap() {
         Msg::PeerChallenge { eph_pub, nonce } => (eph_pub, nonce),
         other => panic!("expected peer challenge, got {other:?}"),
     };
@@ -4244,7 +4238,7 @@ async fn peer_connect(
     .await
     .unwrap();
     let frame = r.recv().await.unwrap();
-    match Msg::decode(&frame).unwrap() {
+    match Msg::decode(frame).unwrap() {
         Msg::PeerResult {
             peer_id: got,
             want: got_want,
@@ -4401,14 +4395,14 @@ async fn peer_control_connect_udp(
     .await
     .unwrap();
     let frame = r.recv().await.unwrap();
-    match Msg::decode(&frame).unwrap() {
+    match Msg::decode(frame).unwrap() {
         Msg::ClientHelloAck { client_id, .. } => assert_eq!(client_id, expected_id),
         other => panic!("expected client hello ack, got {other:?}"),
     }
     answer_announce_challenge(&mut r, &mut w, client_id, provides).await;
     let frame = r.recv().await.unwrap();
     assert!(
-        matches!(Msg::decode(&frame).unwrap(), Msg::PeerAnnounceAck { .. }),
+        matches!(Msg::decode(frame).unwrap(), Msg::PeerAnnounceAck { .. }),
         "expected announce ack"
     );
     (r, w, pump)
@@ -4423,7 +4417,7 @@ async fn recv_peer_probe(
     want: u8,
 ) -> ((u64, zeronat::proto::Capability), [u8; 32]) {
     let frame = r.recv().await.unwrap();
-    match Msg::decode(&frame).unwrap() {
+    match Msg::decode(frame).unwrap() {
         Msg::PeerProbe {
             pair_id: got,
             peer_id,
@@ -4447,7 +4441,7 @@ async fn recv_peer_info(
     pair_id: u64,
 ) -> Vec<std::net::SocketAddr> {
     let frame = r.recv().await.unwrap();
-    match Msg::decode(&frame).unwrap() {
+    match Msg::decode(frame).unwrap() {
         Msg::PeerInfo {
             pair_id: got,
             candidates,
@@ -4743,7 +4737,7 @@ async fn recv_dgram_frame(rx: &mut zeronat::dgram::DgramRx) -> Vec<u8> {
             .await
             .expect("no frame on the datagram channel")
         {
-            Some(zeronat::dgram::Frame::Data(body)) => return body,
+            Some(zeronat::dgram::Frame::Data(body)) => return body.to_vec(),
             Some(_) => continue,
             None => panic!("datagram channel closed"),
         }
@@ -4762,7 +4756,7 @@ async fn assert_control_alive(
         .expect("no pong after the peer path report")
         .unwrap();
     assert!(
-        matches!(Msg::decode(&frame), Ok(Msg::Pong)),
+        matches!(Msg::decode(frame), Ok(Msg::Pong)),
         "control session must survive the peer path report"
     );
 }
@@ -5023,7 +5017,7 @@ async fn probe_resends_local_candidate_until_peer_info() {
                             zeronat::dgram::DgramRx::new(inbound, std::sync::Arc::new(noise));
                         while let Some(frame) = rx.recv().await {
                             if let zeronat::dgram::Frame::Data(body) = frame {
-                                let a = zeronat::proto::decode_sockaddr(&body).unwrap();
+                                let a = zeronat::proto::decode_sockaddr(body).unwrap();
                                 if frames_tx.send(a).await.is_err() {
                                     return;
                                 }
@@ -5267,7 +5261,7 @@ async fn recv_relay_open(
         .await
         .expect("no relay open")
         .unwrap();
-    match Msg::decode(&frame).unwrap() {
+    match Msg::decode(frame).unwrap() {
         Msg::PeerRelayOpen {
             pair_id: got,
             id,
@@ -5310,7 +5304,7 @@ async fn assert_next_frame_is_pong(
         .expect("no pong")
         .unwrap();
     assert!(
-        matches!(Msg::decode(&frame), Ok(Msg::Pong)),
+        matches!(Msg::decode(frame), Ok(Msg::Pong)),
         "an unexpected frame arrived ahead of the pong"
     );
 }
@@ -5414,6 +5408,7 @@ async fn recv_stream_leg(r: &mut zeronat::noise::NoiseReader) -> Vec<u8> {
         .await
         .expect("no frame on the stream leg")
         .expect("stream leg closed")
+        .to_vec()
 }
 
 // A relayed pair carries frames both ways: the first relay report opens a leg
@@ -5920,8 +5915,8 @@ async fn peer_inner_handshake_ignores_frames_ahead_of_it() {
         tokio::spawn(zeronat::server::run(cli_settings(control, vec![], vec![])));
         let pair = relay_pair(control).await;
 
-        let (c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
-        let (p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
+        let (mut c_leg, _c_pump) = dgram_leg(control, pair.c_leg).await;
+        let (mut p_leg, _p_pump) = dgram_leg(control, pair.p_leg).await;
 
         // Each party's first inbound frame is a session frame from the far
         // side, under keys neither of them holds yet.
@@ -6525,7 +6520,7 @@ async fn recv_pair_probe(
         .await
         .expect("no peer probe")
         .unwrap();
-    match Msg::decode(&frame).unwrap() {
+    match Msg::decode(frame).unwrap() {
         Msg::PeerProbe {
             pair_id,
             peer_id,
@@ -6995,7 +6990,7 @@ async fn prior_role_frames_are_rejected_by_current_server() {
     control_w.send(&Msg::Ping.encode()).await.unwrap();
     assert!(matches!(
         Msg::decode(
-            &timeout(Duration::from_secs(2), control_r.recv())
+            timeout(Duration::from_secs(2), control_r.recv())
                 .await
                 .expect("server did not authorize the current client")
                 .unwrap()
@@ -7004,7 +6999,7 @@ async fn prior_role_frames_are_rejected_by_current_server() {
     ));
     assert!(matches!(
         Msg::decode(
-            &timeout(Duration::from_secs(2), control_r.recv())
+            timeout(Duration::from_secs(2), control_r.recv())
                 .await
                 .expect("server did not register the current client")
                 .unwrap()
@@ -7013,7 +7008,7 @@ async fn prior_role_frames_are_rejected_by_current_server() {
     ));
     let _public_conn = TcpStream::connect(("127.0.0.1", public)).await.unwrap();
     let id = match Msg::decode(
-        &timeout(Duration::from_secs(2), control_r.recv())
+        timeout(Duration::from_secs(2), control_r.recv())
             .await
             .expect("server did not open the data stream")
             .unwrap(),

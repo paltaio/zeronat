@@ -2070,7 +2070,7 @@ pub async fn probe_candidates(
     .await
     .map_err(|_| -> crate::Error { "probe handshake timed out".into() })??;
     let public = decode_sockaddr(&reply)?;
-    let tx = DgramTx::new(sess.send_tx(), conv, Arc::new(noise));
+    let mut tx = DgramTx::new(sess.send_tx(), conv, Arc::new(noise));
     let body = encode_sockaddr(local);
     tx.send(&body).await?;
     let resend = AbortOnDrop(crate::spawn(async move {
@@ -2129,7 +2129,7 @@ async fn bridge_lease(
     let Msg::ClientHelloAck {
         client_id,
         bridge_capability,
-    } = Msg::decode(&frame)?
+    } = Msg::decode(frame)?
     else {
         return Err("server did not authorize the client session".into());
     };
@@ -2305,7 +2305,7 @@ async fn udp_l2(client: &Client, label: &str, link: &LinkCell) -> Result<UdpL2> 
 
     let noise = Arc::new(noise);
     let (inbound, guard) = sess.register_dgram(BRIDGE_CONV);
-    let tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
+    let mut tx = DgramTx::new(sess.send_tx(), BRIDGE_CONV, noise.clone());
     let rx = DgramRx::new(inbound, noise);
     // Announce this client's label so the server's fleet view names the port.
     let _ = tx.send_name(&lease.client_id).await;
@@ -2353,13 +2353,15 @@ async fn l2_udp(client: &Client, l2: &L2, link: &LinkCell) -> (Result<()>, bool)
             };
             // UDP requires a literal ip:port, so the configured server is the real peer.
             let server_ip = server_v4(&client.server);
-            let result = crate::pppoe::tunnel::run_dgram(
+            let result = crate::pppoe::tunnel::run(
                 dp,
                 bringup(server_ip, pp, status.clone()),
-                up.rx,
-                up.tx,
+                crate::pppoe::tunnel::Wire::Dgram {
+                    rx: up.rx,
+                    tx: up.tx,
+                    name: &up.lease.client_id,
+                },
                 up.cancel,
-                &up.lease.client_id,
             )
             .await;
             (result, true)
@@ -2450,11 +2452,13 @@ async fn l2_tcp(client: &Client, l2: &L2, link: &LinkCell) -> (Result<()>, bool)
             };
             // Pin the IP the tunnel actually connected to (handles a hostname --server).
             let server_ip = up.peer.and_then(peer_v4);
-            let result = crate::pppoe::tunnel::run_stream(
+            let result = crate::pppoe::tunnel::run(
                 dp,
                 bringup(server_ip, pp, status.clone()),
-                up.nr,
-                up.nw,
+                crate::pppoe::tunnel::Wire::Stream {
+                    nr: up.nr,
+                    nw: up.nw,
+                },
                 up.cancel,
             )
             .await;
@@ -2877,7 +2881,7 @@ async fn control_loop(
         if let Some(wait) = pings.heard() {
             ping_at = tokio::time::Instant::now() + wait;
         }
-        let open = match Msg::decode(&msg) {
+        let open = match Msg::decode(msg) {
             Ok(Msg::Open {
                 proto,
                 port,
@@ -4093,7 +4097,7 @@ mod tests {
         let server = crate::spawn(async move {
             let mut pings = 0u32;
             while let Ok(frame) = sr.recv().await {
-                assert!(matches!(Msg::decode(&frame), Ok(Msg::Ping)));
+                assert!(matches!(Msg::decode(frame), Ok(Msg::Ping)));
                 if pings == 0 {
                     sw.send(&Msg::Pong.encode()).await.unwrap();
                 }

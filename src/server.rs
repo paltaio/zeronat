@@ -17,7 +17,8 @@ use crate::bridge;
 use crate::config;
 use crate::dgram::{DgramRx, DgramTx, Frame};
 use crate::kcp::{
-    admitted_session_from, can_open_session, route, route_admitted, Accepted, ConvGuard, Session,
+    admitted_session_from, can_open_session, route, route_admitted, Accepted, ConvGuard, Delivery,
+    Inbound, Session, Slot,
 };
 #[cfg(target_os = "linux")]
 use crate::kcp::{BRIDGE_CONV, BRIDGE_ID};
@@ -345,19 +346,10 @@ impl LegRead {
     /// and vanishes when written to one, so both leg kinds drop them and the
     /// pipe carries the same frames on every path. Everything else crosses
     /// opaque.
-    async fn recv(&mut self) -> Option<Vec<u8>> {
-        loop {
-            match self {
-                LegRead::Stream(r) => match r.recv().await {
-                    Ok(frame) if frame.is_empty() => continue,
-                    Ok(frame) => return Some(frame),
-                    Err(_) => return None,
-                },
-                LegRead::Dgram(rx) => match rx.recv().await? {
-                    Frame::Data(body) if !body.is_empty() => return Some(body),
-                    _ => continue,
-                },
-            }
+    async fn recv(&mut self) -> Option<&[u8]> {
+        match self {
+            LegRead::Stream(r) => r.recv_data().await,
+            LegRead::Dgram(rx) => rx.recv_data().await,
         }
     }
 }
@@ -387,7 +379,7 @@ async fn splice_relay(a: RelayLeg, b: RelayLeg, stop: oneshot::Receiver<()>) {
 
 async fn pump_leg(from: &mut LegRead, to: &mut LegWrite) {
     while let Some(frame) = from.recv().await {
-        if to.send(&frame).await.is_err() {
+        if to.send(frame).await.is_err() {
             break;
         }
     }
@@ -442,7 +434,7 @@ struct UdpPending {
     public_socket: Arc<UdpSocket>,
     public_src: SocketAddr,
     public_local: Option<crate::pktinfo::LocalAddr>,
-    dgram_rx: mpsc::Receiver<Vec<u8>>,
+    dgram_rx: Inbound,
     idle: Duration,
     cancel: watch::Receiver<bool>,
 }
@@ -1673,7 +1665,7 @@ pub(crate) async fn serve_stream(
         Ok(res) => res?,
         Err(_) => return Err("timed out waiting for role frame".into()),
     };
-    match (auth_identity, Msg::decode(&first)?) {
+    match (auth_identity, Msg::decode(first)?) {
         (AuthIdentity::Client(client_id), Msg::ClientHello { version, .. }) => {
             check_version(version)?;
             let (tx, mut cancelled, writer) =
@@ -1691,7 +1683,7 @@ pub(crate) async fn serve_stream(
                         Some(Ok(Ok(bytes))) => bytes,
                         _ => break,
                     };
-                handle_control_frame(&srv, &client_id, &tx, &mut pending_announce, &bytes);
+                handle_control_frame(&srv, &client_id, &tx, &mut pending_announce, bytes);
             }
             unregister_client(&srv, &client_id, &tx);
             writer.abort();
@@ -1754,7 +1746,7 @@ async fn serve_admin(
                 Ok(res) => res?,
                 Err(_) => return Err("timed out waiting for admin request".into()),
             };
-            let req = Msg::decode(&bytes)?;
+            let req = Msg::decode(bytes)?;
             let (ok, msg) = apply_mutation(&srv, req).await;
             crate::elog!("admin mutation: ok={ok} {msg}");
             w.send(&Msg::MutationResult { ok, msg }.encode()).await?;
@@ -2755,8 +2747,7 @@ async fn udp_listener(
     // carries a custom idle so the sweep never undercuts a longer-lived bridge).
     // A closed channel (bridge ended) or a stale TTL evicts the entry, so a
     // source that sends once and vanishes cannot pin a dead Sender slot forever.
-    let mut sessions: HashMap<SocketAddr, (mpsc::Sender<Vec<u8>>, Instant, Duration)> =
-        HashMap::new();
+    let mut sessions: HashMap<SocketAddr, (Slot, Instant, Duration)> = HashMap::new();
     let mut last_drop_log = None;
     let mut buf = [0u8; 65535];
     let mut sweep = tokio::time::interval(UDP_SWEEP_INTERVAL);
@@ -2781,32 +2772,26 @@ async fn udp_listener(
             },
             _ = sweep.tick() => {
                 let now = Instant::now();
-                sessions.retain(|_, (tx, last, ttl)| {
-                    !tx.is_closed() && now.duration_since(*last) < *ttl
+                sessions.retain(|_, (slot, last, ttl)| {
+                    !slot.is_closed() && now.duration_since(*last) < *ttl
                 });
                 continue;
             }
         };
-        let data = buf[..n].to_vec();
-
         // Route to an existing session; recover the datagram if it is dead.
-        let data = if let Some((tx, last, _)) = sessions.get_mut(&src) {
-            match tx.try_send(data) {
-                Ok(()) => {
+        let data = if let Some((slot, last, _)) = sessions.get_mut(&src) {
+            match slot.deliver(&buf[..n]) {
+                Delivery::Queued | Delivery::Full => {
                     *last = Instant::now();
                     continue;
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    *last = Instant::now();
-                    continue;
-                }
-                Err(mpsc::error::TrySendError::Closed(v)) => {
+                Delivery::Closed(v) => {
                     sessions.remove(&src);
                     v
                 }
             }
         } else {
-            data
+            buf[..n].to_vec()
         };
 
         park_udp_source(
@@ -2837,7 +2822,7 @@ fn park_udp_source(
     src: SocketAddr,
     local: Option<crate::pktinfo::LocalAddr>,
     data: Vec<u8>,
-    sessions: &mut HashMap<SocketAddr, (mpsc::Sender<Vec<u8>>, Instant, Duration)>,
+    sessions: &mut HashMap<SocketAddr, (Slot, Instant, Duration)>,
     last_drop_log: &mut Option<Instant>,
 ) {
     // Admit the new source against this listener's own session count, so a
@@ -2847,7 +2832,8 @@ fn park_udp_source(
     // client.
     if sessions.len() >= MAX_SOURCES_PER_UDP_FORWARD {
         let now = Instant::now();
-        sessions.retain(|_, (tx, last, ttl)| !tx.is_closed() && now.duration_since(*last) < *ttl);
+        sessions
+            .retain(|_, (slot, last, ttl)| !slot.is_closed() && now.duration_since(*last) < *ttl);
         if sessions.len() >= MAX_SOURCES_PER_UDP_FORWARD {
             if drop_log_due(last_drop_log, now) {
                 crate::elog!(
@@ -2873,9 +2859,9 @@ fn park_udp_source(
         Some(idle) => UDP_DATA_TTL.max(idle + Duration::from_secs(60)),
         None => UDP_DATA_TTL,
     };
-    let (dtx, drx) = mpsc::channel::<Vec<u8>>(64);
-    dtx.try_send(data).ok();
-    sessions.insert(src, (dtx, Instant::now(), ttl));
+    let (mut slot, drx) = Slot::pair(64);
+    slot.deliver(&data);
+    sessions.insert(src, (slot, Instant::now(), ttl));
 
     match handle.transport {
         ActiveTransport::Tcp => {
@@ -3339,7 +3325,7 @@ async fn accept_probe(
     let mut rx = DgramRx::new(inbound, Arc::new(noise));
     let local = loop {
         match timeout(PAIR_PROBE_DEADLINE, rx.recv()).await {
-            Ok(Some(Frame::Data(body))) => match crate::proto::decode_sockaddr(&body) {
+            Ok(Some(Frame::Data(body))) => match crate::proto::decode_sockaddr(body) {
                 Ok(a) => break a,
                 Err(_) => return,
             },
@@ -3821,6 +3807,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         let capability = [5; crate::proto::CAPABILITY_LEN];
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let (_dgram_tx, dgram_rx) = mpsc::channel(1);
+        let dgram_rx = Inbound::from(dgram_rx);
         let (cancel_tx, cancel) = watch::channel(false);
         srv.udp_pending.lock().unwrap().insert(
             9,
@@ -4565,10 +4552,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         .await
         .unwrap();
         let bytes = cr.recv().await.unwrap();
-        assert!(matches!(
-            Msg::decode(&bytes),
-            Ok(Msg::ClientHelloAck { .. })
-        ));
+        assert!(matches!(Msg::decode(bytes), Ok(Msg::ClientHelloAck { .. })));
         (cr, cw, server)
     }
 
@@ -4590,7 +4574,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             .await
             .expect("no challenge")
             .unwrap();
-        let (eph_pub, nonce) = match Msg::decode(&bytes).unwrap() {
+        let (eph_pub, nonce) = match Msg::decode(bytes).unwrap() {
             Msg::PeerChallenge { eph_pub, nonce } => (eph_pub, nonce),
             other => return other,
         };
@@ -4612,7 +4596,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             .await
             .expect("no announce verdict")
             .unwrap();
-        Msg::decode(&bytes).unwrap()
+        Msg::decode(bytes).unwrap()
     }
 
     // A proven announce is acked with the control address recorded at
@@ -4745,7 +4729,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             .await
             .expect("no refusal")
             .unwrap();
-        match Msg::decode(&bytes).unwrap() {
+        match Msg::decode(bytes).unwrap() {
             Msg::PeerAnnounceRefuse { reason } => {
                 assert_eq!(reason, PeerRefuseReason::MalformedIdentity);
             }
@@ -4780,7 +4764,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             .await
             .expect("no first challenge")
             .unwrap();
-        let (eph_pub, nonce) = match Msg::decode(&bytes).unwrap() {
+        let (eph_pub, nonce) = match Msg::decode(bytes).unwrap() {
             Msg::PeerChallenge { eph_pub, nonce } => (eph_pub, nonce),
             other => panic!("expected a challenge, got {other:?}"),
         };
@@ -4790,7 +4774,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             .expect("no second challenge")
             .unwrap();
         assert!(matches!(
-            Msg::decode(&bytes).unwrap(),
+            Msg::decode(bytes).unwrap(),
             Msg::PeerChallenge { .. }
         ));
 
@@ -4813,7 +4797,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             .await
             .expect("no refusal")
             .unwrap();
-        match Msg::decode(&bytes).unwrap() {
+        match Msg::decode(bytes).unwrap() {
             Msg::PeerAnnounceRefuse { reason } => {
                 assert_eq!(reason, PeerRefuseReason::FailedProof);
             }
@@ -4830,7 +4814,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             .expect("no pong")
             .unwrap();
         assert!(
-            matches!(Msg::decode(&bytes), Ok(Msg::Pong)),
+            matches!(Msg::decode(bytes), Ok(Msg::Pong)),
             "a stray proof must be dropped without a reply"
         );
         assert_eq!(
@@ -4901,7 +4885,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             .await
             .expect("no displacement verdict")
             .unwrap();
-        match Msg::decode(&bytes).unwrap() {
+        match Msg::decode(bytes).unwrap() {
             Msg::PeerAnnounceRefuse { reason } => {
                 assert_eq!(reason, PeerRefuseReason::IdentityClaimed);
             }
@@ -4957,7 +4941,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             .expect("no challenge")
             .unwrap();
         assert!(matches!(
-            Msg::decode(&bytes).unwrap(),
+            Msg::decode(bytes).unwrap(),
             Msg::PeerChallenge { .. }
         ));
         // The proof never arrives; the claim occupies nothing.
@@ -5029,7 +5013,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             .expect("no pong")
             .unwrap();
         assert!(
-            matches!(Msg::decode(&bytes), Ok(Msg::Pong)),
+            matches!(Msg::decode(bytes), Ok(Msg::Pong)),
             "unannounced PeerConnect must be dropped without a reply"
         );
         assert!(srv.pairs.lock().unwrap().is_empty());

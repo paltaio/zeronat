@@ -326,9 +326,18 @@ impl TapDevice {
     }
 
     pub async fn read_frame(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.read_frame_into(&mut buf).await?;
+        Ok(buf)
+    }
+
+    /// Read the next frame into `buf`, which a relay keeps and reuses so its
+    /// data path allocates nothing per frame.
+    pub async fn read_frame_into(&self, buf: &mut Vec<u8>) -> Result<()> {
+        buf.clear();
+        buf.resize(self.mtu + 64, 0);
         loop {
             let mut guard = self.fd.readable().await?;
-            let mut buf = vec![0u8; self.mtu + 64];
             match guard.try_io(|inner| {
                 let n = unsafe {
                     libc::read(
@@ -345,7 +354,7 @@ impl TapDevice {
             }) {
                 Ok(Ok(n)) => {
                     buf.truncate(n);
-                    return Ok(buf);
+                    return Ok(());
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_would_block) => continue,

@@ -3,8 +3,8 @@ use std::sync::Mutex;
 
 use crate::hash::{blake2s, ct_eq, hmac_blake2s};
 use crate::{Error, Result};
-use chacha20poly1305::aead::Aead;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};
 
@@ -219,24 +219,44 @@ fn aead_nonce(n: u64) -> Nonce {
     Nonce::from(nonce)
 }
 
-fn aead_encrypt(key: &[u8; 32], n: u64, ad: &[u8], pt: &[u8]) -> Vec<u8> {
-    let cipher = ChaCha20Poly1305::new(key.into());
-    cipher
-        .encrypt(
-            &aead_nonce(n),
-            chacha20poly1305::aead::Payload { msg: pt, aad: ad },
-        )
+/// Encrypt `buf` in place under nonce `n` and return the tag that follows the
+/// ciphertext on the wire.
+#[inline(never)]
+fn aead_seal(key: &[u8; 32], n: u64, ad: &[u8], buf: &mut [u8]) -> [u8; TAGLEN] {
+    ChaCha20Poly1305::new(key.into())
+        .encrypt_in_place_detached(&aead_nonce(n), ad, buf)
         .expect("chacha20poly1305 encrypt is infallible for valid sizes")
+        .into()
+}
+
+/// Authenticate and decrypt `ct` (ciphertext followed by its tag) in place; the
+/// plaintext is the leading `ct.len() - TAGLEN` bytes.
+#[inline(never)]
+fn aead_open<'a>(key: &[u8; 32], n: u64, ad: &[u8], ct: &'a mut [u8]) -> Result<&'a [u8]> {
+    let split = ct
+        .len()
+        .checked_sub(TAGLEN)
+        .ok_or("aead authentication failed")?;
+    let (body, tag) = ct.split_at_mut(split);
+    ChaCha20Poly1305::new(key.into())
+        .decrypt_in_place_detached(&aead_nonce(n), ad, body, Tag::from_slice(tag))
+        .map_err(|_| -> Error { "aead authentication failed".into() })?;
+    Ok(body)
+}
+
+fn aead_encrypt(key: &[u8; 32], n: u64, ad: &[u8], pt: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pt.len() + TAGLEN);
+    out.extend_from_slice(pt);
+    let tag = aead_seal(key, n, ad, &mut out);
+    out.extend_from_slice(&tag);
+    out
 }
 
 fn aead_decrypt(key: &[u8; 32], n: u64, ad: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new(key.into());
-    cipher
-        .decrypt(
-            &aead_nonce(n),
-            chacha20poly1305::aead::Payload { msg: ct, aad: ad },
-        )
-        .map_err(|_| -> Error { "aead authentication failed".into() })
+    let mut buf = ct.to_vec();
+    let n = aead_open(key, n, ad, &mut buf)?.len();
+    buf.truncate(n);
+    Ok(buf)
 }
 
 struct SymmetricState {
@@ -525,7 +545,7 @@ async fn initiate(
     let mut ss = nn_start(psk, prologue);
     // Message 1: tokens [psk, e]
     let (e_priv, msg1) = nn_write(&mut ss, None, payload1);
-    write_frame(&mut stream, &msg1).await?;
+    write_frame(&mut *stream, &msg1).await?;
     // Message 2: tokens [e, ee]
     let msg2 = read_frame(&mut stream).await?;
     let (_, payload2) = nn_read(
@@ -551,7 +571,7 @@ async fn respond(
     let (re, payload1) = nn_read(&mut ss, None, &msg1, "handshake message 1 too short")?;
     // Message 2: tokens [e, ee]
     let (_, msg2) = nn_write(&mut ss, Some(&re), payload2);
-    write_frame(&mut stream, &msg2).await?;
+    write_frame(&mut *stream, &msg2).await?;
     Ok((stream, ss.keys(false), payload1))
 }
 
@@ -674,6 +694,7 @@ fn finish(stream: BoxStream, keys: Keys) -> Noise {
             wh: Box::new(wh),
             send_key: keys.send_key,
             send_n: 0,
+            buf: Vec::new(),
         },
     )
 }
@@ -685,6 +706,10 @@ fn finish(stream: BoxStream, keys: Keys) -> Noise {
 /// so dropping a `recv` future mid-frame (e.g. as the losing branch of a
 /// `tokio::select!`) keeps already-read bytes and the next `recv` resumes from
 /// where it left off. Without this, a cancelled read would desync the framing.
+///
+/// `body` is the one frame buffer for the reader's whole life: each frame is
+/// read into it and decrypted in place, and `recv` hands out the plaintext as a
+/// slice of it, so a relay moves a frame without touching the heap.
 pub struct NoiseReader {
     rh: BoxRead,
     recv_key: [u8; 32],
@@ -697,7 +722,28 @@ pub struct NoiseReader {
 }
 
 impl NoiseReader {
-    pub async fn recv(&mut self) -> Result<Vec<u8>> {
+    /// The next frame's plaintext, valid until the next call.
+    pub async fn recv(&mut self) -> Result<&[u8]> {
+        let n = self.fill().await?;
+        Ok(&self.body[..n])
+    }
+
+    /// The next frame with a body, skipping empty frames; `None` once the
+    /// connection is closed or a frame fails to decrypt.
+    pub async fn recv_data(&mut self) -> Option<&[u8]> {
+        let n = loop {
+            match self.fill().await {
+                Ok(0) => continue,
+                Ok(n) => break n,
+                Err(_) => return None,
+            }
+        };
+        Some(&self.body[..n])
+    }
+
+    /// Read the next frame into `body` and decrypt it in place; the plaintext
+    /// is the first `n` bytes of `body`, where `n` is returned.
+    async fn fill(&mut self) -> Result<usize> {
         while self.len_filled < 2 {
             let n = self.rh.read(&mut self.len[self.len_filled..]).await?;
             if n == 0 {
@@ -706,7 +752,8 @@ impl NoiseReader {
             self.len_filled += n;
         }
         if !self.have_len {
-            self.body = vec![0u8; u16::from_be_bytes(self.len) as usize];
+            self.body.clear();
+            self.body.resize(u16::from_be_bytes(self.len) as usize, 0);
             self.body_filled = 0;
             self.have_len = true;
         }
@@ -718,29 +765,30 @@ impl NoiseReader {
             self.body_filled += n;
         }
 
-        let ct = std::mem::take(&mut self.body);
         self.len_filled = 0;
         self.have_len = false;
-        let pt = aead_decrypt(&self.recv_key, self.recv_n, &[], &ct)
-            .map_err(|_| -> Error { "decrypt failed".into() })?;
+        let n = aead_open(&self.recv_key, self.recv_n, &[], &mut self.body)
+            .map_err(|_| -> Error { "decrypt failed".into() })?
+            .len();
         self.recv_n += 1;
-        Ok(pt)
+        Ok(n)
     }
 }
 
-/// Sending half of an encrypted connection.
+/// Sending half of an encrypted connection. `buf` holds the frame being sent,
+/// `[len:2][ciphertext][tag]`, encrypted in place and reused for every frame.
 pub struct NoiseWriter {
     wh: BoxWrite,
     send_key: [u8; 32],
     send_n: u64,
+    buf: Vec<u8>,
 }
 
 impl NoiseWriter {
     pub async fn send(&mut self, plaintext: &[u8]) -> Result<()> {
         for chunk in plaintext.chunks(MAX_PLAINTEXT) {
-            let ct = aead_encrypt(&self.send_key, self.send_n, &[], chunk);
-            self.send_n += 1;
-            write_frame(&mut self.wh, &ct).await?;
+            self.frame(chunk);
+            write_buf(&mut *self.wh, &self.buf).await?;
         }
         Ok(())
     }
@@ -750,9 +798,19 @@ impl NoiseWriter {
     /// forwarding it to the target. `send(&[])` would emit nothing, so this is
     /// the explicit one-frame form.
     pub async fn probe(&mut self) -> Result<()> {
-        let ct = aead_encrypt(&self.send_key, self.send_n, &[], &[]);
+        self.frame(&[]);
+        write_buf(&mut *self.wh, &self.buf).await
+    }
+
+    /// Lay one frame out in `buf` and advance the nonce.
+    fn frame(&mut self, chunk: &[u8]) {
+        self.buf.clear();
+        self.buf
+            .extend_from_slice(&((chunk.len() + TAGLEN) as u16).to_be_bytes());
+        self.buf.extend_from_slice(chunk);
+        let tag = aead_seal(&self.send_key, self.send_n, &[], &mut self.buf[2..]);
+        self.buf.extend_from_slice(&tag);
         self.send_n += 1;
-        write_frame(&mut self.wh, &ct).await
     }
 }
 
@@ -765,8 +823,14 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     Ok(b)
 }
 
-async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, b: &[u8]) -> Result<()> {
-    w.write_all(&(b.len() as u16).to_be_bytes()).await?;
+async fn write_frame(w: &mut (dyn AsyncWrite + Unpin + Send), b: &[u8]) -> Result<()> {
+    let mut frame = Vec::with_capacity(2 + b.len());
+    frame.extend_from_slice(&(b.len() as u16).to_be_bytes());
+    frame.extend_from_slice(b);
+    write_buf(w, &frame).await
+}
+
+async fn write_buf(w: &mut (dyn AsyncWrite + Unpin + Send), b: &[u8]) -> Result<()> {
     w.write_all(b).await?;
     w.flush().await?;
     Ok(())
@@ -836,6 +900,23 @@ impl StatelessNoise {
     /// Returns an error after the directional nonce space is exhausted or if
     /// the nonce state is unavailable.
     pub fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(8 + plaintext.len() + TAGLEN);
+        out.extend_from_slice(&[0u8; 8]);
+        out.extend_from_slice(plaintext);
+        self.seal_at(&mut out, 0)?;
+        Ok(out)
+    }
+
+    /// Seal a datagram body laid out in `out` from `at`: the 8 bytes there
+    /// receive the nonce, the plaintext after them is encrypted in place, and
+    /// the tag is appended. The caller lays the body out in a buffer it keeps,
+    /// so the datagram path allocates nothing per packet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after the directional nonce space is exhausted or if
+    /// the nonce state is unavailable.
+    pub fn seal_at(&self, out: &mut Vec<u8>, at: usize) -> Result<()> {
         let nonce = {
             let mut n = self
                 .send_nonce
@@ -847,22 +928,30 @@ impl StatelessNoise {
                 .ok_or_else(|| -> Error { "stateless send nonce exhausted".into() })?;
             v
         };
-        let ct = aead_encrypt(&self.send_key, nonce, &[], plaintext);
-        let mut out = Vec::with_capacity(8 + ct.len());
-        out.extend_from_slice(&nonce.to_be_bytes());
-        out.extend_from_slice(&ct);
-        Ok(out)
+        out[at..at + 8].copy_from_slice(&nonce.to_be_bytes());
+        let tag = aead_seal(&self.send_key, nonce, &[], &mut out[at + 8..]);
+        out.extend_from_slice(&tag);
+        Ok(())
     }
 
     /// Decrypt a `[nonce:8][ciphertext]` datagram body.
     pub fn open(&self, datagram: &[u8]) -> Result<Vec<u8>> {
+        let mut buf = datagram.to_vec();
+        let n = self.open_in_place(&mut buf)?.len();
+        buf.drain(..8);
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// Decrypt a `[nonce:8][ciphertext]` datagram body in place; the plaintext
+    /// is returned as a slice of `datagram`.
+    pub fn open_in_place<'a>(&self, datagram: &'a mut [u8]) -> Result<&'a [u8]> {
         if datagram.len() < 8 + TAGLEN {
             return Err("short datagram".into());
         }
-        let mut nonce_bytes = [0u8; 8];
-        nonce_bytes.copy_from_slice(&datagram[..8]);
-        let nonce = u64::from_be_bytes(nonce_bytes);
-        let plaintext = aead_decrypt(&self.recv_key, nonce, &[], &datagram[8..])
+        let (nonce_bytes, ct) = datagram.split_at_mut(8);
+        let nonce = u64::from_be_bytes(nonce_bytes.try_into().unwrap());
+        let plaintext = aead_open(&self.recv_key, nonce, &[], ct)
             .map_err(|_| -> Error { "stateless decrypt failed".into() })?;
         self.recv_window
             .lock()
@@ -1042,6 +1131,154 @@ mod tests {
         datagram.extend_from_slice(&nonce.to_be_bytes());
         datagram.extend_from_slice(&ciphertext);
         datagram
+    }
+
+    /// The crate's allocating API: the reference the in-place path must match
+    /// byte for byte.
+    fn crate_encrypt(key: &[u8; 32], n: u64, ad: &[u8], pt: &[u8]) -> Vec<u8> {
+        use chacha20poly1305::aead::Aead;
+        ChaCha20Poly1305::new(key.into())
+            .encrypt(
+                &aead_nonce(n),
+                chacha20poly1305::aead::Payload { msg: pt, aad: ad },
+            )
+            .unwrap()
+    }
+
+    fn crate_decrypt(key: &[u8; 32], n: u64, ad: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
+        use chacha20poly1305::aead::Aead;
+        ChaCha20Poly1305::new(key.into())
+            .decrypt(
+                &aead_nonce(n),
+                chacha20poly1305::aead::Payload { msg: ct, aad: ad },
+            )
+            .ok()
+    }
+
+    fn junk(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    const SIZES: [usize; 14] = [
+        0, 1, 2, 15, 16, 17, 63, 64, 65, 1000, 1200, 1400, 4096, 16384,
+    ];
+    const NONCES: [u64; 8] = [0, 1, 2, 255, 256, 65535, 1 << 32, u64::MAX - 2];
+
+    #[test]
+    fn in_place_aead_matches_the_crate() {
+        let key = derive_psk("in-place aead key");
+        for (i, &len) in SIZES.iter().enumerate() {
+            for &n in &NONCES {
+                let pt = junk(n ^ len as u64, len);
+                let ad = junk(i as u64, i * 3);
+                let want = crate_encrypt(&key, n, &ad, &pt);
+                assert_eq!(aead_encrypt(&key, n, &ad, &pt), want, "len {len} nonce {n}");
+                let mut buf = pt.clone();
+                let tag = aead_seal(&key, n, &ad, &mut buf);
+                buf.extend_from_slice(&tag);
+                assert_eq!(buf, want, "in place len {len} nonce {n}");
+                assert_eq!(aead_open(&key, n, &ad, &mut buf).unwrap(), pt);
+                assert_eq!(crate_decrypt(&key, n, &ad, &want).unwrap(), pt);
+                buf[len] ^= 1;
+                assert!(aead_open(&key, n, &ad, &mut buf).is_err());
+            }
+        }
+        let mut short = [0u8; TAGLEN - 1];
+        assert!(aead_open(&key, 0, &[], &mut short).is_err());
+    }
+
+    #[test]
+    fn stateless_seal_matches_the_crate() {
+        let send_key = derive_psk("stateless seal send");
+        let recv_key = derive_psk("stateless seal recv");
+        let noise = StatelessNoise::from_keys(Keys { send_key, recv_key });
+        let opener = || {
+            StatelessNoise::from_keys(Keys {
+                send_key: recv_key,
+                recv_key: send_key,
+            })
+        };
+        for &len in &SIZES {
+            for &n in &NONCES {
+                let pt = junk(n.wrapping_add(len as u64), len);
+                let mut want = n.to_be_bytes().to_vec();
+                want.extend_from_slice(&crate_encrypt(&send_key, n, &[], &pt));
+                *noise.send_nonce.lock().unwrap() = n;
+                assert_eq!(noise.seal(&pt).unwrap(), want, "len {len} nonce {n}");
+                *noise.send_nonce.lock().unwrap() = n;
+                let mut body = vec![0xAA; 5];
+                body.extend_from_slice(&[0u8; 8]);
+                body.extend_from_slice(&pt);
+                noise.seal_at(&mut body, 5).unwrap();
+                assert_eq!(body[..5], [0xAA; 5]);
+                assert_eq!(body[5..], want, "seal_at len {len} nonce {n}");
+                assert_eq!(*noise.send_nonce.lock().unwrap(), n + 1);
+                assert_eq!(opener().open_in_place(&mut body[5..]).unwrap(), pt);
+                assert_eq!(opener().open(&want).unwrap(), pt);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_frames_match_the_crate() {
+        let key = derive_psk("writer frame key");
+        let (a, mut b) = tokio::io::duplex(1 << 20);
+        let mut w = NoiseWriter {
+            wh: Box::new(a),
+            send_key: key,
+            send_n: 0,
+            buf: Vec::new(),
+        };
+        let mut r = NoiseReader {
+            rh: Box::new(tokio::io::empty()),
+            recv_key: key,
+            recv_n: 0,
+            len: [0; 2],
+            len_filled: 0,
+            have_len: false,
+            body: Vec::new(),
+            body_filled: 0,
+        };
+        for start in [0u64, 1 << 40, u64::MAX - 40] {
+            w.send_n = start;
+            let mut n = start;
+            for &len in SIZES.iter().chain(&[65519, 65520, 200_000]) {
+                let pt = junk(n, len);
+                let chunks: Vec<&[u8]> = if len == 0 {
+                    w.probe().await.unwrap();
+                    vec![&[]]
+                } else {
+                    w.send(&pt).await.unwrap();
+                    pt.chunks(MAX_PLAINTEXT).collect()
+                };
+                for chunk in chunks {
+                    let ct = crate_encrypt(&key, n, &[], chunk);
+                    let mut want = (ct.len() as u16).to_be_bytes().to_vec();
+                    want.extend_from_slice(&ct);
+                    let mut got = vec![0u8; want.len()];
+                    b.read_exact(&mut got).await.unwrap();
+                    assert_eq!(got, want, "len {len} nonce {n}");
+                    // The reader decrypts that same frame in place.
+                    r.body.clear();
+                    r.body.extend_from_slice(&ct);
+                    r.body_filled = ct.len();
+                    r.have_len = true;
+                    r.len_filled = 2;
+                    r.recv_n = n;
+                    assert_eq!(r.recv().await.unwrap(), chunk);
+                    n += 1;
+                }
+                assert_eq!(w.send_n, n);
+            }
+        }
     }
 
     #[tokio::test]

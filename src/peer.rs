@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval_at, timeout, Instant};
 
 use crate::client::{AbortOnDrop, RelayDgramLeg, PING_INTERVAL};
-use crate::dgram::{DgramRx, DgramTx, Frame};
+use crate::dgram::{DgramRx, DgramTx};
 use crate::kcp::ConvGuard;
 use crate::noise::{public_identity, Noise, NoiseReader, NoiseWriter, StatelessNoise, XxHandshake};
 use crate::punch::{LinkHold, PeerLink};
@@ -150,19 +150,10 @@ impl PathRx {
     /// The next inner frame, or `None` once the path dies. A dgram keepalive
     /// belongs to the hop below and an empty frame cannot survive a stream
     /// leg, so both are dropped here exactly as the relay drops them.
-    async fn recv(&mut self) -> Option<Vec<u8>> {
-        loop {
-            match self {
-                PathRx::Dgram(rx) => match rx.recv().await? {
-                    Frame::Data(body) if !body.is_empty() => return Some(body),
-                    _ => continue,
-                },
-                PathRx::Stream(r) => match r.recv().await {
-                    Ok(frame) if frame.is_empty() => continue,
-                    Ok(frame) => return Some(frame),
-                    Err(_) => return None,
-                },
-            }
+    async fn recv(&mut self) -> Option<&[u8]> {
+        match self {
+            PathRx::Dgram(rx) => rx.recv_data().await,
+            PathRx::Stream(r) => r.recv_data().await,
         }
     }
 }
@@ -417,13 +408,12 @@ impl PeerSession {
 /// Seal one frame for the session: the frame byte, then the kind-tagged
 /// plaintext under the session keys.
 fn session_frame(noise: &StatelessNoise, kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
-    let mut plaintext = Vec::with_capacity(1 + payload.len());
-    plaintext.push(kind);
-    plaintext.extend_from_slice(payload);
-    let sealed = noise.seal(&plaintext)?;
-    let mut frame = Vec::with_capacity(1 + sealed.len());
+    let mut frame = Vec::with_capacity(1 + 8 + 1 + payload.len() + 16);
     frame.push(FRAME_SESSION);
-    frame.extend_from_slice(&sealed);
+    frame.extend_from_slice(&[0u8; 8]);
+    frame.push(kind);
+    frame.extend_from_slice(payload);
+    noise.seal_at(&mut frame, 1)?;
     Ok(frame)
 }
 

@@ -102,7 +102,7 @@ async fn exchange(path: &Path, mode: u8, req: Option<ClientMsg>) -> Result<Clien
         w.send(&req.encode()).await?;
     }
     let frame = r.recv().await?;
-    ClientMsg::decode(&frame)
+    ClientMsg::decode(frame)
 }
 
 /// Fetch the running client's snapshot, render it, and exit.

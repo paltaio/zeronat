@@ -89,7 +89,7 @@ async fn exchange(server: &str, psk: &[u8; 32], mode: u8, req: Option<Msg>) -> R
         w.send(&req.encode()).await?;
     }
     let body = r.recv().await?;
-    Msg::decode(&body)
+    Msg::decode(body)
 }
 
 fn route_state(state: u8) -> &'static str {

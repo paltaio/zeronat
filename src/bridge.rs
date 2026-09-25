@@ -1,6 +1,5 @@
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
-use std::future::Future;
 use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicBool;
@@ -33,12 +32,13 @@ fn widen_counter(v: u32) -> u64 {
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
+#[cfg(any(target_os = "linux", test))]
 use tokio::sync::mpsc;
-#[cfg(target_os = "linux")]
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
 use crate::dgram::{DgramRx, DgramTx, Frame};
+use crate::kcp::Inbound;
 use crate::noise::{NoiseReader, NoiseWriter};
 use crate::pktinfo::LocalAddr;
 #[cfg(target_os = "linux")]
@@ -56,27 +56,110 @@ const UDP_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 pub const TCP_IDLE: Duration = Duration::from_secs(120);
 
 /// The local plaintext side of a reliable relay. `read` yields the next chunk
-/// (an empty `Vec` signals a closed local side, e.g. a TCP EOF); `write`
+/// (an empty chunk signals a closed local side, e.g. a TCP EOF); `write`
 /// delivers a decrypted frame back to it. Both take `&mut self` and are driven
-/// from independent halves so the two directions never serialize.
-trait LocalRead {
-    fn read(&mut self) -> impl Future<Output = crate::Result<Vec<u8>>>;
-}
-trait LocalWrite {
-    fn write(&mut self, buf: &[u8]) -> impl Future<Output = crate::Result<()>>;
+/// from independent halves so the two directions never serialize. Each variant
+/// keeps the buffer its chunk lives in, so a relay reads without allocating.
+enum LocalRead {
+    Tcp(OwnedReadHalf, Vec<u8>),
+    /// One whole Ethernet frame per read, never empty, so it never collides
+    /// with the empty EOF sentinel the relay uses for TCP.
+    #[cfg(target_os = "linux")]
+    Tap(Arc<TapDevice>, Vec<u8>),
+    /// The next switch-routed inbound frame (TAP -> client). A closed channel
+    /// is the empty EOF sentinel, which a switch frame never collides with
+    /// (a TAP frame is never empty).
+    #[cfg(target_os = "linux")]
+    Port {
+        rx: mpsc::Receiver<Vec<u8>>,
+        switch: Arc<TapSwitch>,
+        stats: Arc<PortStats>,
+        last: Vec<u8>,
+    },
+    /// Test-only: blocks on an mpsc the test feeds; `None` is the EOF sentinel.
+    #[cfg(test)]
+    Chan(mpsc::Receiver<Vec<u8>>, Vec<u8>),
 }
 
-impl LocalRead for OwnedReadHalf {
-    async fn read(&mut self) -> crate::Result<Vec<u8>> {
-        let mut buf = [0u8; TCP_BUF];
-        let n = AsyncReadExt::read(self, &mut buf).await?;
-        Ok(buf[..n].to_vec()) // empty == EOF
+enum LocalWrite {
+    Tcp(OwnedWriteHalf),
+    #[cfg(target_os = "linux")]
+    Tap(Arc<TapDevice>),
+    /// An egress frame (client -> BRAS) learns its source MAC onto this port,
+    /// then writes to the shared TAP.
+    #[cfg(target_os = "linux")]
+    Port {
+        switch: Arc<TapSwitch>,
+        port_id: u32,
+        stats: Arc<PortStats>,
+    },
+    /// Test-only: records every forwarded frame so a test can assert what
+    /// reached it.
+    #[cfg(test)]
+    Chan(mpsc::UnboundedSender<Vec<u8>>),
+}
+
+impl LocalRead {
+    fn tcp(r: OwnedReadHalf) -> Self {
+        LocalRead::Tcp(r, vec![0u8; TCP_BUF])
+    }
+
+    async fn read(&mut self) -> crate::Result<&[u8]> {
+        match self {
+            LocalRead::Tcp(r, buf) => {
+                let n = AsyncReadExt::read(r, &mut buf[..]).await?;
+                Ok(&buf[..n]) // empty == EOF
+            }
+            #[cfg(target_os = "linux")]
+            LocalRead::Tap(tap, last) => {
+                tap.read_frame_into(last).await?;
+                Ok(last)
+            }
+            #[cfg(target_os = "linux")]
+            LocalRead::Port {
+                rx,
+                switch,
+                stats,
+                last,
+            } => {
+                let next = rx.recv().await.unwrap_or_default();
+                switch.reclaim(std::mem::replace(last, next));
+                // An empty frame is the channel-closed EOF sentinel, not real traffic.
+                if !last.is_empty() {
+                    stats.note_tx(last.len());
+                }
+                Ok(last)
+            }
+            #[cfg(test)]
+            LocalRead::Chan(rx, last) => {
+                *last = rx.recv().await.unwrap_or_default();
+                Ok(last)
+            }
+        }
     }
 }
-impl LocalWrite for OwnedWriteHalf {
+
+impl LocalWrite {
     async fn write(&mut self, buf: &[u8]) -> crate::Result<()> {
-        self.write_all(buf).await?;
-        Ok(())
+        match self {
+            LocalWrite::Tcp(w) => {
+                w.write_all(buf).await?;
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            LocalWrite::Tap(tap) => tap.write_frame(buf).await,
+            #[cfg(target_os = "linux")]
+            LocalWrite::Port {
+                switch,
+                port_id,
+                stats,
+            } => {
+                stats.note_rx(buf.len());
+                switch.learn_and_write_egress(buf, *port_id).await
+            }
+            #[cfg(test)]
+            LocalWrite::Chan(tx) => tx.send(buf.to_vec()).map_err(|_| "closed".into()),
+        }
     }
 }
 
@@ -94,18 +177,14 @@ impl LocalWrite for OwnedWriteHalf {
 /// whole window). The mark is an AtomicU32 in whole seconds: 32-bit targets
 /// (mips) have no 64-bit atomics and second resolution is ample for a 120s
 /// window.
-async fn stream_relay<R, W, C>(
-    mut local_r: R,
-    mut local_w: W,
+async fn stream_relay(
+    mut local_r: LocalRead,
+    mut local_w: LocalWrite,
     mut nr: NoiseReader,
     mut nw: NoiseWriter,
     idle: Duration,
-    cancel: C,
-) where
-    R: LocalRead,
-    W: LocalWrite,
-    C: Future<Output = ()>,
-{
+    cancel: Option<Arc<Notify>>,
+) {
     // tokio's clock so the idle math and the watchdog's sleep share one time
     // source (and so a paused-time test can drive it deterministically).
     let base = tokio::time::Instant::now();
@@ -125,7 +204,7 @@ async fn stream_relay<R, W, C>(
                     }
                     // Bound the send so a send-side black hole cannot park here
                     // forever and starve the idle watchdog below.
-                    match timeout(UDP_SEND_TIMEOUT, nw.send(&m)).await {
+                    match timeout(UDP_SEND_TIMEOUT, nw.send(m)).await {
                         Ok(r) => r?,
                         Err(_) => break,
                     }
@@ -148,7 +227,7 @@ async fn stream_relay<R, W, C>(
             if m.is_empty() {
                 continue; // keepalive probe; nothing to forward
             }
-            local_w.write(&m).await?;
+            local_w.write(m).await?;
         }
         Ok::<_, crate::Error>(())
     };
@@ -168,6 +247,13 @@ async fn stream_relay<R, W, C>(
         }
     };
 
+    let cancel = async {
+        match &cancel {
+            Some(cancel) => cancel.notified().await,
+            None => std::future::pending().await,
+        }
+    };
+
     tokio::select! {
         _ = up => {}
         _ = down => {}
@@ -182,18 +268,27 @@ async fn stream_relay<R, W, C>(
 pub async fn tcp(plain: TcpStream, nr: NoiseReader, nw: NoiseWriter, idle: Duration) {
     plain.set_nodelay(true).ok();
     let (pr, pw) = plain.into_split();
-    stream_relay(pr, pw, nr, nw, idle, std::future::pending()).await;
+    stream_relay(LocalRead::tcp(pr), LocalWrite::Tcp(pw), nr, nw, idle, None).await;
 }
 
 /// Client side of a UDP stream: shuttle datagrams between a local UDP socket
 /// (connected to the target service) and the encrypted connection.
-pub async fn udp_client(
-    local: UdpSocket,
+pub async fn udp_client(local: UdpSocket, nr: NoiseReader, nw: NoiseWriter, idle: Duration) {
+    let local = DgramLocal::Udp {
+        socket: local,
+        buf: vec![0u8; UDP_BUF],
+    };
+    stream_dgram_relay(local, nr, nw, idle).await;
+}
+
+/// Relay datagrams between a local side and the encrypted connection, one
+/// Noise record per datagram, on a probe-then-reap watchdog bounded by `idle`.
+async fn stream_dgram_relay(
+    mut local: DgramLocal,
     mut nr: NoiseReader,
     mut nw: NoiseWriter,
     idle: Duration,
 ) {
-    let mut buf = [0u8; UDP_BUF];
     // Floored at a second: interval_at panics on a zero period.
     let half = (idle / 2).max(Duration::from_secs(1));
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
@@ -204,13 +299,15 @@ pub async fn udp_client(
             m = nr.recv() => match m {
                 Ok(m) => {
                     last_in = Instant::now();
-                    m.is_empty() || local.send(&m).await.is_ok()
+                    m.is_empty() || local.write(m).await
                 }
                 Err(_) => false,
             },
-            r = local.recv(&mut buf) => match r {
-                Ok(n) => matches!(timeout(UDP_SEND_TIMEOUT, nw.send(&buf[..n])).await, Ok(Ok(()))),
-                Err(_) => false,
+            frame = local.read() => match frame {
+                Some(frame) => {
+                    matches!(timeout(UDP_SEND_TIMEOUT, nw.send(frame)).await, Ok(Ok(())))
+                }
+                None => false,
             },
             _ = tick.tick() => {
                 last_in.elapsed() < idle
@@ -231,61 +328,19 @@ pub async fn udp_server(
     socket: Arc<UdpSocket>,
     src: SocketAddr,
     local: Option<LocalAddr>,
-    mut dgram_rx: mpsc::Receiver<Vec<u8>>,
-    mut nr: NoiseReader,
-    mut nw: NoiseWriter,
+    dgram_rx: Inbound,
+    nr: NoiseReader,
+    nw: NoiseWriter,
     idle: Duration,
 ) {
-    // Floored at a second: interval_at panics on a zero period.
-    let half = (idle / 2).max(Duration::from_secs(1));
-    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_in = Instant::now();
-    loop {
-        let alive = tokio::select! {
-            d = dgram_rx.recv() => match d {
-                Some(d) => matches!(timeout(UDP_SEND_TIMEOUT, nw.send(&d)).await, Ok(Ok(()))),
-                None => false,
-            },
-            m = nr.recv() => match m {
-                Ok(m) => {
-                    last_in = Instant::now();
-                    m.is_empty()
-                        || crate::pktinfo::send_to(&socket, &m, src, local).await.is_ok()
-                }
-                Err(_) => false,
-            },
-            _ = tick.tick() => {
-                last_in.elapsed() < idle
-                    && matches!(timeout(UDP_SEND_TIMEOUT, nw.probe()).await, Ok(Ok(())))
-            }
-        };
-        if !alive {
-            break;
-        }
-    }
-}
-
-/// Local-side adapters for the TAP device: both halves share the device via
-/// `Arc` because `read_frame`/`write_frame` take `&self`.
-#[cfg(target_os = "linux")]
-struct TapRead(Arc<TapDevice>);
-#[cfg(target_os = "linux")]
-struct TapWrite(Arc<TapDevice>);
-
-#[cfg(target_os = "linux")]
-impl LocalRead for TapRead {
-    async fn read(&mut self) -> crate::Result<Vec<u8>> {
-        // A TAP read is one whole Ethernet frame and never empty, so it never
-        // collides with the empty-Vec EOF sentinel the relay uses for TCP.
-        self.0.read_frame().await
-    }
-}
-#[cfg(target_os = "linux")]
-impl LocalWrite for TapWrite {
-    async fn write(&mut self, buf: &[u8]) -> crate::Result<()> {
-        self.0.write_frame(buf).await
-    }
+    let local = DgramLocal::Server {
+        socket,
+        src,
+        local,
+        dgram_rx,
+        last: Vec::new(),
+    };
+    stream_dgram_relay(local, nr, nw, idle).await;
 }
 
 /// Relay Ethernet frames between a TAP device and the unreliable datagram
@@ -299,40 +354,161 @@ impl LocalWrite for TapWrite {
 #[cfg(target_os = "linux")]
 pub async fn tap_dgram(
     tap: Arc<TapDevice>,
-    mut rx: DgramRx,
+    rx: DgramRx,
     tx: DgramTx,
     cancel: Arc<Notify>,
     name: &str,
 ) {
-    let half = UDP_IDLE / 2;
+    let local = DgramLocal::Tap {
+        tap,
+        last: Vec::new(),
+    };
+    dgram_relay(local, rx, tx, UDP_IDLE, Some(cancel), Some(name)).await;
+}
+
+/// The local side of a datagram relay: where a frame from the channel goes,
+/// and what feeds the channel.
+enum DgramLocal {
+    /// The client's point-to-point bridge device.
+    #[cfg(target_os = "linux")]
+    Tap { tap: Arc<TapDevice>, last: Vec<u8> },
+    /// One port of the server's switch. The handle's drop evicts the port.
+    #[cfg(target_os = "linux")]
+    Port {
+        handle: SwitchHandle,
+        out_rx: mpsc::Receiver<Vec<u8>>,
+        last: Vec<u8>,
+    },
+    /// A local UDP socket connected to the forward's target.
+    Udp { socket: UdpSocket, buf: Vec<u8> },
+    /// The server's public socket: inbound datagrams arrive on `dgram_rx`,
+    /// replies leave for `src` from the local address it sent to.
+    Server {
+        socket: Arc<UdpSocket>,
+        src: SocketAddr,
+        local: Option<LocalAddr>,
+        dgram_rx: Inbound,
+        last: Vec<u8>,
+    },
+}
+
+impl DgramLocal {
+    /// The next frame bound for the channel, or `None` once this side is done.
+    async fn read(&mut self) -> Option<&[u8]> {
+        match self {
+            #[cfg(target_os = "linux")]
+            DgramLocal::Tap { tap, last } => {
+                tap.read_frame_into(last).await.ok()?;
+                Some(last)
+            }
+            #[cfg(target_os = "linux")]
+            DgramLocal::Port {
+                handle,
+                out_rx,
+                last,
+                ..
+            } => {
+                let next = out_rx.recv().await?;
+                handle.switch.reclaim(std::mem::replace(last, next));
+                handle.stats.note_tx(last.len());
+                Some(last)
+            }
+            DgramLocal::Udp { socket, buf } => {
+                let n = socket.recv(buf).await.ok()?;
+                Some(&buf[..n])
+            }
+            DgramLocal::Server { dgram_rx, last, .. } => {
+                let next = dgram_rx.recv().await?;
+                dgram_rx.reclaim(std::mem::replace(last, next));
+                Some(last)
+            }
+        }
+    }
+
+    /// Deliver a frame from the channel; false once this side is done.
+    async fn write(&mut self, frame: &[u8]) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            DgramLocal::Tap { tap, .. } => tap.write_frame(frame).await.is_ok(),
+            #[cfg(target_os = "linux")]
+            DgramLocal::Port { handle, .. } => {
+                handle.stats.note_rx(frame.len());
+                handle
+                    .switch
+                    .learn_and_write_egress(frame, handle.port_id)
+                    .await
+                    .is_ok()
+            }
+            DgramLocal::Udp { socket, .. } => socket.send(frame).await.is_ok(),
+            DgramLocal::Server {
+                socket, src, local, ..
+            } => crate::pktinfo::send_to(socket, frame, *src, *local)
+                .await
+                .is_ok(),
+        }
+    }
+
+    /// Any frame from the channel is the peer's proof that it is still there.
+    fn heard(&self) {
+        #[cfg(target_os = "linux")]
+        if let DgramLocal::Port { handle, .. } = self {
+            handle.prove();
+        }
+    }
+}
+
+/// Relay frames between a local side and the unreliable datagram channel.
+/// Returns when either side fails, the peer stops answering keepalives for
+/// `idle`, or `cancel` fires. The tick keeps the CG-NAT UDP mapping warm and,
+/// paired with the idle mark, self-heals if the mapping silently expires: with
+/// no inbound frame for the whole window the relay reaps and the owner
+/// redials. With a `name`, the tick re-announces it so a lost attach frame
+/// self-heals; the server applies it idempotently on every receipt.
+async fn dgram_relay(
+    mut local: DgramLocal,
+    mut rx: DgramRx,
+    mut tx: DgramTx,
+    idle: Duration,
+    cancel: Option<Arc<Notify>>,
+    name: Option<&str>,
+) {
+    // Floored at a second: interval_at panics on a zero period.
+    let half = (idle / 2).max(Duration::from_secs(1));
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_in = Instant::now();
     loop {
+        let stop = async {
+            match &cancel {
+                Some(cancel) => cancel.notified().await,
+                None => std::future::pending().await,
+            }
+        };
         let alive = tokio::select! {
-            _ = cancel.notified() => false,
-            frame = tap.read_frame() => match frame {
-                Ok(f) => tx.send(&f).await.is_ok(),
-                Err(_) => false,
-            },
+            _ = stop => false,
             m = rx.recv() => match m {
                 Some(f) => {
                     last_in = Instant::now();
+                    local.heard();
                     match f {
                         Frame::Keepalive => true,
                         // A name frame is server-bound only; ignore it here.
                         Frame::Name(_) => true,
-                        Frame::Data(d) => tap.write_frame(&d).await.is_ok(),
+                        Frame::Data(d) => local.write(d).await,
                     }
                 }
                 None => false,
             },
+            frame = local.read() => match frame {
+                Some(frame) => tx.send(frame).await.is_ok(),
+                None => false,
+            },
             _ = tick.tick() => {
-                let live = last_in.elapsed() < UDP_IDLE;
+                let live = last_in.elapsed() < idle;
                 if live {
-                    // Re-announce the name so a lost attach frame self-heals; the
-                    // server applies it idempotently on every receipt.
-                    tx.send_name(name).await.ok();
+                    if let Some(name) = name {
+                        tx.send_name(name).await.ok();
+                    }
                 }
                 live && tx.probe().await.is_ok()
             }
@@ -355,12 +531,12 @@ pub async fn tap_stream(
     cancel: Arc<Notify>,
 ) {
     stream_relay(
-        TapRead(tap.clone()),
-        TapWrite(tap),
+        LocalRead::Tap(tap.clone(), Vec::new()),
+        LocalWrite::Tap(tap),
         nr,
         nw,
         TCP_IDLE,
-        cancel.notified(),
+        Some(cancel),
     )
     .await;
 }
@@ -383,6 +559,11 @@ const SWITCH_PORT_CAP: usize = 256;
 /// bridge-client row's width; routing still uses the full per-switch MAC table.
 #[cfg(target_os = "linux")]
 const MAX_DISPLAY_MACS: usize = 16;
+
+/// Bound on frame buffers the ports have handed back for the reader to fill
+/// again; anything past it is dropped.
+#[cfg(target_os = "linux")]
+const SWITCH_RECYCLE_CAP: usize = 32;
 
 /// Live traffic counters for one switch port, shared by `Arc` so a port's relay
 /// bumps them with a single atomic add per frame and never touches the `ports`
@@ -497,6 +678,9 @@ pub struct TapSwitch {
     ports: Mutex<HashMap<u32, SwitchPort>>,
     macs: Mutex<HashMap<[u8; 6], (u32, Instant)>>,
     next_port: AtomicU32,
+    /// Frame buffers the ports are done with, for `read_loop` to fill again.
+    recycle: mpsc::Sender<Vec<u8>>,
+    returns: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
 }
 
 /// Parse an Ethernet frame's destination and source MAC. `None` for a buffer too
@@ -553,6 +737,7 @@ impl TapSwitch {
     }
 
     fn build(tap: Arc<TapDevice>, is_l2: bool, port_to_port: bool) -> Arc<Self> {
+        let (recycle, returns) = mpsc::channel(SWITCH_RECYCLE_CAP);
         Arc::new(TapSwitch {
             tap,
             is_l2,
@@ -560,23 +745,40 @@ impl TapSwitch {
             ports: Mutex::new(HashMap::new()),
             macs: Mutex::new(HashMap::new()),
             next_port: AtomicU32::new(0),
+            recycle,
+            returns: Mutex::new(Some(returns)),
         })
+    }
+
+    /// Hand a frame buffer a port is done with back to the reader.
+    fn reclaim(&self, frame: Vec<u8>) {
+        if frame.capacity() != 0 {
+            let _ = self.recycle.try_send(frame);
+        }
     }
 
     /// Sole owner of `tap.read_frame()`: fan every inbound frame out to the right
     /// port(s). On an unrecoverable read error, cancel every port (so their relays
-    /// reap) and exit, ending the switch's inbound path.
+    /// reap) and exit, ending the switch's inbound path. Each frame is read into
+    /// a buffer a port handed back, or the one the last flood left over.
     pub async fn read_loop(self: Arc<Self>) {
+        let mut returns = self
+            .returns
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| mpsc::channel(1).1);
+        let mut spare = Vec::new();
         loop {
-            let frame = match self.tap.read_frame().await {
-                Ok(f) => f,
-                Err(_) => {
-                    for port in self.ports.lock().unwrap().values() {
-                        port.cancel.notify_one();
-                    }
-                    return;
+            let mut frame = returns
+                .try_recv()
+                .unwrap_or_else(|_| std::mem::take(&mut spare));
+            if self.tap.read_frame_into(&mut frame).await.is_err() {
+                for port in self.ports.lock().unwrap().values() {
+                    port.cancel.notify_one();
                 }
-            };
+                return;
+            }
             // Single-port fast path: with exactly one client attached, forward the
             // frame untouched without parsing. This preserves `--tun` (raw L3, no
             // Ethernet header) and single-client `--tap` byte-for-byte.
@@ -588,16 +790,22 @@ impl TapSwitch {
                     None
                 }
             };
-            if let Some(out) = sole {
-                let _ = out.try_send(frame);
-                continue;
-            }
-            match dst_src(&frame) {
-                Some((dst, src)) => self.forward_inbound(dst, src, frame),
-                // No Ethernet header but more than one port: nothing to address it
-                // to, so flood it to every port.
-                None => self.flood(&frame),
-            }
+            spare = match sole {
+                Some(out) => out
+                    .try_send(frame)
+                    .err()
+                    .map(|e| e.into_inner())
+                    .unwrap_or_default(),
+                None => match dst_src(&frame) {
+                    Some((dst, src)) => self.forward_inbound(dst, src, frame),
+                    // No Ethernet header but more than one port: nothing to address
+                    // it to, so flood it to every port.
+                    None => {
+                        self.flood(&frame);
+                        frame
+                    }
+                },
+            };
         }
     }
 
@@ -605,18 +813,19 @@ impl TapSwitch {
     /// and unknown unicast to every port; deliver learned unicast to the one
     /// owning port (falling back to a flood if that port has since vanished).
     /// The source transmitted on the device's side of the switch, so whatever
-    /// port binding it holds is stale and is dropped.
-    fn forward_inbound(&self, dst: [u8; 6], src: [u8; 6], frame: Vec<u8>) {
+    /// port binding it holds is stale and is dropped. Returns the buffer when
+    /// the frame was copied rather than moved to a port.
+    fn forward_inbound(&self, dst: [u8; 6], src: [u8; 6], frame: Vec<u8>) -> Vec<u8> {
         self.unlearn(src);
         if dst[0] & 1 != 0 {
             // Broadcast or multicast group bit set.
             self.flood(&frame);
-            return;
+            return frame;
         }
         let owner = self.macs.lock().unwrap().get(&dst).map(|&(p, _)| p);
         let Some(port_id) = owner else {
             self.flood(&frame);
-            return;
+            return frame;
         };
         let target = self
             .ports
@@ -625,13 +834,19 @@ impl TapSwitch {
             .get(&port_id)
             .map(|p| p.out.clone());
         match target {
-            Some(out) => {
-                if let Err(mpsc::error::TrySendError::Closed(_)) = out.try_send(frame) {
+            Some(out) => match out.try_send(frame) {
+                Ok(()) => Vec::new(),
+                Err(mpsc::error::TrySendError::Full(frame)) => frame,
+                Err(mpsc::error::TrySendError::Closed(frame)) => {
                     self.evict_port(port_id);
+                    frame
                 }
-            }
+            },
             // Learned port is gone: flood so the frame is not black-holed.
-            None => self.flood(&frame),
+            None => {
+                self.flood(&frame);
+                frame
+            }
         }
     }
 
@@ -948,47 +1163,15 @@ impl Drop for SwitchHandle {
 /// reader on device death and by `SwitchHandle`'s drop), on channel close, or on
 /// the idle reaper; idle and keepalive semantics match the client's `tap_dgram`.
 #[cfg(target_os = "linux")]
-pub async fn switch_port_dgram(mut handle: SwitchHandle, mut rx: DgramRx, tx: DgramTx) {
-    let mut out_rx = handle.out_rx.take().expect("switch port out_rx");
-    let switch = handle.switch.clone();
-    let port_id = handle.port_id;
-    let stats = handle.stats.clone();
-    let half = UDP_IDLE / 2;
-    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_in = Instant::now();
-    loop {
-        let alive = tokio::select! {
-            _ = handle.cancel.notified() => false,
-            m = rx.recv() => match m {
-                Some(f) => {
-                    last_in = Instant::now();
-                    // Any frame is the client's proof that it is still there.
-                    handle.prove();
-                    match f {
-                        Frame::Keepalive => true,
-                        Frame::Name(_) => true,
-                        Frame::Data(d) => {
-                            stats.note_rx(d.len());
-                            switch.learn_and_write_egress(&d, port_id).await.is_ok()
-                        }
-                    }
-                }
-                None => false,
-            },
-            f = out_rx.recv() => match f {
-                Some(f) => {
-                    stats.note_tx(f.len());
-                    tx.send(&f).await.is_ok()
-                }
-                None => false,
-            },
-            _ = tick.tick() => last_in.elapsed() < UDP_IDLE && tx.probe().await.is_ok(),
-        };
-        if !alive {
-            break;
-        }
-    }
+pub async fn switch_port_dgram(mut handle: SwitchHandle, rx: DgramRx, tx: DgramTx) {
+    let out_rx = handle.out_rx.take().expect("switch port out_rx");
+    let cancel = handle.cancel.clone();
+    let local = DgramLocal::Port {
+        handle,
+        out_rx,
+        last: Vec::new(),
+    };
+    dgram_relay(local, rx, tx, UDP_IDLE, Some(cancel), None).await;
 }
 
 /// Per-client half of the switch over the reliable Noise stream (TCP fallback).
@@ -1000,18 +1183,26 @@ pub async fn switch_port_dgram(mut handle: SwitchHandle, mut rx: DgramRx, tx: Dg
 #[cfg(target_os = "linux")]
 pub async fn switch_port_stream(mut handle: SwitchHandle, nr: NoiseReader, nw: NoiseWriter) {
     let out_rx = handle.out_rx.take().expect("switch port out_rx");
-    let local_r = PortRead {
+    let local_r = LocalRead::Port {
         rx: out_rx,
+        switch: handle.switch.clone(),
         stats: handle.stats.clone(),
+        last: Vec::new(),
     };
-    let local_w = PortWrite {
+    let local_w = LocalWrite::Port {
         switch: handle.switch.clone(),
         port_id: handle.port_id,
         stats: handle.stats.clone(),
     };
-    let port_cancel = handle.cancel.clone();
-    let stop = async move { port_cancel.notified().await };
-    stream_relay(local_r, local_w, nr, nw, TCP_IDLE, stop).await;
+    stream_relay(
+        local_r,
+        local_w,
+        nr,
+        nw,
+        TCP_IDLE,
+        Some(handle.cancel.clone()),
+    )
+    .await;
 }
 
 /// A peer session is neither of the two control transports the switch records
@@ -1073,73 +1264,13 @@ enum PeerStep {
     ToPeer(Option<Vec<u8>>),
 }
 
-/// `stream_relay` local-read half for a switch port: yields the next switch-routed
-/// inbound frame (TAP -> client). A closed channel is the empty-Vec EOF sentinel,
-/// which a switch frame never collides with (a TAP frame is never empty).
-#[cfg(target_os = "linux")]
-struct PortRead {
-    rx: mpsc::Receiver<Vec<u8>>,
-    stats: Arc<PortStats>,
-}
-/// `stream_relay` local-write half for a switch port: an egress frame (client ->
-/// BRAS) learns its source MAC onto this port, then writes to the shared TAP.
-#[cfg(target_os = "linux")]
-struct PortWrite {
-    switch: Arc<TapSwitch>,
-    port_id: u32,
-    stats: Arc<PortStats>,
-}
-
-#[cfg(target_os = "linux")]
-impl LocalRead for PortRead {
-    async fn read(&mut self) -> crate::Result<Vec<u8>> {
-        let frame = self.rx.recv().await.unwrap_or_default();
-        // An empty frame is the channel-closed EOF sentinel, not real traffic.
-        if !frame.is_empty() {
-            self.stats.note_tx(frame.len());
-        }
-        Ok(frame)
-    }
-}
-#[cfg(target_os = "linux")]
-impl LocalWrite for PortWrite {
-    async fn write(&mut self, buf: &[u8]) -> crate::Result<()> {
-        self.stats.note_rx(buf.len());
-        self.switch.learn_and_write_egress(buf, self.port_id).await
-    }
-}
-
 /// Client side of a UDP-forward stream over the raw datagram channel.
-pub async fn udp_client_stateless(local: UdpSocket, mut rx: DgramRx, tx: DgramTx, idle: Duration) {
-    let mut buf = [0u8; UDP_BUF];
-    // Floored at a second: interval_at panics on a zero period.
-    let half = (idle / 2).max(Duration::from_secs(1));
-    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_in = Instant::now();
-    loop {
-        let alive = tokio::select! {
-            m = rx.recv() => match m {
-                Some(f) => {
-                    last_in = Instant::now();
-                    match f {
-                        Frame::Keepalive => true,
-                        Frame::Name(_) => true,
-                        Frame::Data(d) => local.send(&d).await.is_ok(),
-                    }
-                }
-                None => false,
-            },
-            r = local.recv(&mut buf) => match r {
-                Ok(n) => tx.send(&buf[..n]).await.is_ok(),
-                Err(_) => false,
-            },
-            _ = tick.tick() => last_in.elapsed() < idle && tx.probe().await.is_ok(),
-        };
-        if !alive {
-            break;
-        }
-    }
+pub async fn udp_client_stateless(local: UdpSocket, rx: DgramRx, tx: DgramTx, idle: Duration) {
+    let local = DgramLocal::Udp {
+        socket: local,
+        buf: vec![0u8; UDP_BUF],
+    };
+    dgram_relay(local, rx, tx, idle, None, None).await;
 }
 
 /// Server side of a UDP-forward stream over the raw datagram channel. Replies
@@ -1148,41 +1279,19 @@ pub async fn udp_server_stateless(
     socket: Arc<UdpSocket>,
     src: SocketAddr,
     local: Option<LocalAddr>,
-    mut dgram_rx: mpsc::Receiver<Vec<u8>>,
-    mut rx: DgramRx,
+    dgram_rx: Inbound,
+    rx: DgramRx,
     tx: DgramTx,
     idle: Duration,
 ) {
-    // Floored at a second: interval_at panics on a zero period.
-    let half = (idle / 2).max(Duration::from_secs(1));
-    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_in = Instant::now();
-    loop {
-        let alive = tokio::select! {
-            d = dgram_rx.recv() => match d {
-                Some(d) => tx.send(&d).await.is_ok(),
-                None => false,
-            },
-            m = rx.recv() => match m {
-                Some(f) => {
-                    last_in = Instant::now();
-                    match f {
-                        Frame::Keepalive => true,
-                        Frame::Name(_) => true,
-                        Frame::Data(d) => {
-                            crate::pktinfo::send_to(&socket, &d, src, local).await.is_ok()
-                        }
-                    }
-                }
-                None => false,
-            },
-            _ = tick.tick() => last_in.elapsed() < idle && tx.probe().await.is_ok(),
-        };
-        if !alive {
-            break;
-        }
-    }
+    let local = DgramLocal::Server {
+        socket,
+        src,
+        local,
+        dgram_rx,
+        last: Vec::new(),
+    };
+    dgram_relay(local, rx, tx, idle, None, None).await;
 }
 
 #[cfg(test)]
@@ -1190,23 +1299,6 @@ mod tests {
     use super::*;
     use crate::noise::{client_handshake, derive_psk, server_handshake};
     use tokio::sync::mpsc;
-
-    // Test-only local side: `read` blocks on an mpsc the test feeds, `write`
-    // records every forwarded frame so a test can assert what reached it.
-    struct ChanRead(mpsc::Receiver<Vec<u8>>);
-    struct ChanWrite(mpsc::UnboundedSender<Vec<u8>>);
-
-    impl LocalRead for ChanRead {
-        async fn read(&mut self) -> crate::Result<Vec<u8>> {
-            // None == closed local side, signalled as the empty-Vec EOF sentinel.
-            Ok(self.0.recv().await.unwrap_or_default())
-        }
-    }
-    impl LocalWrite for ChanWrite {
-        async fn write(&mut self, buf: &[u8]) -> crate::Result<()> {
-            self.0.send(buf.to_vec()).map_err(|_| "closed".into())
-        }
-    }
 
     async fn noise_pair() -> (NoiseReader, NoiseWriter, NoiseReader, NoiseWriter) {
         let psk = derive_psk("bridge relay test");
@@ -1228,12 +1320,12 @@ mod tests {
         // Keep the peer halves alive but inert; dropping them would close the
         // stream and reap via the error path instead of the idle watchdog.
         let relay = crate::spawn(stream_relay(
-            ChanRead(feed_rx),
-            ChanWrite(out_tx),
+            LocalRead::Chan(feed_rx, Vec::new()),
+            LocalWrite::Chan(out_tx),
             cr,
             cw,
             TCP_IDLE,
-            std::future::pending(),
+            None,
         ));
         relay.await.unwrap();
         let elapsed = start.elapsed();
@@ -1253,12 +1345,12 @@ mod tests {
         let (out_tx, _out_rx) = mpsc::unbounded_channel();
         let start = tokio::time::Instant::now();
         let relay = crate::spawn(stream_relay(
-            ChanRead(feed_rx),
-            ChanWrite(out_tx),
+            LocalRead::Chan(feed_rx, Vec::new()),
+            LocalWrite::Chan(out_tx),
             cr,
             cw,
             idle,
-            std::future::pending(),
+            None,
         ));
         relay.await.unwrap();
         let elapsed = start.elapsed();
@@ -1294,12 +1386,12 @@ mod tests {
             }
         });
         let relay = crate::spawn(stream_relay(
-            ChanRead(feed_rx),
-            ChanWrite(out_tx),
+            LocalRead::Chan(feed_rx, Vec::new()),
+            LocalWrite::Chan(out_tx),
             cr,
             cw,
             TCP_IDLE,
-            std::future::pending(),
+            None,
         ));
         // Far longer than one idle window: a live peer must not be reaped.
         if tokio::time::timeout(TCP_IDLE * 5, relay).await.is_ok() {
@@ -1316,12 +1408,12 @@ mod tests {
         let (_feed_tx, feed_rx) = mpsc::channel::<Vec<u8>>(4);
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let relay = crate::spawn(stream_relay(
-            ChanRead(feed_rx),
-            ChanWrite(out_tx),
+            LocalRead::Chan(feed_rx, Vec::new()),
+            LocalWrite::Chan(out_tx),
             cr,
             cw,
             TCP_IDLE,
-            std::future::pending(),
+            None,
         ));
         // Drain inbound on the peer so the relay's nw.send/probe never blocks.
         let drain = crate::spawn(async move { while sr.recv().await.is_ok() {} });
@@ -1719,14 +1811,14 @@ mod switch_tests {
         // hands a datagram to the port: class byte and tag stripped.
         let (client_out, mut client_pkts) = mpsc::channel(4);
         DgramTx::new(client_out, 0, client).probe().await.unwrap();
-        let pkt = client_pkts.recv().await.unwrap();
+        let pkt = client_pkts.recv().await.unwrap().pkt;
         let (inbound_tx, inbound_rx) = mpsc::channel(4);
         inbound_tx.send(pkt[5..].to_vec()).await.unwrap();
 
         let (out_tx, _out_rx) = mpsc::channel(4);
         let relay = crate::spawn(switch_port_dgram(
             handle,
-            DgramRx::new(inbound_rx, server.clone()),
+            DgramRx::new(crate::kcp::Inbound::from(inbound_rx), server.clone()),
             DgramTx::new(out_tx, 0, server),
         ));
         timeout(Duration::from_secs(5), async {
