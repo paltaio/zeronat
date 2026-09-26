@@ -1196,7 +1196,6 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
     use std::io::{Read as _, Write as _};
-    use std::os::fd::AsRawFd as _;
     use std::path::PathBuf;
     use std::process::Output;
 
@@ -1353,10 +1352,21 @@ mod tests {
             _: &[&str],
             output: &std::fs::File,
         ) -> Result<Output, String> {
+            use std::os::unix::fs::MetadataExt;
             use std::os::unix::process::ExitStatusExt;
 
-            let fd_path = format!("/proc/self/fd/{}", output.as_raw_fd());
-            self.path = Some(std::fs::read_link(fd_path).unwrap());
+            // The download is the `artifact` under the temp dir that is this
+            // open file.
+            let file = output.metadata().unwrap();
+            let path = std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .filter_map(|entry| Some(entry.ok()?.path().join("artifact")))
+                .find(|path| {
+                    std::fs::symlink_metadata(path)
+                        .is_ok_and(|m| (m.dev(), m.ino()) == (file.dev(), file.ino()))
+                })
+                .expect("the download file is under the temp dir");
+            self.path = Some(path);
             output
                 .try_clone()
                 .unwrap()
