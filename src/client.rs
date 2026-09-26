@@ -1923,6 +1923,7 @@ async fn l2_session(
 /// spawn the inbound RX pump. Shared by the control and bridge UDP paths.
 async fn udp_connect(client: &Client) -> Result<(Arc<Session>, AbortOnDrop, Arc<Notify>)> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    crate::kcp::fit_datagrams(&socket);
     let server: SocketAddr = client
         .server
         .parse()
@@ -2026,6 +2027,7 @@ pub async fn probe_candidates(
     (probe_id, probe_capability): (u64, crate::proto::Capability),
 ) -> Result<ProbeSession> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    crate::kcp::fit_datagrams(&socket);
     // The route-source address toward the server: the wildcard-bound probe
     // socket reports 0.0.0.0 as its own address, so a throwaway connected
     // socket learns the ip the kernel picks for that route.
@@ -3059,6 +3061,7 @@ fn proxy_header(peer: SocketAddr, listener: SocketAddr) -> Vec<u8> {
 /// A local udp socket connected to `target`.
 async fn connect_local_udp(target: &str) -> Result<UdpSocket> {
     let local = UdpSocket::bind("0.0.0.0:0").await?;
+    crate::kcp::fit_datagrams(&local);
     local
         .connect(target)
         .await

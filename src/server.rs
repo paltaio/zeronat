@@ -2542,6 +2542,7 @@ fn start_listener(
             crate::pktinfo::record_local_addr(&socket).map_err(|e| -> crate::Error {
                 errf!("cannot record local addresses on {bind_ip}:{port}: {e}")
             })?;
+            crate::kcp::fit_datagrams(&socket);
             srv.listeners.lock().unwrap().insert(
                 key,
                 ListenerHandle {
@@ -2974,6 +2975,7 @@ async fn bind_control_sockets(
     control_port: u16,
 ) -> Result<(Arc<UdpSocket>, TcpListener)> {
     let udp_control = Arc::new(UdpSocket::bind((bind, control_port)).await?);
+    crate::kcp::fit_datagrams(&udp_control);
     // A bind covering more than one local address must answer each client from
     // the address that client dialed, not from the one the route back to it
     // selects, or a client whose socket is connected to the dialed address drops

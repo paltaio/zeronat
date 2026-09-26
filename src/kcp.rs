@@ -614,6 +614,70 @@ pub enum Accepted {
     },
 }
 
+/// Socket buffer a datagram socket asks for in each direction: room for a few
+/// datagrams of the largest UDP payload.
+#[cfg(target_os = "freebsd")]
+const DATAGRAM_BUFFER: libc::c_int = 256 * 1024;
+
+/// Grow a socket's buffers to carry the largest UDP payload. FreeBSD fails a
+/// send larger than the send buffer with EMSGSIZE and drops a datagram larger
+/// than the free receive buffer, and its defaults (`net.inet.udp.maxdgram`,
+/// `net.inet.udp.recvspace`) sit below 64 KiB. Best effort: when
+/// `kern.ipc.maxsockbuf` refuses the full size, a buffer takes the largest
+/// halving of it the kernel accepts or keeps its default, and the first such
+/// shortfall in the process is logged. Linux defaults already hold one, so
+/// there the socket is left as it is.
+#[cfg(target_os = "freebsd")]
+pub fn fit_datagrams(socket: &UdpSocket) {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static SHORT: AtomicBool = AtomicBool::new(false);
+    let fd = socket.as_raw_fd();
+    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        let mut current: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&current) as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                std::ptr::addr_of_mut!(current).cast(),
+                &mut len,
+            )
+        };
+        if rc < 0 {
+            continue;
+        }
+        let mut size = DATAGRAM_BUFFER;
+        while size > current {
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    opt,
+                    std::ptr::addr_of!(size).cast(),
+                    len,
+                )
+            };
+            if rc == 0 {
+                break;
+            }
+            size /= 2;
+        }
+        if size < DATAGRAM_BUFFER && !SHORT.swap(true, Ordering::Relaxed) {
+            crate::elog!(
+                "udp socket buffer limited to {} bytes by kern.ipc.maxsockbuf; \
+                 larger datagrams are dropped",
+                size.max(current)
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn fit_datagrams(_socket: &UdpSocket) {}
+
 /// Build a session bound to `peer` and spawn its socket-sender task. Returns the
 /// session plus the receive loop driver inputs. The caller runs `recv_loop`.
 pub fn session(socket: Arc<UdpSocket>, peer: SocketAddr, first_conv: u32) -> Arc<Session> {

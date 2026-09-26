@@ -5069,6 +5069,7 @@ async fn punch_forwarder(
     drop_dgrams: usize,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let sock = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    zeronat::kcp::fit_datagrams(&sock);
     let addr = sock.local_addr().unwrap();
     let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
@@ -5371,6 +5372,7 @@ async fn dgram_leg_via(
     use zeronat::kcp::{route, session};
     let psk = zeronat::noise::derive_psk(claim.credential);
     let socket = std::sync::Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+    zeronat::kcp::fit_datagrams(&socket);
     socket.connect(server).await.unwrap();
     zeronat::admission::admit(&socket, server).await.unwrap();
     let sess = session(socket.clone(), server, 1);
