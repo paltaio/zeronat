@@ -134,15 +134,22 @@ pub struct Outbound {
 
 /// Drains the socket-sender channel to the single per-session peer address. With
 /// a `local` address every packet leaves from it, so a session on a socket bound
-/// to many addresses answers from the one the peer dialed.
+/// to many addresses answers from the one the peer dialed. A socket connected to
+/// the peer sends without a destination: the BSDs fail `sendto` with an address
+/// on a connected socket (EISCONN).
 async fn socket_writer(
     socket: Arc<UdpSocket>,
     peer: std::net::SocketAddr,
     local: Option<LocalAddr>,
     mut rx: mpsc::Receiver<Outbound>,
 ) {
+    let connected = socket.peer_addr().is_ok();
     while let Some(Outbound { pkt, back }) = rx.recv().await {
-        let _ = crate::pktinfo::send_to(&socket, &pkt, peer, local).await;
+        let _ = if connected {
+            socket.send(&pkt).await
+        } else {
+            crate::pktinfo::send_to(&socket, &pkt, peer, local).await
+        };
         if let Some(back) = back {
             let _ = back.try_send(pkt);
         }

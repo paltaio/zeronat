@@ -103,15 +103,17 @@ impl CookieJar {
 /// Client half: prove return routability to `server` on `socket` before any
 /// KCP traffic. Sends a padded hello until the challenge arrives, echoes its
 /// cookie back, and returns; datagrams from other sources are ignored, so an
-/// unconnected socket works. The server sends no admit confirmation: the
-/// caller's own handshake timeout catches a lost admit.
+/// unconnected socket works. A connected one sends without a destination, which
+/// the BSDs require. The server sends no admit confirmation: the caller's own
+/// handshake timeout catches a lost admit.
 pub async fn admit(socket: &UdpSocket, server: SocketAddr) -> Result<()> {
     let mut hello = [0u8; HELLO_LEN];
     hello[0] = CLASS_HELLO;
+    let connected = socket.peer_addr().is_ok();
     timeout(ADMIT_TIMEOUT, async {
         let mut buf = [0u8; 128];
         loop {
-            socket.send_to(&hello, server).await?;
+            send(socket, connected, &hello, server).await?;
             let resend = tokio::time::sleep(HELLO_RESEND);
             tokio::pin!(resend);
             loop {
@@ -124,7 +126,7 @@ pub async fn admit(socket: &UdpSocket, server: SocketAddr) -> Result<()> {
                         let mut admit = [0u8; 1 + COOKIE_LEN];
                         admit[0] = CLASS_ADMIT;
                         admit[1..].copy_from_slice(&buf[1..CHALLENGE_LEN]);
-                        socket.send_to(&admit, server).await?;
+                        send(socket, connected, &admit, server).await?;
                         return Ok(());
                     }
                     _ = &mut resend => break,
@@ -134,6 +136,19 @@ pub async fn admit(socket: &UdpSocket, server: SocketAddr) -> Result<()> {
     })
     .await
     .map_err(|_| -> crate::Error { "udp admission timed out".into() })?
+}
+
+async fn send(
+    socket: &UdpSocket,
+    connected: bool,
+    pkt: &[u8],
+    server: SocketAddr,
+) -> std::io::Result<usize> {
+    if connected {
+        socket.send(pkt).await
+    } else {
+        socket.send_to(pkt, server).await
+    }
 }
 
 #[cfg(test)]
