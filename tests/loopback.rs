@@ -6366,6 +6366,7 @@ async fn peer_exit_provider_refuses_a_pair_the_server_forgot() {
 
 /// Pair with `provider` for `want` as a relay-only consumer "c" and return
 /// the refusal the provider's verdict carried.
+#[cfg(target_os = "linux")]
 async fn pair_refusal(
     control: u16,
     r: &mut zeronat::noise::NoiseReader,
@@ -6406,6 +6407,7 @@ async fn pair_refusal(
 // served session to the consumer, which resets its backoff and re-pairs on
 // every cycle for as long as the misconfiguration lasts; a refusal makes it
 // back off. The state outlives the pair, so the pair after it is refused too.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_exit_provider_refuses_a_pair_it_cannot_serve() {
     let body = async {

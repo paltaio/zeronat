@@ -1254,9 +1254,14 @@ fn exit_precheck(exit: &PeerExit) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = exit;
-        Ok(())
+        Err(NO_TUN_PROVIDER.into())
     }
 }
+
+/// What an exit provider off Linux answers every pair with.
+#[cfg(not(target_os = "linux"))]
+const NO_TUN_PROVIDER: &str =
+    "a peer exit provider needs a tun device, which is only supported on Linux";
 
 /// What a segment provider can decide about its bringup with no pair in hand.
 fn segment_precheck(segment: &PeerSegment) -> Result<()> {
@@ -1805,11 +1810,13 @@ mod tests {
             device: "znx0".into(),
             mtu: 1400,
             // Masquerading onto the tun the pair itself rides is a bringup no
-            // pair can make work, and it reads the same on every call.
+            // pair can make work, and it reads the same on every call. Off
+            // Linux there is no tun to bring up at all.
             iface: Some("znx0".into()),
         });
         let health = AdapterHealth::new(exit.kind());
         let first = health.refusal(&exit).expect("a standing failure refuses");
+        #[cfg(target_os = "linux")]
         assert!(first.contains("znx0"), "{first}");
         assert_eq!(health.refusal(&exit), Some(first));
 
