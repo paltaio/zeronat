@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -35,6 +35,7 @@ use crate::proto::{
     PeerIdentity, PeerRefuseReason, PeerStatus, Proto, RouteEntry, SnapshotBody, Source,
     PROVIDES_EXIT,
 };
+use crate::seed::Seed;
 #[cfg(target_os = "linux")]
 use crate::tap::TapDevice;
 use crate::tap::{TapConfig, TunConfig};
@@ -60,6 +61,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// few ping intervals to tolerate a missed ping without falsely tearing down a
 /// healthy idle link.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(90);
+/// A session heard from within this window keeps its client id: a second
+/// connection with the same credential is refused. The client pings every 25s,
+/// so a working session never falls outside it; one that has gone quiet this
+/// long gives way to the new connection.
+pub const HELD_WINDOW: Duration = Duration::from_secs(40);
 /// Ceiling on concurrent handshakes, shared by the TCP accept loop and the
 /// KCP stream paths. The accept loop claims a permit before spawning a task
 /// and drops the socket when none is free, so stalled TCP peers hold at most
@@ -234,6 +240,8 @@ struct ClientHandle {
     peer_identity: Option<PeerIdentity>,
     bridge_capability: Option<Capability>,
     cancel: watch::Sender<bool>,
+    /// When the session's last control frame arrived.
+    heard: Arc<Mutex<Instant>>,
 }
 
 /// One forward's client-announced options: send `OpenProxy` for TCP opens, and
@@ -447,8 +455,16 @@ struct PendingStream {
 }
 
 pub(crate) struct Server {
-    client_credentials: ClientCredentials,
+    /// Swapped whole when the config file's `[[clients]]` change; a handshake
+    /// takes the table current when it starts.
+    client_credentials: RwLock<Arc<ClientCredentials>>,
+    /// What a reloaded `[[clients]]` resolves against: the `--client` entries
+    /// used when the file has none, and the seed for entries without a secret.
+    cli_clients: Vec<config::CfgClient>,
+    seed: Option<Seed>,
     admin_psk: Option<[u8; 32]>,
+    discovery_psk: Option<[u8; 32]>,
+    held_window: Duration,
     server_id: String,
     next_id: Mutex<u64>,
     pending: Mutex<HashMap<u64, PendingStream>>,
@@ -479,7 +495,7 @@ pub(crate) struct Server {
     file_control: Option<String>,
     file_seed: Option<String>,
     file_admin_secret: Option<String>,
-    file_clients: Vec<config::CfgClient>,
+    file_clients: Mutex<Vec<config::CfgClient>>,
     file_exit: Option<bool>,
     file_exit_iface: Option<String>,
     /// Serializes config writes so two concurrent admin sessions never interleave
@@ -499,6 +515,10 @@ impl Server {
         getrandom::getrandom(&mut capability)
             .map_err(|e| -> crate::Error { errf!("cannot read the system random source: {e}") })?;
         Ok(capability)
+    }
+
+    fn client_credentials(&self) -> Arc<ClientCredentials> {
+        self.client_credentials.read().unwrap().clone()
     }
 
     fn next_id(&self) -> u64 {
@@ -1209,9 +1229,46 @@ pub struct RouteSpec {
     pub source: Source,
 }
 
-pub struct ClientCredentialSpec {
-    pub client_id: String,
-    pub secret: String,
+struct ClientCredentialSpec {
+    client_id: String,
+    secret: String,
+}
+
+/// Resolve the authorized clients: the config file's `[[clients]]` when it has
+/// any, else the `--client` entries. An entry without a secret takes its
+/// credential from the seed.
+fn client_specs(
+    file: &[config::CfgClient],
+    cli: &[config::CfgClient],
+    seed: Option<&Seed>,
+) -> Result<Vec<ClientCredentialSpec>> {
+    let (entries, no_credential) = if file.is_empty() {
+        (
+            cli,
+            "give --client ID:64-HEX or set a seed (--seed or ZERONAT_SEED)",
+        )
+    } else {
+        (file, "add `secret` or set [server].seed")
+    };
+    entries
+        .iter()
+        .map(|client| {
+            let secret = match (&client.secret, seed) {
+                (Some(secret), _) => secret.clone(),
+                (None, Some(seed)) => seed.client(&client.id),
+                (None, None) => {
+                    return Err(errf!(
+                        "client `{}` has no credential: {no_credential}",
+                        client.id
+                    ));
+                }
+            };
+            Ok(ClientCredentialSpec {
+                client_id: client.id.clone(),
+                secret,
+            })
+        })
+        .collect()
 }
 
 /// TUN all-ports mode. The server forwards every inbound port (except the
@@ -1240,7 +1297,14 @@ pub struct ServerSettings {
     /// otherwise. Never derived from `secret`, so handing out discovery does
     /// not hand out session access.
     pub discovery: Option<String>,
-    pub client_credentials: Vec<ClientCredentialSpec>,
+    /// The `--client` entries, authorized when the config file has no
+    /// `[[clients]]`.
+    pub cli_clients: Vec<config::CfgClient>,
+    /// Fills the credential of each client entry without a secret.
+    pub seed: Option<Seed>,
+    /// How long a quiet session keeps its client id against a new connection
+    /// with the same credential; zero lets every new connection take over.
+    pub held_window: Duration,
     pub admin_secret: Option<String>,
     pub server_id: String,
     pub tap: Option<TapConfig>,
@@ -1302,68 +1366,91 @@ struct Boot {
     _nat_guard: Option<netfilter::NatGuard>,
 }
 
+const ADMIN_NOT_DISTINCT: &str = "admin secret must differ from network and client credentials";
+const DISCOVERY_NOT_DISTINCT: &str =
+    "discovery credential must differ from network, client, and admin credentials";
+
+/// The normalized credentials a server boots with.
+struct Credentials {
+    clients: ClientCredentials,
+    admin_psk: Option<[u8; 32]>,
+    discovery: Option<String>,
+    discovery_psk: Option<[u8; 32]>,
+}
+
 /// Normalize and cross-check the network, client, admin and discovery
-/// credentials: the authorized client table, the admin PSK, and the
-/// normalized discovery credential.
+/// credentials.
 #[inline(never)]
-fn credentials(
-    settings: &ServerSettings,
-) -> Result<(ClientCredentials, Option<[u8; 32]>, Option<String>)> {
+fn credentials(settings: &ServerSettings) -> Result<Credentials> {
     let secret = crate::secret::normalize(&settings.secret)?;
     let discovery = settings
         .discovery
         .as_deref()
         .map(crate::secret::normalize)
         .transpose()?;
-    let mut authorized_clients = ClientCredentials::new();
-    let mut authorized_ids = HashSet::new();
-    for credential in &settings.client_credentials {
-        if credential.client_id.is_empty() {
-            return Err("client id must not be empty".into());
-        }
-        if !authorized_ids.insert(credential.client_id.clone()) {
-            return Err(errf!("duplicate client id `{}`", credential.client_id));
-        }
-        let secret = crate::secret::normalize(&credential.secret)?;
-        let psk = crate::noise::derive_psk(&secret);
-        let selector = crate::noise::client_selector(&psk);
-        if authorized_clients
-            .insert(selector, (credential.client_id.clone(), psk))
-            .is_some()
-        {
-            return Err("client credentials must be unique".into());
-        }
-    }
+    let discovery_psk = discovery.as_deref().map(crate::noise::derive_psk);
     let admin_secret = settings
         .admin_secret
         .as_deref()
         .map(crate::secret::normalize)
         .transpose()?;
     let admin_psk = admin_secret.as_deref().map(crate::noise::derive_psk);
-    if admin_secret.as_deref() == Some(secret.as_str())
-        || admin_psk.as_ref().is_some_and(|admin| {
-            authorized_clients
-                .values()
-                .any(|(_, client)| client == admin)
-        })
-    {
-        return Err("admin secret must differ from network and client credentials".into());
+    let specs = client_specs(
+        &settings.file_clients,
+        &settings.cli_clients,
+        settings.seed.as_ref(),
+    )?;
+    let clients = client_table(&specs, admin_psk.as_ref(), discovery_psk.as_ref())?;
+    if admin_secret.as_deref() == Some(secret.as_str()) {
+        return Err(ADMIN_NOT_DISTINCT.into());
     }
     if let Some(d) = discovery.as_deref() {
-        let d_psk = crate::noise::derive_psk(d);
-        if d == secret
-            || admin_secret.as_deref() == Some(d)
-            || authorized_clients
-                .values()
-                .any(|(_, client)| *client == d_psk)
-        {
-            return Err(
-                "discovery credential must differ from network, client, and admin credentials"
-                    .into(),
-            );
+        if d == secret || admin_secret.as_deref() == Some(d) {
+            return Err(DISCOVERY_NOT_DISTINCT.into());
         }
     }
-    Ok((authorized_clients, admin_psk, discovery))
+    Ok(Credentials {
+        clients,
+        admin_psk,
+        discovery,
+        discovery_psk,
+    })
+}
+
+/// Build the authorized client table: ids and credentials unique, and no
+/// credential equal to the admin or discovery one.
+#[inline(never)]
+fn client_table(
+    specs: &[ClientCredentialSpec],
+    admin_psk: Option<&[u8; 32]>,
+    discovery_psk: Option<&[u8; 32]>,
+) -> Result<ClientCredentials> {
+    let mut table = ClientCredentials::new();
+    let mut ids = HashSet::new();
+    for credential in specs {
+        if credential.client_id.is_empty() {
+            return Err("client id must not be empty".into());
+        }
+        if !ids.insert(credential.client_id.clone()) {
+            return Err(errf!("duplicate client id `{}`", credential.client_id));
+        }
+        let secret = crate::secret::normalize(&credential.secret)?;
+        let psk = crate::noise::derive_psk(&secret);
+        if admin_psk == Some(&psk) {
+            return Err(ADMIN_NOT_DISTINCT.into());
+        }
+        if discovery_psk == Some(&psk) {
+            return Err(DISCOVERY_NOT_DISTINCT.into());
+        }
+        let selector = crate::noise::client_selector(&psk);
+        if table
+            .insert(selector, (credential.client_id.clone(), psk))
+            .is_some()
+        {
+            return Err("client credentials must be unique".into());
+        }
+    }
+    Ok(table)
 }
 
 /// Open the `--tun` or `--tap` device, with the TUN NAT rules installed.
@@ -1426,7 +1513,12 @@ fn open_device(settings: &ServerSettings) -> Result<OpenedDevice> {
 /// touches the network.
 #[inline(never)]
 fn boot(settings: ServerSettings) -> Result<Boot> {
-    let (authorized_clients, admin_psk, discovery) = credentials(&settings)?;
+    let Credentials {
+        clients: authorized_clients,
+        admin_psk,
+        discovery,
+        discovery_psk,
+    } = credentials(&settings)?;
     #[cfg(target_os = "linux")]
     let (tap, _nat_guard) = open_device(&settings)?;
     #[cfg(not(target_os = "linux"))]
@@ -1477,11 +1569,18 @@ fn boot(settings: ServerSettings) -> Result<Boot> {
         file_clients,
         file_exit,
         file_exit_iface,
+        cli_clients,
+        seed,
+        held_window,
         ..
     } = settings;
     let srv = Arc::new(Server {
-        client_credentials: authorized_clients,
+        client_credentials: RwLock::new(Arc::new(authorized_clients)),
+        cli_clients,
+        seed,
         admin_psk,
+        discovery_psk,
+        held_window,
         server_id,
         next_id: Mutex::new(1),
         pending: Mutex::new(HashMap::new()),
@@ -1512,7 +1611,7 @@ fn boot(settings: ServerSettings) -> Result<Boot> {
         file_control,
         file_seed,
         file_admin_secret,
-        file_clients,
+        file_clients: Mutex::new(file_clients),
         file_exit,
         file_exit_iface,
         save_lock: tokio::sync::Mutex::new(()),
@@ -1567,6 +1666,9 @@ async fn serve(settings: ServerSettings) -> Result<()> {
             crate::elog!("{e}");
         }
     }
+    if let Some(path) = srv.config_path.clone() {
+        crate::spawn(watch_clients(srv.clone(), path));
+    }
 
     let bind = bind_ip.to_string();
     let (udp_control, l) = bind_control_sockets(&bind, control_port).await?;
@@ -1615,11 +1717,12 @@ async fn handle_incoming(
     permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     sock.set_nodelay(true).ok();
+    let client_credentials = srv.client_credentials();
     let (role, (r, w)) = {
         let _permit = permit;
         match timeout(
             HANDSHAKE_TIMEOUT,
-            server_handshake_remote(sock, &srv.client_credentials, srv.admin_psk.as_ref()),
+            server_handshake_remote(sock, &client_credentials, srv.admin_psk.as_ref()),
         )
         .await
         {
@@ -1668,8 +1771,14 @@ pub(crate) async fn serve_stream(
     match (auth_identity, Msg::decode(first)?) {
         (AuthIdentity::Client(client_id), Msg::ClientHello { version, .. }) => {
             check_version(version)?;
-            let (tx, mut cancelled, writer) =
-                register_client(&srv, &client_id, transport, peer, w)?;
+            let (tx, mut cancelled, writer, heard) =
+                match register_client(&srv, &client_id, transport, peer, w)? {
+                    Admit::Registered(registered) => registered,
+                    Admit::Refused(mut w) => {
+                        w.send(&Msg::ClientHelloRefuse.encode()).await.ok();
+                        return Ok(());
+                    }
+                };
             // Drain inbound control frames. Any frame (Ping, ...) resets the
             // liveness deadline; reply to Ping with Pong so the client's own
             // deadline also keeps resetting. A timeout (no inbound frame for the
@@ -1683,6 +1792,7 @@ pub(crate) async fn serve_stream(
                         Some(Ok(Ok(bytes))) => bytes,
                         _ => break,
                     };
+                *heard.lock().unwrap() = Instant::now();
                 handle_control_frame(&srv, &client_id, &tx, &mut pending_announce, bytes);
             }
             unregister_client(&srv, &client_id, &tx);
@@ -1765,15 +1875,29 @@ fn check_version(version: u8) -> Result<()> {
 }
 
 /// A registered client session: its control channel, the cancellation it
-/// watches, and the task that writes its outbound frames.
+/// watches, the task that writes its outbound frames, and the time its last
+/// control frame arrived.
 type Registered = (
     mpsc::Sender<Vec<u8>>,
     watch::Receiver<bool>,
     tokio::task::JoinHandle<()>,
+    Arc<Mutex<Instant>>,
 );
 
+/// The outcome of a client hello: a registered session, or a refusal because
+/// another live session holds the id, with the writer to send it on.
+enum Admit {
+    Registered(Registered),
+    Refused(crate::noise::NoiseWriter),
+}
+
+fn addr_label(addr: Option<SocketAddr>) -> String {
+    addr.map_or_else(|| "an unknown address".to_string(), |a| a.to_string())
+}
+
 /// Register a client session under its id, ack the hello, and start the task
-/// that writes its outbound frames.
+/// that writes its outbound frames. While the id's current session is live the
+/// new one is refused; one that has gone quiet is superseded.
 #[inline(never)]
 fn register_client(
     srv: &Server,
@@ -1781,22 +1905,27 @@ fn register_client(
     transport: ActiveTransport,
     peer: Option<SocketAddr>,
     mut w: crate::noise::NoiseWriter,
-) -> Result<Registered> {
+) -> Result<Admit> {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
     let (cancel, cancelled) = watch::channel(false);
+    let heard = Arc::new(Mutex::new(Instant::now()));
     let bridge_capability = Server::capability()?;
-    send(
-        &tx,
-        Msg::ClientHelloAck {
-            client_id: client_id.to_string(),
-            bridge_capability,
-        },
-    );
-    // Register this session under its client_id. A reconnect with the same
-    // id supersedes the previous handle in one lock acquisition, so the
-    // routing slot is reclaimed immediately; the old reader self-reaps.
+    // Check and register in one lock acquisition, so two hellos for one id
+    // cannot both find the slot free. A superseded handle's routing slot is
+    // reclaimed immediately; the old reader self-reaps.
     let superseded = {
         let mut clients = srv.clients.lock().unwrap();
+        if let Some(held) = clients.get(client_id) {
+            if held.heard.lock().unwrap().elapsed() < srv.held_window {
+                crate::elog!(
+                    "client {client_id}: refused a connection from {}: the session from {} is live; \
+                     two clients may share this credential",
+                    addr_label(peer),
+                    addr_label(held.observed)
+                );
+                return Ok(Admit::Refused(w));
+            }
+        }
         clients.insert(
             client_id.to_string(),
             ClientHandle {
@@ -1809,11 +1938,23 @@ fn register_client(
                 peer_identity: None,
                 bridge_capability: Some(bridge_capability),
                 cancel,
+                heard: heard.clone(),
             },
         )
     };
+    send(
+        &tx,
+        Msg::ClientHelloAck {
+            client_id: client_id.to_string(),
+            bridge_capability,
+        },
+    );
     if let Some(superseded) = superseded {
-        crate::elog!("client {client_id} reconnected, superseding previous session");
+        crate::elog!(
+            "client {client_id} reconnected from {}, superseding its quiet session from {}",
+            addr_label(peer),
+            addr_label(superseded.observed)
+        );
         superseded.cancel.send(true).ok();
         srv.revoke_claims(client_id, &superseded.tx);
         srv.invalidate_pairs(client_id);
@@ -1826,7 +1967,7 @@ fn register_client(
             }
         }
     });
-    Ok((tx, cancelled, writer))
+    Ok(Admit::Registered((tx, cancelled, writer, heard)))
 }
 
 /// Remove a client session at its end, but only if the registry still points
@@ -2333,13 +2474,98 @@ impl Server {
             control: self.file_control.clone(),
             seed: self.file_seed.clone(),
             admin_secret: self.file_admin_secret.clone(),
-            clients: self.file_clients.clone(),
+            clients: self.file_clients.lock().unwrap().clone(),
             exit: self.file_exit,
             exit_iface: self.file_exit_iface.clone(),
             listeners,
             routes,
         };
         config::serialize(&cfg)
+    }
+
+    /// Apply the `[[clients]]` of the config file at `path`. A client whose
+    /// credential was removed or changed loses its live session. A file that
+    /// does not load or resolve leaves the current clients in place.
+    #[inline(never)]
+    fn reload_clients(&self, path: &Path) {
+        let file = match config::load(path) {
+            Ok(file) => file,
+            Err(config::LoadError::Malformed(e) | config::LoadError::Unreadable(e)) => {
+                crate::elog!("config: {e}; keeping the current clients");
+                return;
+            }
+        };
+        if *self.file_clients.lock().unwrap() == file.clients {
+            return;
+        }
+        let table =
+            client_specs(&file.clients, &self.cli_clients, self.seed.as_ref()).and_then(|specs| {
+                client_table(&specs, self.admin_psk.as_ref(), self.discovery_psk.as_ref())
+            });
+        let table = match table {
+            Ok(table) => Arc::new(table),
+            Err(e) => {
+                crate::elog!("config: {e}; keeping the current clients");
+                return;
+            }
+        };
+        let old = std::mem::replace(
+            &mut *self.client_credentials.write().unwrap(),
+            table.clone(),
+        );
+        *self.file_clients.lock().unwrap() = file.clients;
+
+        let by_id = |t: &ClientCredentials| -> HashMap<String, [u8; 32]> {
+            t.values().map(|(id, psk)| (id.clone(), *psk)).collect()
+        };
+        let (old, new) = (by_id(&old), by_id(&table));
+        let mut added: Vec<&str> = new
+            .keys()
+            .filter(|id| !old.contains_key(*id))
+            .map(String::as_str)
+            .collect();
+        let mut removed: Vec<&str> = old
+            .keys()
+            .filter(|id| !new.contains_key(*id))
+            .map(String::as_str)
+            .collect();
+        let mut changed: Vec<&str> = old
+            .iter()
+            .filter(|(id, psk)| new.get(*id).is_some_and(|p| p != *psk))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        added.sort_unstable();
+        removed.sort_unstable();
+        changed.sort_unstable();
+        let mut summary = Vec::new();
+        for (what, ids) in [
+            ("added", &added),
+            ("removed", &removed),
+            ("new credential for", &changed),
+        ] {
+            if !ids.is_empty() {
+                summary.push(format!("{what} {}", ids.join(", ")));
+            }
+        }
+        if summary.is_empty() {
+            return;
+        }
+        crate::elog!("config: clients reloaded: {}", summary.join("; "));
+        let clients = self.clients.lock().unwrap();
+        for id in removed.iter().chain(&changed) {
+            if let Some(handle) = clients.get(*id) {
+                handle.cancel.send(true).ok();
+            }
+        }
+    }
+}
+
+/// Reload the config file's `[[clients]]` after each edit.
+async fn watch_clients(srv: Arc<Server>, path: PathBuf) {
+    let mut watch = crate::filewatch::FileWatch::new(&path);
+    loop {
+        watch.changed().await;
+        srv.reload_clients(&path);
     }
 }
 
@@ -3094,7 +3320,7 @@ fn dispatch_accepted(
             ..
         }) => {
             let srv = srv.clone();
-            let client_credentials = srv.client_credentials.clone();
+            let client_credentials = srv.client_credentials();
             let admin_psk = srv.admin_psk;
             crate::spawn(async move {
                 let handshake = timeout(
@@ -3115,7 +3341,7 @@ fn dispatch_accepted(
         }) => {
             let srv = srv.clone();
             let sess2 = sess.clone();
-            let client_credentials = srv.client_credentials.clone();
+            let client_credentials = srv.client_credentials();
             crate::spawn(async move {
                 // Message 2's payload carries the datagram source address
                 // back to the initiator: a probe reads its public mapping
@@ -3633,8 +3859,12 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         .into_iter()
         .collect();
         Arc::new(Server {
-            client_credentials,
+            client_credentials: RwLock::new(Arc::new(client_credentials)),
+            cli_clients: Vec::new(),
+            seed: None,
             admin_psk: Some(crate::noise::derive_psk("test-admin-secret")),
+            discovery_psk: None,
+            held_window: HELD_WINDOW,
             server_id: "test".into(),
             next_id: Mutex::new(1),
             pending: Mutex::new(HashMap::new()),
@@ -3652,7 +3882,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
             file_control: None,
             file_seed: None,
             file_admin_secret: None,
-            file_clients: Vec::new(),
+            file_clients: Mutex::new(Vec::new()),
             file_exit: None,
             file_exit_iface: None,
             save_lock: tokio::sync::Mutex::new(()),
@@ -3982,6 +4212,7 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
                 peer_identity,
                 bridge_capability: None,
                 cancel,
+                heard: Arc::new(Mutex::new(Instant::now())),
             },
         );
         if let Some(identity) = peer_identity {
@@ -4523,6 +4754,18 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         client_id: &str,
         observed: SocketAddr,
     ) -> (NoiseReader, NoiseWriter, tokio::task::JoinHandle<()>) {
+        let (cr, cw, server, reply) = hello_control(srv, client_id, observed).await;
+        assert!(matches!(reply, Msg::ClientHelloAck { .. }));
+        (cr, cw, server)
+    }
+
+    /// Open a hand-rolled control session, send `ClientHello`, and return the
+    /// session halves, the server task, and the server's reply.
+    async fn hello_control(
+        srv: &Arc<Server>,
+        client_id: &str,
+        observed: SocketAddr,
+    ) -> (NoiseReader, NoiseWriter, tokio::task::JoinHandle<()>, Msg) {
         let (client_io, server_io) = tokio::io::duplex(8192);
         let psk = test_psk();
         let srv2 = srv.clone();
@@ -4554,8 +4797,48 @@ zn0\t00000000\t0150A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         .await
         .unwrap();
         let bytes = cr.recv().await.unwrap();
-        assert!(matches!(Msg::decode(bytes), Ok(Msg::ClientHelloAck { .. })));
-        (cr, cw, server)
+        let reply = Msg::decode(bytes).unwrap();
+        (cr, cw, server, reply)
+    }
+
+    #[tokio::test]
+    async fn a_live_session_keeps_its_id_and_a_quiet_one_gives_way() {
+        let srv = test_server();
+        let first: SocketAddr = "198.51.100.1:4000".parse().unwrap();
+        let second: SocketAddr = "198.51.100.2:4000".parse().unwrap();
+        let (mut ar, _aw, a_task) = connect_control(&srv, "c", first).await;
+
+        // A second connection with the credential while the first is live is
+        // refused and closed; the first keeps the registry slot.
+        let (mut br, _bw, b_task, reply) = hello_control(&srv, "c", second).await;
+        assert!(matches!(reply, Msg::ClientHelloRefuse));
+        assert!(timeout(Duration::from_secs(2), br.recv())
+            .await
+            .unwrap()
+            .is_err());
+        b_task.await.unwrap();
+        assert_eq!(
+            srv.clients.lock().unwrap().get("c").unwrap().observed,
+            Some(first)
+        );
+
+        // Once the first has been quiet for the window, a new connection
+        // supersedes it and the old session is torn down.
+        {
+            let clients = srv.clients.lock().unwrap();
+            let mut heard = clients.get("c").unwrap().heard.lock().unwrap();
+            *heard = heard.checked_sub(HELD_WINDOW).unwrap();
+        }
+        let (_cr, _cw, _c_task) = connect_control(&srv, "c", second).await;
+        assert!(timeout(Duration::from_secs(2), ar.recv())
+            .await
+            .unwrap()
+            .is_err());
+        a_task.await.unwrap();
+        assert_eq!(
+            srv.clients.lock().unwrap().get("c").unwrap().observed,
+            Some(second)
+        );
     }
 
     /// Drive the four-message announce exchange, answering the challenge with

@@ -173,7 +173,8 @@ pub struct FwdOptionEntry {
 /// Control channel (client -> server): `ClientHello`, then optionally one
 /// `FwdOptions` (only when at least one forward carries a non-default option),
 /// then periodic `Ping`.
-/// Control channel (server -> client): `Pong` in reply to each `Ping`,
+/// Control channel (server -> client): `ClientHelloAck`, or `ClientHelloRefuse`
+/// when another live session holds the credential; `Pong` in reply to each `Ping`,
 /// `FwdOptionsAck` strictly in reply to `FwdOptions` (an old client cannot
 /// decode it, so it is never sent unsolicited; an old server silently ignores
 /// `FwdOptions` and never acks), and `Open` for each new public connection,
@@ -216,6 +217,7 @@ pub enum Msg {
         client_id: String,
         bridge_capability: Capability,
     },
+    ClientHelloRefuse,
     AdminHello {
         version: u8,
         mode: u8,
@@ -1268,6 +1270,7 @@ impl Msg {
                 put_bytes(&mut b, bridge_capability);
                 b
             }
+            Msg::ClientHelloRefuse => tagged(28),
         }
     }
 
@@ -1461,6 +1464,7 @@ impl Msg {
             Some(27) if b.len() == 2 => Msg::PeerAnnounceRefuse {
                 reason: REFUSE_REASONS[r.index(4, "unknown refuse reason")],
             },
+            Some(28) if b.len() == 1 => Msg::ClientHelloRefuse,
             _ => {
                 r.fail(errf!("malformed message ({} bytes)", b.len()));
                 Msg::Ping
@@ -2102,6 +2106,14 @@ mod tests {
     }
 
     #[test]
+    fn client_hello_refuse_exact() {
+        let enc = Msg::ClientHelloRefuse.encode();
+        assert_eq!(enc, vec![28]);
+        assert!(matches!(Msg::decode(&enc), Ok(Msg::ClientHelloRefuse)));
+        assert!(Msg::decode(&[28, 0]).is_err());
+    }
+
+    #[test]
     fn open_proxy_roundtrip() {
         let pairs: [(SocketAddr, SocketAddr); 3] = [
             (
@@ -2236,8 +2248,8 @@ mod tests {
             bad[1] = bad_bits;
             assert!(Msg::decode(&bad).is_err());
         }
-        // The tag after the peer block is still unknown.
-        assert!(Msg::decode(&[28]).is_err());
+        // The first tag past the client hello refusal is still unknown.
+        assert!(Msg::decode(&[29]).is_err());
     }
 
     #[test]

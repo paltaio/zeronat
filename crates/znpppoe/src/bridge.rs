@@ -172,11 +172,12 @@ pub async fn connect(addr: SocketAddr, credential: &str, client_id: &str) -> Res
         .await
         .context("client authorization timed out")?
         .map_err(|e| anyhow!("read client authorization: {e}"))?;
-    let Msg::ClientHelloAck {
-        bridge_capability, ..
-    } = Msg::decode(&frame).map_err(|e| anyhow::anyhow!(e.to_string()))?
-    else {
-        return Err(anyhow!("server did not authorize the bridge client"));
+    let bridge_capability = match Msg::decode(frame).map_err(|e| anyhow!(e.to_string()))? {
+        Msg::ClientHelloAck {
+            bridge_capability, ..
+        } => bridge_capability,
+        Msg::ClientHelloRefuse => return Err(anyhow!(zeronat::client::CredentialInUse)),
+        _ => return Err(anyhow!("server did not authorize the bridge client")),
     };
     let control = AbortOnDrop(crate::spawn({
         let cancel = cancel.clone();

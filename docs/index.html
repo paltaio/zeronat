@@ -308,6 +308,9 @@ entryPoints:
       <p>A client id is the id in the server's <code>--client</code> entry or its <code>[[clients]]</code>
       section; the server hands it to the client when the session opens. Under a seed the client's
       <code>--id</code> is that same id.</p>
+      <p>A client id holds one session at a time. While it is live, the server refuses another
+      connection with the same credential; a session that has sent nothing for 40 seconds gives way
+      to the new one.</p>
       <p>Load listeners, routes, and identity from a file with <code>--config</code>:</p>
 <pre class="v-cli"><code>zeronat server --config /etc/zeronat/server.toml</code></pre>
 <pre class="v-docker"><code>docker run -d --name zeronat --restart unless-stopped --network host \
@@ -341,8 +344,10 @@ client = "rpi-2"</code></pre>
       seed, which <code>[server].seed</code> holds here; <code>--seed</code> or
       <code>ZERONAT_SEED</code> serves the same purpose. The seed also fills
       <code>admin_secret</code> when the file leaves it out.</p>
-      <p>CLI <code>--tcp</code>/<code>--udp</code> forwards merge with the file's listeners. To change the
-      topology, edit the file and restart the server. A malformed config aborts startup.</p>
+      <p>CLI <code>--tcp</code>/<code>--udp</code> forwards merge with the file's listeners. The server
+      rereads <code>[[clients]]</code> when the file is saved: an added client can
+      connect, and a removed client, or one given a new secret, is disconnected. Other changes to the
+      file take effect after a restart. A malformed config aborts startup.</p>
     </section>
 
     <section id="clientconfig">

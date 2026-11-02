@@ -318,16 +318,18 @@ mod pty {
             secret: SECRET.into(),
             discovery: None,
             admin_secret: Some(OTHER_SECRET.into()),
-            client_credentials: vec![
-                zeronat::server::ClientCredentialSpec {
-                    client_id: routed.to_string(),
-                    secret: SECRET.into(),
+            cli_clients: vec![
+                zeronat::config::CfgClient {
+                    id: routed.to_string(),
+                    secret: Some(SECRET.into()),
                 },
-                zeronat::server::ClientCredentialSpec {
-                    client_id: zeronat::identity::derive_client_id(Some("ptyexit")),
-                    secret: PROVIDER_SECRET.into(),
+                zeronat::config::CfgClient {
+                    id: zeronat::identity::derive_client_id(Some("ptyexit")),
+                    secret: Some(PROVIDER_SECRET.into()),
                 },
             ],
+            seed: None,
+            held_window: Duration::ZERO,
             server_id: "0".into(),
             tap: None,
             tun: None,

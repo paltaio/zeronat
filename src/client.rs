@@ -393,6 +393,21 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+/// The server refused the session: another live session holds this
+/// client's credential.
+#[derive(Debug)]
+pub struct CredentialInUse;
+
+impl std::fmt::Display for CredentialInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the server refused the session: another client is connected with this credential",
+        )
+    }
+}
+
+impl std::error::Error for CredentialInUse {}
+
 /// Tracks whether the server answers a control channel's Pings. A restarted
 /// server re-binds its UDP port and drops datagrams for sessions it never saw,
 /// so the client gets neither an ICMP error nor a reply: an unanswered Ping is
@@ -2128,12 +2143,13 @@ async fn bridge_lease(
     let frame = tokio_timeout(CONTROL_TIMEOUT, r.recv())
         .await
         .map_err(|_| -> crate::Error { "client authorization timed out".into() })??;
-    let Msg::ClientHelloAck {
-        client_id,
-        bridge_capability,
-    } = Msg::decode(frame)?
-    else {
-        return Err("server did not authorize the client session".into());
+    let (client_id, bridge_capability) = match Msg::decode(frame)? {
+        Msg::ClientHelloAck {
+            client_id,
+            bridge_capability,
+        } => (client_id, bridge_capability),
+        Msg::ClientHelloRefuse => return Err(Box::new(CredentialInUse)),
+        _ => return Err("server did not authorize the client session".into()),
     };
     let cancel = cancel.clone();
     let task = AbortOnDrop(crate::spawn(async move {
@@ -2634,6 +2650,9 @@ async fn session(
                 link.set(LinkStatus::Connected);
                 let started = Instant::now();
                 let result = control_loop(client, Link::Udp(sess, pump, cancel), r, w, peer).await;
+                if refused(&result) {
+                    return (result, UdpOutcome::Skipped, false);
+                }
                 // Health is measured from when the UDP control channel came up
                 // to when it returned; a short-lived UDP session is a flap.
                 let outcome = if started.elapsed() >= UDP_MIN_HEALTHY {
@@ -2658,10 +2677,18 @@ async fn session(
     match tcp_control(client.clone()).await {
         Ok((r, w)) => {
             link.set(LinkStatus::Connected);
-            (control_loop(client, Link::Tcp, r, w, peer).await, udp, true)
+            let result = control_loop(client, Link::Tcp, r, w, peer).await;
+            let established = !refused(&result);
+            (result, udp, established)
         }
         Err(e) => (Err(e), udp, false),
     }
+}
+
+/// Whether the server refused the session because another client holds the
+/// credential. The reconnect loop counts that as a failed connect.
+fn refused(result: &Result<()>) -> bool {
+    result.as_ref().is_err_and(|e| e.is::<CredentialInUse>())
 }
 
 /// Dial `addr`, disable Nagle, run the Noise handshake, and report the connected
@@ -2909,6 +2936,7 @@ async fn control_loop(
                 }
                 None
             }
+            Ok(Msg::ClientHelloRefuse) => break Err(Box::new(CredentialInUse)),
             Ok(Msg::PeerChallenge { eph_pub, nonce }) => {
                 // The challenge answers this session's announce; the proof
                 // binds the server-authorized client id, which the ordered

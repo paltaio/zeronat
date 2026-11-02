@@ -67,7 +67,9 @@ curl --proxy http://proxy_sjob42:proxypass@127.0.0.1:8081 https://ifconfig.me  #
   its own wins.
 - `ZN_CLIENT_ID` the client id sent to the server; required with `ZN_SEED`.
 - `ZN_SECRET` tunnel secret; `ZN_CLIENT_SECRET` this client's credential
-  (defaults to `ZN_SECRET`).
+  (defaults to `ZN_SECRET`). Each running znpppoe needs a credential of its
+  own: the server refuses a connection whose credential another live session
+  holds.
 - `ZN_DISCOVERY_SECRET` the server's discovery credential, with `--dht`.
 - `ZN_PEER_SECRET` this process's x25519 static key, with `--peer`.
 - `ZN_USER`/`ZN_PASSWORD` PPPoE login; `ZN_SERVICE` optional PPPoE service name.

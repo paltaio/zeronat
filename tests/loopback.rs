@@ -15,7 +15,7 @@ use zeronat::clientproto::{
     ClientMsg, ClientSnapshotBody, LinkStatus, PppPhase, ServerSecret, SessionMode,
 };
 use zeronat::proto::{Msg, PathStatus, PeerStatus, Proto, Source, PROVIDES_EXIT, PROVIDES_SEGMENT};
-use zeronat::server::{ClientCredentialSpec, ListenerSpec, ServerSettings};
+use zeronat::server::{ListenerSpec, ServerSettings};
 
 const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 const SECRET_B: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
@@ -55,36 +55,38 @@ fn cli_settings(control: u16, tcp: Vec<u16>, udp: Vec<u16>) -> ServerSettings {
         secret: SECRET.into(),
         discovery: None,
         admin_secret: Some(ADMIN_SECRET.into()),
-        client_credentials: vec![
-            ClientCredentialSpec {
-                client_id: "rpi".into(),
-                secret: SECRET.into(),
+        cli_clients: vec![
+            zeronat::config::CfgClient {
+                id: "rpi".into(),
+                secret: Some(SECRET.into()),
             },
-            ClientCredentialSpec {
-                client_id: "prov".into(),
-                secret: SECRET_B.into(),
+            zeronat::config::CfgClient {
+                id: "prov".into(),
+                secret: Some(SECRET_B.into()),
             },
-            ClientCredentialSpec {
-                client_id: "c".into(),
-                secret: SECRET_C.into(),
+            zeronat::config::CfgClient {
+                id: "c".into(),
+                secret: Some(SECRET_C.into()),
             },
-            ClientCredentialSpec {
-                client_id: "c1".into(),
-                secret: SECRET_D.into(),
+            zeronat::config::CfgClient {
+                id: "c1".into(),
+                secret: Some(SECRET_D.into()),
             },
-            ClientCredentialSpec {
-                client_id: "c2".into(),
-                secret: SECRET_E.into(),
+            zeronat::config::CfgClient {
+                id: "c2".into(),
+                secret: Some(SECRET_E.into()),
             },
-            ClientCredentialSpec {
-                client_id: zeronat::identity::derive_client_id(Some("provider")),
-                secret: SECRET_F.into(),
+            zeronat::config::CfgClient {
+                id: zeronat::identity::derive_client_id(Some("provider")),
+                secret: Some(SECRET_F.into()),
             },
-            ClientCredentialSpec {
-                client_id: zeronat::identity::derive_client_id(Some("consumer")),
-                secret: SECRET_G.into(),
+            zeronat::config::CfgClient {
+                id: zeronat::identity::derive_client_id(Some("consumer")),
+                secret: Some(SECRET_G.into()),
             },
         ],
+        seed: None,
+        held_window: Duration::ZERO,
         server_id: "0".into(),
         tap: None,
         tun: None,
@@ -268,11 +270,11 @@ async fn start_tagged_pair(
         Proto::Udp => (vec![], vec![public_port]),
     };
     let mut settings = cli_settings(control, tcp_ports, udp_ports);
-    settings.client_credentials = [("rpi-1", SECRET), ("rpi-2", SECRET_B)]
+    settings.cli_clients = [("rpi-1", SECRET), ("rpi-2", SECRET_B)]
         .into_iter()
-        .map(|(client_id, secret)| ClientCredentialSpec {
-            client_id: client_id.into(),
-            secret: secret.into(),
+        .map(|(id, secret)| zeronat::config::CfgClient {
+            id: id.into(),
+            secret: Some(secret.into()),
         })
         .collect();
     tokio::spawn(zeronat::server::run(settings));
@@ -952,11 +954,11 @@ async fn client_credential_cannot_impersonate_supersede_or_route_as_another_clie
     let control = free_port();
     let public = free_port();
     let mut settings = cli_settings(control, vec![public], vec![]);
-    settings.client_credentials = [("victim", SECRET), ("attacker", SECRET_B)]
+    settings.cli_clients = [("victim", SECRET), ("attacker", SECRET_B)]
         .into_iter()
-        .map(|(client_id, secret)| ClientCredentialSpec {
-            client_id: client_id.into(),
-            secret: secret.into(),
+        .map(|(id, secret)| zeronat::config::CfgClient {
+            id: id.into(),
+            secret: Some(secret.into()),
         })
         .collect();
     settings.routes = vec![zeronat::server::RouteSpec {
@@ -1042,9 +1044,9 @@ async fn reconnect_revokes_the_superseded_session_and_its_data_paths() {
     let control = free_port();
     let public = free_port();
     let mut settings = cli_settings(control, vec![public], vec![]);
-    settings.client_credentials = vec![ClientCredentialSpec {
-        client_id: "client".into(),
-        secret: SECRET.into(),
+    settings.cli_clients = vec![zeronat::config::CfgClient {
+        id: "client".into(),
+        secret: Some(SECRET.into()),
     }];
     settings.routes = vec![zeronat::server::RouteSpec {
         bind_ip: Ipv4Addr::LOCALHOST,
@@ -1737,6 +1739,82 @@ fn temp_config_dir(tag: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// Edits to the config file's `[[clients]]` apply to the running server: an
+/// added client can connect, and a removed one loses its live session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_clients_reload_without_restart() {
+    let body = async {
+        let control = free_port();
+        let dir = temp_config_dir("reload-clients");
+        let path = dir.join("server.toml");
+        let entry =
+            |id: &str, secret: &str| format!("[[clients]]\nid = \"{id}\"\nsecret = \"{secret}\"\n");
+        std::fs::write(&path, entry("a", SECRET_B)).unwrap();
+        let mut settings = cli_settings(control, vec![], vec![]);
+        settings.file_clients = vec![zeronat::config::CfgClient {
+            id: "a".into(),
+            secret: Some(SECRET_B.into()),
+        }];
+        settings.config_path = Some(path.clone());
+        tokio::spawn(zeronat::server::run(settings));
+
+        let hello = |id: &'static str| async move {
+            let psk = zeronat::noise::derive_psk(match id {
+                "a" => SECRET_B,
+                _ => SECRET_C,
+            });
+            let (mut r, mut w) =
+                remote_connect(control, &psk, zeronat::noise::AuthRole::Client).await;
+            w.send(
+                &Msg::ClientHello {
+                    version: zeronat::identity::PROTO_VERSION,
+                    client_id: id.into(),
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+            let reply = Msg::decode(r.recv().await.unwrap()).unwrap();
+            assert!(
+                matches!(&reply, Msg::ClientHelloAck { client_id, .. } if client_id == id),
+                "expected an ack for {id}, got {reply:?}"
+            );
+            (r, w)
+        };
+        let (mut a_r, _a_w) = hello("a").await;
+
+        let sock = TcpStream::connect(("127.0.0.1", control)).await.unwrap();
+        let unknown = zeronat::noise::client_handshake_remote(
+            sock,
+            &zeronat::noise::derive_psk(SECRET_C),
+            zeronat::noise::AuthRole::Client,
+        )
+        .await;
+        assert!(unknown.is_err(), "b connected before the config named it");
+
+        std::fs::write(
+            &path,
+            format!("{}\n{}", entry("a", SECRET_B), entry("b", SECRET_C)),
+        )
+        .unwrap();
+        let (_b_r, _b_w) = timeout(Duration::from_secs(15), hello("b"))
+            .await
+            .expect("b was not admitted after it was added to the config");
+
+        std::fs::write(&path, entry("b", SECRET_C)).unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(15), a_r.recv()).await,
+            Ok(Err(_))
+        ));
+        let snap = wait_clients(control, 1).await;
+        assert_eq!(snap.clients[0].client_id, "b");
+    };
+
+    timeout(Duration::from_secs(40), body)
+        .await
+        .expect("client reload did not complete within 40s");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

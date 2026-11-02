@@ -245,7 +245,7 @@ struct ServerArgs {
     seed: Option<String>,
     secret: Option<String>,
     discovery: Option<String>,
-    client_credentials: Vec<zeronat::config::CfgClient>,
+    cli_clients: Vec<zeronat::config::CfgClient>,
     admin_secret: Option<String>,
     server_id: Option<String>,
     tcp: Vec<u16>,
@@ -987,7 +987,7 @@ fn parse_server(iter: Args) -> Result<Cmd> {
         seed,
         secret,
         discovery: discovery.or_else(|| std::env::var("ZERONAT_DISCOVERY_SECRET").ok()),
-        client_credentials: p.clients,
+        cli_clients: p.clients,
         admin_secret: admin_secret.or_else(|| std::env::var("ZERONAT_ADMIN_SECRET").ok()),
         server_id,
         tcp,
@@ -1189,7 +1189,7 @@ fn server_boot(args: ServerArgs) -> Result<server::ServerSettings> {
         seed,
         secret,
         discovery,
-        client_credentials,
+        cli_clients,
         admin_secret,
         server_id,
         tcp,
@@ -1314,36 +1314,9 @@ fn server_boot(args: ServerArgs) -> Result<server::ServerSettings> {
         .clone()
         .or_else(|| seed.as_ref().map(Seed::admin));
 
-    let (client_entries, no_credential) = if file.clients.is_empty() {
-        (
-            &client_credentials,
-            "give --client ID:64-HEX or set a seed (--seed or ZERONAT_SEED)",
-        )
-    } else {
-        if !client_credentials.is_empty() {
-            zeronat::elog!("config [[clients]] overrides --client");
-        }
-        (&file.clients, "add `secret` or set [server].seed")
-    };
-    let client_credentials = client_entries
-        .iter()
-        .map(|client| -> Result<server::ClientCredentialSpec> {
-            let secret = match (&client.secret, &seed) {
-                (Some(secret), _) => secret.clone(),
-                (None, Some(seed)) => seed.client(&client.id),
-                (None, None) => {
-                    return Err(errf!(
-                        "client `{}` has no credential: {no_credential}",
-                        client.id
-                    ));
-                }
-            };
-            Ok(server::ClientCredentialSpec {
-                client_id: client.id.clone(),
-                secret,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    if !file.clients.is_empty() && !cli_clients.is_empty() {
+        zeronat::elog!("config [[clients]] overrides --client");
+    }
 
     let (cli_exit, cli_exit_iface) = (exit, exit_iface);
     if file.exit == Some(false) && cli_exit {
@@ -1516,7 +1489,9 @@ fn server_boot(args: ServerArgs) -> Result<server::ServerSettings> {
         control_port,
         secret,
         discovery,
-        client_credentials,
+        cli_clients,
+        seed,
+        held_window: server::HELD_WINDOW,
         admin_secret,
         server_id,
         tap,
