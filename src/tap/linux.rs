@@ -289,10 +289,10 @@ impl TapDevice {
     }
 
     fn from_raw(fd: RawFd, mtu: usize) -> Result<Self> {
-        Ok(TapDevice {
-            fd: AsyncFd::new(TunFd(fd))?,
-            mtu,
-        })
+        // SAFETY: `TunFd` owns `fd` and closes it only when the `AsyncFd`
+        // holding it drops.
+        let fd = unsafe { AsyncFd::register(TunFd(fd)) }.map_err(io::Error::from)?;
+        Ok(TapDevice { fd, mtu })
     }
 
     /// Build a device backed by one end of a non-blocking `socketpair` for tests

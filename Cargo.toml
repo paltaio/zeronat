@@ -20,7 +20,7 @@ dht = ["dep:ed25519-dalek", "dep:sha1", "dep:sha2"]
 tui = ["dep:zntui"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 x25519-dalek = { version = "2", default-features = false, features = ["getrandom"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 kcp = { version = "0.6", default-features = false }

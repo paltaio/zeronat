@@ -124,10 +124,10 @@ mod inotify {
             if wd < 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Watch {
-                fd: AsyncFd::new(fd)?,
-                name,
-            })
+            // SAFETY: the `OwnedFd` moves into the `AsyncFd` and closes only
+            // when it drops.
+            let fd = unsafe { AsyncFd::register(fd) }?;
+            Ok(Watch { fd, name })
         }
 
         /// Return after an event for the file, once events have stopped for
