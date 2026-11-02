@@ -2483,37 +2483,56 @@ impl Server {
         config::serialize(&cfg)
     }
 
-    /// Apply the `[[clients]]` of the config file at `path`. A client whose
-    /// credential was removed or changed loses its live session. A file that
-    /// does not load or resolve leaves the current clients in place.
+    /// Apply the `[[clients]]` of the config file at `path`. A file that does
+    /// not load or resolve leaves the current clients in place.
     #[inline(never)]
     fn reload_clients(&self, path: &Path) {
-        let file = match config::load(path) {
+        let mut file = match config::load(path) {
             Ok(file) => file,
             Err(config::LoadError::Malformed(e) | config::LoadError::Unreadable(e)) => {
                 crate::elog!("config: {e}; keeping the current clients");
                 return;
             }
         };
-        if *self.file_clients.lock().unwrap() == file.clients {
-            return;
+        let applied = self.update_clients("config", &mut |list| {
+            *list = std::mem::take(&mut file.clients);
+            Ok(())
+        });
+        if let Err(e) = applied {
+            crate::elog!("config: {e}; keeping the current clients");
         }
-        let table =
-            client_specs(&file.clients, &self.cli_clients, self.seed.as_ref()).and_then(|specs| {
-                client_table(&specs, self.admin_psk.as_ref(), self.discovery_psk.as_ref())
-            });
-        let table = match table {
-            Ok(table) => Arc::new(table),
-            Err(e) => {
-                crate::elog!("config: {e}; keeping the current clients");
-                return;
-            }
+    }
+
+    /// Edit the `[[clients]]` list and apply the result: rebuild the credential
+    /// table and drop the live sessions whose credential was removed or
+    /// changed. With no `[[clients]]` the edit starts from the `--client`
+    /// entries, which the list then carries. A failed edit, or a list that
+    /// does not resolve, changes nothing.
+    #[inline(never)]
+    fn update_clients(
+        &self,
+        source: &str,
+        edit: &mut dyn FnMut(&mut Vec<config::CfgClient>) -> Result<()>,
+    ) -> Result<()> {
+        let mut list = self.file_clients.lock().unwrap();
+        let mut next = if list.is_empty() {
+            self.cli_clients.clone()
+        } else {
+            list.clone()
         };
+        edit(&mut next)?;
+        let specs = client_specs(&next, &self.cli_clients, self.seed.as_ref())?;
+        let table = Arc::new(client_table(
+            &specs,
+            self.admin_psk.as_ref(),
+            self.discovery_psk.as_ref(),
+        )?);
         let old = std::mem::replace(
             &mut *self.client_credentials.write().unwrap(),
             table.clone(),
         );
-        *self.file_clients.lock().unwrap() = file.clients;
+        *list = next;
+        drop(list);
 
         let by_id = |t: &ClientCredentials| -> HashMap<String, [u8; 32]> {
             t.values().map(|(id, psk)| (id.clone(), *psk)).collect()
@@ -2548,15 +2567,31 @@ impl Server {
             }
         }
         if summary.is_empty() {
-            return;
+            return Ok(());
         }
-        crate::elog!("config: clients reloaded: {}", summary.join("; "));
+        crate::elog!("{source}: clients changed: {}", summary.join("; "));
         let clients = self.clients.lock().unwrap();
         for id in removed.iter().chain(&changed) {
             if let Some(handle) = clients.get(*id) {
                 handle.cancel.send(true).ok();
             }
         }
+        Ok(())
+    }
+
+    /// A client entry for `client_id` with `secret`, or with the credential
+    /// the seed derives when `secret` is `None`.
+    fn client_entry(&self, client_id: &str, secret: Option<[u8; 32]>) -> Result<config::CfgClient> {
+        if secret.is_none() && self.seed.is_none() {
+            return Err(errf!(
+                "server {} has no seed to derive a credential for `{client_id}` from; give a secret",
+                self.server_id
+            ));
+        }
+        Ok(config::CfgClient {
+            id: client_id.to_string(),
+            secret: secret.map(crate::secret::encode),
+        })
     }
 }
 
@@ -2576,6 +2611,15 @@ async fn watch_clients(srv: Arc<Server>, path: PathBuf) {
 /// even though the mutation already applied in memory, so a scripted admin detects
 /// that the on-disk config did not change.
 async fn apply_mutation(srv: &Arc<Server>, req: Msg) -> (bool, String) {
+    if let Msg::DisconnectClient { client_id } = &req {
+        return match srv.clients.lock().unwrap().get(client_id) {
+            Some(handle) => {
+                handle.cancel.send(true).ok();
+                (true, String::new())
+            }
+            None => (false, format!("client `{client_id}` is not connected")),
+        };
+    }
     let applied = match req {
         Msg::AddListener {
             bind_ip,
@@ -2662,6 +2706,35 @@ fn apply_sync_mutation(srv: &Server, req: Msg) -> Result<()> {
             }
             Ok(())
         }
+        Msg::AddClient { client_id, secret } => {
+            let entry = srv.client_entry(&client_id, secret)?;
+            srv.update_clients("admin", &mut |list| {
+                if list.iter().any(|c| c.id == entry.id) {
+                    return Err(errf!("client `{}` already exists", entry.id));
+                }
+                list.push(entry.clone());
+                Ok(())
+            })
+        }
+        Msg::SetClientSecret { client_id, secret } => {
+            let entry = srv.client_entry(&client_id, secret)?;
+            srv.update_clients("admin", &mut |list| {
+                let held = list
+                    .iter_mut()
+                    .find(|c| c.id == entry.id)
+                    .ok_or_else(|| errf!("no client `{}`", entry.id))?;
+                held.secret = entry.secret.clone();
+                Ok(())
+            })
+        }
+        Msg::RemoveClient { client_id } => srv.update_clients("admin", &mut |list| {
+            let at = list
+                .iter()
+                .position(|c| c.id == client_id)
+                .ok_or_else(|| errf!("no client `{client_id}`"))?;
+            list.remove(at);
+            Ok(())
+        }),
         other => Err(errf!("unexpected mutation message: {other:?}")),
     }
 }

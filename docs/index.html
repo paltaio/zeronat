@@ -413,10 +413,17 @@ password_file = "/etc/zeronat/wan.pass"</code></pre>
 
     <section id="admin">
       <h2>Admin</h2>
-      <p>Inspect a running server's topology over the control port (read-only):</p>
-<pre class="v-cli"><code>ZERONAT_SEED="$SEED" zeronat admin --server &lt;public-ip&gt;:2222 show</code></pre>
+      <p>Inspect and change a running server over the control port:</p>
+<pre class="v-cli"><code>ZERONAT_SEED="$SEED" zeronat admin --server &lt;public-ip&gt;:2222 show
+ZERONAT_SEED="$SEED" zeronat admin --server &lt;public-ip&gt;:2222 add-client site-2 --generate
+ZERONAT_SEED="$SEED" zeronat admin --server &lt;public-ip&gt;:2222 set-route tcp:443 site-2</code></pre>
 <pre class="v-docker"><code><span class="c"># The seed comes from the container's env:</span>
-docker exec -it zeronat /zeronat admin --server &lt;public-ip&gt;:2222 show</code></pre>
+docker exec -it zeronat /zeronat admin --server &lt;public-ip&gt;:2222 show
+docker exec -it zeronat /zeronat admin --server &lt;public-ip&gt;:2222 add-client site-2 --generate
+docker exec -it zeronat /zeronat admin --server &lt;public-ip&gt;:2222 set-route tcp:443 site-2</code></pre>
+      <p>A server started with <code>--config</code> writes each change to the file. Client changes
+      edit its <code>[[clients]]</code>; when the file has none, the <code>--client</code> entries are
+      copied into it first.</p>
       <p>Remote admin runs on its own secret, which the seed derives. Without a seed, start the server
       with <code>--admin-secret</code> or <code>ZERONAT_ADMIN_SECRET</code>, which must differ from the
       network, client, and discovery credentials, and give <code>admin</code> the same value as
@@ -791,6 +798,14 @@ curl --proxy http://proxy_sjob42:&lt;proxy-pass&gt;@127.0.0.1:8081 https://ifcon
       <table>
         <tbody>
           <tr><td><code>show</code></td><td>Print the server's current topology (default command)</td></tr>
+          <tr><td><code>add-listener &lt;PROTO:PORT&gt;</code></td><td>Open a public port, e.g. <code>tcp:443</code>; <code>--bind &lt;IP&gt;</code> (default <code>0.0.0.0</code>)</td></tr>
+          <tr><td><code>remove-listener &lt;PROTO:PORT&gt;</code></td><td>Close a public port; a port set by <code>--tcp</code>/<code>--udp</code> is refused</td></tr>
+          <tr><td><code>set-route &lt;PROTO:PORT&gt; &lt;CLIENT-ID&gt;</code></td><td>Send the port's new connections to that client</td></tr>
+          <tr><td><code>clear-route &lt;PROTO:PORT&gt;</code></td><td>Remove the port's route</td></tr>
+          <tr><td><code>add-client &lt;ID&gt;</code></td><td>Authorize a client; the credential is read from stdin, generated and printed with <code>--generate</code>, or derived from the server's seed with <code>--derive</code></td></tr>
+          <tr><td><code>set-client-secret &lt;ID&gt;</code></td><td>Replace a client's credential, taken as for <code>add-client</code>; its live session is dropped</td></tr>
+          <tr><td><code>remove-client &lt;ID&gt;</code></td><td>Revoke a client and drop its live session</td></tr>
+          <tr><td><code>disconnect &lt;ID&gt;</code></td><td>Drop a client's live session; it may reconnect</td></tr>
           <tr><td><code>--server &lt;ADDR&gt;</code></td><td>Server control address <code>host:port</code></td></tr>
           <tr><td><code>--secret &lt;64-HEX&gt;</code></td><td>32-byte admin secret (or env <code>ZERONAT_ADMIN_SECRET</code>, or derived from env <code>ZERONAT_SEED</code>, or either one read from <code>/etc/zeronat/.env</code>)</td></tr>
         </tbody>

@@ -1760,48 +1760,23 @@ async fn config_clients_reload_without_restart() {
         settings.config_path = Some(path.clone());
         tokio::spawn(zeronat::server::run(settings));
 
-        let hello = |id: &'static str| async move {
-            let psk = zeronat::noise::derive_psk(match id {
-                "a" => SECRET_B,
-                _ => SECRET_C,
-            });
-            let (mut r, mut w) =
-                remote_connect(control, &psk, zeronat::noise::AuthRole::Client).await;
-            w.send(
-                &Msg::ClientHello {
-                    version: zeronat::identity::PROTO_VERSION,
-                    client_id: id.into(),
-                }
-                .encode(),
-            )
-            .await
-            .unwrap();
-            let reply = Msg::decode(r.recv().await.unwrap()).unwrap();
-            assert!(
-                matches!(&reply, Msg::ClientHelloAck { client_id, .. } if client_id == id),
-                "expected an ack for {id}, got {reply:?}"
-            );
-            (r, w)
-        };
-        let (mut a_r, _a_w) = hello("a").await;
-
-        let sock = TcpStream::connect(("127.0.0.1", control)).await.unwrap();
-        let unknown = zeronat::noise::client_handshake_remote(
-            sock,
-            &zeronat::noise::derive_psk(SECRET_C),
-            zeronat::noise::AuthRole::Client,
-        )
-        .await;
-        assert!(unknown.is_err(), "b connected before the config named it");
+        let (mut a_r, _a_w) = client_hello(control, SECRET_B, "a").await;
+        assert!(
+            !credential_admitted(control, SECRET_C).await,
+            "b connected before the config named it"
+        );
 
         std::fs::write(
             &path,
             format!("{}\n{}", entry("a", SECRET_B), entry("b", SECRET_C)),
         )
         .unwrap();
-        let (_b_r, _b_w) = timeout(Duration::from_secs(15), hello("b"))
-            .await
-            .expect("b was not admitted after it was added to the config");
+        let (_b_r, _b_w) = timeout(
+            Duration::from_secs(15),
+            client_hello(control, SECRET_C, "b"),
+        )
+        .await
+        .expect("b was not admitted after it was added to the config");
 
         std::fs::write(&path, entry("b", SECRET_C)).unwrap();
         assert!(matches!(
@@ -1815,6 +1790,130 @@ async fn config_clients_reload_without_restart() {
     timeout(Duration::from_secs(40), body)
         .await
         .expect("client reload did not complete within 40s");
+}
+
+/// Open a control session with `secret`, retrying until the server admits the
+/// credential, and expect the hello to be acked under `id`.
+async fn client_hello(
+    control: u16,
+    secret: &str,
+    id: &str,
+) -> (zeronat::noise::NoiseReader, zeronat::noise::NoiseWriter) {
+    let psk = zeronat::noise::derive_psk(secret);
+    let (mut r, mut w) = remote_connect(control, &psk, zeronat::noise::AuthRole::Client).await;
+    w.send(
+        &Msg::ClientHello {
+            version: zeronat::identity::PROTO_VERSION,
+            client_id: id.into(),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let reply = Msg::decode(r.recv().await.unwrap()).unwrap();
+    assert!(
+        matches!(&reply, Msg::ClientHelloAck { client_id, .. } if client_id == id),
+        "expected an ack for {id}, got {reply:?}"
+    );
+    (r, w)
+}
+
+/// Whether one handshake with `secret` completes.
+async fn credential_admitted(control: u16, secret: &str) -> bool {
+    let sock = TcpStream::connect(("127.0.0.1", control)).await.unwrap();
+    zeronat::noise::client_handshake_remote(
+        sock,
+        &zeronat::noise::derive_psk(secret),
+        zeronat::noise::AuthRole::Client,
+    )
+    .await
+    .is_ok()
+}
+
+/// Admin commands add, re-key, disconnect and remove clients on a running
+/// server, and each change lands in its config file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_manages_clients_and_saves_them() {
+    let body = async {
+        let control = free_port();
+        let path = temp_config_dir("admin-clients").join("server.toml");
+        let mut settings = cli_settings(control, vec![], vec![]);
+        settings.cli_clients = vec![zeronat::config::CfgClient {
+            id: "a".into(),
+            secret: Some(SECRET_B.into()),
+        }];
+        settings.config_path = Some(path.clone());
+        tokio::spawn(zeronat::server::run(settings));
+        let (mut a_r, _a_w) = client_hello(control, SECRET_B, "a").await;
+
+        let key = |secret: &str| Some(zeronat::secret::decode(secret).unwrap());
+        let add = |secret| Msg::AddClient {
+            client_id: "b".into(),
+            secret,
+        };
+        let (ok, msg) = admin_mutate(control, add(None)).await;
+        assert!(!ok && msg.contains("no seed"), "{msg}");
+        assert_eq!(
+            admin_mutate(control, add(key(SECRET_C))).await,
+            (true, String::new())
+        );
+        let (ok, msg) = admin_mutate(control, add(key(SECRET_D))).await;
+        assert!(!ok && msg.contains("already exists"), "{msg}");
+        // The first client change copies the --client entry into the file.
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("id = \"a\"") && saved.contains("id = \"b\""),
+            "{saved}"
+        );
+        let (mut b_r, _b_w) = client_hello(control, SECRET_C, "b").await;
+
+        // A disconnect drops the session and keeps the credential.
+        let disconnect = |id: &str| Msg::DisconnectClient {
+            client_id: id.into(),
+        };
+        assert_eq!(
+            admin_mutate(control, disconnect("b")).await,
+            (true, String::new())
+        );
+        assert!(matches!(
+            timeout(Duration::from_secs(5), b_r.recv()).await,
+            Ok(Err(_))
+        ));
+        let (mut b_r, _b_w) = client_hello(control, SECRET_C, "b").await;
+
+        // A new credential drops the session and retires the old credential.
+        let rekey = Msg::SetClientSecret {
+            client_id: "b".into(),
+            secret: key(SECRET_D),
+        };
+        assert_eq!(admin_mutate(control, rekey).await, (true, String::new()));
+        assert!(matches!(
+            timeout(Duration::from_secs(5), b_r.recv()).await,
+            Ok(Err(_))
+        ));
+        assert!(!credential_admitted(control, SECRET_C).await);
+        let (_b_r, _b_w) = client_hello(control, SECRET_D, "b").await;
+
+        let remove = || Msg::RemoveClient {
+            client_id: "a".into(),
+        };
+        assert_eq!(admin_mutate(control, remove()).await, (true, String::new()));
+        assert!(matches!(
+            timeout(Duration::from_secs(5), a_r.recv()).await,
+            Ok(Err(_))
+        ));
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("id = \"a\""));
+        let (ok, msg) = admin_mutate(control, remove()).await;
+        assert!(!ok && msg.contains("no client"), "{msg}");
+        let (ok, msg) = admin_mutate(control, disconnect("a")).await;
+        assert!(!ok && msg.contains("not connected"), "{msg}");
+    };
+
+    timeout(Duration::from_secs(30), body)
+        .await
+        .expect("admin client management did not complete within 30s");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

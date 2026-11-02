@@ -113,7 +113,8 @@ pub fn show(socket: Option<&Path>) -> Reply<'_> {
 
 /// A CLI command's reply future, boxed: the caller holds one pointer instead
 /// of the exchange's whole state.
-type Reply<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+pub(crate) type Reply<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
 
 async fn print_snapshot(socket: Option<&Path>) -> Result<()> {
     let path = resolve_socket(socket)?;
@@ -317,7 +318,7 @@ async fn send_command(socket: Option<&Path>, req: ClientMsg) -> Result<()> {
 }
 
 /// A `PROTO:PORT` forward key, e.g. `tcp:443`.
-fn parse_proto_port(spec: &str) -> Result<(Proto, u16)> {
+pub(crate) fn parse_proto_port(spec: &str) -> Result<(Proto, u16)> {
     let (proto, port) = spec
         .split_once(':')
         .ok_or_else(|| -> crate::Error { errf!("expected PROTO:PORT, got `{spec}`") })?;
@@ -336,7 +337,7 @@ fn parse_proto_port(spec: &str) -> Result<(Proto, u16)> {
 
 /// Read the secret from stdin: prompted with echo off on a terminal, read
 /// plainly when piped. One line, without the trailing newline.
-fn read_secret() -> Result<String> {
+pub(crate) fn read_secret() -> Result<String> {
     use std::io::BufRead;
     let tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
     if tty {

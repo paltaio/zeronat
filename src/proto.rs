@@ -183,8 +183,9 @@ pub struct FwdOptionEntry {
 /// Data channel (client -> server, first message): `Data` carrying the protocol
 /// version and stream id.
 /// Admin channel (admin -> server): `AdminHello` mode 0 -> `Snapshot`; mode 1 ->
-/// one mutation message (`AddListener`/`RemoveListener`/`SetRoute`/`ClearRoute`),
-/// answered by `MutationResult`.
+/// one mutation message (`AddListener`/`RemoveListener`/`SetRoute`/`ClearRoute`,
+/// `AddClient`/`SetClientSecret`/`RemoveClient`, `DisconnectClient`), answered by
+/// `MutationResult`.
 /// Peer rendezvous (control channel): a peer-capable client sends `PeerAnnounce`
 /// after `ClientHello`; the server answers `PeerChallenge`, the client proves
 /// possession of the announced identity with `PeerProof`, and the server
@@ -331,6 +332,24 @@ pub enum Msg {
     PeerPath {
         pair_id: u64,
         status: PathStatus,
+    },
+    /// Authorize a new client id. `None` derives the credential from the
+    /// server's seed.
+    AddClient {
+        client_id: String,
+        secret: Option<[u8; 32]>,
+    },
+    /// Replace an authorized client's credential, as `AddClient` gives it.
+    SetClientSecret {
+        client_id: String,
+        secret: Option<[u8; 32]>,
+    },
+    RemoveClient {
+        client_id: String,
+    },
+    /// Drop a client's live session, leaving its credential authorized.
+    DisconnectClient {
+        client_id: String,
     },
 }
 
@@ -990,6 +1009,28 @@ fn want(r: &mut Rd) -> u8 {
 
 /// The `(bind_ip, proto, port)` triple the listener and route mutations carry.
 #[inline(never)]
+/// An `AddClient` or `SetClientSecret` body: the id, then a flag and the
+/// secret when one is given.
+fn client_credential(tag: u8, client_id: &str, secret: &Option<[u8; 32]>) -> Vec<u8> {
+    let mut b = tagged(tag);
+    put_str(&mut b, client_id);
+    put_u8(&mut b, u8::from(secret.is_some()));
+    if let Some(secret) = secret {
+        put_bytes(&mut b, secret);
+    }
+    b
+}
+
+fn take_client_credential(r: &mut Rd) -> (String, Option<[u8; 32]>) {
+    let client_id = r.str();
+    r.need(1, "truncated client credential");
+    let secret = r
+        .flag("unknown client credential flag")
+        .then(|| r.arr32("client secret"));
+    r.done("trailing bytes in client credential");
+    (client_id, secret)
+}
+
 fn put_target(b: &mut Vec<u8>, bind_ip: Ipv4Addr, proto: Proto, port: u16) {
     put_ip(b, bind_ip);
     put_u8(b, proto_byte(proto));
@@ -1271,6 +1312,18 @@ impl Msg {
                 b
             }
             Msg::ClientHelloRefuse => tagged(28),
+            Msg::AddClient { client_id, secret } => client_credential(29, client_id, secret),
+            Msg::SetClientSecret { client_id, secret } => client_credential(30, client_id, secret),
+            Msg::RemoveClient { client_id } => {
+                let mut b = tagged(31);
+                put_str(&mut b, client_id);
+                b
+            }
+            Msg::DisconnectClient { client_id } => {
+                let mut b = tagged(32);
+                put_str(&mut b, client_id);
+                b
+            }
         }
     }
 
@@ -1465,6 +1518,24 @@ impl Msg {
                 reason: REFUSE_REASONS[r.index(4, "unknown refuse reason")],
             },
             Some(28) if b.len() == 1 => Msg::ClientHelloRefuse,
+            Some(29) => {
+                let (client_id, secret) = take_client_credential(&mut r);
+                Msg::AddClient { client_id, secret }
+            }
+            Some(30) => {
+                let (client_id, secret) = take_client_credential(&mut r);
+                Msg::SetClientSecret { client_id, secret }
+            }
+            Some(31) => {
+                let client_id = r.str();
+                r.done("trailing bytes in remove client");
+                Msg::RemoveClient { client_id }
+            }
+            Some(32) => {
+                let client_id = r.str();
+                r.done("trailing bytes in disconnect client");
+                Msg::DisconnectClient { client_id }
+            }
             _ => {
                 r.fail(errf!("malformed message ({} bytes)", b.len()));
                 Msg::Ping
@@ -2106,6 +2177,54 @@ mod tests {
     }
 
     #[test]
+    fn client_admin_messages_roundtrip() {
+        for secret in [None, Some([7u8; 32])] {
+            match roundtrip(&Msg::AddClient {
+                client_id: "site-2".into(),
+                secret,
+            }) {
+                Msg::AddClient {
+                    client_id,
+                    secret: got,
+                } => assert_eq!((client_id.as_str(), got), ("site-2", secret)),
+                other => panic!("expected add client, got {other:?}"),
+            }
+            match roundtrip(&Msg::SetClientSecret {
+                client_id: "site-2".into(),
+                secret,
+            }) {
+                Msg::SetClientSecret {
+                    client_id,
+                    secret: got,
+                } => assert_eq!((client_id.as_str(), got), ("site-2", secret)),
+                other => panic!("expected set client secret, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            roundtrip(&Msg::RemoveClient { client_id: "a".into() }),
+            Msg::RemoveClient { client_id } if client_id == "a"
+        ));
+        assert!(matches!(
+            roundtrip(&Msg::DisconnectClient { client_id: "a".into() }),
+            Msg::DisconnectClient { client_id } if client_id == "a"
+        ));
+        let good = Msg::AddClient {
+            client_id: "a".into(),
+            secret: Some([1; 32]),
+        }
+        .encode();
+        for cut in 1..good.len() {
+            assert!(Msg::decode(&good[..cut]).is_err(), "cut {cut} should error");
+        }
+        let mut junk = good.clone();
+        junk.push(0);
+        assert!(Msg::decode(&junk).is_err());
+        let mut bad_flag = good;
+        bad_flag[4] = 2;
+        assert!(Msg::decode(&bad_flag).is_err());
+    }
+
+    #[test]
     fn client_hello_refuse_exact() {
         let enc = Msg::ClientHelloRefuse.encode();
         assert_eq!(enc, vec![28]);
@@ -2248,8 +2367,8 @@ mod tests {
             bad[1] = bad_bits;
             assert!(Msg::decode(&bad).is_err());
         }
-        // The first tag past the client hello refusal is still unknown.
-        assert!(Msg::decode(&[29]).is_err());
+        // The first tag past the client admin messages is still unknown.
+        assert!(Msg::decode(&[33]).is_err());
     }
 
     #[test]

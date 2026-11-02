@@ -1,5 +1,9 @@
-use crate::proto::{path_name, proto_name, provides_name, Msg, RouteEntry, SnapshotBody, Source};
+use crate::client_admin::Reply;
+use crate::proto::{
+    path_name, proto_name, provides_name, Msg, Proto, RouteEntry, SnapshotBody, Source,
+};
 use crate::Result;
+use std::net::Ipv4Addr;
 use tokio::net::TcpStream;
 
 /// Where the installer writes the deployment env file. `admin` reads its
@@ -60,14 +64,101 @@ pub async fn fetch_snapshot(server: &str, psk: &[u8; 32]) -> Result<SnapshotBody
     }
 }
 
-/// Send one mutation (`AddListener`/`RemoveListener`/`SetRoute`/`ClearRoute`) and
-/// return the server's `(ok, message)` verdict. Transport errors propagate as
+/// Send one mutation and return the server's `(ok, message)` verdict. Transport errors propagate as
 /// `Err`; an applied-but-rejected mutation comes back as `Ok((false, reason))`.
 pub async fn mutate(server: &str, psk: &[u8; 32], req: Msg) -> Result<(bool, String)> {
     match exchange(server, psk, 1, Some(req)).await? {
         Msg::MutationResult { ok, msg } => Ok((ok, msg)),
         other => Err(errf!("expected mutation result, got {other:?}")),
     }
+}
+
+/// Send one mutation and print the server's verdict: `ok`, or the server's
+/// message. A refused mutation is an error.
+#[inline(never)]
+pub fn command(server: String, secret: String, req: Msg) -> Reply<'static> {
+    Box::pin(send_command(server, secret, req, None))
+}
+
+async fn send_command(
+    server: String,
+    secret: String,
+    req: Msg,
+    generated: Option<String>,
+) -> Result<()> {
+    let psk = crate::noise::derive_psk(&crate::secret::normalize(&secret)?);
+    let (ok, msg) = mutate(&server, &psk, req).await?;
+    if !ok {
+        return Err(msg.into());
+    }
+    match generated {
+        Some(credential) => println!("ZERONAT_CLIENT_SECRET={credential}"),
+        None if msg.is_empty() => println!("ok"),
+        None => println!("{msg}"),
+    }
+    Ok(())
+}
+
+/// Where an `add-client` or `set-client-secret` credential comes from.
+pub enum CredentialSource {
+    /// Read from stdin: prompted with echo off on a terminal.
+    Stdin,
+    /// A new random credential, printed once the server accepts it.
+    Generate,
+    /// Derived on the server from its seed.
+    Derive,
+}
+
+/// Authorize `client_id` (`add`) or replace its credential, taking the
+/// credential from `source`.
+#[inline(never)]
+pub fn set_client(
+    server: String,
+    secret: String,
+    client_id: String,
+    add: bool,
+    source: CredentialSource,
+) -> Result<Reply<'static>> {
+    let (credential, generated) = match source {
+        CredentialSource::Stdin => (Some(crate::client_admin::read_secret()?), false),
+        CredentialSource::Generate => {
+            let credential = crate::secret::generate().map_err(|e| -> crate::Error {
+                errf!("cannot read the system random source: {e}")
+            })?;
+            (Some(credential), true)
+        }
+        CredentialSource::Derive => (None, false),
+    };
+    let bytes = credential
+        .as_deref()
+        .map(crate::secret::decode)
+        .transpose()?;
+    let req = if add {
+        Msg::AddClient {
+            client_id,
+            secret: bytes,
+        }
+    } else {
+        Msg::SetClientSecret {
+            client_id,
+            secret: bytes,
+        }
+    };
+    let generated = credential.filter(|_| generated);
+    Ok(Box::pin(send_command(server, secret, req, generated)))
+}
+
+/// The `(bind_ip, proto, port)` of a listener given as `PROTO:PORT` and an
+/// optional bind address (default `0.0.0.0`).
+pub fn listener_key(spec: &str, bind: Option<&str>) -> Result<(Ipv4Addr, Proto, u16)> {
+    let (proto, port) = crate::client_admin::parse_proto_port(spec)?;
+    let bind_ip = match bind {
+        Some(bind) => bind
+            .parse()
+            .map_err(|_| -> crate::Error { errf!("invalid bind address `{bind}`") })?,
+        None => Ipv4Addr::UNSPECIFIED,
+    };
+    Ok((bind_ip, proto, port))
 }
 
 /// One admin round trip: connect, handshake, hello in `mode`, the request if

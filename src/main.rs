@@ -188,6 +188,23 @@ admin options:
   (no command)        Open the interactive console on a terminal; prints the
                       status and exits when piped or redirected
   show                Print the server's current topology and exit
+  add-listener <PROTO:PORT> [--bind <IP>]
+                      Open a public port, e.g. tcp:443 (bind default: 0.0.0.0)
+  remove-listener <PROTO:PORT> [--bind <IP>]
+                      Close a public port; a port set by --tcp/--udp is refused
+  set-route <PROTO:PORT> <CLIENT-ID> [--bind <IP>]
+                      Send the port's new connections to that client
+  clear-route <PROTO:PORT> [--bind <IP>]
+                      Remove the port's route
+  add-client <ID> [--generate | --derive]
+                      Authorize a client; the credential is read from stdin,
+                      generated and printed (--generate), or derived from the
+                      server's seed (--derive)
+  set-client-secret <ID> [--generate | --derive]
+                      Replace a client's credential, taken as for add-client;
+                      its live session is dropped
+  remove-client <ID>  Revoke a client and drop its live session
+  disconnect <ID>     Drop a client's live session; it may reconnect
   --server <ADDR>     Server control address host:port
   --secret <64-HEX>   32-byte admin secret (or env ZERONAT_ADMIN_SECRET, or
                       derived from env ZERONAT_SEED, or either one read from
@@ -271,6 +288,7 @@ enum Cmd {
         interactive: bool,
     },
     Admin {
+        command: Option<AdminCmd>,
         server: String,
         secret: String,
         interactive: bool,
@@ -282,6 +300,16 @@ enum Cmd {
     },
     Upgrade {
         check: bool,
+    },
+}
+
+enum AdminCmd {
+    Show,
+    Mutate(zeronat::proto::Msg),
+    SetClient {
+        client_id: String,
+        add: bool,
+        source: admin::CredentialSource,
     },
 }
 
@@ -784,9 +812,20 @@ const CLIENT_ADMIN_COMMANDS: &str = "show select-server add-server remove-server
                                      detach-provider";
 
 const ADMIN_FLAGS: Table = Table {
-    names: "-h --help --server --secret",
-    kinds: &[Kind::Help, Kind::Help, Kind::Str(0), Kind::Str(1)],
+    names: "-h --help --server --secret --bind --generate --derive",
+    kinds: &[
+        Kind::Help,
+        Kind::Help,
+        Kind::Str(0),
+        Kind::Str(1),
+        Kind::Str(2),
+        Kind::Switch(0),
+        Kind::Switch(1),
+    ],
 };
+
+const ADMIN_COMMANDS: &str = "show add-listener remove-listener set-route clear-route add-client \
+                              set-client-secret remove-client disconnect";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Sub {
@@ -1065,12 +1104,86 @@ fn parse_derive_client(iter: Args) -> Result<Cmd> {
 
 #[inline(never)]
 fn parse_admin(iter: Args) -> Result<Cmd> {
-    let mut p = walk(iter, &ADMIN_FLAGS, Some(1))?;
-    let command = p.pos.pop();
+    use zeronat::proto::Msg;
+    let mut p = walk(iter, &ADMIN_FLAGS, Some(usize::MAX))?;
+    let mut pos = std::mem::take(&mut p.pos).into_iter();
+    let command = pos.next();
+    let [generate, derive, ..] = p.switches;
+    let bind = p.strs[2].take();
 
-    match command.as_deref() {
-        None | Some("show") => {}
-        Some(other) => return Err(errf!("unknown admin command '{other}'")),
+    let index = match command.as_deref() {
+        None => None,
+        Some(cmd) => Some(
+            lookup(ADMIN_COMMANDS, cmd).ok_or_else(|| errf!("unknown admin command '{cmd}'"))?,
+        ),
+    };
+    if bind.is_some() && !matches!(index, Some(1..=4)) {
+        return Err("--bind only applies to listener and route commands".into());
+    }
+    if (generate || derive) && !matches!(index, Some(5..=6)) {
+        return Err(
+            "--generate and --derive only apply to add-client and set-client-secret".into(),
+        );
+    }
+    if generate && derive {
+        return Err("--generate and --derive cannot be combined".into());
+    }
+
+    let arg = |pos: &mut std::vec::IntoIter<String>, cmd: &str, what: &str| -> Result<String> {
+        pos.next().ok_or_else(|| errf!("{cmd} requires {what}"))
+    };
+    let command = match (command, index) {
+        (Some(cmd), Some(index)) => Some(match index {
+            0 => AdminCmd::Show,
+            1..=4 => {
+                let spec = arg(&mut pos, &cmd, "PROTO:PORT")?;
+                let (bind_ip, proto, port) = admin::listener_key(&spec, bind.as_deref())?;
+                AdminCmd::Mutate(match index {
+                    1 => Msg::AddListener {
+                        bind_ip,
+                        proto,
+                        port,
+                    },
+                    2 => Msg::RemoveListener {
+                        bind_ip,
+                        proto,
+                        port,
+                    },
+                    3 => Msg::SetRoute {
+                        bind_ip,
+                        proto,
+                        port,
+                        client_id: arg(&mut pos, &cmd, "PROTO:PORT and a client id")?,
+                    },
+                    _ => Msg::ClearRoute {
+                        bind_ip,
+                        proto,
+                        port,
+                    },
+                })
+            }
+            5..=6 => AdminCmd::SetClient {
+                client_id: arg(&mut pos, &cmd, "a client id")?,
+                add: index == 5,
+                source: if generate {
+                    admin::CredentialSource::Generate
+                } else if derive {
+                    admin::CredentialSource::Derive
+                } else {
+                    admin::CredentialSource::Stdin
+                },
+            },
+            7 => AdminCmd::Mutate(Msg::RemoveClient {
+                client_id: arg(&mut pos, &cmd, "a client id")?,
+            }),
+            _ => AdminCmd::Mutate(Msg::DisconnectClient {
+                client_id: arg(&mut pos, &cmd, "a client id")?,
+            }),
+        }),
+        _ => None,
+    };
+    if let Some(extra) = pos.next() {
+        return Err(errf!("unexpected argument '{extra}'"));
     }
 
     let server = p.strs[0].take().ok_or("--server is required")?;
@@ -1090,6 +1203,7 @@ fn parse_admin(iter: Args) -> Result<Cmd> {
 
     let interactive = command.is_none() && interactive_default();
     Ok(Cmd::Admin {
+        command,
         server,
         secret,
         interactive,
@@ -1950,6 +2064,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             client_admin::command(socket, req).await
         }
         Cmd::Admin {
+            command,
             server,
             secret,
             interactive,
@@ -1959,7 +2074,15 @@ async fn run(cmd: Cmd) -> Result<()> {
                 return zeronat::tui::run(server, secret).await;
             }
             let _ = interactive;
-            admin::show(server, secret).await
+            match command {
+                None | Some(AdminCmd::Show) => admin::show(server, secret).await,
+                Some(AdminCmd::Mutate(req)) => admin::command(server, secret, req).await,
+                Some(AdminCmd::SetClient {
+                    client_id,
+                    add,
+                    source,
+                }) => admin::set_client(server, secret, client_id, add, source)?.await,
+            }
         }
         Cmd::DeriveClient {
             secret,
